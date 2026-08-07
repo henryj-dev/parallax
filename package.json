@@ -1,0 +1,21 @@
+{
+  "name": "@tinyuniverse/parallax",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A split-horizon DNS control plane",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "dev": "node --watch src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@11.9.0",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

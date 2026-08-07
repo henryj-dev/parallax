@@ -1,0 +1,17 @@
+# Dependencies and build output
+node_modules/
+/dist/
+
+# Test and coverage output
+*.out
+coverage.*
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
