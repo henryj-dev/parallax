@@ -9,6 +9,12 @@ DNS records managed through providers such as Cloudflare.
 
 The project is in its initial setup phase.
 
+The product concept, architecture proposal, and MVP scope are documented in
+[docs/product-design.md](docs/product-design.md).
+
+To continue development in a new session, start with
+[docs/handoff.md](docs/handoff.md).
+
 ## Development
 
 Prerequisites:
@@ -26,4 +32,11 @@ Run the application:
 
 ```sh
 pnpm dev
+```
+
+Type-check and build:
+
+```sh
+pnpm check
+pnpm build
 ```
