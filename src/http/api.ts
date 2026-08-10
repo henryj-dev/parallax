@@ -1,30 +1,35 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { ControlPlane, ConflictError, DEFAULT_HISTORY_PAGE_SIZE, NotFoundError } from "../application/control-plane.ts";
-import { CloudflareCredentialManager, CredentialNotFoundError, CredentialTestError } from "../application/cloudflare-credentials.ts";
-import { ProviderNotConfiguredError, type PageRequest } from "../application/ports.ts";
+import { ConflictError, NotFoundError } from "../application/control-plane.ts";
+import { CredentialNotFoundError, CredentialTestError } from "../application/cloudflare-credentials.ts";
+import { ProviderNotConfiguredError } from "../application/ports.ts";
+import { parseInvocation, UsageError } from "../cli/argv.ts";
+import {
+  CommandPermissionError,
+  CommandUnavailableError,
+  runCommand,
+  UnknownCommandError,
+  type CommandInput,
+  type CommandRuntime,
+} from "../cli/commands.ts";
 import { DomainValidationError } from "../domain/dns.ts";
 import { CredentialInUseError, CredentialValidationError } from "../security/credential-store.ts";
-import { createAuthorizedHandler, type SecurityConfig } from "../security/http-authorization.ts";
-import type { AccessTokenService } from "../application/access-tokens.ts";
-import type { SettingsService } from "../application/settings.ts";
+import { authenticate, createAuthorizedHandler, type Role, type SecurityConfig } from "../security/http-authorization.ts";
 
 const MAX_REQUEST_BODY_BYTES = 1_048_576;
 
-/** Administration surfaces that are optional in tests but present in the server. */
-export interface AdministrationServices {
-  readonly settings?: SettingsService;
-  readonly accessTokens?: AccessTokenService;
-}
-
+/**
+ * Every route is a translation: it turns an HTTP request into one command
+ * invocation and that command's result into a response. The command layer holds
+ * the behaviour, so the API and the command line cannot drift apart.
+ */
 export function createApiHandler(
-  controlPlane: ControlPlane,
+  runtime: CommandRuntime,
   security?: SecurityConfig | (() => SecurityConfig),
-  credentials?: CloudflareCredentialManager,
-  administration: AdministrationServices = {},
 ): (request: Request) => Promise<Response> {
+  const resolveSecurity = typeof security === "function" ? security : () => security ?? { enabled: false, tokens: [] };
   const handler = async (request: Request): Promise<Response> => {
     try {
-      return await route(controlPlane, request, credentials, administration);
+      return await route(runtime, request, resolveSecurity());
     } catch (error) {
       return errorResponse(error);
     }
@@ -43,13 +48,11 @@ export interface NodeHandlerOptions {
 }
 
 export function createNodeHandler(
-  controlPlane: ControlPlane,
+  runtime: CommandRuntime,
   security?: SecurityConfig | (() => SecurityConfig),
-  credentials?: CloudflareCredentialManager,
   options: NodeHandlerOptions = {},
-  administration: AdministrationServices = {},
 ): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
-  const handler = createApiHandler(controlPlane, security, credentials, administration);
+  const handler = createApiHandler(runtime, security);
   return async (request, response) => {
     const origin = requestOrigin(request, options);
     let body: Buffer;
@@ -107,213 +110,201 @@ function firstHeaderValue(value: string | string[] | undefined): string | undefi
   return raw?.split(",")[0]?.trim() || undefined;
 }
 
-async function route(
-  controlPlane: ControlPlane,
-  request: Request,
-  credentials: CloudflareCredentialManager | undefined,
-  administration: AdministrationServices,
-): Promise<Response> {
+/** One HTTP request resolved to a command, its input, and how to answer. */
+interface RouteMatch {
+  readonly command: string;
+  readonly input: CommandInput;
+  readonly status?: number;
+  /** Answer 204 with no body instead of serialising the result. */
+  readonly empty?: boolean;
+  /** Include the result's revision as an ETag. */
+  readonly revisioned?: boolean;
+}
+
+async function route(runtime: CommandRuntime, request: Request, security: SecurityConfig): Promise<Response> {
   const url = new URL(request.url);
   const segments = decodeSegments(url.pathname);
   // HEAD must resolve exactly like GET; the body is dropped by the transport.
   const method = request.method === "HEAD" ? "GET" : request.method;
-  if (segments[0] !== "api" || segments[1] !== "v1") {
+  if (segments[0] !== "api" || segments[1] !== "v1") throw new NotFoundError("route was not found");
+
+  const context = {
+    runtime,
+    actor: request.headers.get("x-parallax-actor") ?? "web-console",
+    role: roleOf(request, security),
+  };
+
+  // The command line, reachable over HTTP. The same dispatcher runs it, so a
+  // caller can drive anything the CLI can without a shell ever being involved.
+  if (segments[2] === "cli" && segments.length === 3 && method === "POST") {
+    const body = await parseJson(request);
+    const argv = body.argv;
+    if (!Array.isArray(argv) || argv.some((token) => typeof token !== "string")) {
+      throw new DomainValidationError(["argv must be an array of strings"]);
+    }
+    const invocation = parseInvocation(argv as string[]);
+    return json({
+      command: invocation.name,
+      result: await runCommand(context, invocation.name, invocation.input),
+    });
+  }
+
+  const match = await matchRoute(segments, method, url, request);
+  const result = await runCommand(context, match.command, match.input);
+  if (match.empty) return new Response(null, { status: 204 });
+  if (match.revisioned) return revisionJson(result as { revision: number }, match.status ?? 200);
+  return json(result, match.status ?? 200);
+}
+
+async function matchRoute(segments: string[], method: string, url: URL, request: Request): Promise<RouteMatch> {
+  const area = segments[2];
+
+  if (area === "settings" && segments.length === 3) {
+    if (method === "GET") return { command: "settings get", input: {} };
+    if (method === "PUT") return { command: "settings set", input: { values: await parseJson(request) } };
+  }
+
+  if (area === "tokens") {
+    if (segments.length === 3 && method === "GET") return { command: "token list", input: {} };
+    if (segments.length === 3 && method === "POST") {
+      const body = await parseJson(request);
+      return { command: "token issue", input: { subject: body.subject, role: body.role }, status: 201 };
+    }
+    if (segments.length === 4 && segments[3] && method === "DELETE") {
+      return { command: "token revoke", input: { id: segments[3] }, empty: true };
+    }
+  }
+
+  if (area === "credentials") return credentialRoute(segments, method, request);
+
+  if (area === "zones") {
+    if (segments.length === 3 && method === "GET") return { command: "zone list", input: {} };
+    if (segments.length === 3 && method === "POST") {
+      const body = await parseJson(request);
+      return { command: "zone create", input: { zone: readString(body, "name") }, status: 201, revisioned: true };
+    }
+
+    const zone = segments[3];
+    if (!zone) throw new NotFoundError("route was not found");
+    const expectedRevision = readExpectedRevision(request);
+
+    if (segments.length === 4 && method === "GET") return { command: "zone get", input: { zone }, revisioned: true };
+    if (segments.length === 4 && method === "PUT") {
+      return {
+        command: "zone replace",
+        input: { zone, desired: await parseJson(request), expectedRevision },
+        revisioned: true,
+      };
+    }
+    if (segments.length === 4 && method === "DELETE") {
+      // Reports what was withdrawn from the provider, so the caller can see the
+      // blast radius of a deletion instead of an empty 204.
+      return {
+        command: "zone delete",
+        input: { zone, expectedRevision, abandonProviderRecords: readBooleanQuery(url, "abandonProviderRecords") },
+      };
+    }
+
+    const action = segments[4];
+    if (action === "preview" && segments.length === 5 && (method === "GET" || method === "POST")) {
+      const desired = method === "POST" ? await parseOptionalJson(request) : undefined;
+      return { command: "preview", input: { zone, view: readViewQuery(url), desired } };
+    }
+    if (action === "apply" && segments.length === 5 && method === "POST") {
+      return { command: "apply", input: { zone, view: readViewQuery(url), expectedRevision }, revisioned: true };
+    }
+    if (action === "status" && segments.length === 5 && method === "GET") {
+      return { command: "status", input: { zone } };
+    }
+    if ((action === "history" || action === "audit") && segments.length === 5 && method === "GET") {
+      return { command: "history", input: { zone, ...readPageQuery(url) } };
+    }
+    if (action === "revisions" && segments.length === 5 && method === "GET") {
+      return { command: "revision list", input: { zone, ...readPageQuery(url) } };
+    }
+    if (action === "revisions" && segments.length === 6 && method === "GET") {
+      return { command: "revision get", input: { zone, revision: readRevision(segments[5]) } };
+    }
+    if (action === "revisions" && segments[6] === "restore" && segments.length === 7 && method === "POST") {
+      return {
+        command: "revision restore",
+        input: { zone, revision: readRevision(segments[5]), expectedRevision },
+        revisioned: true,
+      };
+    }
+    if (action === "views" && segments[6] === "records" && segments.length === 8) {
+      const view = requireSegment(segments[5]);
+      const id = requireSegment(segments[7]);
+      if (method === "PUT") {
+        return {
+          command: "record set",
+          input: { zone, view, id, record: await parseJson(request), expectedRevision },
+          revisioned: true,
+        };
+      }
+      if (method === "DELETE") {
+        return { command: "record delete", input: { zone, view, id, expectedRevision }, revisioned: true };
+      }
+    }
+  }
+
+  throw new NotFoundError("route was not found");
+}
+
+async function credentialRoute(segments: string[], method: string, request: Request): Promise<RouteMatch> {
+  if (segments[3] === "profiles") {
+    if (segments.length === 4 && method === "GET") return { command: "credential profile list", input: {} };
+    const name = segments[4];
+    if (!name) throw new NotFoundError("route was not found");
+    if (segments.length === 5 && method === "GET") {
+      return { command: "credential profile get", input: { name } };
+    }
+    if (segments.length === 5 && method === "PUT") {
+      const body = await parseJson(request);
+      return {
+        command: "credential profile set",
+        input: { name, token: body.token, accountId: body.accountId },
+      };
+    }
+    if (segments.length === 5 && method === "DELETE") {
+      return { command: "credential profile delete", input: { name }, empty: true };
+    }
+    if (segments.length === 6 && segments[5] === "test" && method === "POST") {
+      const body = await parseJson(request);
+      return { command: "credential profile test", input: { name, zoneId: body.zoneId, token: body.token } };
+    }
     throw new NotFoundError("route was not found");
   }
-  if (segments[2] === "credentials") return credentialRoute(credentials, segments, request, method);
-  if (segments[2] === "settings") return settingsRoute(administration.settings, segments, request, method);
-  if (segments[2] === "tokens") return tokenRoute(administration.accessTokens, segments, request, method);
-  if (segments[2] !== "zones") throw new NotFoundError("route was not found");
-  const actor = request.headers.get("x-parallax-actor") ?? "web-console";
 
-  if (segments.length === 3 && method === "GET") {
-    return json({ zones: await controlPlane.listZones() });
-  }
-  if (segments.length === 3 && method === "POST") {
-    const body = await parseJson(request);
-    return revisionJson(await controlPlane.createZone(readString(body, "name"), actor), 201);
-  }
-
-  const zone = segments[3];
-  if (!zone) throw new NotFoundError("route was not found");
-  if (segments.length === 4 && method === "GET") return revisionJson(await controlPlane.getZone(zone));
-  if (segments.length === 4 && method === "PUT") {
-    return revisionJson(await controlPlane.replaceDesiredState(zone, await parseJson(request), actor, readExpectedRevision(request)));
-  }
-  if (segments.length === 4 && method === "DELETE") {
-    // Reports what was withdrawn from the provider, so the caller can see the
-    // blast radius of a deletion instead of an empty 204.
-    return json(await controlPlane.deleteZone(zone, actor, readExpectedRevision(request), {
-      abandonProviderRecords: readBooleanQuery(url, "abandonProviderRecords") === true,
-    }));
-  }
-
-  if (segments[4] === "preview" && segments.length === 5 && (method === "GET" || method === "POST")) {
-    const candidate = method === "POST" ? await parseOptionalJson(request) : undefined;
-    return json(await controlPlane.preview(zone, readViewQuery(url), candidate));
-  }
-  if (segments[4] === "apply" && segments.length === 5 && method === "POST") {
-    return revisionJson(await controlPlane.apply(zone, readViewQuery(url), readExpectedRevision(request)));
-  }
-  if (segments[4] === "status" && segments.length === 5 && method === "GET") {
-    return json(await controlPlane.status(zone));
-  }
-  if ((segments[4] === "history" || segments[4] === "audit") && segments.length === 5 && method === "GET") {
-    return json(await controlPlane.audit(zone, readPageQuery(url)));
-  }
-  if (segments[4] === "revisions" && segments.length === 5 && method === "GET") {
-    return json(await controlPlane.listRevisions(zone, readPageQuery(url)));
-  }
-  if (segments[4] === "revisions" && segments.length === 6 && method === "GET") {
-    return json(await controlPlane.getRevision(zone, readRevision(segments[5])));
-  }
-  if (segments[4] === "revisions" && segments[6] === "restore" && segments.length === 7 && method === "POST") {
-    return revisionJson(await controlPlane.restoreRevision(zone, readRevision(segments[5]), actor, readExpectedRevision(request)));
-  }
-  if (segments[4] === "views" && segments[6] === "records" && segments.length === 8) {
-    const view = requireSegment(segments[5]);
-    const recordId = requireSegment(segments[7]);
-    if (method === "PUT") {
-      return revisionJson(await controlPlane.upsertRecord(zone, view, recordId, await parseJson(request), actor, readExpectedRevision(request)));
-    }
-    if (method === "DELETE") {
-      return revisionJson(await controlPlane.deleteRecord(zone, view, recordId, actor, readExpectedRevision(request)));
-    }
-  }
-  throw new NotFoundError("route was not found");
-}
-
-async function settingsRoute(
-  settings: SettingsService | undefined,
-  segments: string[],
-  request: Request,
-  method: string,
-): Promise<Response> {
-  if (!settings || segments.length !== 3) throw new NotFoundError("route was not found");
-  if (method === "GET") return json({ settings: settings.current() });
-  if (method === "PUT") return json({ settings: await settings.update(await parseJson(request)) });
-  throw new NotFoundError("route was not found");
-}
-
-async function tokenRoute(
-  accessTokens: AccessTokenService | undefined,
-  segments: string[],
-  request: Request,
-  method: string,
-): Promise<Response> {
-  if (!accessTokens) throw new NotFoundError("route was not found");
-  if (segments.length === 3 && method === "GET") return json({ tokens: accessTokens.list() });
-  if (segments.length === 3 && method === "POST") {
-    const body = await parseJson(request);
-    // The generated token is returned exactly once and never stored in full.
-    const issued = await accessTokens.issue(body.subject, body.role);
-    return json(issued, 201);
-  }
-  const id = segments[3];
-  if (segments.length === 4 && id && method === "DELETE") {
-    if (!await accessTokens.revoke(id)) throw new NotFoundError("access token was not found");
-    return new Response(null, { status: 204 });
-  }
-  throw new NotFoundError("route was not found");
-}
-
-async function credentialRoute(
-  credentials: CloudflareCredentialManager | undefined,
-  segments: string[],
-  request: Request,
-  method: string,
-): Promise<Response> {
-  if (!credentials) throw new NotFoundError("route was not found");
-  if (segments[3] === "profiles") return profileRoute(credentials, segments, request, method);
   if (segments[3] !== "cloudflare") throw new NotFoundError("route was not found");
-
-  if (segments.length === 4 && method === "GET") return json({ credentials: await credentials.listZones() });
+  if (segments.length === 4 && method === "GET") return { command: "credential zone list", input: {} };
   const zone = segments[4];
   if (!zone) throw new NotFoundError("route was not found");
-  if (segments.length === 5 && method === "GET") {
-    const binding = await credentials.getZone(zone);
-    if (!binding) throw new CredentialNotFoundError();
-    return json(binding);
-  }
+  if (segments.length === 5 && method === "GET") return { command: "credential zone get", input: { zone } };
   if (segments.length === 5 && method === "PUT") {
-    return json(await bindZone(credentials, zone, await parseJson(request)));
+    const body = await parseJson(request);
+    return {
+      command: "credential zone set",
+      input: { zone, zoneId: body.zoneId, profile: body.profile, token: body.token, accountId: body.accountId },
+    };
   }
   if (segments.length === 5 && method === "DELETE") {
-    if (!await credentials.unbindZone(zone)) throw new CredentialNotFoundError();
-    return new Response(null, { status: 204 });
+    return { command: "credential zone delete", input: { zone }, empty: true };
   }
   if (segments.length === 6 && segments[5] === "test" && method === "POST") {
     const body = await parseOptionalJson(request);
-    const credential = await credentials.test(zone, body ? readZoneTestInput(body) : undefined);
-    return json({ ok: true, credential });
+    return {
+      command: "credential zone test",
+      input: { zone, zoneId: body?.zoneId, token: body?.token, accountId: body?.accountId },
+    };
   }
   throw new NotFoundError("route was not found");
 }
 
-async function profileRoute(
-  credentials: CloudflareCredentialManager,
-  segments: string[],
-  request: Request,
-  method: string,
-): Promise<Response> {
-  if (segments.length === 4 && method === "GET") return json({ profiles: await credentials.listProfiles() });
-  const name = segments[4];
-  if (!name) throw new NotFoundError("route was not found");
-  if (segments.length === 5 && method === "GET") {
-    const profile = await credentials.getProfile(name);
-    if (!profile) throw new CredentialNotFoundError();
-    return json(profile);
-  }
-  if (segments.length === 5 && method === "PUT") {
-    const body = await parseJson(request);
-    return json(await credentials.upsertProfile(name, {
-      token: readString(body, "token"),
-      ...(body.accountId === undefined ? {} : { accountId: readString(body, "accountId") }),
-    }));
-  }
-  if (segments.length === 5 && method === "DELETE") {
-    if (!await credentials.deleteProfile(name)) throw new CredentialNotFoundError();
-    return new Response(null, { status: 204 });
-  }
-  if (segments.length === 6 && segments[5] === "test" && method === "POST") {
-    const body = await parseJson(request);
-    const profile = await credentials.testProfile(
-      name,
-      readString(body, "zoneId"),
-      body.token === undefined ? undefined : readString(body, "token"),
-    );
-    return json({ ok: true, profile });
-  }
-  throw new NotFoundError("route was not found");
-}
-
-/**
- * Accepts either a reference to a reusable profile or, for a single-zone setup,
- * an inline token that is stored as a profile named after the zone.
- */
-async function bindZone(
-  credentials: CloudflareCredentialManager,
-  zone: string,
-  body: Record<string, unknown>,
-): Promise<unknown> {
-  const zoneId = readString(body, "zoneId");
-  if (body.profile !== undefined) {
-    return credentials.bindZone(zone, { zoneId, profile: readString(body, "profile") });
-  }
-  const profile = zone.trim().toLowerCase().replace(/\.$/u, "").replace(/\./gu, "-");
-  await credentials.upsertProfile(profile, {
-    token: readString(body, "token"),
-    ...(body.accountId === undefined ? {} : { accountId: readString(body, "accountId") }),
-  });
-  return credentials.bindZone(zone, { zoneId, profile });
-}
-
-function readZoneTestInput(body: Record<string, unknown>): { zoneId: string; token: string; accountId?: string } {
-  return {
-    zoneId: readString(body, "zoneId"),
-    token: readString(body, "token"),
-    ...(body.accountId === undefined ? {} : { accountId: readString(body, "accountId") }),
-  };
+/** The role the security layer already authenticated, or admin when it is off. */
+function roleOf(request: Request, security: SecurityConfig): Role {
+  if (!security.enabled) return "admin";
+  return authenticate(request, security)?.role ?? "viewer";
 }
 
 function json(value: unknown, status = 200): Response {
@@ -334,6 +325,11 @@ function errorResponse(error: unknown): Response {
   if (error instanceof CredentialTestError) return json({ error: "provider_test_failed", message: error.message }, 502);
   if (error instanceof ConflictError) return json({ error: "conflict", message: error.message }, 409);
   if (error instanceof ProviderNotConfiguredError) return json({ error: "provider_not_configured", message: error.message }, 409);
+  if (error instanceof UnknownCommandError || error instanceof UsageError) {
+    return json({ error: "unknown_command", message: error.message }, 400);
+  }
+  if (error instanceof CommandPermissionError) return json({ error: "forbidden", message: error.message }, 403);
+  if (error instanceof CommandUnavailableError) return json({ error: "not_found", message: error.message }, 404);
   if (error instanceof CredentialValidationError) return json({ error: "validation_failed", message: error.message }, 400);
   if (error instanceof CredentialInUseError) return json({ error: "conflict", message: error.message, zones: error.zones }, 409);
   if (error instanceof URIError) return json({ error: "validation_failed", message: "request path is not valid percent-encoding" }, 400);
@@ -391,11 +387,13 @@ function readBooleanQuery(url: URL, key: string): boolean | undefined {
   return value === "true";
 }
 
-function readPageQuery(url: URL): PageRequest | undefined {
+function readPageQuery(url: URL): { limit?: number; offset?: number } {
   const limit = readNonNegativeQuery(url, "limit");
   const offset = readNonNegativeQuery(url, "offset");
-  if (limit === undefined && offset === undefined) return undefined;
-  return { limit: limit ?? DEFAULT_HISTORY_PAGE_SIZE, offset: offset ?? 0 };
+  return {
+    ...(limit === undefined ? {} : { limit }),
+    ...(offset === undefined ? {} : { offset }),
+  };
 }
 
 function readNonNegativeQuery(url: URL, key: string): number | undefined {

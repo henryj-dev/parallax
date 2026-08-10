@@ -42,7 +42,7 @@ describe("Cloudflare credential HTTP API", () => {
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
         createAdapter: () => ({ async list() { return []; }, async apply() {} }),
       });
-      const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), security, manager);
+      const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), credentials: manager }, security);
       const secret = "never-return-this-token";
 
       assert.equal((await api(request("/api/v1/credentials/cloudflare", "GET", undefined, "editor-token-00000000000000000000"))).status, 403);
@@ -80,7 +80,7 @@ describe("Cloudflare credential HTTP API", () => {
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
         createAdapter: () => ({ async list() { return []; }, async apply() {} }),
       });
-      const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), security, manager);
+      const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), credentials: manager }, security);
       const secret = "account-wide-token";
 
       assert.equal((await api(request("/api/v1/credentials/profiles/account-a", "PUT", {
@@ -127,7 +127,7 @@ describe("Cloudflare credential HTTP API", () => {
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
         createAdapter: () => ({ async list() { throw new Error("leaked secret-value"); }, async apply() {} }),
       });
-      const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), security, manager);
+      const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), credentials: manager }, security);
       const response = await api(request(
         "/api/v1/credentials/cloudflare/example.com/test",
         "POST",

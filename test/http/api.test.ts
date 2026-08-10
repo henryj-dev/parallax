@@ -9,7 +9,7 @@ import { createInMemoryAdapters } from "../../src/infrastructure/in-memory.ts";
 
 function setup(): ReturnType<typeof createApiHandler> {
   const adapters = createInMemoryAdapters();
-  return createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
+  return createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
 }
 
 function request(path: string, method = "GET", body?: unknown, headers: Record<string, string> = {}): Request {
@@ -26,7 +26,7 @@ function request(path: string, method = "GET", body?: unknown, headers: Record<s
 describe("HTTP API", () => {
   it("resolves HEAD exactly like GET and answers it without a body", async () => {
     const adapters = createInMemoryAdapters();
-    const handler = createNodeHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
+    const handler = createNodeHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
     const incoming = Readable.from([]) as IncomingMessage;
     incoming.method = "HEAD";
     incoming.url = "/api/v1/zones";
@@ -69,10 +69,12 @@ describe("HTTP API", () => {
 
   it("reports an unconfigured provider as a conflict rather than an internal error", async () => {
     const adapters = createInMemoryAdapters();
-    const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, {
-      list: () => { throw new ProviderNotConfiguredError("no provider is configured for example.com/external"); },
-      apply: async () => undefined,
-    }));
+    const api = createApiHandler({
+      controlPlane: new ControlPlane(adapters.zones, adapters.statuses, {
+        list: () => { throw new ProviderNotConfiguredError("no provider is configured for example.com/external"); },
+        apply: async () => undefined,
+      }),
+    });
     await api(request("/api/v1/zones", "POST", { name: "example.com" }));
     await api(request("/api/v1/zones/example.com/views/external/records/web", "PUT", {
       name: "www", type: "A", content: "8.8.8.8", ttl: 300,
@@ -111,7 +113,7 @@ describe("HTTP API", () => {
 
   it("withdraws published records when deleting a zone and reports what it removed", async () => {
     const adapters = createInMemoryAdapters();
-    const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
+    const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
     await api(request("/api/v1/zones", "POST", { name: "example.com" }));
     await api(request("/api/v1/zones/example.com/views/external/records/root", "PUT", {
       name: "@", type: "A", content: "8.8.8.8", ttl: 300,
@@ -134,7 +136,7 @@ describe("HTTP API", () => {
 
   it("abandons published records only when the caller opts in explicitly", async () => {
     const adapters = createInMemoryAdapters();
-    const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
+    const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
     await api(request("/api/v1/zones", "POST", { name: "example.com" }));
     await api(request("/api/v1/zones/example.com/views/external/records/root", "PUT", {
       name: "@", type: "A", content: "8.8.8.8", ttl: 300,
@@ -161,7 +163,7 @@ describe("HTTP API", () => {
 
   it("rejects oversized request bodies before buffering them", async () => {
     const adapters = createInMemoryAdapters();
-    const handler = createNodeHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
+    const handler = createNodeHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
     const incoming = Readable.from([]) as IncomingMessage;
     incoming.method = "POST";
     incoming.url = "/api/v1/zones";
@@ -386,7 +388,7 @@ describe("HTTP API", () => {
 
   it("rejects apply when desired state changed after preview without touching the provider", async () => {
     const adapters = createInMemoryAdapters();
-    const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
+    const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
     await api(request("/api/v1/zones", "POST", { name: "example.com" }));
     const preview = await api(request("/api/v1/zones/example.com/preview", "POST"));
     assert.equal((await preview.json() as { revision: number }).revision, 1);

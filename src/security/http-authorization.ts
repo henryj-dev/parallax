@@ -83,6 +83,10 @@ export function authorize(principal: Principal, request: Request): boolean {
   const administration = new Set(["credentials", "settings", "tokens"]);
   if (segments[0] === "api" && segments[1] === "v1" && administration.has(segments[2] ?? "")) return false;
 
+  // The command endpoint is reachable by any role; the command it names then
+  // enforces its own minimum, so one gate does not have to mirror the other.
+  if (segments[0] === "api" && segments[1] === "v1" && segments[2] === "cli") return method === "POST";
+
   // Preview queries the live provider on every call, so it needs write-level
   // trust even though it mutates nothing.
   const previewsProvider = segments[0] === "api" && segments[1] === "v1" && segments[2] === "zones"

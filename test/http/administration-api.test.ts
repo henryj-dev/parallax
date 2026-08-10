@@ -51,10 +51,8 @@ async function setup() {
   await settings.load();
   await accessTokens.load();
   const api = createApiHandler(
-    new ControlPlane(adapters.zones, adapters.statuses, adapters.provider),
+    { controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), settings, accessTokens },
     security,
-    undefined,
-    { settings, accessTokens },
   );
   return { api, settings, accessTokens };
 }
@@ -113,9 +111,47 @@ describe("administration HTTP API", () => {
     assert.equal((await api(request("/api/v1/tokens", "POST", { subject: "x", role: "admin" }, editor))).status, 403);
   });
 
+  it("runs any command through the API, so the CLI surface is reachable over HTTP", async () => {
+    const { api } = await setup();
+
+    const created = await api(request("/api/v1/cli", "POST", { argv: ["zone", "create", "--zone", "example.com"] }));
+    assert.equal(created.status, 200);
+    assert.deepEqual((await created.json() as { command: string }).command, "zone create");
+
+    const listed = await api(request("/api/v1/cli", "POST", { argv: ["zone", "list"] }));
+    const body = await listed.json() as { command: string; result: { zones: Array<{ name: string }> } };
+    assert.deepEqual(body.result.zones.map((zone) => zone.name), ["example.com"]);
+
+    // The same command, reached the ordinary way, gives the same answer.
+    const direct = await (await api(request("/api/v1/zones"))).json() as { zones: Array<{ name: string }> };
+    assert.deepEqual(direct.zones.map((zone) => zone.name), ["example.com"]);
+  });
+
+  it("applies the caller's role to a command reached through the API", async () => {
+    const { api } = await setup();
+    const editor = "editor-token-00000000000000000000";
+
+    // An editor may run an editor command over the endpoint...
+    assert.equal((await api(request("/api/v1/cli", "POST", { argv: ["zone", "create", "--zone", "a.example"] }, editor))).status, 200);
+    // ...but the endpoint is not a way around what the role cannot do.
+    const forbidden = await api(request("/api/v1/cli", "POST", { argv: ["settings", "get"] }, editor));
+    assert.equal(forbidden.status, 403);
+    assert.match(JSON.stringify(await forbidden.json()), /requires the admin role/);
+  });
+
+  it("rejects an unusable command invocation without running anything", async () => {
+    const { api } = await setup();
+    for (const argv of [["nonsense"], ["zone", "list", "extra"]]) {
+      const response = await api(request("/api/v1/cli", "POST", { argv }));
+      assert.equal(response.status, 400, JSON.stringify(argv));
+    }
+    assert.equal((await api(request("/api/v1/cli", "POST", { argv: "zone list" }))).status, 400);
+    assert.equal((await api(request("/api/v1/cli", "POST", { argv: ["zone", "get"] }))).status, 400);
+  });
+
   it("reports the routes as absent when administration is not wired in", async () => {
     const adapters = createInMemoryAdapters();
-    const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), security);
+    const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) }, security);
     assert.equal((await api(request("/api/v1/settings"))).status, 404);
     assert.equal((await api(request("/api/v1/tokens"))).status, 404);
   });

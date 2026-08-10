@@ -1,99 +1,50 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { AccessTokenService } from "./application/access-tokens.ts";
-import { ControlPlane } from "./application/control-plane.ts";
-import { CloudflareCredentialManager } from "./application/cloudflare-credentials.ts";
-import { SettingsService, type ParallaxSettings } from "./application/settings.ts";
-import { CoreDnsFileAdapter } from "./adapters/coredns-file.ts";
-import { NodeCoreDnsFileOperations } from "./adapters/node-coredns-files.ts";
-import { RoutingProviderAdapter } from "./adapters/router.ts";
 import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "./config.ts";
 import { createNodeHandler } from "./http/api.ts";
-import { createFileStateAdapters } from "./infrastructure/file-state.ts";
-import { FileConfigurationStore } from "./infrastructure/file-settings.ts";
-import { FileProviderAdapter } from "./infrastructure/file-provider.ts";
-import {
-  createPostgresAdapters,
-  createPostgresPool,
-  PostgresAccessTokenRepository,
-  PostgresCredentialRepository,
-  PostgresSettingsRepository,
-} from "./infrastructure/postgres.ts";
-import { EncryptedCredentialStore } from "./security/credential-store.ts";
+import { createRuntime } from "./runtime.ts";
 import { authenticate } from "./security/http-authorization.ts";
 
 const config = readConfig();
 
-// One decision picks every backend: a database when DATABASE_URL is set, files
-// otherwise. Settings, credentials and tokens follow the zones.
-const pool = config.databaseUrl ? createPostgresPool(config.databaseUrl) : undefined;
-const fileConfiguration = pool ? undefined : new FileConfigurationStore(resolve(config.configurationFile));
-const persisted = pool ? createPostgresAdapters(pool) : createFileStateAdapters(resolve(config.stateFile));
-const settingsRepository = pool ? new PostgresSettingsRepository(pool) : fileConfiguration!.settings;
-const credentialRepository = pool ? new PostgresCredentialRepository(pool) : fileConfiguration!.credentials;
-const accessTokenRepository = pool ? new PostgresAccessTokenRepository(pool) : fileConfiguration!.accessTokens;
-
-const settingsService = new SettingsService(settingsRepository);
-const accessTokens = new AccessTokenService(accessTokenRepository, config.bootstrapTokens);
+let runtime;
 try {
-  await settingsService.load();
-  await accessTokens.load();
+  runtime = await createRuntime(config);
 } catch (error) {
-  console.error(`parallax: configuration could not be read: ${error instanceof Error ? error.message : "unknown error"}`);
+  console.error(`parallax: ${error instanceof Error ? error.message : "startup failed"}`);
   process.exit(1);
 }
+
+const { controlPlane, settings: settingsService, accessTokens, provider } = runtime;
 
 if (!accessTokens.security().enabled && !isLoopbackHost(config.host)) {
   console.error("parallax: refusing to serve a non-loopback address with no access token. Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.");
   process.exit(1);
 }
 
-const provider = new RoutingProviderAdapter();
-const credentialManager = config.credentialMasterKey
-  ? new CloudflareCredentialManager({
-    store: new EncryptedCredentialStore({ repository: credentialRepository, masterKey: config.credentialMasterKey }),
-    router: provider,
-    ownershipSecret: config.ownershipSecret ?? "",
-  })
-  : undefined;
-
-/** Rebuilds the provider wiring that settings control, without a restart. */
-function applyProviderSettings(settings: ParallaxSettings): void {
-  provider.setFallback(settings.allowLocalProvider
-    ? new FileProviderAdapter({ path: resolve(config.providerStateFile) })
-    : undefined);
-  provider.setInternal(settings.coreDnsDirectory && config.ownershipSecret
-    ? new CoreDnsFileAdapter({
-      files: new NodeCoreDnsFileOperations({ root: resolve(settings.coreDnsDirectory) }),
-      pathForTarget: (target) => `${target.slice(0, target.lastIndexOf("/"))}.zone`,
-      ownershipSecret: config.ownershipSecret,
-    })
-    : undefined);
-}
-
-applyProviderSettings(settingsService.current());
-settingsService.onChange((settings) => { applyProviderSettings(settings); });
-
-try {
-  await credentialManager?.initialize();
-} catch (error) {
-  // A credential store that cannot be decrypted is usually a mismatched master
-  // key. Fail with one actionable line instead of an unhandled rejection.
-  console.error(`parallax: ${error instanceof Error ? error.message : "credential store could not be opened"}. Check PARALLAX_CREDENTIAL_MASTER_KEY matches the key that sealed the stored credentials.`);
-  process.exit(1);
-}
-
-const controlPlane = new ControlPlane(persisted.zones, persisted.statuses, provider, undefined, persisted.applyLock, {
-  get maxRevisionsPerZone() { return settingsService.current().revisionRetention; },
-  get auditRetentionDays() { return settingsService.current().auditRetentionDays; },
-});
-const handleApi = createNodeHandler(controlPlane, () => accessTokens.security(), credentialManager, {
+const handleApi = createNodeHandler(runtime, () => accessTokens.security(), {
   get publicOrigin() { return settingsService.current().publicOrigin || undefined; },
   get trustForwardedHeaders() { return settingsService.current().trustForwardedHeaders; },
-}, { settings: settingsService, accessTokens });
-const publicDirectory = resolve(import.meta.dirname, "..", "public");
+});
+
+/**
+ * The portal lives beside the sources when run from TypeScript and two levels
+ * up from the emitted JavaScript, so it is located rather than assumed.
+ */
+function findPublicDirectory(): string {
+  let directory = import.meta.dirname;
+  for (let depth = 0; depth < 4; depth += 1) {
+    const candidate = resolve(directory, "public");
+    if (existsSync(candidate)) return candidate;
+    directory = resolve(directory, "..");
+  }
+  throw new Error("the portal's public directory could not be located");
+}
+
+const publicDirectory = findPublicDirectory();
 
 const staticFiles = new Map([
   ["/", { file: "index.html", type: "text/html; charset=utf-8" }],
