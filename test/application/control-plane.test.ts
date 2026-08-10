@@ -447,6 +447,49 @@ describe("ControlPlane", () => {
     assert.doesNotMatch(JSON.stringify(deleted?.detail), /credential|secret|token/i);
   });
 
+  it("bounds stored revisions and ages out audit history as changes accumulate", async () => {
+    const adapters = createInMemoryAdapters();
+    let now = new Date("2026-01-01T00:00:00.000Z");
+    const service = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider, {
+      now: () => now,
+    }, adapters.applyLock, { maxRevisionsPerZone: 3, auditRetentionDays: 30 });
+
+    await service.createZone("example.com", "alice");
+    for (let index = 0; index < 6; index += 1) {
+      await service.upsertRecord("example.com", "external", `r${index}`, {
+        name: `n${index}`, type: "A", content: "8.8.8.8", ttl: 300,
+      }, "alice");
+    }
+
+    // Only the newest snapshots survive, and the current revision is always one.
+    const stored = await adapters.zones.listRevisions("example.com");
+    assert.deepEqual(stored.map((snapshot) => snapshot.revision), [5, 6, 7]);
+    assert.equal((await service.getZone("example.com")).revision, 7);
+    assert.equal((await service.audit("example.com")).entries.length, 7);
+
+    // A change made after the window has passed drops everything older than it.
+    now = new Date("2026-03-01T00:00:00.000Z");
+    await service.upsertRecord("example.com", "external", "late", {
+      name: "late", type: "A", content: "8.8.8.8", ttl: 300,
+    }, "alice");
+
+    const remaining = (await service.audit("example.com")).entries;
+    assert.deepEqual(remaining.map((entry) => entry.revision), [8]);
+    assert.deepEqual((await adapters.zones.listRevisions("example.com")).map((item) => item.revision), [6, 7, 8]);
+  });
+
+  it("keeps every revision and audit entry when retention is not configured", async () => {
+    const { service } = setup();
+    await service.createZone("example.com");
+    for (let index = 0; index < 5; index += 1) {
+      await service.upsertRecord("example.com", "external", `r${index}`, {
+        name: `n${index}`, type: "A", content: "8.8.8.8", ttl: 300,
+      });
+    }
+    assert.equal((await service.listRevisions("example.com")).revisions.length, 6);
+    assert.equal((await service.audit("example.com")).entries.length, 6);
+  });
+
   it("withdraws its own published records when a zone is deleted and leaves foreign records alone", async () => {
     const { service, provider } = setup();
     await service.createZone("example.com", "alice");

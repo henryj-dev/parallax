@@ -1,6 +1,6 @@
 import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
-import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type PageRequest, type ProviderAdapter, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 
 export class InMemoryApplyLock implements ApplyLock {
   readonly #tails = new Map<string, Promise<void>>();
@@ -85,6 +85,7 @@ export class InMemoryZoneRepository implements ZoneRepository, StatusRepository 
     this.#audit.push(audit);
     this.#nextAuditId += 1;
     for (const status of statuses) this.#statuses.set(key(status.zone, status.view), status);
+    this.#applyRetention(snapshot.name, change.retention);
   }
 
   async commitZoneDeletion(deletion: ZoneDeletion): Promise<void> {
@@ -103,6 +104,23 @@ export class InMemoryZoneRepository implements ZoneRepository, StatusRepository 
     }
     this.#audit.push(audit);
     this.#nextAuditId += 1;
+    this.#applyRetention(deletion.zone, deletion.retention);
+  }
+
+  #applyRetention(zone: string, retention: RetentionPolicy | undefined): void {
+    if (!retention) return;
+    const maxRevisions = retention.maxRevisionsPerZone ?? 0;
+    const revisions = this.#revisions.get(zone);
+    if (maxRevisions > 0 && revisions) {
+      const drop = [...revisions.keys()].sort((left, right) => right - left).slice(maxRevisions);
+      for (const revision of drop) revisions.delete(revision);
+    }
+    const before = retention.deleteAuditBefore;
+    if (!before) return;
+    for (let index = this.#audit.length - 1; index >= 0; index -= 1) {
+      const entry = this.#audit[index];
+      if (entry && entry.zone === zone && entry.at < before) this.#audit.splice(index, 1);
+    }
   }
 
   async listRevisions(zone: string, page?: PageRequest): Promise<ZoneRevision[]> {

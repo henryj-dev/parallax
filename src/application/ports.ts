@@ -6,16 +6,29 @@ export class RevisionConflictError extends Error {}
 /** No provider implementation is wired for a `<zone>/<view>` target. */
 export class ProviderNotConfiguredError extends Error {}
 
+/**
+ * Bounds what a zone's history keeps. Applied inside the same atomic commit as
+ * the change that produced it, so storage cannot grow without limit.
+ */
+export interface RetentionPolicy {
+  /** Newest snapshots to keep for the zone. Omit or use 0 to keep every one. */
+  readonly maxRevisionsPerZone?: number;
+  /** ISO timestamp; audit entries for the zone recorded before it are removed. */
+  readonly deleteAuditBefore?: string;
+}
+
 export interface DesiredChange {
   snapshot: ZoneRevision;
   audit: Omit<AuditEntry, "id">;
   statuses: ApplyStatus[];
+  retention?: RetentionPolicy;
 }
 
 export interface ZoneDeletion {
   zone: string;
   expectedRevision: number;
   audit: Omit<AuditEntry, "id">;
+  retention?: RetentionPolicy;
 }
 
 /** A bounded window over an otherwise unbounded history listing. */

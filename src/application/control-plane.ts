@@ -14,7 +14,7 @@ import {
   type ZoneRevision,
 } from "../domain/dns.ts";
 import { buildReconcilePlan, type ReconcilePlan } from "../domain/reconciliation.ts";
-import { ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type PageRequest, type ProviderAdapter, type StatusRepository, type ZoneRepository } from "./ports.ts";
+import { ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneRepository } from "./ports.ts";
 
 export class NotFoundError extends Error {}
 export class ConflictError extends Error {}
@@ -60,12 +60,21 @@ export interface Clock {
   now(): Date;
 }
 
+/** Operator-facing retention settings; the repository sees resolved values. */
+export interface RetentionSettings {
+  /** Newest snapshots kept per zone. 0 keeps every revision. */
+  readonly maxRevisionsPerZone?: number;
+  /** Days of audit history kept per zone. 0 keeps every entry. */
+  readonly auditRetentionDays?: number;
+}
+
 export class ControlPlane {
   readonly #zones: ZoneRepository;
   readonly #statuses: StatusRepository;
   readonly #provider: ProviderAdapter;
   readonly #clock: Clock;
   readonly #applyLock: ApplyLock;
+  readonly #retention: RetentionSettings;
   readonly #operationTails = new Map<string, Promise<void>>();
 
   constructor(
@@ -74,12 +83,27 @@ export class ControlPlane {
     provider: ProviderAdapter,
     clock: Clock = { now: () => new Date() },
     applyLock: ApplyLock = { withZoneLock: (_zone, operation) => operation() },
+    retention: RetentionSettings = {},
   ) {
     this.#zones = zones;
     this.#statuses = statuses;
     this.#provider = provider;
     this.#clock = clock;
     this.#applyLock = applyLock;
+    this.#retention = retention;
+  }
+
+  /** Resolves the operator's settings against the current clock for one commit. */
+  #retentionPolicy(): RetentionPolicy | undefined {
+    const maxRevisionsPerZone = this.#retention.maxRevisionsPerZone ?? 0;
+    const auditRetentionDays = this.#retention.auditRetentionDays ?? 0;
+    if (maxRevisionsPerZone <= 0 && auditRetentionDays <= 0) return undefined;
+    return {
+      ...(maxRevisionsPerZone > 0 ? { maxRevisionsPerZone } : {}),
+      ...(auditRetentionDays > 0
+        ? { deleteAuditBefore: new Date(this.#clock.now().getTime() - auditRetentionDays * 86_400_000).toISOString() }
+        : {}),
+    };
   }
 
   listZones(): Promise<Zone[]> {
@@ -124,10 +148,12 @@ export class ControlPlane {
       ? []
       : await this.#purgeProviderRecords(zone);
     const revision = zone.revision + 1;
+    const retention = this.#retentionPolicy();
     try {
       await this.#zones.commitZoneDeletion({
         zone: zone.name,
         expectedRevision: zone.revision,
+        ...(retention ? { retention } : {}),
         audit: {
           zone: zone.name,
           revision,
@@ -412,9 +438,11 @@ export class ControlPlane {
     if (expandedViews.has("external")) expandedViews.add("internal");
     const statuses: ApplyStatus[] = [];
     for (const view of expandedViews) statuses.push(await this.#pendingStatus(zone, view));
+    const retention = this.#retentionPolicy();
     try {
       await this.#zones.commitDesiredChange({
         snapshot: zone,
+        ...(retention ? { retention } : {}),
         audit: {
           zone: zone.name,
           revision: zone.revision,

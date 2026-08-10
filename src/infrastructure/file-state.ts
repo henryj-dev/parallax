@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { RevisionConflictError, type ApplyStatus, type DesiredChange, type PageRequest, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { RevisionConflictError, type ApplyStatus, type DesiredChange, type PageRequest, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
 import { InMemoryApplyLock } from "./in-memory.ts";
 
@@ -100,6 +100,7 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
       state.audit.push(entry);
       state.nextAuditId += 1;
       for (const status of statuses) state.statuses[statusKey(status.zone, status.view)] = status;
+      applyRetention(state, snapshot.name, change.retention);
     });
   }
 
@@ -118,6 +119,7 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
       }
       state.audit.push(entry);
       state.nextAuditId += 1;
+      applyRetention(state, deletion.zone, deletion.retention);
     });
   }
 
@@ -250,6 +252,24 @@ export function createFileStateAdapters(path: string): {
   // coordinates ControlPlane instances from this bundle; multi-host
   // deployments must use PostgreSQL for cross-process apply coordination.
   return { zones: repository, statuses: repository, applyLock: new InMemoryApplyLock() };
+}
+
+/** Trims a single zone's history in the same replacement as the change itself. */
+function applyRetention(state: PersistedState, zone: string, retention: RetentionPolicy | undefined): void {
+  if (!retention) return;
+  const maxRevisions = retention.maxRevisionsPerZone ?? 0;
+  if (maxRevisions > 0) {
+    const revisions = state.revisions[zone];
+    if (revisions) {
+      const keep = Object.keys(revisions)
+        .map(Number)
+        .sort((left, right) => right - left)
+        .slice(0, maxRevisions);
+      state.revisions[zone] = Object.fromEntries(keep.map((revision) => [String(revision), revisions[String(revision)] as ZoneRevision]));
+    }
+  }
+  const before = retention.deleteAuditBefore;
+  if (before) state.audit = state.audit.filter((entry) => entry.zone !== zone || entry.at >= before);
 }
 
 function emptyState(): PersistedState {

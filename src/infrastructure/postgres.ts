@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
-import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type PageRequest, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type PageRequest, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import {
   createDesiredRecord,
   normalizeZoneName,
@@ -157,6 +157,7 @@ export class PostgresZoneRepository implements ZoneRepository {
           change.audit.at, JSON.stringify(detail)],
       );
       for (const status of statuses) await saveStatus(client, status);
+      await pruneHistory(client, valid.name, change.retention);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -198,6 +199,7 @@ export class PostgresZoneRepository implements ZoneRepository {
       if (!deleted.rows[0] || readString(deleted.rows[0].name, "deleted zone name") !== deletion.zone) {
         throw new RevisionConflictError(`zone ${deletion.zone} disappeared while it was being deleted`);
       }
+      await pruneHistory(client, deletion.zone, deletion.retention);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -478,6 +480,27 @@ function validateStatus(status: ApplyStatus): ApplyStatus {
     last_attempt_at: status.lastAttemptAt ?? null,
     error: status.error ?? null,
   });
+}
+
+/** Trims one zone's history inside the transaction that produced the change. */
+async function pruneHistory(client: PgQueryable, zone: string, retention: RetentionPolicy | undefined): Promise<void> {
+  if (!retention) return;
+  const maxRevisions = retention.maxRevisionsPerZone ?? 0;
+  if (maxRevisions > 0) {
+    await client.query(
+      `DELETE FROM parallax_zone_revisions
+       WHERE zone_name = $1 AND revision NOT IN (
+         SELECT revision FROM parallax_zone_revisions WHERE zone_name = $1 ORDER BY revision DESC LIMIT $2
+       )`,
+      [zone, maxRevisions],
+    );
+  }
+  if (retention.deleteAuditBefore) {
+    await client.query(
+      "DELETE FROM parallax_audit WHERE zone_name = $1 AND occurred_at < $2",
+      [zone, retention.deleteAuditBefore],
+    );
+  }
 }
 
 async function saveStatus(queryable: PgQueryable, valid: ApplyStatus): Promise<void> {
