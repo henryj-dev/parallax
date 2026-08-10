@@ -65,8 +65,10 @@ export const messages = Object.freeze({
     "zone.created": "{name} was created.",
     "zone.createFailed": "Zone was not created: {error}",
     "zone.creating": "Creating…",
-    "zone.deleteConfirm": "Delete {name} and its desired state? Managed provider records are not deleted automatically.",
-    "zone.deleted": "{name} was deleted.",
+    "zone.deleteConfirm": "Delete {name}? Its desired state is removed and every record Parallax published for it is withdrawn from the DNS provider. Records Parallax does not manage are left alone. This cannot be undone.",
+    "zone.deleted": "{name} was deleted. No published records needed to be withdrawn.",
+    "zone.deletedRecords.one": "{name} was deleted and 1 published record was withdrawn.",
+    "zone.deletedRecords.other": "{name} was deleted and {count} published records were withdrawn.",
     "zone.deleteFailed": "Zone was not deleted: {error}",
     "horizon.eyebrow": "Split-horizon lens",
     "horizon.title": "One name, two answers",
@@ -124,6 +126,7 @@ export const messages = Object.freeze({
     "history.changed": "Desired state changed",
     "audit.zoneCreated": "Zone created", "audit.zoneDeleted": "Zone deleted", "audit.recordUpserted": "Record saved", "audit.recordDeleted": "Record deleted", "audit.desiredReplaced": "Desired state replaced", "audit.desiredRestored": "Desired state restored",
     "provider.operationFailed": "Provider operation failed", "provider.unmanagedConflict": "Unmanaged provider records conflict with desired state",
+    "provider.notConfigured": "No DNS provider is configured for {target}",
     "history.system": "system",
     "history.revision": "revision {revision}",
     "dialog.close": "Close dialog",
@@ -225,11 +228,11 @@ export const messages = Object.freeze({
     "nav.skip": "작업 영역으로 건너뛰기", "nav.home": "Parallax 홈", "brand.subtitle": "DNS 관측소", "provider.settings": "프로바이더 설정", "status.controlPlane": "컨트롤 플레인", "status.connecting": "연결 중", "status.online": "컨트롤 플레인 온라인", "status.unavailable": "컨트롤 플레인에 연결할 수 없음",
     "zones.label": "존", "zones.observed": "관측 중인 존", "zones.create": "존 만들기", "zones.filterLabel": "존 필터", "zones.filterPlaceholder": "도메인으로 필터…", "zones.list": "존 목록", "zones.none": "아직 존이 없습니다. 하나 만들어 시작하세요.", "zones.noMatch": "필터와 일치하는 존이 없습니다.", "zones.loadFailed": "존을 불러오지 못했습니다.", "zones.retry": "다시 시도", "zones.notObserved": "관측되지 않음",
     "policy.label": "관리 정책", "policy.managedOnly": "관리 레코드만", "welcome.eyebrow": "선택한 존 없음", "welcome.title": "관측 지점을 선택하세요.", "welcome.body": "존을 선택하여 내부와 외부 DNS 뷰를 비교하거나 이 컨트롤 플레인에 첫 번째 존을 만드세요.", "welcome.create": "존 만들기",
-    "zone.active": "활성 존", "zone.loading": "존 불러오는 중…", "zone.desiredRevision": "목표 리비전 {revision}", "zone.lastChanged": "마지막 변경 {date}", "zone.delete": "존 삭제", "zone.refresh": "새로고침", "zone.revisions": "리비전", "zone.preview": "계획 미리보기", "zone.apply": "변경 적용", "zone.applying": "적용 중…", "zone.discardChanges": "저장하지 않은 레코드 변경을 버릴까요?", "zone.detailsFailed": "존 상세 정보를 불러오지 못했습니다: {error}", "zone.created": "{name} 존을 만들었습니다.", "zone.createFailed": "존을 만들지 못했습니다: {error}", "zone.creating": "만드는 중…", "zone.deleteConfirm": "{name} 및 목표 상태를 삭제할까요? 관리 중인 프로바이더 레코드는 자동 삭제되지 않습니다.", "zone.deleted": "{name} 존을 삭제했습니다.", "zone.deleteFailed": "존을 삭제하지 못했습니다: {error}",
+    "zone.active": "활성 존", "zone.loading": "존 불러오는 중…", "zone.desiredRevision": "목표 리비전 {revision}", "zone.lastChanged": "마지막 변경 {date}", "zone.delete": "존 삭제", "zone.refresh": "새로고침", "zone.revisions": "리비전", "zone.preview": "계획 미리보기", "zone.apply": "변경 적용", "zone.applying": "적용 중…", "zone.discardChanges": "저장하지 않은 레코드 변경을 버릴까요?", "zone.detailsFailed": "존 상세 정보를 불러오지 못했습니다: {error}", "zone.created": "{name} 존을 만들었습니다.", "zone.createFailed": "존을 만들지 못했습니다: {error}", "zone.creating": "만드는 중…", "zone.deleteConfirm": "{name}을(를) 삭제할까요? 목표 상태가 제거되고 Parallax가 게시한 레코드는 DNS 프로바이더에서 모두 회수됩니다. Parallax가 관리하지 않는 레코드는 그대로 둡니다. 되돌릴 수 없습니다.", "zone.deleted": "{name} 존을 삭제했습니다. 회수할 게시 레코드는 없었습니다.", "zone.deletedRecords.one": "{name} 존을 삭제하고 게시 레코드 1건을 회수했습니다.", "zone.deletedRecords.other": "{name} 존을 삭제하고 게시 레코드 {count}건을 회수했습니다.", "zone.deleteFailed": "존을 삭제하지 못했습니다: {error}",
     "horizon.eyebrow": "분할 DNS 렌즈", "horizon.title": "하나의 이름, 두 개의 응답", "horizon.focus": "포커스 레코드", "horizon.internal": "내부 뷰", "horizon.privateResolver": "사설 리졸버", "horizon.sameName": "같은 이름", "horizon.external": "외부 뷰", "horizon.cloudflareEdge": "Cloudflare 엣지",
     "record.desiredState": "목표 상태", "record.title": "DNS 레코드", "record.add": "레코드 추가", "record.addFirst": "첫 레코드 추가", "record.nameType": "이름 / 유형", "record.internalAnswer": "내부 응답", "record.externalAnswer": "외부 응답", "record.ttlViews": "TTL (내부 / 외부)", "record.actions": "작업", "record.noneDefined": "정의된 레코드가 없습니다", "record.noneBody": "A, AAAA, CNAME 또는 TXT 레코드를 추가하여 이 존의 첫 번째 분할 뷰를 만드세요.", "record.none": "레코드 없음", "record.noneYet": "아직 레코드 없음", "record.noAnswer": "응답 없음", "record.noAnswerDefined": "정의된 응답 없음", "record.overridden": "RRset으로 재정의됨", "record.proxied": "프록시됨", "record.proxiedLabel": "프록시됨", "record.dnsOnly": "DNS 전용", "record.edit": "수정", "record.delete": "삭제", "record.editDesired": "목표 레코드 수정", "record.desired": "목표 레코드", "record.removeConfirm": "목표 상태에서 {name} {type} 레코드를 제거할까요?", "record.updatedLocal": "목표 상태를 로컬에서 변경했습니다. 적용 전에 계획을 미리 보세요.", "record.removedLocal": "레코드를 로컬에서 제거했습니다. 계획 미리보기에서 삭제를 확인하세요.", "record.duplicate": "이 RRset에 같은 값이 이미 있습니다.", "record.cnameConflict": "CNAME은 해당 이름의 유일한 레코드여야 합니다.",
     "sync.eyebrow": "동기화", "sync.title": "동기화 상태", "sync.checking": "확인 중", "sync.internal": "내부 DNS", "sync.cloudflare": "Cloudflare", "sync.waiting": "상태 대기 중", "sync.comparing": "목표 리비전과 적용된 리비전을 비교하고 있습니다.", "sync.appliedRevision": "적용된 리비전 {revision}", "sync.progress": "{desired} 중 {applied} 리비전 적용됨.", "sync.noneApplied": "아직 적용된 리비전이 없습니다.", "status.pending": "대기 중", "status.applied": "적용됨", "status.failed": "실패", "status.unknown": "알 수 없음",
-    "history.eyebrow": "감사 추적", "history.title": "최근 변경", "history.none": "이 존에 기록된 변경이 없습니다.", "history.changed": "목표 상태 변경됨", "history.system": "시스템", "history.revision": "리비전 {revision}", "audit.zoneCreated": "존 생성", "audit.zoneDeleted": "존 삭제", "audit.recordUpserted": "레코드 저장", "audit.recordDeleted": "레코드 삭제", "audit.desiredReplaced": "목표 상태 교체", "audit.desiredRestored": "목표 상태 복원", "provider.operationFailed": "프로바이더 작업 실패", "provider.unmanagedConflict": "관리되지 않는 프로바이더 레코드가 목표 상태와 충돌합니다", "dialog.close": "대화 상자 닫기", "dialog.cancel": "취소",
+    "history.eyebrow": "감사 추적", "history.title": "최근 변경", "history.none": "이 존에 기록된 변경이 없습니다.", "history.changed": "목표 상태 변경됨", "history.system": "시스템", "history.revision": "리비전 {revision}", "audit.zoneCreated": "존 생성", "audit.zoneDeleted": "존 삭제", "audit.recordUpserted": "레코드 저장", "audit.recordDeleted": "레코드 삭제", "audit.desiredReplaced": "목표 상태 교체", "audit.desiredRestored": "목표 상태 복원", "provider.operationFailed": "프로바이더 작업 실패", "provider.unmanagedConflict": "관리되지 않는 프로바이더 레코드가 목표 상태와 충돌합니다", "provider.notConfigured": "{target}에 설정된 DNS 프로바이더가 없습니다", "dialog.close": "대화 상자 닫기", "dialog.cancel": "취소",
     "zoneDialog.eyebrow": "새 관측 지점", "zoneDialog.title": "존 만들기", "zoneDialog.body": "Parallax는 직접 만들거나 명시적으로 채택한 레코드만 관리합니다.", "zoneDialog.domain": "도메인 이름", "zoneDialog.provider": "외부 프로바이더",
     "recordDialog.name": "이름", "recordDialog.type": "유형", "recordDialog.content": "내용", "recordDialog.internalHelp": "비워 두면 외부 응답을 상속합니다", "recordDialog.internalTtl": "내부 TTL(초)", "recordDialog.externalHelp": "설정된 프로바이더를 통해 게시됩니다", "recordDialog.proxy": "Cloudflare 프록시", "recordDialog.proxyHelp": "지원되는 주소 및 CNAME 레코드에서 사용할 수 있습니다.", "recordDialog.externalTtl": "외부 TTL", "recordDialog.ttlHelp": "자동은 1, DNS 전용 레코드는 60~86400초를 사용하세요.", "recordDialog.proxiedTtlHelp": "Cloudflare 프록시 레코드는 항상 자동 TTL(5분)을 사용합니다.", "recordDialog.ttlInvalid": "자동(1) 또는 60~86400초 값을 사용하세요.", "recordDialog.nonGlobal": "비전역 주소 게시 확인", "recordDialog.nonGlobalHelp": "이 주소는 사설 또는 예약 주소이며 유효하지 않은 외부 DNS 응답을 노출할 수 있습니다. 의도를 검토한 후에만 선택하세요.", "recordDialog.save": "목표 상태 저장",
     "plan.eyebrow": "동기화 미리보기", "plan.title": "적용 계획 검토", "plan.comparing": "Parallax가 목표 상태와 실제 상태를 비교하고 있습니다.", "plan.keepEditing": "계속 수정", "plan.apply": "이 계획 적용", "plan.failed": "계획을 생성하지 못했습니다.", "plan.failedHelp": "{error} 존 설정을 확인한 후 다시 시도하세요.", "plan.operations.one": "이 존을 동기화할 작업이 1개 있습니다.", "plan.operations.other": "이 존을 동기화할 작업이 {count}개 있습니다.", "plan.noChanges": "목표 상태와 실제 상태가 이미 일치합니다. 적용할 항목이 없습니다.", "plan.provider": "DNS 프로바이더", "plan.record": "레코드", "plan.reconciled": "상태가 동기화됩니다", "plan.noDrift": "차이가 감지되지 않았습니다.", "operation.create": "생성", "operation.update": "업데이트", "operation.delete": "삭제", "operation.conflict": "충돌", "apply.started": "적용을 시작했습니다.", "apply.startedRevision": "리비전 {revision} 적용을 시작했습니다.", "apply.forRevision": "(리비전 {revision})", "apply.failed": "변경을 적용하지 못했습니다: {error}",
@@ -273,8 +276,13 @@ export function localizeAuditAction(value, translate) {
 }
 
 export function localizeProviderError(value, translate) {
-  const key = PROVIDER_ERROR_KEYS[String(value || "")];
-  return key ? translate(key) : value;
+  const message = String(value || "");
+  const key = PROVIDER_ERROR_KEYS[message];
+  if (key) return translate(key);
+  // The provider-not-configured message names the target it is missing, so it
+  // is matched by shape rather than by exact text.
+  const missing = /^no provider is configured for (\S+)$/.exec(message);
+  return missing ? translate("provider.notConfigured", { target: missing[1] }) : value;
 }
 
 export function localizeViewName(value, translate) {

@@ -2,6 +2,10 @@ import { effectiveExternalTtl, isValidDnsOnlyTtl } from "./ttl.js";
 import { createSemanticMessage, createTranslator, escapeHtml, localizeAuditAction, localizedValidationMessage, localizeProviderError, localizeViewName, pluralKey, readPersistedLocale, renderSemanticMessage, resolveLocale, translateDocument, writePersistedLocale } from "./i18n.js";
 
 const API_ROOT = "/api/v1";
+// The server orders history newest first and bounds every page, so the portal
+// asks for exactly what it renders.
+const HISTORY_PAGE_SIZE = 5;
+const REVISION_PAGE_SIZE = 50;
 
 const state = {
   zones: [],
@@ -215,7 +219,7 @@ async function selectZone(zone) {
     const [detail, status, history] = await Promise.all([
       api(`/zones/${encodeURIComponent(name)}`),
       api(`/zones/${encodeURIComponent(name)}/status`).catch(() => null),
-      api(`/zones/${encodeURIComponent(name)}/history`).catch(() => []),
+      api(`/zones/${encodeURIComponent(name)}/history?limit=${HISTORY_PAGE_SIZE}`).catch(() => []),
     ]);
     if (zoneName(state.activeZone) !== name) return;
     state.activeZone = { ...zone, ...detail };
@@ -343,7 +347,7 @@ function setTargetStatus(prefix, target) {
 function renderHistory(payload) {
   const entries = Array.isArray(payload) ? payload : payload?.entries || payload?.history || payload?.items || [];
   $("#history-empty").hidden = entries.length > 0;
-  $("#history-list").innerHTML = entries.slice(0, 5).map((entry) => {
+  $("#history-list").innerHTML = entries.slice(0, HISTORY_PAGE_SIZE).map((entry) => {
     const action = entry.summary || entry.action || entry.event;
     return `<li><b>${escapeHtml(action ? localizeAuditAction(action, t) : t("history.changed"))}</b><time>${escapeHtml(formatDate(entry.createdAt || entry.timestamp || entry.at))}</time><small>${escapeHtml(entry.actor?.name || entry.actor || t("history.system"))}${entry.revision ? ` · ${escapeHtml(t("history.revision", { revision: entry.revision }))}` : ""}</small></li>`;
   }).join("");
@@ -621,7 +625,7 @@ async function openRevisions() {
   dialog.showModal();
   $("#revisions-content").innerHTML = '<div class="skeleton plan-skeleton"></div><div class="skeleton plan-skeleton"></div>';
   try {
-    const payload = await api(`/zones/${encodeZone(state.activeZone)}/revisions`);
+    const payload = await api(`/zones/${encodeZone(state.activeZone)}/revisions?limit=${REVISION_PAGE_SIZE}`);
     const revisions = payload?.revisions || [];
     state.revisions = revisions;
     state.revisionsLoadError = "";
@@ -665,10 +669,12 @@ async function deleteActiveZone() {
   const name = zoneName(state.activeZone);
   if (!name || !confirm(t("zone.deleteConfirm", { name }))) return;
   try {
-    await api(`/zones/${encodeURIComponent(name)}`, { method: "DELETE", headers: activeRevisionHeaders() });
+    const result = await api(`/zones/${encodeURIComponent(name)}`, { method: "DELETE", headers: activeRevisionHeaders() });
     state.activeZone = null;
     state.records = [];
-    toast("zone.deleted", { name });
+    const withdrawn = result?.removedProviderRecords?.length ?? 0;
+    if (withdrawn > 0) toast(pluralKey("zone.deletedRecords", withdrawn), { name, count: withdrawn });
+    else toast("zone.deleted", { name });
     await loadZones();
   } catch (error) {
     toast("zone.deleteFailed", { error: error.message }, "error");
