@@ -6,9 +6,12 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "check": "tsc --noEmit",
-    "dev": "node --watch src/index.ts",
-    "start": "node dist/index.js"
+    "check": "tsc --noEmit -p tsconfig.test.json",
+    "dev": "node --env-file-if-exists=.env --watch src/index.ts",
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage",
+    "test:watch": "node --test --watch"
   },
   "engines": {
     "node": ">=24"
@@ -17,5 +20,8 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "pg": "^8.22.0"
   }
 }
