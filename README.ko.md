@@ -168,6 +168,54 @@ PostgreSQL을 사용할 때는 서비스를 시작하기 전에 스키마를 적
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
 ```
 
+## 하나의 표면, 세 가지 진입로
+
+모든 작업은 명령(command)으로 한 번만 정의됩니다. 동작을 가진 곳은 그곳뿐입니다.
+
+```
+포털(GUI)   ──HTTP──▶  API  ──▶  명령 계층  ──▶  컨트롤 플레인
+터미널(CLI) ────────────────▶  명령 계층  ──▶  컨트롤 플레인
+```
+
+포털은 API하고만 통신하며 다른 어디에도 닿지 않습니다. API의 각 라우트는 번역기일
+뿐입니다. 요청을 명령 호출 하나로 바꾸고, 그 결과를 응답으로 바꿉니다. `parallax`는
+argv를 같은 호출로 파싱합니다. API는 명령 계층이 제공하지 않는 일을 할 수 없고 CLI는
+바로 그 명령들을 실행하므로, 둘이 어긋날 수 없습니다.
+
+`POST /api/v1/cli`는 명령줄 자체를 받습니다.
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/v1/cli \
+  -H 'content-type: application/json' \
+  -d '{"argv":["zone","create","--zone","example.com"]}'
+```
+
+셸이나 하위 프로세스 없이 같은 디스패처를 프로세스 안에서 실행하며, 호출자의 역할을
+해당 명령에 적용합니다. 따라서 이 엔드포인트로 토큰 권한을 우회할 수 없습니다.
+
+## 명령줄
+
+```sh
+pnpm cli help                 # 전체 명령
+pnpm cli help record set      # 특정 명령의 옵션
+pnpm cli zone list
+pnpm cli zone create --zone example.com
+pnpm cli record set --zone example.com --view external --id www \
+  --record '{"name":"www","type":"A","content":"93.184.216.34","ttl":300}'
+pnpm cli preview --zone example.com
+pnpm cli apply --zone example.com
+pnpm cli settings set --values '{"allowLocalProvider":true}'
+pnpm cli token issue --subject deploy-bot --role editor
+```
+
+CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽에 즉시 보입니다. 감사
+기록에는 실행자가 `cli:<user>`로 남습니다. 기계가 읽을 출력은 `--json`을 붙이세요.
+종료 코드는 `sysexits`를 따릅니다. `64` 사용법, `65` 잘못된 입력, `69` 없음,
+`70` 충돌, `77` 권한, `78` 사용 불가.
+
+명령줄은 저장소에 직접 접근하므로 전체 권한으로 동작합니다. HTTP 호출자는 토큰의
+역할이 허용하는 범위로 제한됩니다.
+
 ## HTTP API
 
 모든 컨트롤 플레인 경로는 `/api/v1` 아래에 있습니다.
@@ -185,6 +233,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
 - `GET /credentials/cloudflare`
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
 - `POST /credentials/cloudflare/:zone/test` — 저장하지 않은 `{ zoneId, token }`도 선택적으로 테스트
+- `POST /cli` (모든 명령 실행. `{ "argv": ["zone", "list"] }`)
 - `GET /health/live`, `GET /health/ready`
 
 인증을 활성화한 경우 `Authorization: Bearer <token>`을 전달합니다. 목표 상태는

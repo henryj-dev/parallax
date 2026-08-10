@@ -171,6 +171,57 @@ For a PostgreSQL deployment, apply the schema before starting the service:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
 ```
 
+## One surface, three ways in
+
+Every operation is defined once, as a command. Nothing else holds behaviour:
+
+```
+portal (GUI)  ──HTTP──▶  API  ──▶  command layer  ──▶  control plane
+terminal (CLI) ─────────────────▶  command layer  ──▶  control plane
+```
+
+The portal talks only to the API and reaches nothing else. Each API route is a
+translation: it turns a request into one command invocation and that command's
+result into a response. `parallax` parses argv into the same invocation. Because
+the API cannot do anything the command layer does not expose, and the CLI runs
+the very same commands, the two can never drift apart.
+
+`POST /api/v1/cli` takes the command line itself:
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/v1/cli \
+  -H 'content-type: application/json' \
+  -d '{"argv":["zone","create","--zone","example.com"]}'
+```
+
+It runs the same dispatcher in-process -- no shell, no subprocess -- and applies
+the caller's role to the command it names, so the endpoint is not a way around
+what a token cannot already do.
+
+## Command line
+
+```sh
+pnpm cli help                 # every command
+pnpm cli help record set      # one command's options
+pnpm cli zone list
+pnpm cli zone create --zone example.com
+pnpm cli record set --zone example.com --view external --id www \
+  --record '{"name":"www","type":"A","content":"93.184.216.34","ttl":300}'
+pnpm cli preview --zone example.com
+pnpm cli apply --zone example.com
+pnpm cli settings set --values '{"allowLocalProvider":true}'
+pnpm cli token issue --subject deploy-bot --role editor
+```
+
+The CLI reads the same store as the server, so a change made in one is visible
+in the other immediately. It records who ran it (`cli:<user>`) in the audit
+trail. Add `--json` for machine-readable output. Exit codes follow `sysexits`:
+`64` usage, `65` invalid input, `69` not found, `70` conflict, `77` permission,
+`78` unavailable.
+
+Because the command line reaches the store directly it acts with full rights;
+HTTP callers are limited to what their token's role allows.
+
 ## HTTP API
 
 All control-plane routes are under `/api/v1`.
@@ -191,6 +242,7 @@ All control-plane routes are under `/api/v1`.
 - `GET /credentials/cloudflare`
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
 - `POST /credentials/cloudflare/:zone/test` (optionally tests an unsaved `{ zoneId, token }`)
+- `POST /cli` (runs any command; `{ "argv": ["zone", "list"] }`)
 - `GET /health/live` and `GET /health/ready`
 
 Supply `Authorization: Bearer <token>` when authentication is enabled. Desired
