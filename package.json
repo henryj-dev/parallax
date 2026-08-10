@@ -8,8 +8,9 @@
     "audit": "pnpm audit --audit-level moderate",
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit -p tsconfig.test.json",
+    "cli": "node --env-file-if-exists=.env cmd/parallax/main.ts",
     "dev": "node --env-file-if-exists=.env --watch src/index.ts",
-    "start": "node --env-file-if-exists=.env dist/index.js",
+    "start": "node --env-file-if-exists=.env dist/src/index.js",
     "test": "node --test",
     "test:coverage": "node --test --experimental-test-coverage",
     "test:watch": "node --test --watch",
@@ -28,5 +29,8 @@
   },
   "dependencies": {
     "pg": "^8.22.0"
+  },
+  "bin": {
+    "parallax": "dist/cmd/parallax/main.js"
   }
 }

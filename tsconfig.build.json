@@ -5,7 +5,11 @@
     "noEmit": false,
     "outDir": "dist",
     "rewriteRelativeImportExtensions": true,
-    "rootDir": "src",
+    "rootDir": ".",
     "sourceMap": true
-  }
+  },
+  "include": [
+    "src/**/*.ts",
+    "cmd/**/*.ts"
+  ]
 }
