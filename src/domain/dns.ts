@@ -1,12 +1,15 @@
 import { BlockList, isIP } from "node:net";
 
 export const RECORD_TYPES = ["A", "AAAA", "CNAME", "TXT"] as const;
+/** The only views Parallax can reconcile; every provider target is `<zone>/<view>`. */
+export const PROVIDER_VIEWS = ["external", "internal"] as const;
 export const CLOUDFLARE_AUTO_TTL = 1;
 export const CLOUDFLARE_AUTO_TTL_SECONDS = 300;
 export const CLOUDFLARE_DNS_ONLY_MIN_TTL = 60;
 export const CLOUDFLARE_MAX_TTL = 86_400;
 
 export type RecordType = (typeof RECORD_TYPES)[number];
+export type ProviderView = (typeof PROVIDER_VIEWS)[number];
 
 export interface DesiredRecord {
   id: string;
@@ -56,6 +59,8 @@ export class DomainValidationError extends Error {
 }
 
 const DNS_LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
+/** RFC 8552 underscored names (`_dmarc`, `_acme-challenge`, `sel._domainkey`). */
+const UNDERSCORED_LABEL = /^_(?!-)[a-z0-9-]{1,62}(?<!-)$/;
 const IDENTIFIER = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 
 export function normalizeZoneName(value: string): string {
@@ -67,12 +72,30 @@ export function normalizeZoneName(value: string): string {
   return zone;
 }
 
-export function validateViewName(value: string): string {
+/** Accepts only views Parallax can reconcile, so unroutable views can never be stored. */
+export function validateViewName(value: string): ProviderView {
+  const view = value.trim().toLowerCase();
+  if (!PROVIDER_VIEWS.some((candidate) => candidate === view)) {
+    throw new DomainValidationError([`view must be one of ${PROVIDER_VIEWS.join(" or ")}`]);
+  }
+  return view as ProviderView;
+}
+
+/**
+ * Reads a view name from durable state. Snapshots written before views were
+ * restricted may still carry other identifiers; they stay readable so an
+ * operator can remove them instead of losing access to the whole zone.
+ */
+export function readPersistedViewName(value: string): string {
   const view = value.trim().toLowerCase();
   if (!IDENTIFIER.test(view)) {
     throw new DomainValidationError(["view must contain only lowercase letters, digits, _ or -"]);
   }
   return view;
+}
+
+export function isProviderView(value: string): value is ProviderView {
+  return PROVIDER_VIEWS.some((candidate) => candidate === value);
 }
 
 export function validateRecordId(value: string): string {
@@ -104,14 +127,15 @@ export function createDesiredRecord(id: string, input: unknown): DesiredRecord {
   }
 
   const requestedTtl = value.ttl;
-  const usesCloudflareAutoTtl = value.proxied === true
-    && ["A", "AAAA", "CNAME"].includes(typeValue)
-    && typeof requestedTtl === "number"
-    && Number.isFinite(requestedTtl);
-  const ttl = usesCloudflareAutoTtl ? CLOUDFLARE_AUTO_TTL : requestedTtl;
-  if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > 2_147_483_647) {
-    issues.push("ttl must be an integer between 1 and 2147483647");
-  }
+  const hasValidTtl = typeof requestedTtl === "number"
+    && Number.isInteger(requestedTtl)
+    && requestedTtl >= 1
+    && requestedTtl <= 2_147_483_647;
+  if (!hasValidTtl) issues.push("ttl must be an integer between 1 and 2147483647");
+  // Cloudflare forces Auto on proxied address and CNAME records, but the request
+  // still has to carry a TTL this control plane would accept on its own.
+  const usesCloudflareAutoTtl = value.proxied === true && ["A", "AAAA", "CNAME"].includes(typeValue);
+  const ttl = usesCloudflareAutoTtl && hasValidTtl ? CLOUDFLARE_AUTO_TTL : requestedTtl;
 
   if (value.proxied !== undefined && typeof value.proxied !== "boolean") {
     issues.push("proxied must be a boolean");
@@ -203,13 +227,17 @@ function asObject(input: unknown): Record<string, unknown> {
   return input as Record<string, unknown>;
 }
 
+function isValidLabel(label: string): boolean {
+  return DNS_LABEL.test(label) || UNDERSCORED_LABEL.test(label);
+}
+
 function isValidRecordName(name: string): boolean {
   if (name === "@" || name === "*") return true;
   const normalized = name.startsWith("*.") ? name.slice(2) : name;
-  return normalized.length <= 253 && normalized.split(".").every((label) => DNS_LABEL.test(label));
+  return normalized.length <= 253 && normalized.split(".").every(isValidLabel);
 }
 
 function isValidHostname(value: string): boolean {
   const hostname = value.toLowerCase().replace(/\.$/, "");
-  return hostname.length > 0 && hostname.length <= 253 && hostname.split(".").every((label) => DNS_LABEL.test(label));
+  return hostname.length > 0 && hostname.length <= 253 && hostname.split(".").every(isValidLabel);
 }

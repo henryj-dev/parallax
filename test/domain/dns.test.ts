@@ -42,7 +42,16 @@ describe("DNS desired state validation", () => {
 
   it("uses Cloudflare Auto TTL for proxied records and validates DNS-only limits", () => {
     const proxied = createDesiredRecord("web", { name: "www", type: "A", content: "8.8.8.8", ttl: 3600, proxied: true });
-    assert.equal(createDesiredRecord("auto", { name: "auto", type: "CNAME", content: "example.com", ttl: 0, proxied: true }).ttl, 1);
+    assert.equal(createDesiredRecord("auto", { name: "auto", type: "CNAME", content: "example.com", ttl: 120, proxied: true }).ttl, 1);
+    // Auto TTL replaces the requested value, but only after it is a TTL this
+    // control plane would have accepted on its own.
+    for (const ttl of [0, -5, 3.7, "300"]) {
+      assert.throws(
+        () => createDesiredRecord("auto", { name: "auto", type: "CNAME", content: "example.com", ttl, proxied: true }),
+        /ttl must be an integer/,
+        `proxied ttl ${String(ttl)}`,
+      );
+    }
     assert.equal(effectiveExternalTtl(proxied), 1);
     assert.equal(normalizeExternalRecords([proxied])[0]?.ttl, 1);
 
