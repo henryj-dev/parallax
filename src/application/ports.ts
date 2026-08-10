@@ -3,6 +3,9 @@ import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliatio
 
 export class RevisionConflictError extends Error {}
 
+/** No provider implementation is wired for a `<zone>/<view>` target. */
+export class ProviderNotConfiguredError extends Error {}
+
 export interface DesiredChange {
   snapshot: ZoneRevision;
   audit: Omit<AuditEntry, "id">;

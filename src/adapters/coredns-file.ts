@@ -63,37 +63,197 @@ export class CoreDnsFileAdapter implements ProviderAdapter {
   }
 }
 
+const RECORD_CLASSES = new Set(["IN", "CS", "CH", "HS"]);
+
+/**
+ * Reads every resource record in an RFC 1035 zone file, including the common
+ * forms that omit the TTL (inheriting `$TTL`) or the owner name (inheriting the
+ * previous record's owner). A record line that cannot be understood is an error
+ * rather than an absent record: treating it as absent would let reconciliation
+ * append a second RRset value next to an answer it never saw.
+ */
 function parseDocument(contents: string, target: string, ownershipSecret: string): ParsedLine[] {
   const result: ParsedLine[] = [];
+  const zone = zoneFromTarget(target);
   const lines = contents.split("\n");
-  for (let index = 0; index < lines.length; index += 1) {
-    const raw = lines[index] ?? "";
-    const split = splitRecordAndComment(raw);
-    const recordText = split.record.trim();
-    const markerText = split.comment?.trim();
-    const match = /^(\S+)\s+(\d+)\s+(?:IN\s+)?(A|AAAA|CNAME|TXT)\s+(.+?)\s*$/i.exec(recordText);
-    if (!match?.[1] || !match[2] || !match[3] || match[4] === undefined) continue;
-    const type = match[3].toUpperCase() as RecordType;
-    const content = parseContent(type, match[4]);
-    if (content === undefined) continue;
-    const ownership = readOwnershipComment(markerText, ownershipSecret);
+  let defaultTtl: number | undefined;
+  let lastOwner = "@";
+
+  for (const logical of readLogicalRecords(lines)) {
+    const directive = /^\$(TTL|ORIGIN|INCLUDE)\b\s*(\S*)/i.exec(logical.text.trim());
+    if (directive) {
+      if (directive[1]?.toUpperCase() === "TTL") defaultTtl = parseTtl(directive[2] ?? "");
+      continue;
+    }
+
+    const fields = readRecordFields(logical, lastOwner, defaultTtl);
+    if (!fields) {
+      throw new Error(`CoreDNS zone file line ${logical.startLine + 1} is not a record this adapter understands`);
+    }
+    lastOwner = fields.owner;
+    if (!isManagedType(fields.type)) continue;
+    const content = parseContent(fields.type, fields.rdata);
+    if (content === undefined) {
+      throw new Error(`CoreDNS zone file line ${logical.startLine + 1} has ${fields.type} data this adapter cannot read`);
+    }
+
+    const ownership = readOwnershipComment(logical.comment?.trim(), ownershipSecret);
     const managed = ownership?.target === target;
-    const recordId = managed ? ownership.recordId : `line-${index + 1}`;
+    const lineNumber = logical.startLine + 1;
     result.push({
-      lineIndex: index,
+      lineIndex: logical.startLine,
       ...(ownership ? { ownership } : {}),
       record: {
-        id: recordId,
-        providerId: managed ? `managed:${ownership.recordId}` : `line:${index + 1}`,
+        id: managed ? ownership.recordId : `line-${lineNumber}`,
+        providerId: managed ? `managed:${ownership.recordId}` : `line:${lineNumber}`,
         managed,
-        name: normalizeOwner(match[1], zoneFromTarget(target)),
-        type,
+        name: normalizeOwner(fields.owner, zone),
+        type: fields.type,
         content,
-        ttl: Number(match[2]),
+        ttl: fields.ttl,
       },
     });
   }
   return result;
+}
+
+interface LogicalRecord {
+  startLine: number;
+  text: string;
+  comment?: string;
+  /** The record omitted its owner name and inherits the previous one. */
+  inheritsOwner: boolean;
+}
+
+/** Groups physical lines into records, joining RFC 1035 parenthesized continuations. */
+function readLogicalRecords(lines: string[]): LogicalRecord[] {
+  const records: LogicalRecord[] = [];
+  let open: (LogicalRecord & { depth: number }) | undefined;
+  for (let index = 0; index < lines.length; index += 1) {
+    const raw = lines[index] ?? "";
+    const split = splitRecordAndComment(raw);
+    if (!open && split.record.trim().length === 0) continue;
+    if (open) {
+      open.text += ` ${split.record.trim()}`;
+      if (split.comment !== undefined) open.comment = `${open.comment ?? ""} ${split.comment}`;
+    } else {
+      open = {
+        startLine: index,
+        text: split.record.trim(),
+        inheritsOwner: /^[ \t]/.test(raw),
+        depth: 0,
+        ...(split.comment !== undefined ? { comment: split.comment } : {}),
+      };
+    }
+    open.depth += parenthesisDelta(split.record);
+    if (open.depth > 0) continue;
+    const { depth: _depth, ...completed } = open;
+    records.push(completed);
+    open = undefined;
+  }
+  if (open) {
+    const { depth: _depth, ...completed } = open;
+    records.push(completed);
+  }
+  return records;
+}
+
+function parenthesisDelta(text: string): number {
+  let delta = 0;
+  let quoted = false;
+  let escaped = false;
+  for (const character of text) {
+    if (escaped) escaped = false;
+    else if (character === "\\") escaped = true;
+    else if (character === '"') quoted = !quoted;
+    else if (!quoted && character === "(") delta += 1;
+    else if (!quoted && character === ")") delta -= 1;
+  }
+  return delta;
+}
+
+interface RecordFields {
+  owner: string;
+  ttl: number;
+  type: string;
+  rdata: string;
+}
+
+/** Reads `[owner] [ttl] [class] type rdata`, where TTL and class are optional and order-independent. */
+function readRecordFields(logical: LogicalRecord, previousOwner: string, defaultTtl: number | undefined): RecordFields | undefined {
+  const text = logical.text.replace(/[()]/g, " ");
+  const tokens = readTokens(text);
+  let index = 0;
+  let owner = previousOwner;
+  if (!logical.inheritsOwner) {
+    const first = tokens[index];
+    if (!first) return undefined;
+    owner = first.value;
+    index += 1;
+  }
+
+  let ttl: number | undefined;
+  for (let field = 0; field < 2; field += 1) {
+    const token = tokens[index];
+    if (!token || token.quoted) break;
+    if (ttl === undefined && /^\d+$/.test(token.value)) {
+      ttl = parseTtl(token.value);
+      if (ttl === undefined) return undefined;
+      index += 1;
+      continue;
+    }
+    if (RECORD_CLASSES.has(token.value.toUpperCase())) {
+      index += 1;
+      continue;
+    }
+    break;
+  }
+
+  const typeToken = tokens[index];
+  if (!typeToken || typeToken.quoted) return undefined;
+  const effectiveTtl = ttl ?? defaultTtl;
+  if (effectiveTtl === undefined) return undefined;
+  const rdata = text.slice(typeToken.end).trim();
+  if (rdata.length === 0) return undefined;
+  return { owner, ttl: effectiveTtl, type: typeToken.value.toUpperCase(), rdata };
+}
+
+function readTokens(text: string): Array<{ value: string; end: number; quoted: boolean }> {
+  const tokens: Array<{ value: string; end: number; quoted: boolean }> = [];
+  let index = 0;
+  while (index < text.length) {
+    if (/\s/.test(text[index] ?? "")) {
+      index += 1;
+      continue;
+    }
+    const start = index;
+    const quoted = text[index] === '"';
+    if (quoted) {
+      index += 1;
+      let escaped = false;
+      while (index < text.length) {
+        const character = text[index] ?? "";
+        index += 1;
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') break;
+      }
+    } else {
+      while (index < text.length && !/\s/.test(text[index] ?? "")) index += 1;
+    }
+    tokens.push({ value: quoted ? text.slice(start + 1, Math.max(start + 1, index - 1)) : text.slice(start, index), end: index, quoted });
+  }
+  return tokens;
+}
+
+function parseTtl(value: string): number | undefined {
+  if (!/^\d+$/.test(value)) return undefined;
+  const ttl = Number(value);
+  return Number.isSafeInteger(ttl) && ttl >= 0 && ttl <= 2_147_483_647 ? ttl : undefined;
+}
+
+function isManagedType(value: string): value is RecordType {
+  return value === "A" || value === "AAAA" || value === "CNAME" || value === "TXT";
 }
 
 function formatRecord(target: string, record: DesiredRecord, ownershipSecret: string): string {

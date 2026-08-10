@@ -126,6 +126,41 @@ describe("CoreDnsFileAdapter", () => {
     }]);
   });
 
+  it("reads records that inherit $TTL, the previous owner, or use underscored names", async () => {
+    const store = memoryFiles([
+      "$ORIGIN example.com.",
+      "$TTL 3600",
+      "@ 3600 IN SOA ns1.example.com. hostmaster.example.com. 7 3600 600 604800 300",
+      "@ 3600 IN NS ns1.example.com.",
+      "legacy       IN A 10.9.9.9",
+      "mail         IN A 10.9.9.10",
+      "             IN A 10.9.9.12",
+      "withttl 1800 IN A 10.9.9.11",
+      "noclass 900 A 10.9.9.13",
+      '_dmarc 600 IN TXT "v=DMARC1; p=none"',
+      "",
+    ].join("\n"));
+    const adapter = new CoreDnsFileAdapter({ files: store.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
+
+    assert.deepEqual((await adapter.list("example.com/internal")).map((record) => `${record.name}/${record.type}/${record.content}/${record.ttl}`), [
+      "legacy/A/10.9.9.9/3600",
+      "mail/A/10.9.9.10/3600",
+      "mail/A/10.9.9.12/3600",
+      "withttl/A/10.9.9.11/1800",
+      "noclass/A/10.9.9.13/900",
+      "_dmarc/TXT/v=DMARC1; p=none/600",
+    ]);
+  });
+
+  it("reports an unreadable record line instead of treating it as an absent record", async () => {
+    const store = memoryFiles("$ORIGIN example.com.\nlegacy IN A 10.9.9.9\n");
+    const adapter = new CoreDnsFileAdapter({ files: store.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
+
+    // No $TTL and no explicit TTL: the answer exists but its duration is unknown,
+    // so silently reporting no record would let a create duplicate the RRset.
+    await assert.rejects(() => adapter.list("example.com/internal"), /line 2 is not a record this adapter understands/);
+  });
+
   it("refuses to mutate unmanaged provider ids", async () => {
     const store = memoryFiles("www 60 IN A 192.0.2.1\n");
     const adapter = new CoreDnsFileAdapter({ files: store.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });

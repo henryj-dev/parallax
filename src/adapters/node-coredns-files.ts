@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { CoreDnsFileOperations } from "./coredns-file.ts";
@@ -82,13 +82,17 @@ export class NodeCoreDnsFileOperations implements CoreDnsFileOperations {
   }
 }
 
+// CoreDNS usually runs as its own user, so a zone file it cannot read is an
+// outage. Zone data is public by definition, unlike the credential store.
+const ZONE_FILE_MODE = 0o644;
+
 async function atomicWrite(path: string, contents: string): Promise<void> {
   const directory = dirname(path);
   await mkdir(directory, { recursive: true });
   const temporaryPath = `${path}.${randomUUID()}.tmp`;
   let temporaryExists = false;
   try {
-    await writeFile(temporaryPath, contents, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await writeFile(temporaryPath, contents, { encoding: "utf8", flag: "wx", mode: ZONE_FILE_MODE });
     temporaryExists = true;
     await rename(temporaryPath, path);
     temporaryExists = false;

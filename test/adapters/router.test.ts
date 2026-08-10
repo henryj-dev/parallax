@@ -48,7 +48,7 @@ describe("RoutingProviderAdapter", () => {
 
   it("rejects malformed or unsupported targets", async () => {
     const router = new RoutingProviderAdapter({ fallback: new SpyAdapter() });
-    await assert.rejects(() => router.list("example.com/private"), /invalid provider target/i);
-    await assert.rejects(() => router.list("localhost/external"), /invalid provider target/i);
+    await assert.rejects(() => router.list("example.com/private"), /no provider is configured/i);
+    await assert.rejects(() => router.list("localhost/external"), /invalid provider target zone/i);
   });
 });

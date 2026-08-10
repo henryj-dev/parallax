@@ -1,4 +1,4 @@
-import type { ProviderAdapter } from "../application/ports.ts";
+import { ProviderNotConfiguredError, type ProviderAdapter } from "../application/ports.ts";
 import type { ReconcileOperation } from "../domain/reconciliation.ts";
 
 export interface RoutingProviderAdapterOptions {
@@ -29,7 +29,12 @@ export class RoutingProviderAdapter implements ProviderAdapter {
   }
 
   isConfigured(target: string): boolean {
-    const parsed = parseTarget(target);
+    let parsed: { zone: string; view: "internal" | "external" };
+    try {
+      parsed = parseTarget(target);
+    } catch {
+      return false;
+    }
     return (parsed.view === "external" ? this.#external.has(parsed.zone) : this.#internal !== undefined)
       || this.#fallback !== undefined;
   }
@@ -48,14 +53,14 @@ export class RoutingProviderAdapter implements ProviderAdapter {
     const parsed = parseTarget(target);
     const adapter = parsed.view === "external" ? this.#external.get(parsed.zone) : this.#internal;
     const selected = adapter ?? this.#fallback;
-    if (!selected) throw new Error(`no provider configured for ${parsed.target}`);
+    if (!selected) throw new ProviderNotConfiguredError(`no provider is configured for ${parsed.target}`);
     return { adapter: selected, target: parsed.target };
   }
 }
 
 function parseTarget(target: string): { zone: string; view: "internal" | "external"; target: string } {
   const match = /^(.+?)\/(internal|external)$/i.exec(target.trim());
-  if (!match?.[1] || !match[2]) throw new Error(`invalid provider target ${target}`);
+  if (!match?.[1] || !match[2]) throw new ProviderNotConfiguredError(`no provider is configured for ${target}`);
   const zone = normalizeZone(match[1]);
   const view = match[2].toLowerCase() as "internal" | "external";
   return { zone, view, target: `${zone}/${view}` };
