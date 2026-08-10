@@ -29,6 +29,8 @@ const state = {
   selectedProfile: null,
   selectedBinding: null,
   providerPanel: "profiles",
+  settings: null,
+  tokens: [],
   revisions: [],
   zonesLoadError: "",
   revisionsLoadError: "",
@@ -76,7 +78,7 @@ function renderLocalizedState() {
     if (state.revisionsLoadError) renderRevisionListError(state.revisionsLoadError);
     else renderRevisionList(state.revisions);
   }
-  if ($("#credential-dialog").open) { renderProfileList(); renderCredentialList(); renderProfileOptions(); }
+  if ($("#credential-dialog").open) { renderProfileList(); renderCredentialList(); renderProfileOptions(); renderTokenList(); }
   if ($("#record-dialog").open) renderRecordDialogHeading();
   syncExternalTtl();
 }
@@ -102,7 +104,9 @@ async function api(path, options = {}) {
     if (response.status === 401) {
       state.authenticated = false;
       syncSessionControls();
-      openAuthDialog();
+      // Issuing the first token turns authentication on mid-operation; the
+      // caller handles that case so the new token stays on screen.
+      if (!options.allowUnauthorized) openAuthDialog();
     }
     const error = new Error(detail);
     error.status = response.status;
@@ -761,6 +765,9 @@ async function openCredentialSettings() {
   $("#profile-form-error").hidden = true;
   $("#credential-form-error").hidden = true;
   $("#credential-access-message").hidden = true;
+  $("#settings-form-error").hidden = true;
+  $("#token-form-error").hidden = true;
+  $("#issued-token").hidden = true;
   state.selectedProfile = null;
   state.selectedBinding = null;
   $("#profile-list").innerHTML = '<div class="skeleton plan-skeleton"></div>';
@@ -774,18 +781,18 @@ async function openCredentialSettings() {
 function selectProviderPanel(panel) {
   state.providerPanel = panel;
   for (const tab of $$(".provider-tab")) tab.setAttribute("aria-selected", String(tab.dataset.panel === panel));
-  $("#panel-profiles").hidden = panel !== "profiles";
-  $("#panel-bindings").hidden = panel !== "bindings";
+  for (const name of ["profiles", "bindings", "settings", "tokens"]) $(`#panel-${name}`).hidden = panel !== name;
 }
 
 async function refreshProviderSettings() {
   try {
     const [profilePayload, bindingPayload] = await Promise.all([
-      api("/credentials/profiles"),
-      api("/credentials/cloudflare"),
+      api("/credentials/profiles").catch((error) => { if (error.status === 404) return { profiles: [] }; throw error; }),
+      api("/credentials/cloudflare").catch((error) => { if (error.status === 404) return { credentials: [] }; throw error; }),
     ]);
     state.profiles = profilePayload?.profiles || [];
     state.credentials = bindingPayload?.credentials || [];
+    await refreshAdministration();
     $("#credential-access-message").hidden = true;
     setProviderEditorsEnabled(true);
     renderProfileList();
@@ -800,6 +807,110 @@ async function refreshProviderSettings() {
     if (error.status === 403) showCredentialAccess("credentials.adminView", {}, true);
     else if (error.status === 404) showCredentialAccess("credentials.disabled");
     else showCredentialAccess("credentials.loadFailed", { error: error.message }, true);
+  }
+}
+
+async function refreshAdministration(options = {}) {
+  const [settingsPayload, tokenPayload] = await Promise.all([api("/settings", options), api("/tokens", options)]);
+  state.settings = settingsPayload?.settings || null;
+  state.tokens = tokenPayload?.tokens || [];
+  renderSettingsForm();
+  renderTokenList();
+}
+
+function renderSettingsForm() {
+  const form = $("#settings-form");
+  const settings = state.settings;
+  if (!settings) return;
+  form.elements.allowLocalProvider.checked = Boolean(settings.allowLocalProvider);
+  form.elements.trustForwardedHeaders.checked = Boolean(settings.trustForwardedHeaders);
+  form.elements.coreDnsDirectory.value = settings.coreDnsDirectory || "";
+  form.elements.publicOrigin.value = settings.publicOrigin || "";
+  form.elements.revisionRetention.value = String(settings.revisionRetention ?? 0);
+  form.elements.auditRetentionDays.value = String(settings.auditRetentionDays ?? 0);
+}
+
+function renderTokenList() {
+  $("#token-list").innerHTML = state.tokens.length ? state.tokens.map((token) => {
+    const revoke = token.managed
+      ? `<small>${escapeHtml(t("tokens.environment"))}</small>`
+      : `<button class="button compact" type="button" data-revoke-token="${escapeHtml(token.id)}">${escapeHtml(t("tokens.revoke"))}</button>`;
+    return `<article class="credential-item"><b>${escapeHtml(token.subject)}</b><small><span class="token-role">${escapeHtml(t(`tokens.role${token.role.charAt(0).toUpperCase()}${token.role.slice(1)}`))}</span></small><small>${escapeHtml(t("credentials.updated", { date: formatDate(token.createdAt) }))}</small>${revoke}</article>`;
+  }).join("") : `<div class="mini-empty">${escapeHtml(t("tokens.none"))}</div>`;
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.checkValidity()) { form.reportValidity(); return; }
+  $("#save-settings-button").disabled = true;
+  try {
+    const payload = await api("/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        allowLocalProvider: form.elements.allowLocalProvider.checked,
+        trustForwardedHeaders: form.elements.trustForwardedHeaders.checked,
+        coreDnsDirectory: String(form.elements.coreDnsDirectory.value).trim(),
+        publicOrigin: String(form.elements.publicOrigin.value).trim(),
+        revisionRetention: Number(form.elements.revisionRetention.value),
+        auditRetentionDays: Number(form.elements.auditRetentionDays.value),
+      }),
+    });
+    state.settings = payload?.settings || state.settings;
+    $("#settings-form-error").hidden = true;
+    renderSettingsForm();
+    toast("settings.saved");
+  } catch (error) {
+    showFormError("settings", error.status === 403 ? "credentials.adminSave" : "settings.saveFailed",
+      error.status === 403 ? {} : { error: error.message });
+  } finally {
+    $("#save-settings-button").disabled = false;
+  }
+}
+
+async function issueToken(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.checkValidity()) { form.reportValidity(); return; }
+  $("#issue-token-button").disabled = true;
+  try {
+    const issued = await api("/tokens", {
+      method: "POST",
+      body: JSON.stringify({ subject: String(form.elements.subject.value).trim(), role: form.elements.role.value }),
+    });
+    // Shown once: the server keeps only a digest and cannot display it again.
+    $("#issued-token-value").textContent = issued.token;
+    $("#issued-token").hidden = false;
+    $("#token-form-error").hidden = true;
+    form.elements.subject.value = "";
+    toast("tokens.issued", { subject: issued.metadata.subject });
+    try {
+      await refreshAdministration({ allowUnauthorized: true });
+    } catch (error) {
+      // The first token switches this server from open to protected, so the
+      // very request that lists it is the first one to need a session.
+      if (error.status !== 401) throw error;
+      state.authRequired = true;
+      syncSessionControls();
+      showFormError("token", "tokens.nowRequired");
+    }
+  } catch (error) {
+    showFormError("token", error.status === 403 ? "credentials.adminSave" : "tokens.issueFailed",
+      error.status === 403 ? {} : { error: error.message });
+  } finally {
+    $("#issue-token-button").disabled = false;
+  }
+}
+
+async function revokeToken(id) {
+  const token = state.tokens.find((item) => item.id === id);
+  if (!token || !confirm(t("tokens.revokeConfirm", { subject: token.subject }))) return;
+  try {
+    await api(`/tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+    toast("tokens.revoked", { subject: token.subject });
+    await refreshAdministration();
+  } catch (error) {
+    showFormError("token", "tokens.revokeFailed", { error: error.message });
   }
 }
 
@@ -1083,6 +1194,12 @@ $("#profile-form").addEventListener("submit", saveProfile);
 $("#test-profile-button").addEventListener("click", testProfile);
 $("#delete-profile-button").addEventListener("click", deleteProfile);
 for (const tab of $$(".provider-tab")) tab.addEventListener("click", () => selectProviderPanel(tab.dataset.panel));
+$("#settings-form").addEventListener("submit", saveSettings);
+$("#token-form").addEventListener("submit", issueToken);
+$("#token-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-revoke-token]");
+  if (button) revokeToken(button.dataset.revokeToken);
+});
 $("#profile-list").addEventListener("click", (event) => {
   const pick = event.target.closest("[data-profile]");
   if (pick) selectProfile(pick.dataset.profile);
