@@ -92,6 +92,23 @@ came from this origin, so only the portal can obtain or drop a session. Because
 the cookie is `HttpOnly`, page script never sees the credential. API clients can
 keep using `Authorization: Bearer` and skip sessions entirely.
 
+### Provider credentials
+
+Cloudflare credentials are split so an account-wide token is entered once. A
+**profile** holds the reusable account ID and API token; each **apex domain**
+binds to a profile plus the zone ID Cloudflare assigned it. Rotating a token on
+one profile immediately re-routes every domain that uses it, and a profile
+cannot be deleted while a domain still points at it.
+
+The admin portal's **Provider settings** screen manages both: one tab lists
+saved profiles with the domains reusing them, the other binds apex domains to a
+profile. Tokens are write-only -- they are encrypted at rest and never returned
+to the portal, so the field is blank until you type a replacement.
+
+Store files written before profiles existed are migrated on first read: each
+distinct token becomes one profile, named after the first zone that used it, and
+every zone keeps its own zone ID. Nothing has to be re-entered.
+
 Use a minimum-scope Cloudflare API token. When authentication is configured,
 the portal asks for an access token and keeps it only in the current browser
 tab's memory. Generate the credential-store key with `openssl rand -base64 32`.
@@ -152,6 +169,9 @@ All control-plane routes are under `/api/v1`.
 - `GET /zones/:zone/revisions` (`?limit=&offset=`, newest window, ascending)
 - `GET /zones/:zone/revisions/:revision`
 - `POST /zones/:zone/revisions/:revision/restore`
+- `GET /credentials/profiles`
+- `GET|PUT|DELETE /credentials/profiles/:name`
+- `POST /credentials/profiles/:name/test` (needs a `{ zoneId }` to read through)
 - `GET /credentials/cloudflare`
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
 - `POST /credentials/cloudflare/:zone/test` (optionally tests an unsaved `{ zoneId, token }`)
