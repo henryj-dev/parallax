@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { readConfig } from "../src/config.ts";
+import { readConfig, usesPlaintextPostgres } from "../src/config.ts";
 
 describe("configuration", () => {
   it("uses local safe defaults with authentication explicitly disabled", () => {
@@ -13,6 +13,8 @@ describe("configuration", () => {
       cloudflareZones: [],
       security: { enabled: false, tokens: [] },
       trustForwardedHeaders: false,
+      revisionRetention: 100,
+      auditRetentionDays: 365,
     });
   });
 
@@ -37,6 +39,8 @@ describe("configuration", () => {
       allowLocalProvider: false,
       security: { enabled: false, tokens: [] },
       trustForwardedHeaders: false,
+      revisionRetention: 100,
+      auditRetentionDays: 365,
     });
     assert.throws(
       () => readConfig({ PARALLAX_CLOUDFLARE_ZONES: '{"example.com":{"token":"do-not-echo"}}' }),
@@ -101,6 +105,20 @@ describe("configuration", () => {
   it("requires an explicit boolean for local provider mode", () => {
     assert.equal(readConfig({ PARALLAX_ALLOW_LOCAL_PROVIDER: "false" }).allowLocalProvider, false);
     assert.throws(() => readConfig({ PARALLAX_ALLOW_LOCAL_PROVIDER: "yes" }), /true or false/);
+  });
+
+  it("bounds stored history and detects a cleartext PostgreSQL session", () => {
+    assert.equal(readConfig({}).revisionRetention, 100);
+    assert.equal(readConfig({}).auditRetentionDays, 365);
+    assert.equal(readConfig({ PARALLAX_REVISION_RETENTION: "0" }).revisionRetention, 0);
+    assert.equal(readConfig({ PARALLAX_AUDIT_RETENTION_DAYS: "30" }).auditRetentionDays, 30);
+    assert.throws(() => readConfig({ PARALLAX_REVISION_RETENTION: "-1" }), /non-negative integer/);
+    assert.throws(() => readConfig({ PARALLAX_AUDIT_RETENTION_DAYS: "many" }), /non-negative integer/);
+
+    assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax"), true);
+    assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?sslmode=prefer"), true);
+    assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?sslmode=verify-full"), false);
+    assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?ssl=true"), false);
   });
 
   it("reads the public origin used to prove same-origin behind a TLS-terminating proxy", () => {

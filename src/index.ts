@@ -7,7 +7,7 @@ import { CloudflareProviderAdapter } from "./adapters/cloudflare.ts";
 import { CoreDnsFileAdapter } from "./adapters/coredns-file.ts";
 import { NodeCoreDnsFileOperations } from "./adapters/node-coredns-files.ts";
 import { RoutingProviderAdapter } from "./adapters/router.ts";
-import { readConfig } from "./config.ts";
+import { readConfig, usesPlaintextPostgres } from "./config.ts";
 import { createNodeHandler } from "./http/api.ts";
 import { createFileStateAdapters } from "./infrastructure/file-state.ts";
 import { FileProviderAdapter } from "./infrastructure/file-provider.ts";
@@ -42,7 +42,10 @@ const credentialManager = config.credentialFile && config.credentialMasterKey ? 
   ownershipSecret: config.ownershipSecret!,
 }) : undefined;
 await credentialManager?.initialize();
-const controlPlane = new ControlPlane(persisted.zones, persisted.statuses, provider, undefined, persisted.applyLock);
+const controlPlane = new ControlPlane(persisted.zones, persisted.statuses, provider, undefined, persisted.applyLock, {
+  maxRevisionsPerZone: config.revisionRetention,
+  auditRetentionDays: config.auditRetentionDays,
+});
 const handleApi = createNodeHandler(controlPlane, config.security, credentialManager, {
   ...(config.publicOrigin ? { publicOrigin: config.publicOrigin } : {}),
   trustForwardedHeaders: config.trustForwardedHeaders,
@@ -164,5 +167,8 @@ server.listen(config.port, config.host, () => {
   }
   if (config.allowLocalProvider) {
     console.warn("parallax: the local file provider is active as a fallback; applied changes for unconfigured targets do not reach a real DNS provider.");
+  }
+  if (config.databaseUrl && usesPlaintextPostgres(config.databaseUrl)) {
+    console.warn("parallax: DATABASE_URL does not request TLS; zone data and audit history cross the network in cleartext. Append ?sslmode=verify-full unless PostgreSQL is reached over a trusted local socket.");
   }
 });

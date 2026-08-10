@@ -16,7 +16,14 @@ export interface ParallaxConfig {
   /** Absolute origin browsers reach the portal at, used to prove same-origin. */
   publicOrigin?: string;
   trustForwardedHeaders: boolean;
+  /** Newest revision snapshots kept per zone; 0 keeps every one. */
+  revisionRetention: number;
+  /** Days of audit history kept per zone; 0 keeps every entry. */
+  auditRetentionDays: number;
 }
+
+export const DEFAULT_REVISION_RETENTION = 100;
+export const DEFAULT_AUDIT_RETENTION_DAYS = 365;
 
 export function readConfig(environment: NodeJS.ProcessEnv = process.env): ParallaxConfig {
   const host = environment.HOST?.trim() || "127.0.0.1";
@@ -40,6 +47,8 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     throw new Error("PARALLAX_CREDENTIAL_FILE and PARALLAX_CREDENTIAL_MASTER_KEY must be configured together");
   }
   const publicOrigin = readPublicOrigin(environment.PARALLAX_PUBLIC_ORIGIN);
+  const revisionRetention = readCount(environment.PARALLAX_REVISION_RETENTION, DEFAULT_REVISION_RETENTION, "PARALLAX_REVISION_RETENTION");
+  const auditRetentionDays = readCount(environment.PARALLAX_AUDIT_RETENTION_DAYS, DEFAULT_AUDIT_RETENTION_DAYS, "PARALLAX_AUDIT_RETENTION_DAYS");
   const trustForwardedHeaders = readBoolean(environment.PARALLAX_TRUST_FORWARDED_HEADERS, false);
   if ((cloudflareZones.length > 0 || coreDnsDirectory || credentialFile) && Buffer.byteLength(ownershipSecret ?? "", "utf8") < 32) {
     throw new Error("PARALLAX_OWNERSHIP_SECRET must contain at least 32 bytes when an external provider is configured");
@@ -59,6 +68,8 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     security,
     ...(publicOrigin ? { publicOrigin } : {}),
     trustForwardedHeaders,
+    revisionRetention,
+    auditRetentionDays,
   };
 }
 
@@ -68,6 +79,32 @@ function readBoolean(source: string | undefined, defaultValue: boolean): boolean
   if (value === "true") return true;
   if (value === "false") return false;
   throw new Error("boolean settings must be true or false");
+}
+
+/** A non-negative bound where 0 means "keep everything". */
+function readCount(source: string | undefined, defaultValue: number, name: string): number {
+  const value = source?.trim();
+  if (value === undefined || value === "") return defaultValue;
+  if (!/^\d+$/.test(value)) throw new Error(`${name} must be a non-negative integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a non-negative integer`);
+  return parsed;
+}
+
+/**
+ * Reports whether a PostgreSQL connection string leaves the session in
+ * cleartext. `pg` reads `sslmode` from the URL, but defaults to no TLS.
+ */
+export function usesPlaintextPostgres(connectionString: string): boolean {
+  try {
+    const url = new URL(connectionString);
+    const mode = url.searchParams.get("sslmode");
+    const ssl = url.searchParams.get("ssl");
+    if (ssl === "true" || ssl === "1") return false;
+    return mode === null || mode === "disable" || mode === "allow" || mode === "prefer";
+  } catch {
+    return false;
+  }
 }
 
 /** The absolute origin a browser reaches the portal at, without a path or query. */
