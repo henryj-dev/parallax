@@ -98,11 +98,14 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
       **미실행**이다. `CF_ZONE`, `CF_ZONE_ID`, `CF_API_TOKEN`,
       `CF_VERIFY_ALLOW_WRITES=true`를 설정해 운영자가 직접 실행해야 한다.
 - [x] reverse proxy/TLS 환경의 Origin 처리 — `publicOrigin` / `trustForwardedHeaders`
-      설정으로 해결하고 회귀 테스트로 고정했다.
+      설정으로 해결했고, 실제 nginx TLS 종단 뒤에서 검증했다.
 - [x] Secure cookie — 서버가 `POST /api/v1/session`에서 `HttpOnly; SameSite=Strict`
       쿠키를 발급하며 HTTPS 요청에는 `Secure`를 붙인다.
-- [ ] 실제 TLS 종단 프록시(nginx 등) 뒤에서의 readiness 및 secret redaction 최종 확인
-      — 코드 경로는 테스트로 고정했으나 실제 프록시 구성에서는 미검증이다.
+- [x] 실제 TLS 종단 프록시(nginx) 뒤에서의 readiness 및 Origin 처리 최종 확인
+      — `pnpm verify:proxy`. 설정 없이는 https Origin이 거부되는 것(=감사에서 찾은
+      결함 자체)을 먼저 재현한 뒤, `trustForwardedHeaders`와 `publicOrigin` 각각이
+      이를 복구함을 확인한다. Secure/HttpOnly/SameSite 쿠키 속성, HSTS, 미인증
+      readiness의 상세 정보 차단, 교차 사이트 Origin 거부까지 함께 확인한다.
 
 외부 계정이나 실행 바이너리가 없는 로컬 mock 결과를 실제 provider 통합 성공으로
 표현하지 않는다.

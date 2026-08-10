@@ -273,12 +273,19 @@ Unit and HTTP tests use in-memory fakes. These scripts exercise the real thing:
 ```sh
 pnpm verify:postgres    # Docker PostgreSQL: migration, restart, locks, retention
 pnpm verify:coredns     # Docker CoreDNS + dig: zone load, SOA reload, conflicts
+pnpm verify:proxy       # Docker nginx over TLS: origin, cookies, HSTS, readiness
 pnpm verify:cloudflare  # opt-in; needs a real scoped token, skips without one
 pnpm audit              # dependency advisories
 ```
 
-`verify:postgres` and `verify:coredns` need Docker and remove their containers
-on exit. `verify:cloudflare` writes to a live zone, so it refuses to run unless
+`verify:proxy` covers the one shape unit tests cannot stand in for: the server
+sees plain HTTP on loopback while the browser sees HTTPS. It first reproduces
+the misconfigured case, where the `https` Origin is refused, so the checks that
+follow cannot pass vacuously; then it proves `trustForwardedHeaders` and
+`publicOrigin` each repair it, and that a cross-site Origin is still refused.
+
+`verify:postgres`, `verify:coredns`, and `verify:proxy` need Docker and remove
+their containers on exit. `verify:cloudflare` writes to a live zone, so it refuses to run unless
 `CF_ZONE`, `CF_ZONE_ID`, `CF_API_TOKEN`, and `CF_VERIFY_ALLOW_WRITES=true` are
 all set; it confines itself to a `parallax-verify-*` name and asserts that
 records Parallax does not own are never scheduled for deletion.

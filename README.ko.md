@@ -265,12 +265,19 @@ CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽
 ```sh
 pnpm verify:postgres    # Docker PostgreSQL: 마이그레이션, 재시작, 잠금, 보관 정책
 pnpm verify:coredns     # Docker CoreDNS + dig: 존 로드, SOA reload, 충돌 탐지
+pnpm verify:proxy       # Docker nginx TLS 종단: Origin, 쿠키, HSTS, readiness
 pnpm verify:cloudflare  # 옵트인. 실제 토큰이 필요하며 없으면 건너뜀
 pnpm audit              # 의존성 취약점 점검
 ```
 
-`verify:postgres`와 `verify:coredns`는 Docker가 필요하며 종료 시 컨테이너를
-제거합니다. `verify:cloudflare`는 실제 존에 쓰기를 하므로 `CF_ZONE`,
+`verify:proxy`는 단위 테스트가 대신할 수 없는 형태를 다룹니다. 서버는 루프백에서
+평문 HTTP를 보는데 브라우저는 HTTPS를 봅니다. 먼저 설정이 없을 때 `https` Origin이
+거부되는 잘못된 상태를 재현해 이후 검사가 공허하게 통과할 수 없게 만든 뒤,
+`trustForwardedHeaders`와 `publicOrigin`이 각각 이를 복구하는지, 그리고 교차 사이트
+Origin은 여전히 거부되는지 확인합니다.
+
+`verify:postgres`, `verify:coredns`, `verify:proxy`는 Docker가 필요하며 종료 시
+컨테이너를 제거합니다. `verify:cloudflare`는 실제 존에 쓰기를 하므로 `CF_ZONE`,
 `CF_ZONE_ID`, `CF_API_TOKEN`, `CF_VERIFY_ALLOW_WRITES=true`가 모두 설정되지
 않으면 실행을 거부합니다. 작업은 `parallax-verify-*` 이름으로 제한되며, Parallax가
 소유하지 않은 레코드가 삭제 대상이 되지 않는지도 함께 확인합니다.

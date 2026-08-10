@@ -408,8 +408,28 @@ CoreDNS 검증 중 Docker Desktop의 UDP 포워딩이 동작하지 않아 질의
 ### 9.6 여전히 남은 것
 
 - Cloudflare 실계정 검증(9.4) — 운영자가 직접 실행해야 한다.
-- 실제 TLS 종단 프록시(nginx 등) 뒤에서의 readiness·secret redaction 최종 확인. 코드
-  경로는 회귀 테스트로 고정했으나 실제 프록시 구성에서는 미검증이다.
+
+~~실제 TLS 종단 프록시 뒤에서의 검증~~ → 9.7에서 실제 nginx로 검증 완료.
+
+### 9.7 리버스 프록시 검증 (`pnpm verify:proxy`)
+
+S-3(프록시 뒤 Origin 재구성 결함)은 회귀 테스트로 고정했지만, 그 결함이 나타나는
+조건 자체 — 서버는 루프백에서 평문 HTTP를 보는데 브라우저는 HTTPS를 본다 — 는 단위
+테스트로 만들 수 없다. Docker nginx를 TLS 종단으로 세워 실제 구성에서 확인했다.
+
+검사는 **잘못된 상태를 먼저 재현**한다. `publicOrigin`도 `trustForwardedHeaders`도
+없을 때 브라우저의 `https` Origin이 403으로 거부되는 것을 확인한 뒤에야 나머지 검사로
+넘어간다. 이 단계가 없으면 이후 통과가 공허할 수 있다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 설정 없이 https Origin → 거부 (결함 재현) | 403 |
+| `trustForwardedHeaders=true` 후 로그인·변경 | 200 / 201 |
+| 세션 쿠키 속성 | `Secure`, `HttpOnly`, `SameSite=Strict` |
+| HSTS | `max-age=` 전송 확인 |
+| 미인증 readiness | 상세 정보 없음, 인증 시에만 노출 |
+| `publicOrigin`만 설정 (헤더 불신) | 200 / 201 |
+| 교차 사이트 Origin + 유효 세션 쿠키 | 403 |
 
 ## 10. 범위 밖
 
