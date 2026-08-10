@@ -12,6 +12,7 @@ import { createNodeHandler } from "./http/api.ts";
 import { createFileStateAdapters } from "./infrastructure/file-state.ts";
 import { FileProviderAdapter } from "./infrastructure/file-provider.ts";
 import { createPostgresAdapters, createPostgresPool } from "./infrastructure/postgres.ts";
+import { authenticate } from "./security/http-authorization.ts";
 import { EncryptedCredentialStore } from "./security/credential-store.ts";
 
 const config = readConfig();
@@ -42,8 +43,11 @@ const credentialManager = config.credentialFile && config.credentialMasterKey ? 
 }) : undefined;
 await credentialManager?.initialize();
 const controlPlane = new ControlPlane(persisted.zones, persisted.statuses, provider, undefined, persisted.applyLock);
-const handleApi = createNodeHandler(controlPlane, config.security, credentialManager);
-const publicDirectory = resolve(process.cwd(), "public");
+const handleApi = createNodeHandler(controlPlane, config.security, credentialManager, {
+  ...(config.publicOrigin ? { publicOrigin: config.publicOrigin } : {}),
+  trustForwardedHeaders: config.trustForwardedHeaders,
+});
+const publicDirectory = resolve(import.meta.dirname, "..", "public");
 
 const staticFiles = new Map([
   ["/", { file: "index.html", type: "text/html; charset=utf-8" }],
@@ -67,6 +71,17 @@ const server = createServer((request, response) => {
 async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
   setSecurityHeaders(response);
+  // With authentication disabled every caller would be an administrator, so a
+  // request that reached this process through a proxy is refused rather than
+  // silently trusted.
+  if (!config.security.enabled && pathname.startsWith("/api/") && isProxiedRequest(request)) {
+    response.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+    response.end(JSON.stringify({
+      error: "unauthorized",
+      message: "configure PARALLAX_AUTH_TOKENS before serving this control plane through a proxy",
+    }));
+    return;
+  }
   if (pathname === "/health/live") {
     response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     response.end(JSON.stringify({ status: "ok", service: "parallax" }));
@@ -82,7 +97,11 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       });
       if (missingTargets.length > 0) throw new Error("provider configuration is incomplete");
       response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-      response.end(JSON.stringify({ status: "ready", service: "parallax", storage: config.databaseUrl ? "postgresql" : "file", providerMode: config.allowLocalProvider ? "local-fallback" : "configured" }));
+      // Backend and provider details describe the deployment, so only an
+      // authenticated caller receives them.
+      response.end(JSON.stringify(isAuthenticated(request)
+        ? { status: "ready", service: "parallax", storage: config.databaseUrl ? "postgresql" : "file", providerMode: config.allowLocalProvider ? "local-fallback" : "configured" }
+        : { status: "ready", service: "parallax" }));
     } catch {
       response.writeHead(503, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       response.end(JSON.stringify({ status: "not_ready", service: "parallax" }));
@@ -112,8 +131,38 @@ function setSecurityHeaders(response: ServerResponse): void {
   response.setHeader("referrer-policy", "no-referrer");
   response.setHeader("x-content-type-options", "nosniff");
   response.setHeader("x-frame-options", "DENY");
+  // Only meaningful once a browser has already reached the portal over TLS, so
+  // it is safe to send unconditionally and is ignored on plain HTTP.
+  response.setHeader("strict-transport-security", "max-age=31536000; includeSubDomains");
 }
+
+function isProxiedRequest(request: IncomingMessage): boolean {
+  return ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded"]
+    .some((header) => request.headers[header] !== undefined);
+}
+
+function isAuthenticated(request: IncomingMessage): boolean {
+  if (!config.security.enabled) return false;
+  const headers = new Headers();
+  for (const name of ["authorization", "cookie"]) {
+    const value = request.headers[name];
+    if (typeof value === "string") headers.set(name, value);
+  }
+  return authenticate(new Request("http://localhost/health/ready", { headers }), config.security) !== undefined;
+}
+
+// Bound the time a client may take to send headers and a complete request so a
+// slow or stalled connection cannot hold a server slot indefinitely.
+server.headersTimeout = 15_000;
+server.requestTimeout = 60_000;
+server.keepAliveTimeout = 10_000;
 
 server.listen(config.port, config.host, () => {
   console.log(`parallax: http://${config.host}:${config.port}`);
+  if (!config.security.enabled) {
+    console.warn("parallax: authentication is disabled; every caller that reaches this port is an administrator. Set PARALLAX_AUTH_TOKENS before exposing it.");
+  }
+  if (config.allowLocalProvider) {
+    console.warn("parallax: the local file provider is active as a fallback; applied changes for unconfigured targets do not reach a real DNS provider.");
+  }
 });

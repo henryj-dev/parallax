@@ -1,7 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { ControlPlane, ConflictError, NotFoundError } from "../application/control-plane.ts";
+import { ControlPlane, ConflictError, DEFAULT_HISTORY_PAGE_SIZE, NotFoundError } from "../application/control-plane.ts";
 import { CloudflareCredentialManager, CredentialNotFoundError, CredentialTestError } from "../application/cloudflare-credentials.ts";
+import { ProviderNotConfiguredError, type PageRequest } from "../application/ports.ts";
 import { DomainValidationError } from "../domain/dns.ts";
+import { CredentialValidationError } from "../security/credential-store.ts";
 import { createAuthorizedHandler, type SecurityConfig } from "../security/http-authorization.ts";
 
 const MAX_REQUEST_BODY_BYTES = 1_048_576;
@@ -14,14 +16,28 @@ export function createApiHandler(controlPlane: ControlPlane, security?: Security
       return errorResponse(error);
     }
   };
-  const authorized = security ? createAuthorizedHandler(security, handler) : handler;
+  // Always wrap: even with authentication disabled the security layer owns the
+  // audit actor, so a client can never choose the identity of its own changes.
+  const authorized = createAuthorizedHandler(security ?? { enabled: false, tokens: [] }, handler);
   return async (request) => authorized(request);
 }
 
-export function createNodeHandler(controlPlane: ControlPlane, security?: SecurityConfig, credentials?: CloudflareCredentialManager): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
+export interface NodeHandlerOptions {
+  /** Absolute origin the portal is reached at, e.g. `https://dns.example.com`. */
+  readonly publicOrigin?: string;
+  /** Trust `X-Forwarded-Proto`/`X-Forwarded-Host` from a reverse proxy in front of this server. */
+  readonly trustForwardedHeaders?: boolean;
+}
+
+export function createNodeHandler(
+  controlPlane: ControlPlane,
+  security?: SecurityConfig,
+  credentials?: CloudflareCredentialManager,
+  options: NodeHandlerOptions = {},
+): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
   const handler = createApiHandler(controlPlane, security, credentials);
   return async (request, response) => {
-    const origin = `http://${request.headers.host ?? "localhost"}`;
+    const origin = requestOrigin(request, options);
     let body: Buffer;
     try {
       body = request.method === "GET" || request.method === "HEAD" ? Buffer.alloc(0) : await readBody(request);
@@ -44,68 +60,102 @@ export function createNodeHandler(controlPlane: ControlPlane, security?: Securit
     const result = await handler(fetchRequest);
     response.statusCode = result.status;
     result.headers.forEach((value, name) => response.setHeader(name, value));
-    response.end(Buffer.from(await result.arrayBuffer()));
+    const payload = Buffer.from(await result.arrayBuffer());
+    if (request.method === "HEAD") {
+      response.setHeader("content-length", String(payload.byteLength));
+      response.end();
+      return;
+    }
+    response.end(payload);
   };
+}
+
+/**
+ * The origin a browser used to reach this server. Reconstructing it as `http://`
+ * would reject every same-origin proof sent by a client behind TLS termination,
+ * so an explicit public origin or trusted forwarding headers take precedence.
+ */
+function requestOrigin(request: IncomingMessage, options: NodeHandlerOptions): string {
+  if (options.publicOrigin) return options.publicOrigin;
+  const forwarded = options.trustForwardedHeaders ? forwardedOrigin(request) : undefined;
+  return forwarded ?? `http://${request.headers.host ?? "localhost"}`;
+}
+
+function forwardedOrigin(request: IncomingMessage): string | undefined {
+  const protocol = firstHeaderValue(request.headers["x-forwarded-proto"]);
+  const host = firstHeaderValue(request.headers["x-forwarded-host"]) ?? request.headers.host;
+  if (!host || (protocol !== "http" && protocol !== "https")) return undefined;
+  return `${protocol}://${host}`;
+}
+
+function firstHeaderValue(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return raw?.split(",")[0]?.trim() || undefined;
 }
 
 async function route(controlPlane: ControlPlane, request: Request, credentials?: CloudflareCredentialManager): Promise<Response> {
   const url = new URL(request.url);
-  const segments = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  const segments = decodeSegments(url.pathname);
+  // HEAD must resolve exactly like GET; the body is dropped by the transport.
+  const method = request.method === "HEAD" ? "GET" : request.method;
   if (segments[0] !== "api" || segments[1] !== "v1") {
     throw new NotFoundError("route was not found");
   }
-  if (segments[2] === "credentials") return credentialRoute(credentials, segments, request);
+  if (segments[2] === "credentials") return credentialRoute(credentials, segments, request, method);
   if (segments[2] !== "zones") throw new NotFoundError("route was not found");
   const actor = request.headers.get("x-parallax-actor") ?? "web-console";
 
-  if (segments.length === 3 && request.method === "GET") {
+  if (segments.length === 3 && method === "GET") {
     return json({ zones: await controlPlane.listZones() });
   }
-  if (segments.length === 3 && request.method === "POST") {
+  if (segments.length === 3 && method === "POST") {
     const body = await parseJson(request);
     return revisionJson(await controlPlane.createZone(readString(body, "name"), actor), 201);
   }
 
   const zone = segments[3];
   if (!zone) throw new NotFoundError("route was not found");
-  if (segments.length === 4 && request.method === "GET") return revisionJson(await controlPlane.getZone(zone));
-  if (segments.length === 4 && request.method === "PUT") {
+  if (segments.length === 4 && method === "GET") return revisionJson(await controlPlane.getZone(zone));
+  if (segments.length === 4 && method === "PUT") {
     return revisionJson(await controlPlane.replaceDesiredState(zone, await parseJson(request), actor, readExpectedRevision(request)));
   }
-  if (segments.length === 4 && request.method === "DELETE") {
-    await controlPlane.deleteZone(zone, actor, readExpectedRevision(request));
-    return new Response(null, { status: 204 });
+  if (segments.length === 4 && method === "DELETE") {
+    // Reports what was withdrawn from the provider, so the caller can see the
+    // blast radius of a deletion instead of an empty 204.
+    return json(await controlPlane.deleteZone(zone, actor, readExpectedRevision(request), {
+      abandonProviderRecords: readBooleanQuery(url, "abandonProviderRecords") === true,
+    }));
   }
 
-  if (segments[4] === "preview" && segments.length === 5 && (request.method === "GET" || request.method === "POST")) {
-    const candidate = request.method === "POST" ? await parseOptionalJson(request) : undefined;
+  if (segments[4] === "preview" && segments.length === 5 && (method === "GET" || method === "POST")) {
+    const candidate = method === "POST" ? await parseOptionalJson(request) : undefined;
     return json(await controlPlane.preview(zone, readViewQuery(url), candidate));
   }
-  if (segments[4] === "apply" && segments.length === 5 && request.method === "POST") {
+  if (segments[4] === "apply" && segments.length === 5 && method === "POST") {
     return revisionJson(await controlPlane.apply(zone, readViewQuery(url), readExpectedRevision(request)));
   }
-  if (segments[4] === "status" && segments.length === 5 && request.method === "GET") {
+  if (segments[4] === "status" && segments.length === 5 && method === "GET") {
     return json(await controlPlane.status(zone));
   }
-  if ((segments[4] === "history" || segments[4] === "audit") && segments.length === 5 && request.method === "GET") {
-    return json(await controlPlane.audit(zone));
+  if ((segments[4] === "history" || segments[4] === "audit") && segments.length === 5 && method === "GET") {
+    return json(await controlPlane.audit(zone, readPageQuery(url)));
   }
-  if (segments[4] === "revisions" && segments.length === 5 && request.method === "GET") {
-    return json(await controlPlane.listRevisions(zone));
+  if (segments[4] === "revisions" && segments.length === 5 && method === "GET") {
+    return json(await controlPlane.listRevisions(zone, readPageQuery(url)));
   }
-  if (segments[4] === "revisions" && segments.length === 6 && request.method === "GET") {
+  if (segments[4] === "revisions" && segments.length === 6 && method === "GET") {
     return json(await controlPlane.getRevision(zone, readRevision(segments[5])));
   }
-  if (segments[4] === "revisions" && segments[6] === "restore" && segments.length === 7 && request.method === "POST") {
+  if (segments[4] === "revisions" && segments[6] === "restore" && segments.length === 7 && method === "POST") {
     return revisionJson(await controlPlane.restoreRevision(zone, readRevision(segments[5]), actor, readExpectedRevision(request)));
   }
   if (segments[4] === "views" && segments[6] === "records" && segments.length === 8) {
     const view = requireSegment(segments[5]);
     const recordId = requireSegment(segments[7]);
-    if (request.method === "PUT") {
+    if (method === "PUT") {
       return revisionJson(await controlPlane.upsertRecord(zone, view, recordId, await parseJson(request), actor, readExpectedRevision(request)));
     }
-    if (request.method === "DELETE") {
+    if (method === "DELETE") {
       return revisionJson(await controlPlane.deleteRecord(zone, view, recordId, actor, readExpectedRevision(request)));
     }
   }
@@ -116,24 +166,25 @@ async function credentialRoute(
   credentials: CloudflareCredentialManager | undefined,
   segments: string[],
   request: Request,
+  method: string,
 ): Promise<Response> {
   if (!credentials || segments[3] !== "cloudflare") throw new NotFoundError("route was not found");
-  if (segments.length === 4 && request.method === "GET") return json({ credentials: await credentials.list() });
+  if (segments.length === 4 && method === "GET") return json({ credentials: await credentials.list() });
   const zone = segments[4];
   if (!zone) throw new NotFoundError("route was not found");
-  if (segments.length === 5 && request.method === "GET") {
+  if (segments.length === 5 && method === "GET") {
     const credential = await credentials.get(zone);
     if (!credential) throw new CredentialNotFoundError();
     return json(credential);
   }
-  if (segments.length === 5 && request.method === "PUT") {
+  if (segments.length === 5 && method === "PUT") {
     return json(await credentials.update(zone, readCredentialInput(await parseJson(request))));
   }
-  if (segments.length === 5 && request.method === "DELETE") {
+  if (segments.length === 5 && method === "DELETE") {
     if (!await credentials.delete(zone)) throw new CredentialNotFoundError();
     return new Response(null, { status: 204 });
   }
-  if (segments.length === 6 && segments[5] === "test" && request.method === "POST") {
+  if (segments.length === 6 && segments[5] === "test" && method === "POST") {
     const body = await parseOptionalJson(request);
     const credential = await credentials.test(zone, body ? readCredentialInput(body) : undefined);
     return json({ ok: true, credential });
@@ -162,7 +213,9 @@ function errorResponse(error: unknown): Response {
   if (error instanceof CredentialNotFoundError) return json({ error: "not_found", message: error.message }, 404);
   if (error instanceof CredentialTestError) return json({ error: "provider_test_failed", message: error.message }, 502);
   if (error instanceof ConflictError) return json({ error: "conflict", message: error.message }, 409);
-  if (error instanceof TypeError) return json({ error: "validation_failed", message: "invalid provider credential" }, 400);
+  if (error instanceof ProviderNotConfiguredError) return json({ error: "provider_not_configured", message: error.message }, 409);
+  if (error instanceof CredentialValidationError) return json({ error: "validation_failed", message: error.message }, 400);
+  if (error instanceof URIError) return json({ error: "validation_failed", message: "request path is not valid percent-encoding" }, 400);
   return json({ error: "internal_error", message: "an unexpected error occurred" }, 500);
 }
 
@@ -196,6 +249,41 @@ function readString(value: Record<string, unknown>, key: string): string {
 
 function readViewQuery(url: URL): string | undefined {
   return url.searchParams.get("view") ?? undefined;
+}
+
+/** Percent-decodes path segments, reporting malformed escapes as a client error. */
+function decodeSegments(pathname: string): string[] {
+  const raw = pathname.split("/").filter(Boolean);
+  return raw.map((segment) => {
+    try {
+      return decodeURIComponent(segment);
+    } catch {
+      throw new DomainValidationError(["request path is not valid percent-encoding"]);
+    }
+  });
+}
+
+function readBooleanQuery(url: URL, key: string): boolean | undefined {
+  const value = url.searchParams.get(key);
+  if (value === null) return undefined;
+  if (value !== "true" && value !== "false") throw new DomainValidationError([`${key} must be true or false`]);
+  return value === "true";
+}
+
+function readPageQuery(url: URL): PageRequest | undefined {
+  const limit = readNonNegativeQuery(url, "limit");
+  const offset = readNonNegativeQuery(url, "offset");
+  if (limit === undefined && offset === undefined) return undefined;
+  return { limit: limit ?? DEFAULT_HISTORY_PAGE_SIZE, offset: offset ?? 0 };
+}
+
+function readNonNegativeQuery(url: URL, key: string): number | undefined {
+  const value = url.searchParams.get(key);
+  if (value === null) return undefined;
+  if (!/^\d+$/.test(value)) throw new DomainValidationError([`${key} must be a non-negative integer`]);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new DomainValidationError([`${key} must be a non-negative integer`]);
+  return parsed;
 }
 
 function requireSegment(value: string | undefined): string {

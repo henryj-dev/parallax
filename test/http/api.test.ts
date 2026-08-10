@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 import { describe, it } from "node:test";
 import { ControlPlane } from "../../src/application/control-plane.ts";
 import { createApiHandler, createNodeHandler } from "../../src/http/api.ts";
+import { ProviderNotConfiguredError } from "../../src/application/ports.ts";
 import { createInMemoryAdapters } from "../../src/infrastructure/in-memory.ts";
 
 function setup(): ReturnType<typeof createApiHandler> {
@@ -23,6 +24,141 @@ function request(path: string, method = "GET", body?: unknown, headers: Record<s
 }
 
 describe("HTTP API", () => {
+  it("resolves HEAD exactly like GET and answers it without a body", async () => {
+    const adapters = createInMemoryAdapters();
+    const handler = createNodeHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
+    const incoming = Readable.from([]) as IncomingMessage;
+    incoming.method = "HEAD";
+    incoming.url = "/api/v1/zones";
+    incoming.headers = { host: "localhost" };
+    let status = 0;
+    let responseBody: string | undefined = "unset";
+    const headers: Record<string, string> = {};
+    const response = {
+      set statusCode(code: number) { status = code; },
+      setHeader(name: string, value: string) { headers[name] = value; return this; },
+      end(value?: string) { responseBody = value; return this; },
+    } as unknown as ServerResponse;
+
+    await handler(incoming, response);
+    assert.equal(status, 200);
+    assert.equal(responseBody, undefined);
+    assert.equal(headers["content-length"], String(JSON.stringify({ zones: [] }).length));
+  });
+
+  it("reports malformed percent-encoding in a path as a client error", async () => {
+    const api = setup();
+    const response = await api(request("/api/v1/zones/%zz"));
+    assert.equal(response.status, 400);
+    assert.deepEqual((await response.json() as { error: string }).error, "validation_failed");
+  });
+
+  it("refuses views no provider can reconcile instead of storing them", async () => {
+    const api = setup();
+    assert.equal((await api(request("/api/v1/zones", "POST", { name: "example.com" }))).status, 201);
+
+    const stored = await api(request("/api/v1/zones/example.com/views/staging/records/web", "PUT", {
+      name: "www", type: "A", content: "8.8.8.8", ttl: 300,
+    }));
+    assert.equal(stored.status, 400);
+    assert.match(JSON.stringify(await stored.json()), /view must be one of external or internal/);
+
+    // The zone stays previewable rather than being poisoned by an unroutable view.
+    assert.equal((await api(request("/api/v1/zones/example.com/preview"))).status, 200);
+  });
+
+  it("reports an unconfigured provider as a conflict rather than an internal error", async () => {
+    const adapters = createInMemoryAdapters();
+    const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, {
+      list: () => { throw new ProviderNotConfiguredError("no provider is configured for example.com/external"); },
+      apply: async () => undefined,
+    }));
+    await api(request("/api/v1/zones", "POST", { name: "example.com" }));
+    await api(request("/api/v1/zones/example.com/views/external/records/web", "PUT", {
+      name: "www", type: "A", content: "8.8.8.8", ttl: 300,
+    }));
+
+    const preview = await api(request("/api/v1/zones/example.com/preview"));
+    assert.equal(preview.status, 409);
+    assert.deepEqual(await preview.json(), {
+      error: "provider_not_configured",
+      message: "no provider is configured for example.com/external",
+    });
+  });
+
+  it("bounds history and revision pages and reports whether more remain", async () => {
+    const api = setup();
+    await api(request("/api/v1/zones", "POST", { name: "example.com" }));
+    for (const id of ["one", "two", "three"]) {
+      await api(request(`/api/v1/zones/example.com/views/external/records/${id}`, "PUT", {
+        name: id, type: "A", content: "8.8.8.8", ttl: 300,
+      }));
+    }
+
+    const page = await (await api(request("/api/v1/zones/example.com/history?limit=2"))).json() as {
+      entries: Array<{ revision: number }>; limit: number; offset: number; hasMore: boolean;
+    };
+    assert.deepEqual(page.entries.map((entry) => entry.revision), [4, 3]);
+    assert.deepEqual([page.limit, page.offset, page.hasMore], [2, 0, true]);
+
+    const revisions = await (await api(request("/api/v1/zones/example.com/revisions?limit=2"))).json() as {
+      revisions: Array<{ revision: number }>; hasMore: boolean;
+    };
+    assert.deepEqual(revisions.revisions.map((item) => item.revision), [3, 4]);
+    assert.equal(revisions.hasMore, true);
+    assert.equal((await api(request("/api/v1/zones/example.com/history?limit=abc"))).status, 400);
+  });
+
+  it("withdraws published records when deleting a zone and reports what it removed", async () => {
+    const adapters = createInMemoryAdapters();
+    const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
+    await api(request("/api/v1/zones", "POST", { name: "example.com" }));
+    await api(request("/api/v1/zones/example.com/views/external/records/root", "PUT", {
+      name: "@", type: "A", content: "8.8.8.8", ttl: 300,
+    }));
+    await api(request("/api/v1/zones/example.com/apply", "POST"));
+    assert.equal((await adapters.provider.list("example.com/external")).length, 1);
+
+    const deleted = await api(request("/api/v1/zones/example.com", "DELETE"));
+    assert.equal(deleted.status, 200);
+    assert.deepEqual(await deleted.json(), {
+      zone: "example.com",
+      removedProviderRecords: [
+        { view: "external", id: "root", name: "@", type: "A", content: "8.8.8.8" },
+        { view: "internal", id: "internal-root-a-utrwak", name: "@", type: "A", content: "8.8.8.8" },
+      ],
+    });
+    assert.deepEqual(await adapters.provider.list("example.com/external"), []);
+    assert.deepEqual(await adapters.provider.list("example.com/internal"), []);
+  });
+
+  it("abandons published records only when the caller opts in explicitly", async () => {
+    const adapters = createInMemoryAdapters();
+    const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
+    await api(request("/api/v1/zones", "POST", { name: "example.com" }));
+    await api(request("/api/v1/zones/example.com/views/external/records/root", "PUT", {
+      name: "@", type: "A", content: "8.8.8.8", ttl: 300,
+    }));
+    await api(request("/api/v1/zones/example.com/apply", "POST"));
+
+    const deleted = await api(request("/api/v1/zones/example.com?abandonProviderRecords=true", "DELETE"));
+    assert.equal(deleted.status, 200);
+    assert.deepEqual((await deleted.json() as { removedProviderRecords: unknown[] }).removedProviderRecords, []);
+    assert.equal((await adapters.provider.list("example.com/external")).length, 1);
+    assert.equal((await api(request("/api/v1/zones/other.com?abandonProviderRecords=yes", "DELETE"))).status, 400);
+  });
+
+  it("accepts underscored service names required by DMARC, DKIM and ACME", async () => {
+    const api = setup();
+    await api(request("/api/v1/zones", "POST", { name: "example.com" }));
+    const saved = await api(request("/api/v1/zones/example.com/views/external/records/dmarc", "PUT", {
+      name: "_dmarc", type: "TXT", content: "v=DMARC1; p=none", ttl: 300,
+    }));
+    assert.equal(saved.status, 200);
+    const zone = await saved.json() as { views: Array<{ records: Array<{ name: string }> }> };
+    assert.equal(zone.views[0]?.records[0]?.name, "_dmarc");
+  });
+
   it("rejects oversized request bodies before buffering them", async () => {
     const adapters = createInMemoryAdapters();
     const handler = createNodeHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider));
@@ -101,7 +237,7 @@ describe("HTTP API", () => {
     const history = await (await api(request("/api/v1/zones/example.com/history"))).json() as { entries: unknown[] };
     assert.equal(history.entries.length, 2);
     assert.equal((await api(request("/api/v1/zones/example.com/views/external/records/root", "DELETE"))).status, 200);
-    assert.equal((await api(request("/api/v1/zones/example.com", "DELETE"))).status, 204);
+    assert.equal((await api(request("/api/v1/zones/example.com", "DELETE"))).status, 200);
   });
 
   it("keeps individual RRset values addressable through record CRUD", async () => {
@@ -245,7 +381,7 @@ describe("HTTP API", () => {
     ));
     assert.equal(restored.headers.get("etag"), '"3"');
     assert.equal((await api(request("/api/v1/zones/example.com", "DELETE", undefined, { "if-match": '"2"' }))).status, 409);
-    assert.equal((await api(request("/api/v1/zones/example.com", "DELETE", undefined, { "if-match": '"3"' }))).status, 204);
+    assert.equal((await api(request("/api/v1/zones/example.com", "DELETE", undefined, { "if-match": '"3"' }))).status, 200);
   });
 
   it("rejects apply when desired state changed after preview without touching the provider", async () => {

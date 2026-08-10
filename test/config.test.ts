@@ -12,6 +12,7 @@ describe("configuration", () => {
       allowLocalProvider: true,
       cloudflareZones: [],
       security: { enabled: false, tokens: [] },
+      trustForwardedHeaders: false,
     });
   });
 
@@ -31,8 +32,11 @@ describe("configuration", () => {
       coreDnsDirectory: "/srv/coredns/zones",
       ownershipSecret: "test-ownership-secret-that-is-at-least-32-bytes",
       cloudflareZones: [{ zone: "example.com", zoneId: "zone-1", token: "cf-secret" }],
-      allowLocalProvider: true,
+      // A configured provider turns off the local fallback so a missing adapter
+      // fails loudly instead of quietly writing to a file.
+      allowLocalProvider: false,
       security: { enabled: false, tokens: [] },
+      trustForwardedHeaders: false,
     });
     assert.throws(
       () => readConfig({ PARALLAX_CLOUDFLARE_ZONES: '{"example.com":{"token":"do-not-echo"}}' }),
@@ -42,15 +46,22 @@ describe("configuration", () => {
   });
 
   it("parses role token records without returning them in errors", () => {
-    const source = JSON.stringify([{ token: "admin-secret", role: "admin", subject: "owner" }]);
+    const token = "admin-secret-00000000000000000000";
+    const source = JSON.stringify([{ token, role: "admin", subject: "owner" }]);
     assert.deepEqual(readConfig({ PARALLAX_AUTH_TOKENS: source }).security, {
       enabled: true,
-      tokens: [{ token: "admin-secret", role: "admin", subject: "owner" }],
+      tokens: [{ token, role: "admin", subject: "owner" }],
     });
     assert.throws(
       () => readConfig({ PARALLAX_AUTH_TOKENS: '[{"token":"do-not-echo"}]' }),
       (error: unknown) => error instanceof Error && !error.message.includes("do-not-echo"),
     );
+    // A guessable token opens the whole control plane, so it is a startup error.
+    assert.throws(
+      () => readConfig({ PARALLAX_AUTH_TOKENS: '[{"token":"a","role":"admin","subject":"owner"}]' }),
+      /at least 32 bytes/,
+    );
+    assert.throws(() => readConfig({ PARALLAX_AUTH_TOKENS: "[]" }), /at least one token record/);
   });
 
   it("parses encrypted credential configuration only as a complete, exact 32-byte pair", () => {
@@ -79,16 +90,25 @@ describe("configuration", () => {
     assert.throws(() => readConfig({ HOST: "0.0.0.0" }), /PARALLAX_AUTH_TOKENS/);
     assert.equal(readConfig({
       HOST: "0.0.0.0",
-      PARALLAX_AUTH_TOKENS: '[{"token":"admin-secret","role":"admin","subject":"owner"}]',
+      PARALLAX_AUTH_TOKENS: '[{"token":"admin-secret-00000000000000000000","role":"admin","subject":"owner"}]',
     }).security.enabled, true);
     assert.equal(readConfig({
       HOST: "0.0.0.0",
-      PARALLAX_AUTH_TOKENS: '[{"token":"admin-secret","role":"admin","subject":"owner"}]',
+      PARALLAX_AUTH_TOKENS: '[{"token":"admin-secret-00000000000000000000","role":"admin","subject":"owner"}]',
     }).allowLocalProvider, false);
   });
 
   it("requires an explicit boolean for local provider mode", () => {
     assert.equal(readConfig({ PARALLAX_ALLOW_LOCAL_PROVIDER: "false" }).allowLocalProvider, false);
     assert.throws(() => readConfig({ PARALLAX_ALLOW_LOCAL_PROVIDER: "yes" }), /true or false/);
+  });
+
+  it("reads the public origin used to prove same-origin behind a TLS-terminating proxy", () => {
+    assert.equal(readConfig({ PARALLAX_PUBLIC_ORIGIN: "https://dns.example.com" }).publicOrigin, "https://dns.example.com");
+    assert.equal(readConfig({ PARALLAX_PUBLIC_ORIGIN: "https://dns.example.com/" }).publicOrigin, "https://dns.example.com");
+    assert.equal(readConfig({ PARALLAX_TRUST_FORWARDED_HEADERS: "true" }).trustForwardedHeaders, true);
+    for (const value of ["dns.example.com", "https://dns.example.com/portal", "ftp://dns.example.com"]) {
+      assert.throws(() => readConfig({ PARALLAX_PUBLIC_ORIGIN: value }), /absolute http or https origin/, value);
+    }
   });
 });
