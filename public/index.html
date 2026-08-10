@@ -18,6 +18,7 @@
       <div class="masthead-status">
         <label class="language-picker"><span class="sr-only" data-i18n="language.label">Language</span><select id="locale-select" aria-label="Language" data-i18n-aria-label="language.label"><option value="en" data-i18n="language.english">English</option><option value="ko" data-i18n="language.korean">한국어</option></select></label>
         <button class="button compact quiet" id="credential-settings-button" type="button" data-i18n="provider.settings">Provider settings</button>
+        <button class="button compact quiet" id="sign-out-button" type="button" data-i18n="auth.signOut" hidden>Sign out</button>
         <span class="pulse" aria-hidden="true"></span>
         <span><b id="global-status">Connecting</b><small data-i18n="status.controlPlane">CONTROL PLANE</small></span>
       </div>
@@ -187,7 +188,7 @@
     <dialog id="auth-dialog">
       <form id="auth-form" method="dialog">
         <div class="dialog-heading"><span><span class="eyebrow" data-i18n="auth.eyebrow">Protected control plane</span><h2 data-i18n="auth.title">Enter an access token</h2></span></div>
-        <p data-i18n="auth.body">This server requires an administrator, editor, or viewer token. The token is kept only in this browser tab.</p>
+        <p data-i18n="auth.body">This server requires an administrator, editor, or viewer token. It is exchanged for a session cookie that scripts on this page cannot read.</p>
         <label><span data-i18n="auth.token">Access token</span><input name="token" type="password" required data-validation-label="auth.token" autocomplete="off" spellcheck="false"></label>
         <div class="form-error" id="auth-form-error" role="alert" hidden></div>
         <div class="dialog-actions"><button class="button primary" type="submit" data-i18n="auth.open">Open control plane</button></div>

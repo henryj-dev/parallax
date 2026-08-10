@@ -14,7 +14,7 @@ const state = {
   dirty: false,
   previewRevision: null,
   loadingZone: false,
-  accessToken: "",
+  authenticated: false,
   locale: resolveLocale({
     persistedLocale: readStoredLocale(),
     browserLocales: globalThis.navigator?.languages || [globalThis.navigator?.language],
@@ -77,11 +77,13 @@ function renderLocalizedState() {
 }
 
 async function api(path, options = {}) {
+  // The session cookie is HttpOnly, so it is attached by the browser and never
+  // read by this script. `same-origin` keeps it off any cross-site request.
   const response = await fetch(`${API_ROOT}${path}`, {
+    credentials: "same-origin",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
-      ...(state.accessToken ? { Authorization: `Bearer ${state.accessToken}` } : {}),
       ...options.headers,
     },
     ...options,
@@ -92,7 +94,11 @@ async function api(path, options = {}) {
       const body = await response.json();
       detail = body.message || body.error || detail;
     } catch {}
-    if (response.status === 401) openAuthDialog();
+    if (response.status === 401) {
+      state.authenticated = false;
+      syncSessionControls();
+      openAuthDialog();
+    }
     const error = new Error(detail);
     error.status = response.status;
     throw error;
@@ -159,6 +165,8 @@ async function loadZones({ preserveSelection = false } = {}) {
     const payload = await api("/zones");
     state.zones = normalizeZones(payload);
     state.zonesLoadError = "";
+    state.authenticated = true;
+    syncSessionControls();
     renderZoneList();
     setGlobalStatus("online");
     if (!preserveSelection && state.zones.length) await selectZone(state.zones[0]);
@@ -692,18 +700,40 @@ async function authenticatePortal(event) {
   const form = event.currentTarget;
   const token = String(new FormData(form).get("token") || "").trim();
   if (!token) return;
-  state.accessToken = token;
   $("#auth-form-error").hidden = true;
   try {
-    await api("/zones");
+    await api("/session", { method: "POST", body: JSON.stringify({ token }) });
+    state.authenticated = true;
+    syncSessionControls();
     $("#auth-dialog").close();
     form.reset();
     await loadZones();
   } catch (error) {
-    state.accessToken = "";
+    state.authenticated = false;
+    syncSessionControls();
     setLiveMessage($("#auth-form-error"), error.status === 403 ? "auth.forbidden" : "auth.rejected");
     $("#auth-form-error").hidden = false;
   }
+}
+
+async function signOut() {
+  try {
+    await api("/session", { method: "DELETE" });
+  } catch {
+    // The cookie is cleared either way; a failed sign-out still ends the session here.
+  }
+  state.authenticated = false;
+  state.activeZone = null;
+  state.zones = [];
+  state.records = [];
+  syncSessionControls();
+  renderZoneList();
+  showWelcome(true);
+  openAuthDialog();
+}
+
+function syncSessionControls() {
+  $("#sign-out-button").hidden = !state.authenticated;
 }
 
 async function openCredentialSettings() {
@@ -895,6 +925,7 @@ $("#locale-select").addEventListener("change", (event) => setLocale(event.curren
 $("#add-zone-button").addEventListener("click", openCreateZone);
 $("#zone-form").addEventListener("submit", createZone);
 $("#auth-form").addEventListener("submit", authenticatePortal);
+$("#sign-out-button").addEventListener("click", signOut);
 $("#credential-settings-button").addEventListener("click", openCredentialSettings);
 $("#credential-form").addEventListener("submit", saveCredential);
 $("#test-credential-button").addEventListener("click", testCredential);
@@ -939,5 +970,6 @@ $("#revisions-content").addEventListener("click", (event) => {
 window.addEventListener("beforeunload", (event) => { if (state.dirty) event.preventDefault(); });
 
 setLocale(state.locale);
+syncSessionControls();
 showWelcome(true);
 loadZones();

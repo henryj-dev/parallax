@@ -178,6 +178,86 @@ describe("authorized handler", () => {
     assert.equal((await handler(request("/api/v1/zones/example.com/status", "GET", "viewer-secret-0000000000000000000"))).status, 200);
   });
 
+  it("exchanges a token for an HttpOnly session cookie the page cannot read", async () => {
+    const issued = await handler(new Request("https://portal.example/api/v1/session", {
+      method: "POST",
+      headers: { origin: "https://portal.example", "content-type": "application/json" },
+      body: JSON.stringify({ token: "editor-secret-0000000000000000000" }),
+    }));
+
+    assert.equal(issued.status, 200);
+    assert.deepEqual(await issued.json(), { role: "editor", subject: "operator", expiresIn: 43_200 });
+    const cookie = issued.headers.get("set-cookie") ?? "";
+    assert.match(cookie, /^parallax_session=editor-secret-0000000000000000000;/);
+    for (const attribute of ["Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=43200", "Secure"]) {
+      assert.ok(cookie.includes(attribute), `${attribute} in ${cookie}`);
+    }
+
+    // The issued cookie authenticates the next request.
+    const reused = await handler(new Request("https://portal.example/api/v1/zones", {
+      headers: { cookie: cookie.split(";")[0] ?? "" },
+    }));
+    assert.deepEqual(await reused.json(), { actor: "operator" });
+  });
+
+  it("omits Secure on a plain-HTTP origin so a loopback session still works", async () => {
+    const issued = await handler(new Request("http://127.0.0.1:3000/api/v1/session", {
+      method: "POST",
+      headers: { origin: "http://127.0.0.1:3000", "content-type": "application/json" },
+      body: JSON.stringify({ token: "admin-secret-00000000000000000000" }),
+    }));
+    const cookie = issued.headers.get("set-cookie") ?? "";
+    assert.equal(issued.status, 200);
+    assert.ok(cookie.includes("HttpOnly"));
+    assert.ok(!cookie.includes("Secure"), cookie);
+  });
+
+  it("refuses to issue a session cross-site, for a bad token, or without proof of origin", async () => {
+    const body = JSON.stringify({ token: "admin-secret-00000000000000000000" });
+    const crossSite = await handler(new Request("https://portal.example/api/v1/session", {
+      method: "POST", headers: { origin: "https://evil.example", "content-type": "application/json" }, body,
+    }));
+    assert.equal(crossSite.status, 403);
+
+    const noProof = await handler(new Request("https://portal.example/api/v1/session", {
+      method: "POST", headers: { "content-type": "application/json" }, body,
+    }));
+    assert.equal(noProof.status, 403);
+
+    const wrongToken = await handler(new Request("https://portal.example/api/v1/session", {
+      method: "POST",
+      headers: { origin: "https://portal.example", "content-type": "application/json" },
+      body: JSON.stringify({ token: "not-a-configured-token-0000000000" }),
+    }));
+    assert.equal(wrongToken.status, 401);
+    assert.doesNotMatch(await wrongToken.text(), /not-a-configured-token/);
+  });
+
+  it("clears the session cookie on sign-out", async () => {
+    const cleared = await handler(new Request("https://portal.example/api/v1/session", {
+      method: "DELETE",
+      headers: { "sec-fetch-site": "same-origin" },
+    }));
+    assert.equal(cleared.status, 204);
+    const cookie = cleared.headers.get("set-cookie") ?? "";
+    assert.match(cookie, /^parallax_session=;/);
+    assert.ok(cookie.includes("Max-Age=0"), cookie);
+  });
+
+  it("accepts Sec-Fetch-Site as same-origin proof for cookie-authenticated mutations", async () => {
+    const allowed = await handler(new Request("https://portal.example/api/v1/zones/example.com/apply", {
+      method: "POST",
+      headers: { cookie: "parallax_session=editor-secret-0000000000000000000", "sec-fetch-site": "same-origin" },
+    }));
+    assert.equal(allowed.status, 200);
+
+    const crossSite = await handler(new Request("https://portal.example/api/v1/zones/example.com/apply", {
+      method: "POST",
+      headers: { cookie: "parallax_session=editor-secret-0000000000000000000", "sec-fetch-site": "cross-site" },
+    }));
+    assert.equal(crossSite.status, 403);
+  });
+
   it("requires same-origin proof for cookie-authenticated mutations", async () => {
     const cookieHeaders = { cookie: "parallax_session=editor-secret-0000000000000000000" };
     const rejected = await handler(new Request("https://portal.example/api/v1/zones/example.com/apply", {

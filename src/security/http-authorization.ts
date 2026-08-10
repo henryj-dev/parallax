@@ -17,12 +17,16 @@ export interface SecurityConfig {
   readonly maxFailedAttempts?: number;
   /** How long a lockout lasts, in milliseconds. Defaults to one minute. */
   readonly lockoutMs?: number;
+  /** Lifetime of an issued session cookie in seconds. Defaults to 12 hours. */
+  readonly sessionMaxAgeSeconds?: number;
 }
 
 /** Tokens open the whole control plane, so they get the same floor as the other secrets. */
 export const MIN_TOKEN_BYTES = 32;
 const DEFAULT_MAX_FAILED_ATTEMPTS = 10;
 const DEFAULT_LOCKOUT_MS = 60_000;
+const DEFAULT_SESSION_MAX_AGE_SECONDS = 43_200;
+export const SESSION_PATH = "/api/v1/session";
 
 export interface Principal {
   readonly role: Role;
@@ -34,6 +38,11 @@ export type FetchHandler = (request: Request) => Response | Promise<Response>;
 interface PreparedToken {
   readonly digest: Buffer;
   readonly principal: Principal;
+}
+
+interface PreparedConfig {
+  readonly cookieName: string;
+  readonly tokens: readonly PreparedToken[];
 }
 
 // RFC 6750 b64token syntax; excluding whitespace and header/cookie delimiters also
@@ -104,7 +113,11 @@ export function createAuthorizedHandler(config: SecurityConfig, next: FetchHandl
     now,
   );
 
+  const sessionMaxAge = config.sessionMaxAgeSeconds ?? DEFAULT_SESSION_MAX_AGE_SECONDS;
+
   return async (request) => {
+    if (isSessionRoute(request)) return handleSession(request, prepared, throttle, sessionMaxAge);
+
     const principal = authenticateWithPreparedTokens(request, prepared);
     if (!principal) {
       const retryAfterMs = throttle.recordFailure();
@@ -117,6 +130,97 @@ export function createAuthorizedHandler(config: SecurityConfig, next: FetchHandl
     if (!authorize(principal, request)) return authenticationError(403);
     return next(withActor(request, principal.subject));
   };
+}
+
+function isSessionRoute(request: Request): boolean {
+  try {
+    return new URL(request.url).pathname.replace(/\/+$/, "") === SESSION_PATH;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Exchanges a bearer token for an HttpOnly session cookie, so a browser never
+ * has to keep the credential anywhere script can read it. The token arrives in
+ * the body because a cross-site page can neither read a response nor forge the
+ * same-origin proof this route demands.
+ */
+async function handleSession(
+  request: Request,
+  prepared: PreparedConfig,
+  throttle: FailureThrottle,
+  maxAgeSeconds: number,
+): Promise<Response> {
+  if (request.method !== "POST" && request.method !== "DELETE") {
+    return Response.json({ error: "not_found", message: "route was not found" }, { status: 404, headers: { "cache-control": "no-store" } });
+  }
+  if (!hasSameOrigin(request)) return authenticationError(403);
+  if (request.method === "DELETE") {
+    return new Response(null, {
+      status: 204,
+      headers: { "cache-control": "no-store", "set-cookie": clearedCookieValue(prepared.cookieName, request) },
+    });
+  }
+
+  let candidate: unknown;
+  try {
+    const body: unknown = await request.json();
+    candidate = isRecord(body) ? body.token : undefined;
+  } catch {
+    candidate = undefined;
+  }
+  const principal = typeof candidate === "string" ? matchToken(candidate, prepared.tokens) : undefined;
+  if (!principal) {
+    const retryAfterMs = throttle.recordFailure();
+    return retryAfterMs === undefined ? authenticationError(401) : tooManyAttempts(retryAfterMs);
+  }
+  throttle.recordSuccess();
+  return Response.json(
+    { role: principal.role, subject: principal.subject, expiresIn: maxAgeSeconds },
+    {
+      status: 200,
+      headers: {
+        "cache-control": "no-store",
+        "set-cookie": sessionCookieValue(prepared.cookieName, candidate as string, request, maxAgeSeconds),
+      },
+    },
+  );
+}
+
+function sessionCookieValue(name: string, token: string, request: Request, maxAgeSeconds: number): string {
+  return [
+    `${name}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${maxAgeSeconds}`,
+    ...(isSecureRequest(request) ? ["Secure"] : []),
+  ].join("; ");
+}
+
+function clearedCookieValue(name: string, request: Request): string {
+  return [
+    `${name}=`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    "Max-Age=0",
+    ...(isSecureRequest(request) ? ["Secure"] : []),
+  ].join("; ");
+}
+
+/** `Secure` would make the cookie unusable on a plain-HTTP loopback deployment. */
+function isSecureRequest(request: Request): boolean {
+  try {
+    return new URL(request.url).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function withActor(request: Request, subject: string): Request {
@@ -164,7 +268,13 @@ function isUnsafeMethod(method: string): boolean {
   return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
+/**
+ * Both signals are set by the browser and cannot be forged by page script, so
+ * either one is proof the request did not come from another site. `Sec-Fetch-Site`
+ * is the fallback for clients that omit `Origin` on same-origin requests.
+ */
 function hasSameOrigin(request: Request): boolean {
+  if (request.headers.get("sec-fetch-site") === "same-origin") return true;
   const origin = request.headers.get("origin");
   if (!origin) return false;
   try {
@@ -174,7 +284,7 @@ function hasSameOrigin(request: Request): boolean {
   }
 }
 
-function prepareConfig(config: SecurityConfig): { cookieName: string; tokens: readonly PreparedToken[] } {
+function prepareConfig(config: SecurityConfig): PreparedConfig {
   const cookieName = config.cookieName ?? "parallax_session";
   if (!COOKIE_NAME_PATTERN.test(cookieName)) throw invalidConfiguration();
 
@@ -197,17 +307,17 @@ function prepareConfig(config: SecurityConfig): { cookieName: string; tokens: re
   return { cookieName, tokens: prepared };
 }
 
-function authenticateWithPreparedTokens(
-  request: Request,
-  prepared: { cookieName: string; tokens: readonly PreparedToken[] },
-): Principal | undefined {
+function authenticateWithPreparedTokens(request: Request, prepared: PreparedConfig): Principal | undefined {
   const candidate = readCandidate(request, prepared.cookieName);
-  if (candidate === undefined) return undefined;
+  return candidate === undefined ? undefined : matchToken(candidate, prepared.tokens);
+}
 
+function matchToken(candidate: string, tokens: readonly PreparedToken[]): Principal | undefined {
+  if (!TOKEN_PATTERN.test(candidate)) return undefined;
   const candidateDigest = digest(candidate);
   let match: Principal | undefined;
   // Compare every configured digest so the matching record's position is not observable.
-  for (const record of prepared.tokens) {
+  for (const record of tokens) {
     const equal = timingSafeEqual(candidateDigest, record.digest);
     if (equal) match = record.principal;
   }
