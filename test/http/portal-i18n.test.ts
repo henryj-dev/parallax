@@ -115,22 +115,43 @@ describe("portal internationalization", () => {
     assert.equal(escapeHtml(translated), "Zone was not created: &lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
   });
 
-  it("wires an accessible persisted language selector and serves the module", async () => {
-    const [html, app, server] = await Promise.all([
+  it("wires an accessible persisted language selector and serves every portal module", async () => {
+    const [html, app, store, client, server] = await Promise.all([
       readFile(new URL("../../public/index.html", import.meta.url), "utf8"),
       readFile(new URL("../../public/app.js", import.meta.url), "utf8"),
+      readFile(new URL("../../public/store.js", import.meta.url), "utf8"),
+      readFile(new URL("../../public/api-client.js", import.meta.url), "utf8"),
       readFile(new URL("../../src/index.ts", import.meta.url), "utf8"),
     ]);
     assert.match(html, /id="locale-select"[^>]+data-i18n-aria-label="language\.label"/);
     assert.match(html, /<option value="en"[^>]+data-i18n="language\.english"/);
     assert.match(html, /<option value="ko"[^>]+data-i18n="language\.korean"/);
-    assert.match(app, /writePersistedLocale\(globalThis\.localStorage, state\.locale\)/);
-    assert.match(app, /document\.documentElement\.lang = state\.locale/);
-    assert.match(app, /if \(state\.zonesLoadError\) renderZoneListError\(state\.zonesLoadError\)/);
-    assert.match(app, /if \(state\.revisionsLoadError\) renderRevisionListError\(state\.revisionsLoadError\)/);
-    assert.match(app, /state\.zonesLoadError = ""/);
-    assert.match(app, /state\.revisionsLoadError = ""/);
-    assert.match(server, /\["\/i18n\.js", \{ file: "i18n\.js"/);
+    assert.match(app, /writePersistedLocale\(globalThis\.localStorage/);
+    assert.match(app, /document\.documentElement\.lang = locale/);
+    // Load failures are state the store owns; the view only draws them.
+    assert.match(store, /state\.zonesError = /);
+    assert.match(store, /state\.revisionsError = /);
+    assert.match(app, /state\.zonesError/);
+    assert.match(app, /state\.revisionsError/);
+
+    // The layering has to survive: the view never calls the network, and
+    // neither the store nor the client may reach for a document.
+    assert.doesNotMatch(app, /\bfetch\(/);
+    for (const module of [store, client]) {
+      assert.doesNotMatch(module, /\bdocument\.|innerHTML|querySelector/);
+    }
+
+    // Every scope the store can record an error against has somewhere to be
+    // drawn, checked against the store's own list rather than a copy of it.
+    const scopes = /ERROR_SCOPES = \[([^\]]+)\]/.exec(store)?.[1] ?? "";
+    assert.ok(scopes.length > 0, "the store must declare its error scopes");
+    for (const scope of scopes.split(",").map((name) => name.trim().replaceAll('"', ""))) {
+      assert.match(app, new RegExp(`^  ${scope}: "#`, "m"), scope);
+    }
+
+    for (const file of ["i18n.js", "app.js", "store.js", "api-client.js", "ttl.js"]) {
+      assert.ok(server.includes(`file: "${file}"`), file);
+    }
     assert.equal(createTranslator("ko")("meta.title"), "Parallax — DNS 관측소");
   });
 });

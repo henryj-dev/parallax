@@ -51,6 +51,8 @@ const staticFiles = new Map([
   ["/index.html", { file: "index.html", type: "text/html; charset=utf-8" }],
   ["/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
   ["/app.js", { file: "app.js", type: "text/javascript; charset=utf-8" }],
+  ["/api-client.js", { file: "api-client.js", type: "text/javascript; charset=utf-8" }],
+  ["/store.js", { file: "store.js", type: "text/javascript; charset=utf-8" }],
   ["/ttl.js", { file: "ttl.js", type: "text/javascript; charset=utf-8" }],
   ["/i18n.js", { file: "i18n.js", type: "text/javascript; charset=utf-8" }],
 ]);
