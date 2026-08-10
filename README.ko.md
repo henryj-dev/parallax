@@ -44,32 +44,52 @@ pnpm start
 
 ## 환경 설정
 
-`.env.example`을 `.env`로 복사한 뒤 값을 조정합니다. `dev`와 `start` 스크립트는
-파일이 존재할 때 `.env`를 자동으로 읽습니다. 셸에서 직접 지정한 환경 변수가
-`.env`보다 우선하며, 파일이 없으면 서비스 기본값을 사용합니다.
+환경변수에는 저장소에서 읽어올 수 없는 것만 둡니다. 어디에 바인드할지, 저장소에
+어떻게 접속할지, 저장된 값을 보호하는 키가 전부입니다. `.env.example`을 `.env`로
+복사한 뒤 값을 조정하세요. `dev`와 `start` 스크립트는 파일이 존재할 때 `.env`를
+자동으로 읽고, 셸에서 직접 지정한 값이 우선합니다.
 
-| 환경 변수 | 용도 |
+| 변수 | 용도 |
 | --- | --- |
-| `HOST`, `PORT` | 서버 바인딩 주소. 기본값은 `127.0.0.1:3000` |
-| `PARALLAX_STATE_FILE` | 존, 리비전, 상태, 감사 로그 영속 파일 |
-| `PARALLAX_PROVIDER_STATE_FILE` | 대체 수단으로 사용하는 로컬 프로바이더 상태 파일 |
-| `PARALLAX_ALLOW_LOCAL_PROVIDER` | 모의 프로바이더 사용 여부. 프로바이더를 설정하지 않은 루프백 개발 환경에서만 기본 활성화 |
-| `PARALLAX_PUBLIC_ORIGIN` | 브라우저가 포털에 접속하는 절대 origin. TLS 종료 프록시 뒤에서 필요 |
-| `PARALLAX_TRUST_FORWARDED_HEADERS` | 리버스 프록시의 `X-Forwarded-Proto`/`X-Forwarded-Host` 신뢰 여부 |
-| `DATABASE_URL` | 선택적 PostgreSQL 기준 저장소. 먼저 `migrations/001_initial.sql` 적용 필요 |
-| `PARALLAX_COREDNS_DIRECTORY` | 원자적으로 생성되는 CoreDNS 존 파일 디렉터리 |
-| `PARALLAX_OWNERSHIP_SECRET` | 관리 레코드 소유권 마커를 서명하는 32바이트 이상의 비밀값 |
-| `PARALLAX_CLOUDFLARE_ZONES` | 존 이름을 Cloudflare 존 ID 및 API 토큰에 연결하는 선택적 JSON 맵 |
-| `PARALLAX_CREDENTIAL_FILE` | 마스터 키와 함께 설정하는 선택적 암호화 Cloudflare 자격 증명 파일 |
-| `PARALLAX_CREDENTIAL_MASTER_KEY` | base64 또는 64자리 16진수로 인코딩된 정확히 32바이트의 마스터 키 |
-| `PARALLAX_AUTH_TOKENS` | 선택적 admin/editor/viewer 액세스 토큰 JSON 배열. 각 토큰은 32바이트 이상 |
+| `HOST`, `PORT` | 서버 바인드 주소. 기본값 `127.0.0.1:3000` |
+| `DATABASE_URL` | PostgreSQL 원본 저장소. `migrations/*.sql`을 순서대로 적용. TLS는 `?sslmode=verify-full` |
+| `PARALLAX_STATE_FILE` | 데이터베이스가 없을 때 존·리비전·상태·감사 기록 파일 |
+| `PARALLAX_CONFIG_FILE` | 데이터베이스가 없을 때 설정·자격 증명·접근 토큰 파일 |
+| `PARALLAX_PROVIDER_STATE_FILE` | 로컬 프로바이더가 켜져 있을 때만 사용하는 상태 파일 |
+| `PARALLAX_OWNERSHIP_SECRET` | 관리 레코드 소유권 마커에 서명하는 32바이트 이상 시크릿 |
+| `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장 자격 증명을 암호화하는 정확히 32바이트 키(base64 또는 64자 16진수) |
+| `PARALLAX_AUTH_TOKENS` | 선택적 비상용 토큰. 각 32바이트 이상 |
+
+나머지는 전부 — 프로바이더 연결, 보관 정책, 프록시 origin, 접근 토큰, 프로바이더
+자격 증명 — 존과 같은 저장소에 보관되며 포털의 **프로바이더 설정** 화면에서
+관리합니다. 변경은 재배포 없이 즉시 반영되고, PostgreSQL을 쓰면 모든 인스턴스가
+같은 값을 읽습니다.
+
+| 설정 | 효과 |
+| --- | --- |
+| `allowLocalProvider` | 실제 프로바이더가 없을 때 로컬 파일에 게시. 기본값은 꺼짐이므로 라우팅되지 않는 대상은 성공으로 보고되지 않고 실패합니다 |
+| `coreDnsDirectory` | 내부 뷰용 RFC 1035 존 파일 디렉터리. 비우면 비활성 |
+| `publicOrigin` | 브라우저가 포털에 접속하는 절대 origin. 비우면 요청마다 유추 |
+| `trustForwardedHeaders` | 리버스 프록시의 `X-Forwarded-Proto`/`X-Forwarded-Host` 신뢰 |
+| `revisionRetention` | 존별 보관 리비전 스냅샷 수. `0`은 전부 보관 |
+| `auditRetentionDays` | 존별 감사 기록 보관 일수. `0`은 전부 보관 |
+
+### 접근 토큰
+
+토큰은 포털에서 발급하며 SHA-256 다이제스트로만 저장됩니다. 제시된 토큰을 검증할
+수는 있지만 저장소가 토큰을 되만들 수는 없습니다. 새 토큰은 발급 시 한 번만
+표시됩니다. 토큰이 하나도 없으면 컨트롤 플레인은 열린 상태이며 이는 루프백 개발용
+동작입니다. 그 상태에서는 비루프백 주소 바인드를 거부하고, 프록시 전달 헤더가 붙은
+API 요청도 거부합니다. `PARALLAX_AUTH_TOKENS`는 스스로 잠긴 배포를 위한 비상
+경로로 남아 있으며, 해당 토큰은 관리형으로 표시되고 API로 폐기할 수 없습니다.
+마지막 관리자 토큰은 폐기되지 않습니다.
 
 ### 리버스 프록시 뒤에서 서비스하기
 
 쿠키로 인증한 변경 요청은 same-origin을 증명해야 하며, 이때 브라우저가 실제로
-사용한 origin이 필요합니다. TLS 종료 프록시 뒤에서는 `PARALLAX_PUBLIC_ORIGIN`에
-공개 origin을 설정하거나, 프록시를 통해서만 이 프로세스에 도달할 수 있다면
-`PARALLAX_TRUST_FORWARDED_HEADERS=true`를 설정합니다. 둘 다 없으면 서버가 요청을
+사용한 origin이 필요합니다. TLS 종료 프록시 뒤에서는 `publicOrigin` 설정에
+공개 origin을 지정하거나, 프록시를 통해서만 이 프로세스에 도달할 수 있다면
+`trustForwardedHeaders`를 켭니다. 둘 다 없으면 서버가 요청을
 `http`로 재구성해 비교하므로 `https` 요청이 거부됩니다.
 
 인증은 `PARALLAX_AUTH_TOKENS`가 없을 때만 비활성화되며, 이는 루프백 개발 전용
@@ -109,8 +129,7 @@ Cloudflare에는 최소 권한 API 토큰을 사용합니다. 인증이 설정�
 저장소 키는 `openssl rand -base64 32`로 생성할 수 있습니다. 프로바이더 설정
 화면과 자격 증명 API는 관리자 전용입니다. API 토큰은 쓰기 전용이며 목록과
 메타데이터 응답에는 존, 존 ID, 갱신 시각만 포함됩니다. 암호화 자격 증명은
-동일 존의 `PARALLAX_CLOUDFLARE_ZONES` 설정보다 우선하고, 삭제하면 환경 변수로
-설정한 어댑터가 다시 사용됩니다.
+삭제하면 해당 존의 프로바이더 연결이 끊깁니다.
 
 Cloudflare [TTL](https://developers.cloudflare.com/dns/manage-dns-records/reference/ttl/)은
 [API 표현](https://developers.cloudflare.com/api/resources/dns/subresources/records/)에서
@@ -137,8 +156,8 @@ CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일
 ### 보관 정책
 
 목표 상태를 변경할 때마다 불변 스냅샷과 감사 기록이 쌓이므로 히스토리는 사용량에
-비례해 증가합니다. `PARALLAX_REVISION_RETENTION`은 존별 최신 스냅샷 수를,
-`PARALLAX_AUDIT_RETENTION_DAYS`는 감사 기록 보관 기간을 제한합니다. 두 정책 모두
+비례해 증가합니다. `revisionRetention` 설정은 존별 최신 스냅샷 수를,
+`auditRetentionDays`는 감사 기록 보관 기간을 제한합니다. 두 정책 모두
 변경을 기록하는 것과 같은 원자적 커밋 안에서 적용되며, `0`으로 두면 제한이
 없습니다. 보관 기간이 지나 삭제된 리비전을 복원하려 하면 404가 반환되므로,
 실제로 필요한 롤백 범위에 맞춰 리비전 수를 정하세요.

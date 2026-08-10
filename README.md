@@ -44,36 +44,53 @@ ignored by Git. During development, use `pnpm dev`.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and adjust its values. The `dev` and `start`
-scripts automatically load `.env` when it exists; shell environment variables
-still take precedence. If the file is absent, the service uses its normal
-defaults.
+The environment carries only what cannot be read out of the store: where to
+bind, how to reach the store, and the keys that protect what is stored.
 
 | Variable | Purpose |
 | --- | --- |
 | `HOST`, `PORT` | Server bind address; defaults to `127.0.0.1:3000` |
-| `PARALLAX_STATE_FILE` | Durable zones, revisions, statuses, and audit file |
-| `PARALLAX_PROVIDER_STATE_FILE` | Durable local provider state used as fallback |
-| `PARALLAX_ALLOW_LOCAL_PROVIDER` | Simulated provider; defaults on only for loopback development with no provider configured |
-| `PARALLAX_PUBLIC_ORIGIN` | Absolute origin browsers reach the portal at; required behind TLS termination |
-| `PARALLAX_TRUST_FORWARDED_HEADERS` | Trust `X-Forwarded-Proto`/`X-Forwarded-Host` from a reverse proxy |
-| `DATABASE_URL` | Optional PostgreSQL source of truth; apply `migrations/001_initial.sql` first. Append `?sslmode=verify-full` for TLS |
-| `PARALLAX_REVISION_RETENTION` | Newest revision snapshots kept per zone; `0` keeps every one. Defaults to 100 |
-| `PARALLAX_AUDIT_RETENTION_DAYS` | Days of audit history kept per zone; `0` keeps every entry. Defaults to 365 |
-| `PARALLAX_COREDNS_DIRECTORY` | Optional directory for atomically generated zone files |
+| `DATABASE_URL` | PostgreSQL source of truth; apply `migrations/*.sql` in order. Append `?sslmode=verify-full` for TLS |
+| `PARALLAX_STATE_FILE` | Zones, revisions, statuses and audit, when no database is configured |
+| `PARALLAX_CONFIG_FILE` | Settings, credentials and access tokens, when no database is configured |
+| `PARALLAX_PROVIDER_STATE_FILE` | Local provider state, used only while the local provider is enabled |
 | `PARALLAX_OWNERSHIP_SECRET` | 32+ byte secret that signs managed-record ownership markers |
-| `PARALLAX_CLOUDFLARE_ZONES` | Optional JSON map of zone names to Cloudflare zone IDs and API tokens |
-| `PARALLAX_CREDENTIAL_FILE` | Optional encrypted Cloudflare credential file; configure with the master key |
-| `PARALLAX_CREDENTIAL_MASTER_KEY` | Exact 32-byte master key encoded as base64 or 64 hexadecimal characters |
-| `PARALLAX_AUTH_TOKENS` | Optional JSON array of admin/editor/viewer access tokens, each at least 32 bytes |
+| `PARALLAX_CREDENTIAL_MASTER_KEY` | Exactly 32 bytes as base64 or 64 hexadecimal characters; encrypts stored credentials |
+| `PARALLAX_AUTH_TOKENS` | Optional break-glass tokens, each at least 32 bytes |
+
+Everything else -- provider wiring, retention, proxy origin, access tokens and
+provider credentials -- is stored alongside the zones and managed from the
+portal's **Provider settings** screen. A change takes effect immediately across
+the process; nothing needs a redeploy, and with PostgreSQL every instance reads
+the same value.
+
+| Setting | Effect |
+| --- | --- |
+| `allowLocalProvider` | Publish to a local file when no real provider is configured. Off by default, so an unrouted target fails loudly instead of reporting success |
+| `coreDnsDirectory` | Directory of RFC 1035 zone files for the internal view; empty disables it |
+| `publicOrigin` | Absolute origin browsers reach the portal at; empty derives it per request |
+| `trustForwardedHeaders` | Trust `X-Forwarded-Proto`/`X-Forwarded-Host` from a reverse proxy |
+| `revisionRetention` | Newest revision snapshots kept per zone; `0` keeps every one |
+| `auditRetentionDays` | Days of audit history kept per zone; `0` keeps every entry |
+
+### Access tokens
+
+Tokens are issued from the portal and stored only as SHA-256 digests, so the
+store can verify a presented token but never reproduce one. A new token is shown
+exactly once. With no token anywhere the control plane is open, which is
+intended for loopback development: it refuses to bind a non-loopback address in
+that state, and refuses API requests that arrive with proxy forwarding headers.
+`PARALLAX_AUTH_TOKENS` remains as a break-glass path for a deployment that has
+locked itself out; those tokens are listed as managed and cannot be revoked
+through the API. The last administrator token cannot be revoked.
 
 ### Serving the portal behind a reverse proxy
 
 Cookie-authenticated mutations must prove same-origin, which needs the origin a
-browser actually used. Behind TLS termination, set `PARALLAX_PUBLIC_ORIGIN` to
-the public origin, or set `PARALLAX_TRUST_FORWARDED_HEADERS=true` when the proxy
-is the only way to reach this process. Without either, a proxied `https` request
-is rejected because the server would compare it against `http`.
+browser actually used. Behind TLS termination, set the `publicOrigin` setting
+to the public origin, or turn on `trustForwardedHeaders` when the proxy is the
+only way to reach this process. Without either, a proxied `https` request is
+rejected because the server would compare it against `http`.
 
 Authentication is disabled only when `PARALLAX_AUTH_TOKENS` is absent, which is
 intended for loopback development: every caller that reaches the port would
@@ -114,8 +131,7 @@ the portal asks for an access token and keeps it only in the current browser
 tab's memory. Generate the credential-store key with `openssl rand -base64 32`.
 The provider settings dialog and credential API are admin-only. API tokens are
 write-only: list and metadata responses contain only zone, zone ID, and update
-time. Encrypted credentials override `PARALLAX_CLOUDFLARE_ZONES` for the same
-zone; deleting one restores the environment-configured adapter when present.
+time.
 
 Cloudflare [TTL](https://developers.cloudflare.com/dns/manage-dns-records/reference/ttl/)
 uses the [API representation](https://developers.cloudflare.com/api/resources/dns/subresources/records/)
@@ -143,8 +159,8 @@ reconciliation publish a second answer beside one it never saw.
 ### Retention
 
 Every desired-state change stores an immutable snapshot and an audit entry, so
-history grows with use. `PARALLAX_REVISION_RETENTION` keeps the newest snapshots
-per zone and `PARALLAX_AUDIT_RETENTION_DAYS` ages out audit entries; both are
+history grows with use. The `revisionRetention` setting keeps the newest
+snapshots per zone and `auditRetentionDays` ages out audit entries; both are
 enforced inside the same atomic commit as the change that triggered them, and
 `0` disables the bound. Restoring a revision that has aged out returns 404, so
 size the revision bound to the rollback window you actually need.

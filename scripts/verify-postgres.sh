@@ -41,35 +41,62 @@ done
 [ -n "$ready" ] || { docker logs "$CONTAINER" 2>&1 | tail -20 >&2; fail "PostgreSQL did not become ready"; }
 ok "server ready on ${PGPORT}"
 
-echo "== applying migrations/001_initial.sql to a fresh database =="
-docker exec -i "$CONTAINER" psql -h 127.0.0.1 -v ON_ERROR_STOP=1 -U parallax -d parallax < "$ROOT/migrations/001_initial.sql" >/dev/null
+echo "== applying every migration to a fresh database =="
+apply_migrations() {
+  for migration in "$ROOT"/migrations/*.sql; do
+    docker exec -i "$CONTAINER" psql -h 127.0.0.1 -v ON_ERROR_STOP=1 -U parallax -d parallax < "$migration" >/dev/null
+  done
+}
+apply_migrations
 TABLES=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'parallax_%'")
-[ "$TABLES" = "4" ] || fail "expected 4 tables, found $TABLES"
+[ "$TABLES" = "7" ] || fail "expected 7 tables, found $TABLES"
 ok "schema applied ($TABLES tables)"
 
-echo "== re-applying the migration is idempotent =="
-docker exec -i "$CONTAINER" psql -h 127.0.0.1 -v ON_ERROR_STOP=1 -U parallax -d parallax < "$ROOT/migrations/001_initial.sql" >/dev/null
+echo "== re-applying the migrations is idempotent =="
+apply_migrations
 ok "second run succeeded"
 
 start_app() {
   DATABASE_URL="$DATABASE_URL" HOST=127.0.0.1 PORT="$APPPORT" \
-  PARALLAX_REVISION_RETENTION="${1:-100}" PARALLAX_AUDIT_RETENTION_DAYS=365 \
     node "$ROOT/src/index.ts" > "$WORK/app.log" 2>&1 &
   APP_PID=$!
-  for _ in $(seq 1 40); do
+  for _ in $(seq 1 60); do
+    # Confirm the process we just launched is the one answering: a replacement
+    # that died on EADDRINUSE would otherwise be masked by its predecessor.
+    kill -0 "$APP_PID" 2>/dev/null || { cat "$WORK/app.log" >&2; fail "app exited during startup"; }
     curl -sf "http://127.0.0.1:${APPPORT}/health/live" >/dev/null 2>&1 && return 0
     sleep 0.25
   done
   cat "$WORK/app.log" >&2
   fail "app did not start"
 }
-stop_app() { kill "$APP_PID" 2>/dev/null || true; wait "$APP_PID" 2>/dev/null || true; APP_PID=""; }
+stop_app() {
+  kill "$APP_PID" 2>/dev/null || true
+  wait "$APP_PID" 2>/dev/null || true
+  APP_PID=""
+  # Wait for the port to be released: starting the replacement too early makes
+  # it die with EADDRINUSE while the health check still answers from the old one.
+  for _ in $(seq 1 40); do
+    curl -sf "http://127.0.0.1:${APPPORT}/health/live" >/dev/null 2>&1 || return 0
+    sleep 0.25
+  done
+  fail "the previous server did not release port ${APPPORT}"
+}
 
 API="http://127.0.0.1:${APPPORT}/api/v1"
 
+echo "== the local provider is off until a stored setting turns it on =="
+start_app
+UNSET=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
+  -d '{"name":"unrouted.example"}' "$API/zones"; \
+  curl -s -o /dev/null -w '%{http_code}' "$API/zones/unrouted.example/preview")
+[ "${UNSET#201}" = "200" ] || fail "expected a zone with no views to preview cleanly, got $UNSET"
+curl -sf -X DELETE "$API/zones/unrouted.example" >/dev/null
+curl -sf -X PUT -H 'content-type: application/json' -d '{"allowLocalProvider":true}' "$API/settings" >/dev/null
+ok "allowLocalProvider enabled through the settings API, no restart"
+
 echo "== zone lifecycle against real PostgreSQL =="
-start_app 100
 curl -sf -X POST -H 'content-type: application/json' -d '{"name":"example.com"}' "$API/zones" >/dev/null
 curl -sf -X PUT -H 'content-type: application/json' \
   -d '{"name":"www","type":"A","content":"93.184.216.34","ttl":300}' \
@@ -80,15 +107,26 @@ curl -sf -X PUT -H 'content-type: application/json' \
 curl -sf -X POST "$API/zones/example.com/apply" >/dev/null
 ok "zone created, records saved, apply reported"
 
+echo "== settings round-trip through the database =="
+curl -sf -X PUT -H 'content-type: application/json' -d '{"auditRetentionDays":30}' "$API/settings" >/dev/null
+STORED=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
+  "SELECT value FROM parallax_settings WHERE key = 'auditRetentionDays'")
+[ "$STORED" = "30" ] || fail "expected the setting in SQL, found '$STORED'"
+ok "auditRetentionDays stored in parallax_settings as $STORED"
+
 echo "== transactional commit landed in SQL =="
+# Scoped to this zone: the earlier probe zone leaves its own audit trail behind,
+# which is intentional -- a deletion stays recorded after the zone is gone.
 ROWS=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
-  "SELECT (SELECT count(*) FROM parallax_zones) || '/' || (SELECT count(*) FROM parallax_zone_revisions) || '/' || (SELECT count(*) FROM parallax_audit)")
+  "SELECT (SELECT count(*) FROM parallax_zones WHERE name = 'example.com')
+       || '/' || (SELECT count(*) FROM parallax_zone_revisions WHERE zone_name = 'example.com')
+       || '/' || (SELECT count(*) FROM parallax_audit WHERE zone_name = 'example.com')")
 [ "$ROWS" = "1/3/3" ] || fail "expected 1/3/3 zone/revision/audit rows, found $ROWS"
 ok "zone/revision/audit rows = $ROWS"
 
 echo "== restart persistence =="
 stop_app
-start_app 100
+start_app
 REV=$(curl -sf "$API/zones/example.com" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).revision))')
 [ "$REV" = "3" ] || fail "expected revision 3 after restart, found $REV"
 DRIFT=$(curl -sf "$API/zones/example.com/preview" | node -e 'let d="";process.stdin.on("data",c=>c&&(d+=c)).on("end",()=>{const v=JSON.parse(d).views;console.log(Object.values(v).reduce((n,p)=>n+p.operations.length,0))})')
@@ -105,8 +143,8 @@ STATE=$(curl -sf "$API/zones/example.com/status" | node -e 'let d="";process.std
 ok "six concurrent applies converged without deadlock ($STATE)"
 
 echo "== retention prunes revisions in real SQL =="
-stop_app
-start_app 3
+# Retention is a stored setting now, so it is changed through the API.
+curl -sf -X PUT -H 'content-type: application/json' -d '{"revisionRetention":3}' "$API/settings" >/dev/null
 for i in 1 2 3 4 5; do
   curl -sf -X PUT -H 'content-type: application/json' \
     -d "{\"name\":\"host$i\",\"type\":\"A\",\"content\":\"93.184.216.3$i\",\"ttl\":300}" \
@@ -123,7 +161,7 @@ LEFT=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT (SELECT count(*) FROM parallax_zones) || '/' || (SELECT count(*) FROM parallax_zone_revisions) || '/' || (SELECT count(*) FROM parallax_apply_statuses)")
 [ "$LEFT" = "0/0/0" ] || fail "expected cascade to empty child tables, found $LEFT"
 AUDIT=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
-  "SELECT count(*) FROM parallax_audit WHERE action='zone.deleted'")
+  "SELECT count(*) FROM parallax_audit WHERE action='zone.deleted' AND zone_name='example.com'")
 [ "$AUDIT" = "1" ] || fail "expected the deletion to stay audited, found $AUDIT"
 ok "children cascaded to $LEFT, deletion audit retained"
 

@@ -97,8 +97,8 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
       — `pnpm verify:cloudflare` 스크립트는 준비되어 있으나 실제 계정이 없어
       **미실행**이다. `CF_ZONE`, `CF_ZONE_ID`, `CF_API_TOKEN`,
       `CF_VERIFY_ALLOW_WRITES=true`를 설정해 운영자가 직접 실행해야 한다.
-- [x] reverse proxy/TLS 환경의 Origin 처리 — `PARALLAX_PUBLIC_ORIGIN` /
-      `PARALLAX_TRUST_FORWARDED_HEADERS`로 해결하고 회귀 테스트로 고정했다.
+- [x] reverse proxy/TLS 환경의 Origin 처리 — `publicOrigin` / `trustForwardedHeaders`
+      설정으로 해결하고 회귀 테스트로 고정했다.
 - [x] Secure cookie — 서버가 `POST /api/v1/session`에서 `HttpOnly; SameSite=Strict`
       쿠키를 발급하며 HTTPS 요청에는 `Secure`를 붙인다.
 - [ ] 실제 TLS 종단 프록시(nginx 등) 뒤에서의 readiness 및 secret redaction 최종 확인
