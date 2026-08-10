@@ -1,0 +1,184 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { parseInvocation, usage, UsageError } from "../../src/cli/argv.ts";
+import {
+  CommandPermissionError,
+  CommandUnavailableError,
+  listCommands,
+  runCommand,
+  UnknownCommandError,
+  type CommandContext,
+} from "../../src/cli/commands.ts";
+import { AccessTokenService } from "../../src/application/access-tokens.ts";
+import { ControlPlane } from "../../src/application/control-plane.ts";
+import { SettingsService } from "../../src/application/settings.ts";
+import type { AccessTokenRepository, SettingsRepository, StoredAccessToken } from "../../src/application/ports.ts";
+import { createInMemoryAdapters } from "../../src/infrastructure/in-memory.ts";
+import type { Role } from "../../src/security/http-authorization.ts";
+
+class MemorySettingsRepository implements SettingsRepository {
+  values: Record<string, unknown> = {};
+  async read(): Promise<Record<string, unknown>> { return { ...this.values }; }
+  async write(patch: Record<string, unknown>): Promise<void> { this.values = { ...this.values, ...patch }; }
+}
+
+class MemoryAccessTokenRepository implements AccessTokenRepository {
+  tokens: StoredAccessToken[] = [];
+  async list(): Promise<StoredAccessToken[]> { return this.tokens.map((token) => ({ ...token })); }
+  async create(token: StoredAccessToken): Promise<void> { this.tokens.push({ ...token }); }
+  async delete(id: string): Promise<boolean> {
+    const index = this.tokens.findIndex((token) => token.id === id);
+    if (index < 0) return false;
+    this.tokens.splice(index, 1);
+    return true;
+  }
+}
+
+async function context(role: Role = "admin"): Promise<CommandContext> {
+  const adapters = createInMemoryAdapters();
+  const settings = new SettingsService(new MemorySettingsRepository());
+  const accessTokens = new AccessTokenService(new MemoryAccessTokenRepository());
+  await settings.load();
+  await accessTokens.load();
+  return {
+    runtime: {
+      controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider),
+      settings,
+      accessTokens,
+    },
+    actor: "test",
+    role,
+  };
+}
+
+describe("command layer", () => {
+  it("drives a zone through its whole life from commands alone", async () => {
+    const parallax = await context();
+
+    await runCommand(parallax, "zone create", { zone: "example.com" });
+    await runCommand(parallax, "record set", {
+      zone: "example.com",
+      view: "external",
+      id: "www",
+      record: { name: "www", type: "A", content: "8.8.8.8", ttl: 300 },
+    });
+    const applied = await runCommand(parallax, "apply", { zone: "example.com" }) as {
+      statuses: Array<{ view: string; state: string }>;
+    };
+    assert.deepEqual(applied.statuses.map((status) => `${status.view}:${status.state}`), [
+      "external:applied",
+      "internal:applied",
+    ]);
+
+    const listed = await runCommand(parallax, "zone list") as { zones: Array<{ name: string }> };
+    assert.deepEqual(listed.zones.map((zone) => zone.name), ["example.com"]);
+
+    const deleted = await runCommand(parallax, "zone delete", { zone: "example.com" }) as {
+      removedProviderRecords: unknown[];
+    };
+    assert.equal(deleted.removedProviderRecords.length, 2);
+  });
+
+  it("honours the optimistic-concurrency guard rather than the revision being read", async () => {
+    const parallax = await context();
+    await runCommand(parallax, "zone create", { zone: "example.com" });
+    await runCommand(parallax, "record set", {
+      zone: "example.com", view: "external", id: "a",
+      record: { name: "a", type: "A", content: "8.8.8.8", ttl: 300 },
+    });
+
+    await assert.rejects(
+      runCommand(parallax, "record set", {
+        zone: "example.com", view: "external", id: "b",
+        record: { name: "b", type: "A", content: "8.8.8.9", ttl: 300 },
+        expectedRevision: 1,
+      }),
+      /expected revision 1/,
+    );
+  });
+
+  it("refuses a command the caller's role does not reach", async () => {
+    const viewer = await context("viewer");
+    assert.ok(await runCommand(viewer, "zone list"));
+    await assert.rejects(
+      runCommand(viewer, "zone create", { zone: "example.com" }),
+      (error: unknown) => error instanceof CommandPermissionError && /editor role/.test(error.message),
+    );
+    await assert.rejects(
+      runCommand(viewer, "settings get"),
+      (error: unknown) => error instanceof CommandPermissionError,
+    );
+  });
+
+  it("rejects an unknown command and unknown or missing options", async () => {
+    const parallax = await context();
+    await assert.rejects(runCommand(parallax, "zone destroy"), UnknownCommandError);
+    await assert.rejects(runCommand(parallax, "zone get", { zone: "example.com", colour: "red" }), /unknown option --colour/);
+    await assert.rejects(runCommand(parallax, "zone get", {}), /--zone is required/);
+  });
+
+  it("reports a service this process does not have instead of crashing", async () => {
+    const adapters = createInMemoryAdapters();
+    const bare: CommandContext = {
+      runtime: { controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) },
+      actor: "test",
+      role: "admin",
+    };
+    await assert.rejects(runCommand(bare, "settings get"), CommandUnavailableError);
+    await assert.rejects(runCommand(bare, "credential profile list"), CommandUnavailableError);
+  });
+
+  it("coerces argv strings into the types each option declares", async () => {
+    const parallax = await context();
+    await runCommand(parallax, "zone create", { zone: "example.com" });
+    // Everything from a terminal is a string; the layer types it once.
+    const page = await runCommand(parallax, "history", { zone: "example.com", limit: "1" }) as {
+      entries: unknown[]; limit: number;
+    };
+    assert.equal(page.limit, 1);
+    assert.equal(page.entries.length, 1);
+    await assert.rejects(runCommand(parallax, "history", { limit: "lots" }), /--limit must be a number/);
+  });
+
+  it("every command declares a role and a summary", () => {
+    for (const command of listCommands()) {
+      assert.match(command.name, /^[a-z]+( [a-z]+)*$/, command.name);
+      assert.ok(command.summary.length > 0, command.name);
+      assert.ok(["admin", "editor", "viewer"].includes(command.role), command.name);
+    }
+  });
+});
+
+describe("command line parsing", () => {
+  it("matches the longest command path before reading options", () => {
+    assert.deepEqual(parseInvocation(["zone", "list"]), { name: "zone list", input: {} });
+    assert.deepEqual(parseInvocation(["credential", "profile", "set", "--name", "a", "--token", "b"]), {
+      name: "credential profile set",
+      input: { name: "a", token: "b" },
+    });
+  });
+
+  it("reads --flag value, --flag=value, bare flags and --no-flag", () => {
+    assert.deepEqual(parseInvocation(["zone", "delete", "--zone", "a.example", "--abandonProviderRecords"]).input, {
+      zone: "a.example",
+      abandonProviderRecords: true,
+    });
+    assert.deepEqual(parseInvocation(["zone", "delete", "--zone=a.example", "--no-abandonProviderRecords"]).input, {
+      zone: "a.example",
+      abandonProviderRecords: false,
+    });
+  });
+
+  it("refuses an unusable invocation", () => {
+    assert.throws(() => parseInvocation([]), UsageError);
+    assert.throws(() => parseInvocation(["nonsense"]), /unknown command/);
+    assert.throws(() => parseInvocation(["zone", "list", "extra"]), /unexpected argument: extra/);
+    assert.throws(() => parseInvocation(["zone", "list", "value"]), UsageError);
+  });
+
+  it("documents the whole surface and one command at a time", () => {
+    const all = usage();
+    for (const command of listCommands()) assert.ok(all.includes(command.name), command.name);
+    assert.match(usage("record set"), /--record \(required\)/);
+  });
+});
