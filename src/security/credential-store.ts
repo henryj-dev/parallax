@@ -8,6 +8,14 @@ const NONCE_BYTES = 12;
 const AUTHENTICATION_TAG_BYTES = 16;
 const AAD = Buffer.from("parallax:credential-store:v1", "utf8");
 
+/** A caller supplied an unusable zone, zone id, or token. Safe to report as a 400. */
+export class CredentialValidationError extends TypeError {
+  constructor(message = "invalid provider credential") {
+    super(message);
+    this.name = "CredentialValidationError";
+  }
+}
+
 export interface CloudflareCredentialInput {
   readonly zoneId: string;
   readonly token: string;
@@ -300,8 +308,8 @@ function isMissingFile(error: unknown): boolean {
   return isObject(error) && error.code === "ENOENT";
 }
 
-function invalidInput(): TypeError {
-  return new TypeError("invalid provider credential");
+function invalidInput(): CredentialValidationError {
+  return new CredentialValidationError();
 }
 
 function openError(): Error {

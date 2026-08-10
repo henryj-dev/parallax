@@ -2,6 +2,7 @@ import type { ProviderAdapter } from "./ports.ts";
 import { CloudflareProviderAdapter } from "../adapters/cloudflare.ts";
 import { RoutingProviderAdapter } from "../adapters/router.ts";
 import {
+  CredentialValidationError,
   EncryptedCredentialStore,
   type CloudflareCredentialInput,
   type CloudflareCredentialMetadata,
@@ -97,14 +98,14 @@ export class CredentialTestError extends Error {
 function secretForTest(zone: string, input: CloudflareCredentialInput): CloudflareCredentialSecret {
   const normalizedZone = normalizeZone(zone);
   const zoneId = input.zoneId.trim();
-  if (!zoneId || !input.token.trim()) throw new TypeError("invalid provider credential");
+  if (!zoneId || !input.token.trim()) throw new CredentialValidationError();
   return { zone: normalizedZone, zoneId, token: input.token, updatedAt: new Date(0).toISOString() };
 }
 
 function normalizeZone(value: string): string {
   const zone = value.trim().toLowerCase().replace(/\.$/u, "");
   if (!zone.includes(".") || zone.length > 253 || zone.split(".").some((label) => !/^(?!-)[a-z0-9-]{1,63}(?<!-)$/u.test(label))) {
-    throw new TypeError("invalid provider credential");
+    throw new CredentialValidationError();
   }
   return zone;
 }

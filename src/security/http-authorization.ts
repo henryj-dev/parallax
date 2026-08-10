@@ -13,7 +13,16 @@ export interface SecurityConfig {
   readonly enabled: boolean;
   readonly tokens: readonly TokenRecord[];
   readonly cookieName?: string;
+  /** Failed attempts allowed from one client before it is refused. Defaults to 10. */
+  readonly maxFailedAttempts?: number;
+  /** How long a lockout lasts, in milliseconds. Defaults to one minute. */
+  readonly lockoutMs?: number;
 }
+
+/** Tokens open the whole control plane, so they get the same floor as the other secrets. */
+export const MIN_TOKEN_BYTES = 32;
+const DEFAULT_MAX_FAILED_ATTEMPTS = 10;
+const DEFAULT_LOCKOUT_MS = 60_000;
 
 export interface Principal {
   readonly role: Role;
@@ -53,8 +62,13 @@ export function authorize(principal: Principal, request: Request): boolean {
   // Credential management is admin-only, including reads, when introduced.
   if (segments[0] === "api" && segments[1] === "v1" && segments[2] === "credentials") return false;
 
-  if (method === "GET" || method === "HEAD") return true;
+  // Preview queries the live provider on every call, so it needs write-level
+  // trust even though it mutates nothing.
+  const previewsProvider = segments[0] === "api" && segments[1] === "v1" && segments[2] === "zones"
+    && segments.length === 5 && segments[4] === "preview";
+  if ((method === "GET" || method === "HEAD") && !previewsProvider) return true;
   if (principal.role !== "editor") return false;
+  if (previewsProvider) return method === "GET" || method === "HEAD" || method === "POST";
 
   if (segments[0] !== "api" || segments[1] !== "v1" || segments[2] !== "zones") return false;
 
@@ -77,23 +91,73 @@ export function authorize(principal: Principal, request: Request): boolean {
 }
 
 /** Adds optional RBAC in front of any Fetch-style API handler. */
-export function createAuthorizedHandler(config: SecurityConfig, next: FetchHandler): FetchHandler {
-  if (!config.enabled) return next;
+export function createAuthorizedHandler(config: SecurityConfig, next: FetchHandler, now: () => number = Date.now): FetchHandler {
+  if (!config.enabled) {
+    // The actor is security-owned in both modes; a client must never be able to
+    // choose the identity that its changes are recorded under.
+    return (request) => next(withActor(request, "authentication-disabled"));
+  }
   const prepared = prepareConfig(config);
+  const throttle = new FailureThrottle(
+    config.maxFailedAttempts ?? DEFAULT_MAX_FAILED_ATTEMPTS,
+    config.lockoutMs ?? DEFAULT_LOCKOUT_MS,
+    now,
+  );
 
   return async (request) => {
     const principal = authenticateWithPreparedTokens(request, prepared);
-    if (!principal) return authenticationError(401);
+    if (!principal) {
+      const retryAfterMs = throttle.recordFailure();
+      return retryAfterMs === undefined ? authenticationError(401) : tooManyAttempts(retryAfterMs);
+    }
+    throttle.recordSuccess();
     if (isUnsafeMethod(request.method) && !request.headers.has("authorization") && !hasSameOrigin(request)) {
       return authenticationError(403);
     }
     if (!authorize(principal, request)) return authenticationError(403);
-
-    const headers = new Headers(request.headers);
-    // The actor is security-owned when authentication is enabled.
-    headers.set("x-parallax-actor", principal.subject);
-    return next(new Request(request, { headers }));
+    return next(withActor(request, principal.subject));
   };
+}
+
+function withActor(request: Request, subject: string): Request {
+  const headers = new Headers(request.headers);
+  headers.set("x-parallax-actor", subject);
+  return new Request(request, { headers });
+}
+
+/**
+ * Bounds online guessing without letting an attacker lock anyone out: only
+ * requests that fail authentication are counted, so a valid token is always
+ * accepted immediately no matter how much noise precedes it.
+ */
+class FailureThrottle {
+  readonly #limit: number;
+  readonly #windowMs: number;
+  readonly #now: () => number;
+  #failures = 0;
+  #windowStartedAt = 0;
+
+  constructor(limit: number, windowMs: number, now: () => number) {
+    this.#limit = Math.max(1, Math.trunc(limit));
+    this.#windowMs = Math.max(1, Math.trunc(windowMs));
+    this.#now = now;
+  }
+
+  /** Returns the retry-after delay in milliseconds once the window's budget is spent. */
+  recordFailure(): number | undefined {
+    const now = this.#now();
+    if (this.#failures === 0 || now - this.#windowStartedAt >= this.#windowMs) {
+      this.#windowStartedAt = now;
+      this.#failures = 0;
+    }
+    this.#failures += 1;
+    if (this.#failures <= this.#limit) return undefined;
+    return Math.max(1, this.#windowStartedAt + this.#windowMs - now);
+  }
+
+  recordSuccess(): void {
+    this.#failures = 0;
+  }
 }
 
 function isUnsafeMethod(method: string): boolean {
@@ -116,7 +180,9 @@ function prepareConfig(config: SecurityConfig): { cookieName: string; tokens: re
 
   const prepared: PreparedToken[] = [];
   for (const record of config.tokens) {
-    if (!TOKEN_PATTERN.test(record.token) || record.token.length === 0) throw invalidConfiguration();
+    if (!TOKEN_PATTERN.test(record.token) || Buffer.byteLength(record.token, "utf8") < MIN_TOKEN_BYTES) {
+      throw invalidConfiguration();
+    }
     if (record.role !== "admin" && record.role !== "editor" && record.role !== "viewer") throw invalidConfiguration();
     if (!SUBJECT_PATTERN.test(record.subject) || record.subject.trim().length === 0) throw invalidConfiguration();
     const recordDigest = digest(record.token);
@@ -202,6 +268,19 @@ function authenticationError(status: 401 | 403): Response {
       headers: {
         "cache-control": "no-store",
         ...(unauthorized ? { "www-authenticate": "Bearer" } : {}),
+      },
+    },
+  );
+}
+
+function tooManyAttempts(retryAfterMs: number): Response {
+  return Response.json(
+    { error: "too_many_attempts", message: "too many failed authentication attempts" },
+    {
+      status: 429,
+      headers: {
+        "cache-control": "no-store",
+        "retry-after": String(Math.ceil(retryAfterMs / 1000)),
       },
     },
   );

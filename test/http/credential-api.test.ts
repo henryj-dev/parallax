@@ -14,12 +14,12 @@ import { EncryptedCredentialStore } from "../../src/security/credential-store.ts
 const security = {
   enabled: true,
   tokens: [
-    { token: "admin-token", role: "admin" as const, subject: "administrator" },
-    { token: "editor-token", role: "editor" as const, subject: "operator" },
+    { token: "admin-token-000000000000000000000", role: "admin" as const, subject: "administrator" },
+    { token: "editor-token-00000000000000000000", role: "editor" as const, subject: "operator" },
   ],
 };
 
-function request(path: string, method = "GET", body?: unknown, token = "admin-token"): Request {
+function request(path: string, method = "GET", body?: unknown, token = "admin-token-000000000000000000000"): Request {
   return new Request(`http://localhost${path}`, {
     method,
     headers: {
@@ -44,7 +44,7 @@ describe("Cloudflare credential HTTP API", () => {
       const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), security, manager);
       const secret = "never-return-this-token";
 
-      assert.equal((await api(request("/api/v1/credentials/cloudflare", "GET", undefined, "editor-token"))).status, 403);
+      assert.equal((await api(request("/api/v1/credentials/cloudflare", "GET", undefined, "editor-token-00000000000000000000"))).status, 403);
       assert.equal((await api(request("/api/v1/credentials/cloudflare/example.com", "PUT", { zoneId: "zone-1", token: secret }))).status, 200);
 
       for (const path of ["/api/v1/credentials/cloudflare", "/api/v1/credentials/cloudflare/example.com"]) {
