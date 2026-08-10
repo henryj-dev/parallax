@@ -31,6 +31,38 @@ export interface ZoneDeletion {
   retention?: RetentionPolicy;
 }
 
+/** Key/value persistence for operator-owned settings. */
+export interface SettingsRepository {
+  read(): Promise<Record<string, unknown>>;
+  /** Writes only the supplied keys, leaving every other setting untouched. */
+  write(values: Record<string, unknown>): Promise<void>;
+}
+
+/**
+ * Persists the sealed credential document. Implementations move an opaque
+ * string; the encryption key never leaves the application, so neither backend
+ * can read what it stores.
+ */
+export interface CredentialRepository {
+  read(): Promise<string | undefined>;
+  write(document: string): Promise<void>;
+}
+
+export interface StoredAccessToken {
+  readonly id: string;
+  readonly subject: string;
+  readonly role: "admin" | "editor" | "viewer";
+  /** Base64url SHA-256 of the token; the token itself is never stored. */
+  readonly digest: string;
+  readonly createdAt: string;
+}
+
+export interface AccessTokenRepository {
+  list(): Promise<StoredAccessToken[]>;
+  create(token: StoredAccessToken): Promise<void>;
+  delete(id: string): Promise<boolean>;
+}
+
 /** A bounded window over an otherwise unbounded history listing. */
 export interface PageRequest {
   readonly limit: number;

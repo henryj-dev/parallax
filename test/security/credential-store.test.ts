@@ -1,33 +1,48 @@
 import assert from "node:assert/strict";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
+import type { CredentialRepository } from "../../src/application/ports.ts";
+import { FileConfigurationStore } from "../../src/infrastructure/file-settings.ts";
 import { CredentialInUseError, EncryptedCredentialStore } from "../../src/security/credential-store.ts";
 
 const directories: string[] = [];
 
-async function fixture(key = randomBytes(32)) {
-  const directory = await mkdtemp(join(tmpdir(), "parallax-credentials-"));
-  directories.push(directory);
-  const filePath = join(directory, "credentials.json");
-  return { filePath, key, store: new EncryptedCredentialStore({ filePath, masterKey: key }) };
+/** Stands in for any backend; the store only ever hands it a sealed string. */
+class MemoryCredentialRepository implements CredentialRepository {
+  document: string | undefined;
+  async read(): Promise<string | undefined> { return this.document; }
+  async write(document: string): Promise<void> { this.document = document; }
 }
 
-/** Writes a store file in the pre-profile layout so migration can be exercised. */
-async function writeLegacyDocument(filePath: string, key: Buffer, credentials: unknown[]): Promise<void> {
+async function fixture(key = randomBytes(32)) {
+  const repository = new MemoryCredentialRepository();
+  return { repository, key, store: new EncryptedCredentialStore({ repository, masterKey: key }) };
+}
+
+async function fileFixture(key = randomBytes(32)) {
+  const directory = await mkdtemp(join(tmpdir(), "parallax-credentials-"));
+  directories.push(directory);
+  const filePath = join(directory, "configuration.json");
+  const configuration = new FileConfigurationStore(filePath);
+  return { filePath, key, store: new EncryptedCredentialStore({ repository: configuration.credentials, masterKey: key }) };
+}
+
+/** Builds a sealed document in the pre-profile layout so migration is exercised. */
+function legacyDocument(key: Buffer, credentials: unknown[]): string {
   const nonce = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, nonce);
   cipher.setAAD(Buffer.from("parallax:credential-store:v1", "utf8"));
   const ciphertext = Buffer.concat([cipher.update(JSON.stringify({ credentials }), "utf8"), cipher.final()]);
-  await writeFile(filePath, `${JSON.stringify({
+  return `${JSON.stringify({
     version: 1,
     algorithm: "AES-256-GCM",
     nonce: nonce.toString("base64"),
     authenticationTag: cipher.getAuthTag().toString("base64"),
     ciphertext: ciphertext.toString("base64"),
-  })}\n`, "utf8");
+  })}\n`;
 }
 
 afterEach(async () => {
@@ -36,7 +51,7 @@ afterEach(async () => {
 
 describe("EncryptedCredentialStore", () => {
   it("stores a reusable profile and binds apex domains to it without exposing the token", async () => {
-    const { filePath, store } = await fixture();
+    const { filePath, store } = await fileFixture();
     const profile = await store.upsertProfile("Shared-Account", {
       accountId: "cloudflare-account-id",
       token: "highly-sensitive-api-token",
@@ -64,17 +79,17 @@ describe("EncryptedCredentialStore", () => {
 
     const persisted = await readFile(filePath, "utf8");
     assert.doesNotMatch(persisted, /highly-sensitive-api-token|cloudflare-zone-id|example\.com|shared-account/);
-    assert.equal(JSON.parse(persisted).version, 1);
+    assert.equal(JSON.parse(JSON.parse(persisted).credentials).version, 1);
   });
 
   it("reuses one profile across several apex domains", async () => {
-    const { filePath, key, store } = await fixture();
+    const { repository, key, store } = await fixture();
     await store.upsertProfile("account-a", { accountId: "acct-a", token: "token-a" });
     for (const zone of ["one.example", "two.example", "three.example"]) {
       await store.bindZone(zone, { zoneId: `zone-${zone}`, profile: "account-a" });
     }
 
-    const restarted = new EncryptedCredentialStore({ filePath, masterKey: key });
+    const restarted = new EncryptedCredentialStore({ repository, masterKey: key });
     assert.deepEqual((await restarted.listBindings()).map((binding) => binding.zone), ["one.example", "three.example", "two.example"]);
     // Every binding resolves to the same token, so rotating it once is enough.
     for (const zone of ["one.example", "two.example", "three.example"]) {
@@ -113,15 +128,15 @@ describe("EncryptedCredentialStore", () => {
     );
   });
 
-  it("migrates a pre-profile file, sharing one profile per distinct token", async () => {
-    const { filePath, key } = await fixture();
-    await writeLegacyDocument(filePath, key, [
+  it("migrates a pre-profile document, sharing one profile per distinct token", async () => {
+    const { repository, key } = await fixture();
+    repository.document = legacyDocument(key, [
       { zone: "one.example", zoneId: "z1", token: "shared-token", updatedAt: "2026-01-01T00:00:00.000Z" },
       { zone: "two.example", zoneId: "z2", token: "shared-token", updatedAt: "2026-01-02T00:00:00.000Z" },
       { zone: "three.example", zoneId: "z3", token: "other-token", updatedAt: "2026-01-03T00:00:00.000Z" },
     ]);
 
-    const store = new EncryptedCredentialStore({ filePath, masterKey: key });
+    const store = new EncryptedCredentialStore({ repository, masterKey: key });
     assert.deepEqual((await store.listProfiles()).map((profile) => profile.name), ["one-example", "three-example"]);
     assert.deepEqual((await store.listBindings()).map((binding) => `${binding.zone}=${binding.profile}`), [
       "one.example=one-example",
@@ -133,30 +148,30 @@ describe("EncryptedCredentialStore", () => {
   });
 
   it("persists updates and deletions across restarts", async () => {
-    const { filePath, key, store } = await fixture();
+    const { repository, key, store } = await fixture();
     await store.upsertProfile("p", { token: "token-1" });
     await store.bindZone("example.com", { zoneId: "zone-1", profile: "p" });
     await store.bindZone("example.com", { zoneId: "zone-2", profile: "p" });
 
-    const restarted = new EncryptedCredentialStore({ filePath, masterKey: key });
+    const restarted = new EncryptedCredentialStore({ repository, masterKey: key });
     assert.equal((await restarted.getSecret("example.com"))?.zoneId, "zone-2");
     assert.equal(await restarted.unbindZone("example.com"), true);
     assert.equal(await restarted.unbindZone("example.com"), false);
 
-    const restartedAgain = new EncryptedCredentialStore({ filePath, masterKey: key });
+    const restartedAgain = new EncryptedCredentialStore({ repository, masterKey: key });
     assert.deepEqual(await restartedAgain.listBindings(), []);
     assert.equal(await restartedAgain.getSecret("example.com"), undefined);
   });
 
   it("serializes concurrent mutations without losing credentials", async () => {
-    const { filePath, key, store } = await fixture();
+    const { repository, key, store } = await fixture();
     await store.upsertProfile("shared", { token: "token" });
     await Promise.all(Array.from({ length: 20 }, (_, index) => store.bindZone(`zone-${index}.example.com`, {
       zoneId: `zone-id-${index}`,
       profile: "shared",
     })));
 
-    const restarted = new EncryptedCredentialStore({ filePath, masterKey: key });
+    const restarted = new EncryptedCredentialStore({ repository, masterKey: key });
     const listed = await restarted.listBindings();
     assert.equal(listed.length, 20);
     assert.deepEqual(listed.map(({ zone }) => zone), Array.from(
@@ -166,11 +181,11 @@ describe("EncryptedCredentialStore", () => {
   });
 
   it("fails closed for a wrong key without exposing secrets", async () => {
-    const { filePath, store } = await fixture();
+    const { repository, store } = await fixture();
     const secret = "must-never-appear-in-an-error";
     await store.upsertProfile("p", { token: secret });
 
-    const wrongKeyStore = new EncryptedCredentialStore({ filePath, masterKey: randomBytes(32) });
+    const wrongKeyStore = new EncryptedCredentialStore({ repository, masterKey: randomBytes(32) });
     await assert.rejects(
       wrongKeyStore.listProfiles(),
       (error: unknown) => error instanceof Error
@@ -179,13 +194,13 @@ describe("EncryptedCredentialStore", () => {
     );
   });
 
-  it("fails closed for corrupt or unsupported files without leaking file contents", async () => {
-    const { filePath, key, store } = await fixture();
+  it("fails closed for corrupt or unsupported documents without leaking their contents", async () => {
+    const { repository, key, store } = await fixture();
     await store.upsertProfile("p", { token: "secret-token" });
 
     const corruptContent = "corrupt-content-secret";
-    await writeFile(filePath, corruptContent, "utf8");
-    const corruptStore = new EncryptedCredentialStore({ filePath, masterKey: key });
+    repository.document = corruptContent;
+    const corruptStore = new EncryptedCredentialStore({ repository, masterKey: key });
     await assert.rejects(
       corruptStore.getProfile("p"),
       (error: unknown) => error instanceof Error
@@ -196,7 +211,7 @@ describe("EncryptedCredentialStore", () => {
 
   it("requires an exact 32-byte master key and rejects invalid credentials safely", async () => {
     assert.throws(
-      () => new EncryptedCredentialStore({ filePath: "/tmp/unused", masterKey: randomBytes(31) }),
+      () => new EncryptedCredentialStore({ repository: new MemoryCredentialRepository(), masterKey: randomBytes(31) }),
       /master key must be exactly 32 bytes/,
     );
 

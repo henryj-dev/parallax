@@ -1,6 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import type { CredentialRepository } from "../application/ports.ts";
 
 const FILE_VERSION = 1;
 const DOCUMENT_VERSION = 2;
@@ -67,7 +66,8 @@ export interface CloudflareCredentialSecret {
 }
 
 export interface EncryptedCredentialStoreOptions {
-  readonly filePath: string;
+  /** Where the sealed document lives: a file, a database row, anything opaque. */
+  readonly repository: CredentialRepository;
   /** Caller-owned key material is copied and must contain exactly 32 bytes. */
   readonly masterKey: Uint8Array;
   readonly now?: () => Date;
@@ -113,11 +113,12 @@ interface StoreState {
  * holds the reusable account id and token, and each apex domain binds to a
  * profile plus its own zone id.
  *
- * Mutations on one instance are serialized and committed with a same-directory
- * temporary file followed by rename, so readers see either the old or new file.
+ * Mutations on one instance are serialized, and the sealed document is handed to
+ * the repository as a single value, so a reader sees either the old set or the
+ * new one and never a half-written mix.
  */
 export class EncryptedCredentialStore {
-  readonly #filePath: string;
+  readonly #repository: CredentialRepository;
   readonly #masterKey: Buffer;
   readonly #now: () => Date;
   #state: StoreState | undefined;
@@ -127,8 +128,7 @@ export class EncryptedCredentialStore {
     if (options.masterKey.byteLength !== 32) {
       throw new TypeError("master key must be exactly 32 bytes");
     }
-    if (options.filePath.trim().length === 0) throw new TypeError("credential store path is required");
-    this.#filePath = options.filePath;
+    this.#repository = options.repository;
     this.#masterKey = Buffer.from(options.masterKey);
     this.#now = options.now ?? (() => new Date());
   }
@@ -281,15 +281,15 @@ export class EncryptedCredentialStore {
   async #load(): Promise<StoreState> {
     if (this.#state) return this.#state;
 
-    let encoded: string;
+    let encoded: string | undefined;
     try {
-      encoded = await readFile(this.#filePath, "utf8");
-    } catch (error) {
-      if (isMissingFile(error)) {
-        this.#state = { profiles: new Map(), bindings: new Map() };
-        return this.#state;
-      }
+      encoded = await this.#repository.read();
+    } catch {
       throw openError();
+    }
+    if (encoded === undefined) {
+      this.#state = { profiles: new Map(), bindings: new Map() };
+      return this.#state;
     }
 
     try {
@@ -313,10 +313,8 @@ export class EncryptedCredentialStore {
   }
 
   async #persist(state: StoreState): Promise<void> {
-    let temporaryPath: string | undefined;
+    let sealed: string;
     try {
-      const directory = dirname(this.#filePath);
-      await mkdir(directory, { recursive: true, mode: 0o700 });
       const document: PlaintextDocument = {
         version: DOCUMENT_VERSION,
         profiles: [...state.profiles.values()].sort((left, right) => left.name.localeCompare(right.name)),
@@ -333,24 +331,14 @@ export class EncryptedCredentialStore {
         authenticationTag: cipher.getAuthTag().toString("base64"),
         ciphertext: ciphertext.toString("base64"),
       };
-
-      temporaryPath = join(
-        directory,
-        `.${basename(this.#filePath)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
-      );
-      const handle = await open(temporaryPath, "wx", 0o600);
-      try {
-        await handle.writeFile(`${JSON.stringify(envelope)}\n`, "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      await rename(temporaryPath, this.#filePath);
-      temporaryPath = undefined;
+      sealed = `${JSON.stringify(envelope)}\n`;
     } catch {
       throw saveError();
-    } finally {
-      if (temporaryPath) await unlink(temporaryPath).catch(() => undefined);
+    }
+    try {
+      await this.#repository.write(sealed);
+    } catch {
+      throw saveError();
     }
   }
 }
@@ -539,10 +527,6 @@ function isIsoDate(value: string): boolean {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isMissingFile(error: unknown): boolean {
-  return isObject(error) && error.code === "ENOENT";
 }
 
 function invalidInput(): CredentialValidationError {

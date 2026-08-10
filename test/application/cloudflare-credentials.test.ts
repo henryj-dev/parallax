@@ -8,6 +8,7 @@ import { CloudflareCredentialManager } from "../../src/application/cloudflare-cr
 import type { ProviderAdapter } from "../../src/application/ports.ts";
 import { RoutingProviderAdapter } from "../../src/adapters/router.ts";
 import type { ProviderRecord, ReconcileOperation } from "../../src/domain/reconciliation.ts";
+import { FileConfigurationStore } from "../../src/infrastructure/file-settings.ts";
 import { EncryptedCredentialStore, type CloudflareCredentialSecret } from "../../src/security/credential-store.ts";
 
 class SpyAdapter implements ProviderAdapter {
@@ -20,7 +21,7 @@ describe("CloudflareCredentialManager", () => {
   it("loads encrypted credentials, updates live routing, and restores environment routing after deletion", async () => {
     const directory = await mkdtemp(join(tmpdir(), "parallax-manager-"));
     try {
-      const store = new EncryptedCredentialStore({ filePath: join(directory, "credentials.enc"), masterKey: randomBytes(32) });
+      const store = new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) });
       const environment = new SpyAdapter();
       const fallback = new SpyAdapter();
       const created: Array<{ credential: CloudflareCredentialSecret; adapter: SpyAdapter }> = [];
@@ -69,7 +70,7 @@ describe("CloudflareCredentialManager", () => {
   it("rotates one profile and re-routes every apex domain that reuses it", async () => {
     const directory = await mkdtemp(join(tmpdir(), "parallax-manager-"));
     try {
-      const store = new EncryptedCredentialStore({ filePath: join(directory, "credentials.enc"), masterKey: randomBytes(32) });
+      const store = new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) });
       const router = new RoutingProviderAdapter();
       const created: CloudflareCredentialSecret[] = [];
       const manager = new CloudflareCredentialManager({
@@ -102,7 +103,7 @@ describe("CloudflareCredentialManager", () => {
   it("tests supplied credentials without persisting them or exposing provider failures", async () => {
     const directory = await mkdtemp(join(tmpdir(), "parallax-manager-"));
     try {
-      const store = new EncryptedCredentialStore({ filePath: join(directory, "credentials.enc"), masterKey: randomBytes(32) });
+      const store = new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) });
       const manager = new CloudflareCredentialManager({
         store,
         router: new RoutingProviderAdapter(),

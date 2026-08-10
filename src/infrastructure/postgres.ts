@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
-import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type PageRequest, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { RevisionConflictError, type AccessTokenRepository, type ApplyLock, type ApplyStatus, type CredentialRepository, type DesiredChange, type PageRequest, type RetentionPolicy, type SettingsRepository, type StatusRepository, type StoredAccessToken, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import {
   createDesiredRecord,
   normalizeZoneName,
@@ -352,6 +352,104 @@ export class PostgresApplyLock implements ApplyLock {
   }
 }
 
+/** Settings live one row per key so unrelated writes never clobber each other. */
+export class PostgresSettingsRepository implements SettingsRepository {
+  readonly #pool: PgPool;
+
+  constructor(pool: PgPool) {
+    this.#pool = pool;
+  }
+
+  async read(): Promise<Record<string, unknown>> {
+    const result = await this.#pool.query<{ key: unknown; value: unknown }>(
+      "SELECT key, value FROM parallax_settings",
+    );
+    const settings: Record<string, unknown> = {};
+    for (const row of result.rows) settings[readString(row.key, "setting key")] = row.value;
+    return settings;
+  }
+
+  async write(values: Record<string, unknown>): Promise<void> {
+    const entries = Object.entries(values);
+    if (entries.length === 0) return;
+    const client = await this.#pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const [key, value] of entries) {
+        await client.query(
+          `INSERT INTO parallax_settings (key, value, updated_at)
+           VALUES ($1, $2::jsonb, now())
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+          [key, JSON.stringify(value ?? null)],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+/** Holds the sealed credential document; the database never sees plaintext. */
+export class PostgresCredentialRepository implements CredentialRepository {
+  readonly #pool: PgPool;
+
+  constructor(pool: PgPool) {
+    this.#pool = pool;
+  }
+
+  async read(): Promise<string | undefined> {
+    const result = await this.#pool.query<{ document: unknown }>(
+      "SELECT document FROM parallax_credential_store WHERE id = 1",
+    );
+    const row = result.rows[0];
+    return row ? readString(row.document, "credential document") : undefined;
+  }
+
+  async write(document: string): Promise<void> {
+    await this.#pool.query(
+      `INSERT INTO parallax_credential_store (id, document, updated_at)
+       VALUES (1, $1, now())
+       ON CONFLICT (id) DO UPDATE SET document = EXCLUDED.document, updated_at = now()`,
+      [document],
+    );
+  }
+}
+
+export class PostgresAccessTokenRepository implements AccessTokenRepository {
+  readonly #pool: PgPool;
+
+  constructor(pool: PgPool) {
+    this.#pool = pool;
+  }
+
+  async list(): Promise<StoredAccessToken[]> {
+    const result = await this.#pool.query<AccessTokenRow>(
+      "SELECT id, subject, role, token_digest, created_at FROM parallax_access_tokens ORDER BY created_at, id",
+    );
+    return result.rows.map(readAccessToken);
+  }
+
+  async create(token: StoredAccessToken): Promise<void> {
+    await this.#pool.query(
+      `INSERT INTO parallax_access_tokens (id, subject, role, token_digest, created_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [token.id, token.subject, token.role, token.digest, token.createdAt],
+    );
+  }
+
+  async delete(id: string): Promise<boolean> {
+    const result = await this.#pool.query<{ id: unknown }>(
+      "DELETE FROM parallax_access_tokens WHERE id = $1 RETURNING id",
+      [id],
+    );
+    return result.rows.length > 0;
+  }
+}
+
 export function createPostgresAdapters(pool: PgPool): {
   zones: PostgresZoneRepository;
   statuses: PostgresStatusRepository;
@@ -367,6 +465,28 @@ export function createPostgresAdapters(pool: PgPool): {
 }
 
 interface SnapshotRow { snapshot: unknown }
+
+interface AccessTokenRow {
+  id: unknown;
+  subject: unknown;
+  role: unknown;
+  token_digest: unknown;
+  created_at: unknown;
+}
+
+function readAccessToken(row: AccessTokenRow): StoredAccessToken {
+  const role = readString(row.role, "access token role");
+  if (role !== "admin" && role !== "editor" && role !== "viewer") {
+    throw new Error(`invalid PostgreSQL access token role: ${role}`);
+  }
+  return {
+    id: readString(row.id, "access token id"),
+    subject: readString(row.subject, "access token subject"),
+    role,
+    digest: readString(row.token_digest, "access token digest"),
+    createdAt: readTimestamp(row.created_at, "access token timestamp"),
+  };
+}
 
 interface AuditRow {
   id: unknown;

@@ -9,6 +9,7 @@ import { ControlPlane } from "../../src/application/control-plane.ts";
 import { RoutingProviderAdapter } from "../../src/adapters/router.ts";
 import { createApiHandler } from "../../src/http/api.ts";
 import { createInMemoryAdapters } from "../../src/infrastructure/in-memory.ts";
+import { FileConfigurationStore } from "../../src/infrastructure/file-settings.ts";
 import { EncryptedCredentialStore } from "../../src/security/credential-store.ts";
 
 const security = {
@@ -36,7 +37,7 @@ describe("Cloudflare credential HTTP API", () => {
     try {
       const adapters = createInMemoryAdapters();
       const manager = new CloudflareCredentialManager({
-        store: new EncryptedCredentialStore({ filePath: join(directory, "credentials.enc"), masterKey: randomBytes(32) }),
+        store: new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) }),
         router: new RoutingProviderAdapter({ fallback: adapters.provider }),
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
         createAdapter: () => ({ async list() { return []; }, async apply() {} }),
@@ -74,7 +75,7 @@ describe("Cloudflare credential HTTP API", () => {
     try {
       const adapters = createInMemoryAdapters();
       const manager = new CloudflareCredentialManager({
-        store: new EncryptedCredentialStore({ filePath: join(directory, "credentials.enc"), masterKey: randomBytes(32) }),
+        store: new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) }),
         router: new RoutingProviderAdapter({ fallback: adapters.provider }),
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
         createAdapter: () => ({ async list() { return []; }, async apply() {} }),
@@ -121,7 +122,7 @@ describe("Cloudflare credential HTTP API", () => {
     try {
       const adapters = createInMemoryAdapters();
       const manager = new CloudflareCredentialManager({
-        store: new EncryptedCredentialStore({ filePath: join(directory, "credentials.enc"), masterKey: randomBytes(32) }),
+        store: new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) }),
         router: new RoutingProviderAdapter(),
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
         createAdapter: () => ({ async list() { throw new Error("leaked secret-value"); }, async apply() {} }),

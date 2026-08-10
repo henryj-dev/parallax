@@ -10,6 +10,7 @@ import { RoutingProviderAdapter } from "./adapters/router.ts";
 import { readConfig, usesPlaintextPostgres } from "./config.ts";
 import { createNodeHandler } from "./http/api.ts";
 import { createFileStateAdapters } from "./infrastructure/file-state.ts";
+import { FileConfigurationStore } from "./infrastructure/file-settings.ts";
 import { FileProviderAdapter } from "./infrastructure/file-provider.ts";
 import { createPostgresAdapters, createPostgresPool } from "./infrastructure/postgres.ts";
 import { authenticate } from "./security/http-authorization.ts";
@@ -36,7 +37,10 @@ const provider = new RoutingProviderAdapter({
   ...(fallbackProvider ? { fallback: fallbackProvider } : {}),
 });
 const credentialManager = config.credentialFile && config.credentialMasterKey ? new CloudflareCredentialManager({
-  store: new EncryptedCredentialStore({ filePath: resolve(config.credentialFile), masterKey: config.credentialMasterKey }),
+  store: new EncryptedCredentialStore({
+    repository: new FileConfigurationStore(resolve(config.credentialFile)).credentials,
+    masterKey: config.credentialMasterKey,
+  }),
   router: provider,
   environmentAdapters: externalProviders,
   ownershipSecret: config.ownershipSecret!,
