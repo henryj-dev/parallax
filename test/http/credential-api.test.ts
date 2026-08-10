@@ -60,10 +60,57 @@ describe("Cloudflare credential HTTP API", () => {
       assert.equal(tested.status, 200);
       assert.deepEqual(await tested.json(), {
         ok: true,
-        credential: (await manager.get("example.com")),
+        credential: (await manager.getZone("example.com")),
       });
       assert.equal((await api(request("/api/v1/credentials/cloudflare/example.com", "DELETE"))).status, 204);
       assert.equal((await api(request("/api/v1/credentials/cloudflare/example.com"))).status, 404);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses one profile across apex domains and refuses to delete it while bound", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "parallax-credential-api-"));
+    try {
+      const adapters = createInMemoryAdapters();
+      const manager = new CloudflareCredentialManager({
+        store: new EncryptedCredentialStore({ filePath: join(directory, "credentials.enc"), masterKey: randomBytes(32) }),
+        router: new RoutingProviderAdapter({ fallback: adapters.provider }),
+        ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        createAdapter: () => ({ async list() { return []; }, async apply() {} }),
+      });
+      const api = createApiHandler(new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), security, manager);
+      const secret = "account-wide-token";
+
+      assert.equal((await api(request("/api/v1/credentials/profiles/account-a", "PUT", {
+        accountId: "acct-1", token: secret,
+      }))).status, 200);
+
+      // The token is entered once and every apex domain points at the profile.
+      for (const [zone, zoneId] of [["one.example", "z1"], ["two.example", "z2"]] as const) {
+        assert.equal((await api(request(`/api/v1/credentials/cloudflare/${zone}`, "PUT", {
+          zoneId, profile: "account-a",
+        }))).status, 200);
+      }
+
+      const profiles = await (await api(request("/api/v1/credentials/profiles"))).json() as {
+        profiles: Array<{ name: string; accountId?: string; updatedAt: string; zones: string[] }>;
+      };
+      assert.deepEqual(profiles.profiles, [{
+        name: "account-a",
+        accountId: "acct-1",
+        updatedAt: profiles.profiles[0]?.updatedAt,
+        zones: ["one.example", "two.example"],
+      }] as unknown);
+      assert.equal(JSON.stringify(profiles).includes(secret), false);
+
+      const bound = await api(request("/api/v1/credentials/profiles/account-a", "DELETE"));
+      assert.equal(bound.status, 409);
+      assert.match(JSON.stringify(await bound.json()), /one\.example, two\.example/);
+
+      assert.equal((await api(request("/api/v1/credentials/cloudflare/one.example", "DELETE"))).status, 204);
+      assert.equal((await api(request("/api/v1/credentials/cloudflare/two.example", "DELETE"))).status, 204);
+      assert.equal((await api(request("/api/v1/credentials/profiles/account-a", "DELETE"))).status, 204);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -88,7 +135,7 @@ describe("Cloudflare credential HTTP API", () => {
       assert.equal(response.status, 502);
       const text = await response.text();
       assert.equal(text.includes("secret-value"), false);
-      assert.deepEqual(await manager.list(), []);
+      assert.deepEqual(await manager.listZones(), []);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

@@ -3,7 +3,7 @@ import { ControlPlane, ConflictError, DEFAULT_HISTORY_PAGE_SIZE, NotFoundError }
 import { CloudflareCredentialManager, CredentialNotFoundError, CredentialTestError } from "../application/cloudflare-credentials.ts";
 import { ProviderNotConfiguredError, type PageRequest } from "../application/ports.ts";
 import { DomainValidationError } from "../domain/dns.ts";
-import { CredentialValidationError } from "../security/credential-store.ts";
+import { CredentialInUseError, CredentialValidationError } from "../security/credential-store.ts";
 import { createAuthorizedHandler, type SecurityConfig } from "../security/http-authorization.ts";
 
 const MAX_REQUEST_BODY_BYTES = 1_048_576;
@@ -168,32 +168,97 @@ async function credentialRoute(
   request: Request,
   method: string,
 ): Promise<Response> {
-  if (!credentials || segments[3] !== "cloudflare") throw new NotFoundError("route was not found");
-  if (segments.length === 4 && method === "GET") return json({ credentials: await credentials.list() });
+  if (!credentials) throw new NotFoundError("route was not found");
+  if (segments[3] === "profiles") return profileRoute(credentials, segments, request, method);
+  if (segments[3] !== "cloudflare") throw new NotFoundError("route was not found");
+
+  if (segments.length === 4 && method === "GET") return json({ credentials: await credentials.listZones() });
   const zone = segments[4];
   if (!zone) throw new NotFoundError("route was not found");
   if (segments.length === 5 && method === "GET") {
-    const credential = await credentials.get(zone);
-    if (!credential) throw new CredentialNotFoundError();
-    return json(credential);
+    const binding = await credentials.getZone(zone);
+    if (!binding) throw new CredentialNotFoundError();
+    return json(binding);
   }
   if (segments.length === 5 && method === "PUT") {
-    return json(await credentials.update(zone, readCredentialInput(await parseJson(request))));
+    return json(await bindZone(credentials, zone, await parseJson(request)));
   }
   if (segments.length === 5 && method === "DELETE") {
-    if (!await credentials.delete(zone)) throw new CredentialNotFoundError();
+    if (!await credentials.unbindZone(zone)) throw new CredentialNotFoundError();
     return new Response(null, { status: 204 });
   }
   if (segments.length === 6 && segments[5] === "test" && method === "POST") {
     const body = await parseOptionalJson(request);
-    const credential = await credentials.test(zone, body ? readCredentialInput(body) : undefined);
+    const credential = await credentials.test(zone, body ? readZoneTestInput(body) : undefined);
     return json({ ok: true, credential });
   }
   throw new NotFoundError("route was not found");
 }
 
-function readCredentialInput(body: Record<string, unknown>): { zoneId: string; token: string } {
-  return { zoneId: readString(body, "zoneId"), token: readString(body, "token") };
+async function profileRoute(
+  credentials: CloudflareCredentialManager,
+  segments: string[],
+  request: Request,
+  method: string,
+): Promise<Response> {
+  if (segments.length === 4 && method === "GET") return json({ profiles: await credentials.listProfiles() });
+  const name = segments[4];
+  if (!name) throw new NotFoundError("route was not found");
+  if (segments.length === 5 && method === "GET") {
+    const profile = await credentials.getProfile(name);
+    if (!profile) throw new CredentialNotFoundError();
+    return json(profile);
+  }
+  if (segments.length === 5 && method === "PUT") {
+    const body = await parseJson(request);
+    return json(await credentials.upsertProfile(name, {
+      token: readString(body, "token"),
+      ...(body.accountId === undefined ? {} : { accountId: readString(body, "accountId") }),
+    }));
+  }
+  if (segments.length === 5 && method === "DELETE") {
+    if (!await credentials.deleteProfile(name)) throw new CredentialNotFoundError();
+    return new Response(null, { status: 204 });
+  }
+  if (segments.length === 6 && segments[5] === "test" && method === "POST") {
+    const body = await parseJson(request);
+    const profile = await credentials.testProfile(
+      name,
+      readString(body, "zoneId"),
+      body.token === undefined ? undefined : readString(body, "token"),
+    );
+    return json({ ok: true, profile });
+  }
+  throw new NotFoundError("route was not found");
+}
+
+/**
+ * Accepts either a reference to a reusable profile or, for a single-zone setup,
+ * an inline token that is stored as a profile named after the zone.
+ */
+async function bindZone(
+  credentials: CloudflareCredentialManager,
+  zone: string,
+  body: Record<string, unknown>,
+): Promise<unknown> {
+  const zoneId = readString(body, "zoneId");
+  if (body.profile !== undefined) {
+    return credentials.bindZone(zone, { zoneId, profile: readString(body, "profile") });
+  }
+  const profile = zone.trim().toLowerCase().replace(/\.$/u, "").replace(/\./gu, "-");
+  await credentials.upsertProfile(profile, {
+    token: readString(body, "token"),
+    ...(body.accountId === undefined ? {} : { accountId: readString(body, "accountId") }),
+  });
+  return credentials.bindZone(zone, { zoneId, profile });
+}
+
+function readZoneTestInput(body: Record<string, unknown>): { zoneId: string; token: string; accountId?: string } {
+  return {
+    zoneId: readString(body, "zoneId"),
+    token: readString(body, "token"),
+    ...(body.accountId === undefined ? {} : { accountId: readString(body, "accountId") }),
+  };
 }
 
 function json(value: unknown, status = 200): Response {
@@ -215,6 +280,7 @@ function errorResponse(error: unknown): Response {
   if (error instanceof ConflictError) return json({ error: "conflict", message: error.message }, 409);
   if (error instanceof ProviderNotConfiguredError) return json({ error: "provider_not_configured", message: error.message }, 409);
   if (error instanceof CredentialValidationError) return json({ error: "validation_failed", message: error.message }, 400);
+  if (error instanceof CredentialInUseError) return json({ error: "conflict", message: error.message, zones: error.zones }, 409);
   if (error instanceof URIError) return json({ error: "validation_failed", message: "request path is not valid percent-encoding" }, 400);
   return json({ error: "internal_error", message: "an unexpected error occurred" }, 500);
 }

@@ -4,9 +4,11 @@ import { RoutingProviderAdapter } from "../adapters/router.ts";
 import {
   CredentialValidationError,
   EncryptedCredentialStore,
-  type CloudflareCredentialInput,
-  type CloudflareCredentialMetadata,
+  normalizeProfileName,
   type CloudflareCredentialSecret,
+  type CloudflareProfileInput,
+  type CloudflareProfileMetadata,
+  type CloudflareZoneBinding,
 } from "../security/credential-store.ts";
 
 export interface CloudflareCredentialManagerOptions {
@@ -15,6 +17,11 @@ export interface CloudflareCredentialManagerOptions {
   readonly ownershipSecret: string;
   readonly environmentAdapters?: ReadonlyMap<string, ProviderAdapter>;
   readonly createAdapter?: (credential: CloudflareCredentialSecret) => ProviderAdapter;
+}
+
+/** A profile plus the apex domains that reuse it. */
+export interface CloudflareProfileSummary extends CloudflareProfileMetadata {
+  readonly zones: string[];
 }
 
 /** Coordinates encrypted credentials with live provider routing without exposing secrets. */
@@ -36,31 +43,60 @@ export class CloudflareCredentialManager {
   }
 
   async initialize(): Promise<void> {
-    for (const metadata of await this.#store.list()) {
-      const credential = await this.#store.getSecret(metadata.zone);
-      if (credential) this.#router.registerExternal(metadata.zone, this.#createAdapter(credential));
+    for (const binding of await this.#store.listBindings()) await this.#route(binding.zone);
+  }
+
+  /** Profiles carry the reusable account id and API token; tokens never leave the store. */
+  async listProfiles(): Promise<CloudflareProfileSummary[]> {
+    const [profiles, bindings] = await Promise.all([this.#store.listProfiles(), this.#store.listBindings()]);
+    return profiles.map((profile) => ({
+      ...profile,
+      zones: bindings.filter((binding) => binding.profile === profile.name).map((binding) => binding.zone),
+    }));
+  }
+
+  async getProfile(name: string): Promise<CloudflareProfileSummary | undefined> {
+    const profile = await this.#store.getProfile(name);
+    if (!profile) return undefined;
+    const bindings = await this.#store.listBindings();
+    return {
+      ...profile,
+      zones: bindings.filter((binding) => binding.profile === profile.name).map((binding) => binding.zone),
+    };
+  }
+
+  /** Re-routes every zone already bound to the profile so a rotated token takes effect at once. */
+  async upsertProfile(name: string, input: CloudflareProfileInput): Promise<CloudflareProfileSummary> {
+    const profile = await this.#store.upsertProfile(name, input);
+    for (const binding of await this.#store.listBindings()) {
+      if (binding.profile === profile.name) await this.#route(binding.zone);
     }
+    const summary = await this.getProfile(profile.name);
+    if (!summary) throw new Error("provider credential was not available after saving");
+    return summary;
   }
 
-  list(): Promise<CloudflareCredentialMetadata[]> {
-    return this.#store.list();
+  deleteProfile(name: string): Promise<boolean> {
+    return this.#store.deleteProfile(name);
   }
 
-  get(zone: string): Promise<CloudflareCredentialMetadata | undefined> {
-    return this.#store.getMetadata(zone);
+  listZones(): Promise<CloudflareZoneBinding[]> {
+    return this.#store.listBindings();
   }
 
-  async update(zone: string, input: CloudflareCredentialInput): Promise<CloudflareCredentialMetadata> {
-    const metadata = await this.#store.update(zone, input);
-    const credential = await this.#store.getSecret(metadata.zone);
-    if (!credential) throw new Error("provider credential was not available after saving");
-    this.#router.registerExternal(metadata.zone, this.#createAdapter(credential));
-    return metadata;
+  getZone(zone: string): Promise<CloudflareZoneBinding | undefined> {
+    return this.#store.getBinding(zone);
   }
 
-  async delete(zone: string): Promise<boolean> {
-    const deleted = await this.#store.delete(zone);
-    if (!deleted) return false;
+  async bindZone(zone: string, input: { zoneId: string; profile: string }): Promise<CloudflareZoneBinding> {
+    const binding = await this.#store.bindZone(zone, input);
+    await this.#route(binding.zone);
+    return binding;
+  }
+
+  async unbindZone(zone: string): Promise<boolean> {
+    const removed = await this.#store.unbindZone(zone);
+    if (!removed) return false;
     const normalizedZone = normalizeZone(zone);
     const fallback = this.#environmentAdapters.get(normalizedZone);
     if (fallback) this.#router.registerExternal(normalizedZone, fallback);
@@ -68,20 +104,60 @@ export class CloudflareCredentialManager {
     return true;
   }
 
-  async test(zone: string, input?: CloudflareCredentialInput): Promise<CloudflareCredentialMetadata> {
-    const credential = input
-      ? secretForTest(zone, input)
-      : await this.#store.getSecret(zone);
+  /** Checks a stored binding, or an unsaved zone id and token, against the live API. */
+  async test(zone: string, input?: { zoneId: string; token: string; accountId?: string }): Promise<CloudflareZoneBinding> {
+    const credential = input ? secretForTest(zone, input) : await this.#store.getSecret(zone);
     if (!credential) throw new CredentialNotFoundError();
+    await this.#probe(credential);
+    return {
+      zone: credential.zone,
+      zoneId: credential.zoneId,
+      profile: credential.profile,
+      ...(credential.accountId ? { accountId: credential.accountId } : {}),
+      updatedAt: credential.updatedAt,
+    };
+  }
+
+  /**
+   * Checks a profile before any zone uses it. Cloudflare has no token-only
+   * probe, so the caller supplies a zone id to read through.
+   */
+  async testProfile(name: string, zoneId: string, token?: string): Promise<CloudflareProfileMetadata> {
+    const profileName = normalizeProfileName(name);
+    const stored = token === undefined ? await this.#store.getProfileSecret(profileName) : undefined;
+    const secret = token ?? stored?.token;
+    if (!secret) throw new CredentialNotFoundError();
+    await this.#probe({
+      zone: PROBE_ZONE,
+      zoneId: validateZoneId(zoneId),
+      profile: profileName,
+      token: secret,
+      updatedAt: new Date(0).toISOString(),
+    });
+    return (await this.#store.getProfile(profileName)) ?? { name: profileName, updatedAt: new Date(0).toISOString() };
+  }
+
+  async #probe(credential: CloudflareCredentialSecret): Promise<void> {
     const adapter = this.#createAdapter(credential);
     try {
       await adapter.list(`${credential.zone}/external`);
     } catch {
       throw new CredentialTestError();
     }
-    return { zone: credential.zone, zoneId: credential.zoneId, updatedAt: credential.updatedAt };
+  }
+
+  async #route(zone: string): Promise<void> {
+    const credential = await this.#store.getSecret(zone);
+    if (credential) this.#router.registerExternal(zone, this.#createAdapter(credential));
   }
 }
+
+/**
+ * A syntactically valid zone used only to build a provider target while probing
+ * a profile. The Cloudflare adapter addresses records by zone id, so the name
+ * never reaches the API.
+ */
+const PROBE_ZONE = "profile-probe.invalid";
 
 export class CredentialNotFoundError extends Error {
   constructor() {
@@ -95,11 +171,24 @@ export class CredentialTestError extends Error {
   }
 }
 
-function secretForTest(zone: string, input: CloudflareCredentialInput): CloudflareCredentialSecret {
+function secretForTest(zone: string, input: { zoneId: string; token: string; accountId?: string }): CloudflareCredentialSecret {
   const normalizedZone = normalizeZone(zone);
-  const zoneId = input.zoneId.trim();
-  if (!zoneId || !input.token.trim()) throw new CredentialValidationError();
-  return { zone: normalizedZone, zoneId, token: input.token, updatedAt: new Date(0).toISOString() };
+  const zoneId = validateZoneId(input.zoneId);
+  if (!input.token.trim()) throw new CredentialValidationError();
+  return {
+    zone: normalizedZone,
+    zoneId,
+    profile: "unsaved",
+    ...(input.accountId?.trim() ? { accountId: input.accountId.trim() } : {}),
+    token: input.token,
+    updatedAt: new Date(0).toISOString(),
+  };
+}
+
+function validateZoneId(value: string): string {
+  const zoneId = value.trim();
+  if (!zoneId) throw new CredentialValidationError();
+  return zoneId;
 }
 
 function normalizeZone(value: string): string {
