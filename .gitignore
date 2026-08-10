@@ -1,5 +1,8 @@
 # Dependencies and build output
 node_modules/
+# The trailing slash above matches only a directory, so a node_modules symlink --
+# what `git worktree` setups usually create -- would slip past it into a commit.
+node_modules
 /dist/
 
 # Test and coverage output
