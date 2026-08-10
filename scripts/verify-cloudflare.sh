@@ -19,8 +19,37 @@ LABEL="parallax-verify-$$"
 
 fail() { echo "  FAIL: $*" >&2; exit 1; }
 ok() { echo "  ok: $*"; }
+
+# Withdrawing the verify record cannot depend on the run reaching its last step.
+# A failure anywhere after the first apply would otherwise leave a live record
+# in the zone with the temporary state file already gone, so nothing local would
+# remember that Parallax had published it. This talks to Cloudflare directly for
+# that reason: by the time it runs the control plane may be dead.
+withdraw_verify_record() {
+  # Armed only once a write is about to be attempted. A run that skips, or that
+  # dies before publishing anything, must not reach the provider at all.
+  [ "${PUBLISHED:-}" = "1" ] || return 0
+  local api="${CF_API_BASE:-https://api.cloudflare.com/client/v4}/zones/${CF_ZONE_ID}/dns_records"
+  local fqdn="${LABEL}.${CF_ZONE}" ids id
+  # Two guards, because a cleanup path that deletes the wrong record is worse
+  # than one that leaves litter: the API filters by exact name, and the response
+  # is filtered again against the same name and this run's dedicated prefix.
+  ids=$(curl -sf -H "Authorization: Bearer ${CF_API_TOKEN}" "${api}?name=${fqdn}" 2>/dev/null \
+    | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{
+        console.log((JSON.parse(d).result||[])
+          .filter(r=>r.name===process.argv[1]&&r.name.startsWith("parallax-verify-"))
+          .map(r=>r.id).join(" "));
+      }catch{}})' "$fqdn" 2>/dev/null) || return 0
+  for id in $ids; do
+    curl -sf -X DELETE -H "Authorization: Bearer ${CF_API_TOKEN}" "${api}/${id}" >/dev/null 2>&1 \
+      && echo "  cleanup: withdrew leftover ${fqdn}" >&2
+  done
+  return 0
+}
+
 cleanup() {
   if [ -n "${APP_PID:-}" ]; then kill "$APP_PID" 2>/dev/null || true; wait "$APP_PID" 2>/dev/null || true; fi
+  withdraw_verify_record || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -57,6 +86,9 @@ DELETES=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views
 ok "no deletions proposed for records Parallax does not own"
 
 echo "== create, proxied TTL normalization, update and withdraw =="
+# Arm the cleanup before the write, not after: a failure inside the apply is
+# exactly the case where a record exists at the provider and nothing local says so.
+PUBLISHED=1
 curl -sf -X PUT -H 'content-type: application/json' \
   -d "{\"name\":\"${LABEL}\",\"type\":\"A\",\"content\":\"192.0.2.10\",\"ttl\":300,\"acknowledgeNonGlobalIp\":true}" \
   "$API/zones/${CF_ZONE}/views/external/records/verify" >/dev/null
