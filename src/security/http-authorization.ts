@@ -8,10 +8,20 @@ export interface TokenRecord {
   readonly subject: string;
 }
 
+/** A token that was hashed elsewhere, so storage never holds a usable value. */
+export interface TokenDigestRecord {
+  /** Base64url SHA-256 of the token. */
+  readonly digest: string;
+  readonly role: Role;
+  readonly subject: string;
+}
+
 export interface SecurityConfig {
   /** Authentication is bypassed only when this is explicitly false. */
   readonly enabled: boolean;
   readonly tokens: readonly TokenRecord[];
+  /** Pre-hashed tokens, used by backends that never store the token itself. */
+  readonly digests?: readonly TokenDigestRecord[];
   readonly cookieName?: string;
   /** Failed attempts allowed from one client before it is refused. Defaults to 10. */
   readonly maxFailedAttempts?: number;
@@ -68,8 +78,10 @@ export function authorize(principal: Principal, request: Request): boolean {
   const segments = pathnameSegments(request);
   if (!segments) return false;
 
-  // Credential management is admin-only, including reads, when introduced.
-  if (segments[0] === "api" && segments[1] === "v1" && segments[2] === "credentials") return false;
+  // Credentials, settings and access tokens are administration surfaces:
+  // admin-only including reads, since each one exposes or changes who can act.
+  const administration = new Set(["credentials", "settings", "tokens"]);
+  if (segments[0] === "api" && segments[1] === "v1" && administration.has(segments[2] ?? "")) return false;
 
   // Preview queries the live provider on every call, so it needs write-level
   // trust even though it mutates nothing.
@@ -99,23 +111,44 @@ export function authorize(principal: Principal, request: Request): boolean {
     && (method === "PUT" || method === "DELETE");
 }
 
-/** Adds optional RBAC in front of any Fetch-style API handler. */
-export function createAuthorizedHandler(config: SecurityConfig, next: FetchHandler, now: () => number = Date.now): FetchHandler {
-  if (!config.enabled) {
-    // The actor is security-owned in both modes; a client must never be able to
-    // choose the identity that its changes are recorded under.
-    return (request) => next(withActor(request, "authentication-disabled"));
-  }
-  const prepared = prepareConfig(config);
+/**
+ * Adds optional RBAC in front of any Fetch-style API handler. Accepts a
+ * provider so tokens managed at runtime take effect without a restart; the
+ * prepared digests are reused until the provider returns a different object.
+ */
+export function createAuthorizedHandler(
+  source: SecurityConfig | (() => SecurityConfig),
+  next: FetchHandler,
+  now: () => number = Date.now,
+): FetchHandler {
+  const resolve = typeof source === "function" ? source : () => source;
+  const initial = resolve();
   const throttle = new FailureThrottle(
-    config.maxFailedAttempts ?? DEFAULT_MAX_FAILED_ATTEMPTS,
-    config.lockoutMs ?? DEFAULT_LOCKOUT_MS,
+    initial.maxFailedAttempts ?? DEFAULT_MAX_FAILED_ATTEMPTS,
+    initial.lockoutMs ?? DEFAULT_LOCKOUT_MS,
     now,
   );
-
-  const sessionMaxAge = config.sessionMaxAgeSeconds ?? DEFAULT_SESSION_MAX_AGE_SECONDS;
+  let cachedConfig: SecurityConfig | undefined;
+  let cachedPrepared: PreparedConfig | undefined;
+  const preparedFor = (config: SecurityConfig): PreparedConfig => {
+    if (cachedConfig !== config || !cachedPrepared) {
+      cachedPrepared = prepareConfig(config);
+      cachedConfig = config;
+    }
+    return cachedPrepared;
+  };
+  // Fail fast on a configuration that could never authenticate anyone.
+  if (initial.enabled) preparedFor(initial);
 
   return async (request) => {
+    const config = resolve();
+    if (!config.enabled) {
+      // The actor is security-owned in both modes; a client must never be able
+      // to choose the identity that its changes are recorded under.
+      return next(withActor(request, "authentication-disabled"));
+    }
+    const prepared = preparedFor(config);
+    const sessionMaxAge = config.sessionMaxAgeSeconds ?? DEFAULT_SESSION_MAX_AGE_SECONDS;
     if (isSessionRoute(request)) return handleSession(request, prepared, throttle, sessionMaxAge);
 
     const principal = authenticateWithPreparedTokens(request, prepared);
@@ -289,20 +322,25 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
   if (!COOKIE_NAME_PATTERN.test(cookieName)) throw invalidConfiguration();
 
   const prepared: PreparedToken[] = [];
+  const add = (recordDigest: Buffer, role: Role, subject: string): void => {
+    if (role !== "admin" && role !== "editor" && role !== "viewer") throw invalidConfiguration();
+    if (!SUBJECT_PATTERN.test(subject) || subject.trim().length === 0) throw invalidConfiguration();
+    for (const existing of prepared) {
+      if (timingSafeEqual(recordDigest, existing.digest)) throw invalidConfiguration();
+    }
+    prepared.push({ digest: recordDigest, principal: { role, subject } });
+  };
+
   for (const record of config.tokens) {
     if (!TOKEN_PATTERN.test(record.token) || Buffer.byteLength(record.token, "utf8") < MIN_TOKEN_BYTES) {
       throw invalidConfiguration();
     }
-    if (record.role !== "admin" && record.role !== "editor" && record.role !== "viewer") throw invalidConfiguration();
-    if (!SUBJECT_PATTERN.test(record.subject) || record.subject.trim().length === 0) throw invalidConfiguration();
-    const recordDigest = digest(record.token);
-    for (const existing of prepared) {
-      if (timingSafeEqual(recordDigest, existing.digest)) throw invalidConfiguration();
-    }
-    prepared.push({
-      digest: recordDigest,
-      principal: { role: record.role, subject: record.subject },
-    });
+    add(digest(record.token), record.role, record.subject);
+  }
+  for (const record of config.digests ?? []) {
+    const decoded = Buffer.from(record.digest, "base64url");
+    if (decoded.byteLength !== DIGEST_BYTES) throw invalidConfiguration();
+    add(decoded, record.role, record.subject);
   }
   return { cookieName, tokens: prepared };
 }
@@ -355,8 +393,15 @@ function readCookie(header: string | null, name: string): string | undefined {
   return candidate;
 }
 
+const DIGEST_BYTES = 32;
+
 function digest(token: string): Buffer {
   return createHash("sha256").update(token, "utf8").digest();
+}
+
+/** The stored form of a token: verifiable, but never reversible to the token. */
+export function tokenDigest(token: string): string {
+  return digest(token).toString("base64url");
 }
 
 function pathnameSegments(request: Request): string[] | undefined {
