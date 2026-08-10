@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Parallax split-horizon DNS operations portal" data-i18n-content="meta.description">
+    <title>Parallax — DNS observatory</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" type="module"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace" data-i18n="nav.skip">Skip to workspace</a>
+    <header class="masthead">
+      <a class="brand" href="/" aria-label="Parallax home" data-i18n-aria-label="nav.home">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+        <span><strong>PARALLAX</strong><small data-i18n="brand.subtitle">DNS OBSERVATORY</small></span>
+      </a>
+      <div class="masthead-status">
+        <label class="language-picker"><span class="sr-only" data-i18n="language.label">Language</span><select id="locale-select" aria-label="Language" data-i18n-aria-label="language.label"><option value="en" data-i18n="language.english">English</option><option value="ko" data-i18n="language.korean">한국어</option></select></label>
+        <button class="button compact quiet" id="credential-settings-button" type="button" data-i18n="provider.settings">Provider settings</button>
+        <span class="pulse" aria-hidden="true"></span>
+        <span><b id="global-status">Connecting</b><small data-i18n="status.controlPlane">CONTROL PLANE</small></span>
+      </div>
+    </header>
+
+    <div class="shell">
+      <aside class="sidebar" aria-label="Zones" data-i18n-aria-label="zones.label">
+        <div class="sidebar-heading">
+          <div><span class="eyebrow" data-i18n="zones.observed">Observed zones</span><b id="zone-count">—</b></div>
+          <button class="icon-button" id="add-zone-button" type="button" aria-label="Create zone" title="Create zone" data-i18n-aria-label="zones.create" data-i18n-title="zones.create">+</button>
+        </div>
+        <label class="search">
+          <span class="sr-only" data-i18n="zones.filterLabel">Filter zones</span>
+          <span aria-hidden="true">⌕</span>
+          <input id="zone-search" type="search" placeholder="Filter by domain…" data-i18n-placeholder="zones.filterPlaceholder" autocomplete="off">
+        </label>
+        <nav id="zone-list" class="zone-list" aria-label="Zone list" data-i18n-aria-label="zones.list" aria-live="polite">
+          <div class="skeleton zone-skeleton"></div>
+          <div class="skeleton zone-skeleton"></div>
+          <div class="skeleton zone-skeleton"></div>
+        </nav>
+        <div class="sidebar-foot">
+          <span data-i18n="policy.label">MANAGEMENT POLICY</span>
+          <b data-i18n="policy.managedOnly">Managed records only</b>
+        </div>
+      </aside>
+
+      <main id="workspace" class="workspace" tabindex="-1">
+        <section id="welcome-state" class="welcome-state" hidden>
+          <div class="orbital-mark" aria-hidden="true"><i></i><i></i><i></i></div>
+          <span class="eyebrow" data-i18n="welcome.eyebrow">No zone selected</span>
+          <h1 data-i18n="welcome.title">Choose an observation point.</h1>
+          <p data-i18n="welcome.body">Select a zone to compare its internal and external DNS views, or create the first zone in this control plane.</p>
+          <button class="button primary" type="button" data-action="open-create" data-i18n="welcome.create">Create a zone</button>
+        </section>
+
+        <div id="zone-workspace" hidden>
+          <section class="zone-header">
+            <div>
+              <span class="eyebrow"><span data-i18n="zone.active">Active zone</span> <span id="zone-id-label">—</span></span>
+              <h1 id="zone-name">Loading zone…</h1>
+              <div class="zone-meta">
+                <span id="revision-label">Desired revision —</span>
+                <span aria-hidden="true">·</span>
+                <span id="updated-label">Last changed —</span>
+              </div>
+            </div>
+            <div class="header-actions">
+              <button class="button quiet danger-button" id="delete-zone-button" type="button" data-i18n="zone.delete">Delete zone</button>
+              <button class="button quiet" id="refresh-button" type="button" data-i18n="zone.refresh">Refresh</button>
+              <button class="button quiet" id="revisions-button" type="button" data-i18n="zone.revisions">Revisions</button>
+              <button class="button quiet" id="preview-button" type="button" data-i18n="zone.preview">Preview plan</button>
+              <button class="button primary" id="apply-button" type="button" data-i18n="zone.apply">Apply changes</button>
+            </div>
+          </section>
+
+          <section class="horizon" aria-labelledby="horizon-title">
+            <div class="section-heading horizon-heading">
+              <div>
+                <span class="eyebrow" data-i18n="horizon.eyebrow">Split-horizon lens</span>
+                <h2 id="horizon-title" data-i18n="horizon.title">One name, two answers</h2>
+              </div>
+              <label class="record-focus">
+                <span data-i18n="horizon.focus">Focus record</span>
+                <select id="focus-record"></select>
+              </label>
+            </div>
+            <div class="lens" id="horizon-lens">
+              <article class="view-card internal-view">
+                <header><span class="view-symbol">IN</span><span><b data-i18n="horizon.internal">Internal view</b><small data-i18n="horizon.privateResolver">Private resolver</small></span></header>
+                <output id="internal-answer" class="answer">—</output>
+                <div class="answer-meta"><span id="internal-type">—</span><span id="internal-ttl">TTL —</span></div>
+              </article>
+              <div class="sightline" aria-hidden="true">
+                <span></span><i></i><em data-i18n="horizon.sameName">same name</em><i></i><span></span>
+              </div>
+              <article class="view-card external-view">
+                <header><span class="view-symbol">EX</span><span><b data-i18n="horizon.external">External view</b><small data-i18n="horizon.cloudflareEdge">Cloudflare edge</small></span></header>
+                <output id="external-answer" class="answer">—</output>
+                <div class="answer-meta"><span id="external-type">—</span><span id="external-ttl">TTL —</span><span id="proxy-label">DNS only</span></div>
+              </article>
+            </div>
+          </section>
+
+          <div class="content-grid">
+            <section class="records-panel panel" aria-labelledby="records-title">
+              <div class="section-heading">
+                <div><span class="eyebrow" data-i18n="record.desiredState">Desired state</span><h2 id="records-title" data-i18n="record.title">DNS records</h2></div>
+                <button class="button compact" id="add-record-button" type="button" data-i18n="record.add">Add record</button>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th scope="col" data-i18n="record.nameType">Name / type</th><th scope="col" data-i18n="record.internalAnswer">Internal answer</th><th scope="col" data-i18n="record.externalAnswer">External answer</th><th scope="col" data-i18n="record.ttlViews">TTL (IN / EX)</th><th scope="col"><span class="sr-only" data-i18n="record.actions">Actions</span></th></tr></thead>
+                  <tbody id="record-rows"></tbody>
+                </table>
+              </div>
+              <div class="empty-state" id="records-empty" hidden>
+                <b data-i18n="record.noneDefined">No records are defined</b>
+                <p data-i18n="record.noneBody">Add an A, AAAA, CNAME, or TXT record to establish this zone’s first split view.</p>
+                <button class="button compact" type="button" data-action="add-record" data-i18n="record.addFirst">Add first record</button>
+              </div>
+            </section>
+
+            <aside class="activity-column">
+              <section class="panel sync-panel" aria-labelledby="sync-title">
+                <div class="section-heading"><div><span class="eyebrow" data-i18n="sync.eyebrow">Reconciliation</span><h2 id="sync-title" data-i18n="sync.title">Sync state</h2></div><span class="status-chip pending" id="sync-overall" data-i18n="sync.checking">Checking</span></div>
+                <div class="sync-target"><span class="target-icon">IN</span><div><b data-i18n="sync.internal">Internal DNS</b><small id="internal-sync-detail" data-i18n="sync.waiting">Waiting for status</small></div><span class="target-status" id="internal-sync">—</span></div>
+                <div class="sync-target"><span class="target-icon">CF</span><div><b data-i18n="sync.cloudflare">Cloudflare</b><small id="external-sync-detail" data-i18n="sync.waiting">Waiting for status</small></div><span class="target-status" id="external-sync">—</span></div>
+                <div class="revision-track"><span id="revision-progress"></span></div>
+                <small class="track-caption" id="revision-caption" data-i18n="sync.comparing">Desired and applied revisions are being compared.</small>
+              </section>
+
+              <section class="panel history-panel" aria-labelledby="history-title">
+                <div class="section-heading"><div><span class="eyebrow" data-i18n="history.eyebrow">Audit trail</span><h2 id="history-title" data-i18n="history.title">Recent changes</h2></div></div>
+                <ol id="history-list" class="history-list"><li class="history-loading skeleton"></li><li class="history-loading skeleton"></li></ol>
+                <div id="history-empty" class="mini-empty" hidden data-i18n="history.none">No changes have been recorded for this zone.</div>
+              </section>
+            </aside>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <dialog id="zone-dialog">
+      <form id="zone-form" method="dialog">
+        <div class="dialog-heading"><span class="eyebrow" data-i18n="zoneDialog.eyebrow">New observation point</span><h2 data-i18n="zoneDialog.title">Create a zone</h2><button class="icon-button" type="button" data-close-dialog aria-label="Close dialog" data-i18n-aria-label="dialog.close">×</button></div>
+        <p data-i18n="zoneDialog.body">Parallax will manage only records it creates or explicitly adopts.</p>
+        <label><span data-i18n="zoneDialog.domain">Domain name</span><input name="name" type="text" placeholder="example.com" required data-validation-label="zoneDialog.domain" autocomplete="off" spellcheck="false"></label>
+        <label><span data-i18n="zoneDialog.provider">External provider</span><select name="provider"><option value="cloudflare">Cloudflare</option></select></label>
+        <div class="form-error" id="zone-form-error" role="alert" hidden></div>
+        <div class="dialog-actions"><button class="button quiet" type="button" data-close-dialog data-i18n="dialog.cancel">Cancel</button><button class="button primary" id="create-zone-submit" value="default" data-i18n="zones.create">Create zone</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="record-dialog">
+      <form id="record-form" method="dialog">
+        <div class="dialog-heading"><span class="eyebrow" id="record-dialog-mode">Desired record</span><h2 id="record-dialog-title">Add a record</h2><button class="icon-button" type="button" data-close-dialog aria-label="Close dialog" data-i18n-aria-label="dialog.close">×</button></div>
+        <input name="originalName" type="hidden">
+        <div class="form-row">
+          <label><span data-i18n="recordDialog.name">Name</span><input name="name" type="text" placeholder="@ or app" required data-validation-label="recordDialog.name" spellcheck="false"></label>
+          <label><span data-i18n="recordDialog.type">Type</span><select name="type"><option>A</option><option>AAAA</option><option>CNAME</option><option>TXT</option></select></label>
+        </div>
+        <div class="view-inputs internal-inputs">
+          <div class="view-input-heading"><span class="view-symbol">IN</span><span><b data-i18n="record.internalAnswer">Internal answer</b><small data-i18n="recordDialog.internalHelp">Leave empty to inherit the external answer</small></span></div>
+          <label><span data-i18n="recordDialog.content">Content</span><input name="internalContent" type="text" placeholder="10.10.10.10" spellcheck="false"></label>
+          <label><span data-i18n="recordDialog.internalTtl">Internal TTL in seconds</span><input name="internalTtl" type="number" value="300" min="1" step="1" required data-validation-label="recordDialog.internalTtl"></label>
+        </div>
+        <div class="view-inputs external-inputs">
+          <div class="view-input-heading"><span class="view-symbol">EX</span><span><b data-i18n="record.externalAnswer">External answer</b><small data-i18n="recordDialog.externalHelp">Published through the configured provider</small></span></div>
+          <label><span data-i18n="recordDialog.content">Content</span><input name="externalContent" type="text" placeholder="12.34.56.78" required data-validation-label="recordDialog.content" spellcheck="false"></label>
+          <label class="check-label"><input name="proxied" type="checkbox"><span><b data-i18n="recordDialog.proxy">Cloudflare proxy</b><small data-i18n="recordDialog.proxyHelp">Available for supported address and CNAME records.</small></span></label>
+          <label><span data-i18n="recordDialog.externalTtl">External TTL</span><input name="externalTtl" type="number" value="300" min="1" max="86400" step="1" required data-validation-label="recordDialog.externalTtl"><small id="external-ttl-help" data-i18n="recordDialog.ttlHelp">Use 1 for Auto, or 60–86400 seconds for DNS-only records.</small></label>
+          <label class="check-label" id="non-global-warning" hidden><input name="acknowledgeNonGlobalIp" type="checkbox" data-validation-label="recordDialog.nonGlobal"><span><b data-i18n="recordDialog.nonGlobal">Confirm non-global address publication</b><small data-i18n="recordDialog.nonGlobalHelp">This address is private or reserved and may expose an invalid external DNS answer. Check only after reviewing the intent.</small></span></label>
+        </div>
+        <div class="form-error" id="record-form-error" role="alert" hidden></div>
+        <div class="dialog-actions"><button class="button quiet" type="button" data-close-dialog data-i18n="dialog.cancel">Cancel</button><button class="button primary" id="save-record-submit" value="default" data-i18n="recordDialog.save">Save desired state</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="plan-dialog" class="wide-dialog">
+      <div class="dialog-heading"><span><span class="eyebrow" data-i18n="plan.eyebrow">Reconciliation preview</span><h2 data-i18n="plan.title">Review the apply plan</h2></span><button class="icon-button" id="close-plan" aria-label="Close dialog" data-i18n-aria-label="dialog.close">×</button></div>
+      <p id="plan-summary" data-i18n="plan.comparing">Parallax is comparing desired and actual state.</p>
+      <div id="plan-content" class="plan-content" aria-live="polite"><div class="skeleton plan-skeleton"></div><div class="skeleton plan-skeleton"></div></div>
+      <div class="dialog-actions"><button class="button quiet" id="cancel-plan" type="button" data-i18n="plan.keepEditing">Keep editing</button><button class="button primary" id="apply-from-plan" type="button" data-i18n="plan.apply">Apply this plan</button></div>
+    </dialog>
+
+    <dialog id="auth-dialog">
+      <form id="auth-form" method="dialog">
+        <div class="dialog-heading"><span><span class="eyebrow" data-i18n="auth.eyebrow">Protected control plane</span><h2 data-i18n="auth.title">Enter an access token</h2></span></div>
+        <p data-i18n="auth.body">This server requires an administrator, editor, or viewer token. The token is kept only in this browser tab.</p>
+        <label><span data-i18n="auth.token">Access token</span><input name="token" type="password" required data-validation-label="auth.token" autocomplete="off" spellcheck="false"></label>
+        <div class="form-error" id="auth-form-error" role="alert" hidden></div>
+        <div class="dialog-actions"><button class="button primary" type="submit" data-i18n="auth.open">Open control plane</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="revisions-dialog" class="wide-dialog">
+      <div class="dialog-heading"><span><span class="eyebrow" data-i18n="revisions.eyebrow">Immutable desired state</span><h2 data-i18n="revisions.title">Revision history</h2></span><button class="icon-button" id="close-revisions" aria-label="Close dialog" data-i18n-aria-label="dialog.close">×</button></div>
+      <p data-i18n="revisions.body">Restoring a snapshot creates a new revision. Existing history is never rewritten.</p>
+      <div id="revisions-content" class="revision-list" aria-live="polite"></div>
+    </dialog>
+
+    <dialog id="credential-dialog" class="wide-dialog">
+      <form id="credential-form" method="dialog">
+        <div class="dialog-heading"><span><span class="eyebrow" data-i18n="credentials.eyebrow">Administrator settings</span><h2 data-i18n="credentials.title">Cloudflare credentials</h2></span><button class="icon-button" type="button" data-close-dialog aria-label="Close dialog" data-i18n-aria-label="dialog.close">×</button></div>
+        <p data-i18n="credentials.body">Credentials are encrypted by the server. API tokens are write-only and are never returned to this portal.</p>
+        <div id="credential-access-message" class="credential-access-message" hidden></div>
+        <div class="credential-layout">
+          <section aria-labelledby="configured-credentials-title">
+            <span class="eyebrow" id="configured-credentials-title" data-i18n="credentials.configured">Configured zones</span>
+            <div id="credential-list" class="credential-list" aria-live="polite"><div class="skeleton plan-skeleton"></div></div>
+          </section>
+          <section class="credential-editor" aria-labelledby="credential-editor-title">
+            <span class="eyebrow" id="credential-editor-title" data-i18n="credentials.current">Current zone</span>
+            <label><span data-i18n="credentials.zone">Zone</span><input name="zone" type="text" readonly></label>
+            <label><span data-i18n="credentials.zoneId">Cloudflare zone ID</span><input name="zoneId" type="text" required data-validation-label="credentials.zoneId" autocomplete="off" spellcheck="false"></label>
+            <label><span data-i18n="credentials.apiToken">API token</span><input name="token" type="password" placeholder="Leave empty to test the saved token" data-i18n-placeholder="credentials.tokenPlaceholder" autocomplete="new-password" spellcheck="false"></label>
+            <div class="form-error" id="credential-form-error" role="alert" hidden></div>
+            <div class="dialog-actions credential-actions">
+              <button class="button quiet danger-button" id="delete-credential-button" type="button" data-i18n="credentials.delete">Delete saved credential</button>
+              <button class="button quiet" id="test-credential-button" type="button" data-i18n="credentials.test">Test connection</button>
+              <button class="button primary" id="save-credential-button" type="submit" data-i18n="credentials.save">Save credential</button>
+            </div>
+          </section>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>
