@@ -80,6 +80,13 @@ pnpm start
 실패가 반복되면 `429`와 `Retry-After` 헤더로 응답하고, 유효한 토큰은 다른
 클라이언트의 실패 때문에 지연되지 않습니다.
 
+포털은 토큰을 메모리에 들고 있지 않고 세션 쿠키로 교환합니다.
+`POST /api/v1/session`에 `{ "token": "..." }`을 보내면 `HttpOnly; SameSite=Strict;
+Path=/` 쿠키를 발급하고(HTTPS 요청이면 `Secure`도 포함), `DELETE /api/v1/session`으로
+지웁니다. 두 요청 모두 같은 origin에서 왔다는 증명을 요구하므로 포털만 세션을
+얻거나 버릴 수 있습니다. 쿠키가 `HttpOnly`이므로 페이지 스크립트는 자격 증명을
+볼 수 없습니다. API 클라이언트는 계속 `Authorization: Bearer`를 쓰면 됩니다.
+
 Cloudflare에는 최소 권한 API 토큰을 사용합니다. 인증이 설정되면 포털에서
 액세스 토큰을 요청하며 현재 브라우저 탭의 메모리에만 보관합니다. 자격 증명
 저장소 키는 `openssl rand -base64 32`로 생성할 수 있습니다. 프로바이더 설정
@@ -109,6 +116,15 @@ CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일
 괄호로 여러 줄에 걸친 레코드가 포함됩니다. 읽을 수 없는 레코드 줄은 "레코드
 없음"이 아니라 오류로 처리합니다. 없는 것으로 간주하면 보지 못한 응답 옆에
 두 번째 응답을 게시하게 되기 때문입니다.
+
+### 보관 정책
+
+목표 상태를 변경할 때마다 불변 스냅샷과 감사 기록이 쌓이므로 히스토리는 사용량에
+비례해 증가합니다. `PARALLAX_REVISION_RETENTION`은 존별 최신 스냅샷 수를,
+`PARALLAX_AUDIT_RETENTION_DAYS`는 감사 기록 보관 기간을 제한합니다. 두 정책 모두
+변경을 기록하는 것과 같은 원자적 커밋 안에서 적용되며, `0`으로 두면 제한이
+없습니다. 보관 기간이 지나 삭제된 리비전을 복원하려 하면 404가 반환되므로,
+실제로 필요한 롤백 범위에 맞춰 리비전 수를 정하세요.
 
 PostgreSQL을 사용할 때는 서비스를 시작하기 전에 스키마를 적용합니다.
 
@@ -155,6 +171,24 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
 `?abandonProviderRecords=true`를 전달하면 회수를 의도적으로 건너뜁니다. 이는
 프로바이더가 영구히 사라진 경우에만 사용하며, 해당 레코드는 살아 있는 상태로
 남습니다.
+
+## 실제 의존성 대상 검증
+
+단위 테스트와 HTTP 테스트는 인메모리 페이크를 사용합니다. 아래 스크립트는 실제
+구성요소를 대상으로 실행합니다.
+
+```sh
+pnpm verify:postgres    # Docker PostgreSQL: 마이그레이션, 재시작, 잠금, 보관 정책
+pnpm verify:coredns     # Docker CoreDNS + dig: 존 로드, SOA reload, 충돌 탐지
+pnpm verify:cloudflare  # 옵트인. 실제 토큰이 필요하며 없으면 건너뜀
+pnpm audit              # 의존성 취약점 점검
+```
+
+`verify:postgres`와 `verify:coredns`는 Docker가 필요하며 종료 시 컨테이너를
+제거합니다. `verify:cloudflare`는 실제 존에 쓰기를 하므로 `CF_ZONE`,
+`CF_ZONE_ID`, `CF_API_TOKEN`, `CF_VERIFY_ALLOW_WRITES=true`가 모두 설정되지
+않으면 실행을 거부합니다. 작업은 `parallax-verify-*` 이름으로 제한되며, Parallax가
+소유하지 않은 레코드가 삭제 대상이 되지 않는지도 함께 확인합니다.
 
 ## 개발 방식
 

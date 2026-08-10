@@ -57,7 +57,9 @@ defaults.
 | `PARALLAX_ALLOW_LOCAL_PROVIDER` | Simulated provider; defaults on only for loopback development with no provider configured |
 | `PARALLAX_PUBLIC_ORIGIN` | Absolute origin browsers reach the portal at; required behind TLS termination |
 | `PARALLAX_TRUST_FORWARDED_HEADERS` | Trust `X-Forwarded-Proto`/`X-Forwarded-Host` from a reverse proxy |
-| `DATABASE_URL` | Optional PostgreSQL source of truth; apply `migrations/001_initial.sql` first |
+| `DATABASE_URL` | Optional PostgreSQL source of truth; apply `migrations/001_initial.sql` first. Append `?sslmode=verify-full` for TLS |
+| `PARALLAX_REVISION_RETENTION` | Newest revision snapshots kept per zone; `0` keeps every one. Defaults to 100 |
+| `PARALLAX_AUDIT_RETENTION_DAYS` | Days of audit history kept per zone; `0` keeps every entry. Defaults to 365 |
 | `PARALLAX_COREDNS_DIRECTORY` | Optional directory for atomically generated zone files |
 | `PARALLAX_OWNERSHIP_SECRET` | 32+ byte secret that signs managed-record ownership markers |
 | `PARALLAX_CLOUDFLARE_ZONES` | Optional JSON map of zone names to Cloudflare zone IDs and API tokens |
@@ -81,6 +83,14 @@ warning at startup. Configure tokens before putting anything in front of it.
 Each token needs at least 32 bytes; generate one with `openssl rand -base64 32`.
 Repeated authentication failures are answered with `429` and a `Retry-After`
 header, and a valid token is never delayed by another client's failures.
+
+The portal exchanges a token for a session cookie rather than holding it in
+memory: `POST /api/v1/session` with `{ "token": "..." }` replies with
+`HttpOnly; SameSite=Strict; Path=/` (and `Secure` when the request arrived over
+HTTPS), and `DELETE /api/v1/session` clears it. Both require proof the request
+came from this origin, so only the portal can obtain or drop a session. Because
+the cookie is `HttpOnly`, page script never sees the credential. API clients can
+keep using `Authorization: Bearer` and skip sessions entirely.
 
 Use a minimum-scope Cloudflare API token. When authentication is configured,
 the portal asks for an access token and keeps it only in the current browser
@@ -112,6 +122,15 @@ inherit `$TTL`, records that inherit the previous owner name, an optional class
 field, and parenthesized multi-line records. A record line Parallax cannot read
 is an error rather than an absent record, because treating it as absent would let
 reconciliation publish a second answer beside one it never saw.
+
+### Retention
+
+Every desired-state change stores an immutable snapshot and an audit entry, so
+history grows with use. `PARALLAX_REVISION_RETENTION` keeps the newest snapshots
+per zone and `PARALLAX_AUDIT_RETENTION_DAYS` ages out audit entries; both are
+enforced inside the same atomic commit as the change that triggered them, and
+`0` disables the bound. Restoring a revision that has aged out returns 404, so
+size the revision bound to the rollback window you actually need.
 
 For a PostgreSQL deployment, apply the schema before starting the service:
 
@@ -158,6 +177,23 @@ unreachable the zone is kept so the deletion can be retried, rather than leaving
 published records nothing tracks. Pass `?abandonProviderRecords=true` to skip
 withdrawal deliberately — that is only for a provider that is gone for good, and
 it leaves those records live.
+
+## Verifying against real dependencies
+
+Unit and HTTP tests use in-memory fakes. These scripts exercise the real thing:
+
+```sh
+pnpm verify:postgres    # Docker PostgreSQL: migration, restart, locks, retention
+pnpm verify:coredns     # Docker CoreDNS + dig: zone load, SOA reload, conflicts
+pnpm verify:cloudflare  # opt-in; needs a real scoped token, skips without one
+pnpm audit              # dependency advisories
+```
+
+`verify:postgres` and `verify:coredns` need Docker and remove their containers
+on exit. `verify:cloudflare` writes to a live zone, so it refuses to run unless
+`CF_ZONE`, `CF_ZONE_ID`, `CF_API_TOKEN`, and `CF_VERIFY_ALLOW_WRITES=true` are
+all set; it confines itself to a `parallax-verify-*` name and asserts that
+records Parallax does not own are never scheduled for deletion.
 
 ## Development workflow
 

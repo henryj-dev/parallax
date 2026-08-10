@@ -84,12 +84,25 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
 ## 배포 전 외부 검증
 
 자동화된 fake/mock 및 로컬 HTTP 검증과 별개로, 실제 운영 배포 전에는 다음을
-대상 환경에서 확인한다.
+대상 환경에서 확인한다. 아래 항목 중 PostgreSQL과 CoreDNS는 `scripts/`의 검증
+스크립트로 자동화되어 있으며 실제 컨테이너를 상대로 통과했다.
 
-- 실제 PostgreSQL에 fresh migration, 재시작, transaction/advisory-lock 부하 테스트
-- 최소 권한 Cloudflare API token으로 pagination, rate limit, proxy/TTL 동작 확인
-- 실제 CoreDNS 프로세스에서 생성 zone load, SOA serial reload, `dig` 응답 확인
-- reverse proxy/TLS 환경의 Secure cookie, Origin, readiness 및 secret redaction 확인
+- [x] 실제 PostgreSQL에 fresh migration, 재시작, transaction/advisory-lock 부하 테스트
+      — `pnpm verify:postgres` (마이그레이션 멱등성, 트랜잭션 커밋, 재시작 후 상태
+      복원, 동시 apply 6건 직렬화, 보관 정책 pruning, FK cascade 확인)
+- [x] 실제 CoreDNS 프로세스에서 생성 zone load, SOA serial reload, `dig` 응답 확인
+      — `pnpm verify:coredns` (손으로 관리하던 `$TTL` 상속 레코드와의 충돌 탐지,
+      언더스코어 TXT 응답, serial 증가 후 reload 관측, 외부 레코드 보존, 파일 모드)
+- [ ] 최소 권한 Cloudflare API token으로 pagination, rate limit, proxy/TTL 동작 확인
+      — `pnpm verify:cloudflare` 스크립트는 준비되어 있으나 실제 계정이 없어
+      **미실행**이다. `CF_ZONE`, `CF_ZONE_ID`, `CF_API_TOKEN`,
+      `CF_VERIFY_ALLOW_WRITES=true`를 설정해 운영자가 직접 실행해야 한다.
+- [x] reverse proxy/TLS 환경의 Origin 처리 — `PARALLAX_PUBLIC_ORIGIN` /
+      `PARALLAX_TRUST_FORWARDED_HEADERS`로 해결하고 회귀 테스트로 고정했다.
+- [x] Secure cookie — 서버가 `POST /api/v1/session`에서 `HttpOnly; SameSite=Strict`
+      쿠키를 발급하며 HTTPS 요청에는 `Secure`를 붙인다.
+- [ ] 실제 TLS 종단 프록시(nginx 등) 뒤에서의 readiness 및 secret redaction 최종 확인
+      — 코드 경로는 테스트로 고정했으나 실제 프록시 구성에서는 미검증이다.
 
 외부 계정이나 실행 바이너리가 없는 로컬 mock 결과를 실제 provider 통합 성공으로
 표현하지 않는다.

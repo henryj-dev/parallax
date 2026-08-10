@@ -1,7 +1,8 @@
 # Parallax 보안 감사 및 구현 검수 리포트
 
-> **조치 상태 (2026-08-10 갱신)**: 아래 발견 사항을 **전 항목 수정**했습니다.
-> 수정 내역과 검증 결과는 [9. 조치 결과](#9-조치-결과)를 참고하세요.
+> **조치 상태 (2026-08-10 갱신)**: 아래 발견 사항을 **전 항목 수정**했고,
+> 조치 과정에서 드러난 후속 항목까지 [9. 후속 조치](#9-후속-조치)에서 처리했습니다.
+> 수정 내역과 검증 결과는 [8. 조치 결과](#8-조치-결과)를 참고하세요.
 
 
 - **대상**: `mack-erel/parallax` — split-horizon DNS 컨트롤 플레인 (커밋 `3a1f16c`)
@@ -270,7 +271,7 @@ credential 마스터 키, 그리고 DNS 레코드 자체(트래픽 리디렉션�
 - **정정**: 최초 리포트에 "정리 경로가 전혀 없다"고 적었으나 정확하지 않다. 같은 이름으로 존을 다시
   만들고 빈 `external`/`internal` 뷰를 명시 선언한 뒤 apply하면 회수된다(실측 확인). 다만 이 절차는
   문서화되어 있지 않았고 포털 UI로는 불가능했다.
-- **조치**: 삭제가 기본적으로 관리 레코드를 회수하도록 변경했다. 9절 참고.
+- **조치**: 삭제가 기본적으로 관리 레코드를 회수하도록 변경했다. 8절 참고.
 
 ---
 
@@ -299,7 +300,7 @@ credential 마스터 키, 그리고 DNS 레코드 자체(트래픽 리디렉션�
 4. **S-3** — `X-Forwarded-Proto` 또는 `PARALLAX_PUBLIC_ORIGIN` 도입 후 HTTPS 환경 재검증.
 5. **C-3 / C-4** — 오류 매핑 정리(버그 은폐 제거).
 
-## 9. 조치 결과
+## 8. 조치 결과
 
 기준선: `pnpm check` 통과, `pnpm test` **157/157** 통과(감사 전 144건 + 신규 회귀 테스트 13건),
 `pnpm build` 통과. 각 항목은 로컬 서버를 기동해 실제 HTTP/파일 시스템으로 재검증했습니다.
@@ -348,9 +349,71 @@ credential 마스터 키, 그리고 DNS 레코드 자체(트래픽 리디렉션�
 `README.md`, `README.ko.md`, `.env.example`에 리버스 프록시/TLS 배포 절차, 토큰 강도 요건,
 페이징 계약, 뷰 제한, CoreDNS 파싱 범위와 파일 모드를 반영했습니다.
 
+## 9. 후속 조치
+
+감사 항목을 닫은 뒤 남아 있던 다섯 가지를 처리했다. 기준선은 `pnpm check` 통과,
+`pnpm test` **170/170** 통과, `pnpm build` 통과이며, 아래 통합 검증은 실제 컨테이너를
+상대로 실행한 결과다.
+
+### 9.1 쿠키 인증의 발급 경로 (S-3 잔여분)
+
+검증 경로만 있고 발급 주체가 없어 `Secure`/`HttpOnly`/`SameSite`를 정하는 곳이 없었다.
+`POST /api/v1/session`이 토큰을 받아 `HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`
+쿠키를 발급하고(HTTPS 요청이면 `Secure` 추가), `DELETE /api/v1/session`이 지운다. 두
+경로 모두 same-origin 증명을 요구한다. 포털은 토큰을 메모리에 두지 않고 이 쿠키를
+쓰므로 XSS가 자격 증명을 읽을 수 없게 됐고, 로그아웃 버튼이 생겼다. same-origin 증명은
+`Origin` 외에 `Sec-Fetch-Site: same-origin`도 인정한다.
+
+실측: 로그인 200 + 쿠키 발급 → 쿠키로 GET 200 → Origin 있는 POST 201 →
+`Sec-Fetch-Site` POST 201 → 교차 출처 POST 403 → 로그아웃 204 + `Max-Age=0` →
+이후 GET 401 → 위조 쿠키 401.
+
+### 9.2 감사·리비전 리텐션 (S-7 잔여분)
+
+페이징은 응답만 제한했고 저장은 무한히 증가했다. `PARALLAX_REVISION_RETENTION`(기본
+100)과 `PARALLAX_AUDIT_RETENTION_DAYS`(기본 365)를 도입해, 변경을 기록하는 것과 **같은
+원자적 커밋 안에서** 존 단위로 정리한다. `0`은 무제한이다. 파일·인메모리·PostgreSQL
+세 저장소 모두 구현했다. 보관 범위를 벗어난 리비전 복원은 404가 되므로, 필요한 롤백
+범위에 맞춰 값을 정해야 한다.
+
+실측: 리비전 상한 3으로 6회 변경 후 보관된 리비전 `[4, 5, 6]`, 현재 리비전은 항상 유지.
+실제 PostgreSQL에서도 `parallax_zone_revisions` 행이 3으로 고정됨을 확인했다.
+
+### 9.3 PostgreSQL TLS
+
+`pg` 8.22가 연결 문자열의 `sslmode`를 파싱하는 것을 확인했으므로 코드 결함은 아니었다.
+다만 기본값이 평문이고 문서화가 없었다. `usesPlaintextPostgres()`를 추가해 TLS를 요구하지
+않는 `DATABASE_URL`이면 기동 시 경고를 출력하고, README와 `.env.example`에
+`?sslmode=verify-full`을 권장값으로 명시했다(`sslmode=require`는 향후 libpq 호환으로
+의미가 바뀐다는 `pg`의 경고 때문에 피한다).
+
+### 9.4 실제 환경 통합 검증
+
+`scripts/`에 재실행 가능한 검증 스크립트를 추가하고 실제로 실행했다.
+
+| 대상 | 스크립트 | 결과 |
+| --- | --- | --- |
+| PostgreSQL 17 (Docker) | `pnpm verify:postgres` | **통과** — fresh migration, 멱등 재적용, 트랜잭션 커밋(zone/revision/audit = 1/3/3), 재시작 후 상태 복원 및 무드리프트, 동시 apply 6건 직렬화(교착 없음), 리텐션 pruning, 존 삭제 시 FK cascade(0/0/0)와 삭제 감사 보존 |
+| CoreDNS 1.12 (Docker + `dig`) | `pnpm verify:coredns` | **통과** — 손으로 관리하던 `$TTL`·소유자 상속 RRset 응답, 그와 충돌하는 목표 레코드가 중복 대신 conflict 1건으로 보고(S-1 실환경 재확인), 적용 레코드와 언더스코어 TXT DNS 응답(C-1 확인), SOA serial 7→9 증가를 reload로 관측, 외부 레코드·권한 데이터 보존, 파일 모드 644(S-10 확인), 철회 시 응답 소멸 |
+| Cloudflare | `pnpm verify:cloudflare` | **미실행** — 실제 계정이 없다. 스크립트는 작성했고 자격 증명이 없으면 건너뛴다. 실행하려면 `CF_ZONE`, `CF_ZONE_ID`, `CF_API_TOKEN`, `CF_VERIFY_ALLOW_WRITES=true`가 모두 필요하며, 작업은 `parallax-verify-*` 이름으로 제한된다 |
+
+CoreDNS 검증 중 Docker Desktop의 UDP 포워딩이 동작하지 않아 질의는 TCP로 수행한다.
+검사 대상 존 데이터는 전송 방식과 무관하므로 검증 가치는 동일하다.
+
+### 9.5 의존성 스캔
+
+`pnpm audit`을 `package.json` 스크립트로 고정했다. 현재 **알려진 취약점 없음**이며 런타임
+의존성은 `pg` 하나뿐이다.
+
+### 9.6 여전히 남은 것
+
+- Cloudflare 실계정 검증(9.4) — 운영자가 직접 실행해야 한다.
+- 실제 TLS 종단 프록시(nginx 등) 뒤에서의 readiness·secret redaction 최종 확인. 코드
+  경로는 회귀 테스트로 고정했으나 실제 프록시 구성에서는 미검증이다.
+
 ## 10. 범위 밖
 
 - CI/CD 파이프라인, 컨테이너 이미지, 배포 매니페스트: 리포지토리에 존재하지 않음.
-- 실제 Cloudflare 계정·CoreDNS 프로세스·PostgreSQL 서버를 사용한 운영 환경 통합 검증:
-  로컬 mock 및 파일 어댑터로만 확인함 (`docs/handoff.md`의 잔여 검증 항목과 동일).
-- 의존성 취약점 스캔: 런타임 의존성은 `pg` 단일. 별도 SCA 미실시.
+- ~~실제 Cloudflare 계정·CoreDNS 프로세스·PostgreSQL 서버를 사용한 운영 환경 통합 검증~~
+  → PostgreSQL과 CoreDNS는 9.4에서 실제 컨테이너로 검증 완료. Cloudflare만 미실행.
+- ~~의존성 취약점 스캔~~ → 9.5에서 실시, 알려진 취약점 없음.
