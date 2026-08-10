@@ -5,13 +5,26 @@ import { ProviderNotConfiguredError, type PageRequest } from "../application/por
 import { DomainValidationError } from "../domain/dns.ts";
 import { CredentialInUseError, CredentialValidationError } from "../security/credential-store.ts";
 import { createAuthorizedHandler, type SecurityConfig } from "../security/http-authorization.ts";
+import type { AccessTokenService } from "../application/access-tokens.ts";
+import type { SettingsService } from "../application/settings.ts";
 
 const MAX_REQUEST_BODY_BYTES = 1_048_576;
 
-export function createApiHandler(controlPlane: ControlPlane, security?: SecurityConfig, credentials?: CloudflareCredentialManager): (request: Request) => Promise<Response> {
+/** Administration surfaces that are optional in tests but present in the server. */
+export interface AdministrationServices {
+  readonly settings?: SettingsService;
+  readonly accessTokens?: AccessTokenService;
+}
+
+export function createApiHandler(
+  controlPlane: ControlPlane,
+  security?: SecurityConfig | (() => SecurityConfig),
+  credentials?: CloudflareCredentialManager,
+  administration: AdministrationServices = {},
+): (request: Request) => Promise<Response> {
   const handler = async (request: Request): Promise<Response> => {
     try {
-      return await route(controlPlane, request, credentials);
+      return await route(controlPlane, request, credentials, administration);
     } catch (error) {
       return errorResponse(error);
     }
@@ -31,11 +44,12 @@ export interface NodeHandlerOptions {
 
 export function createNodeHandler(
   controlPlane: ControlPlane,
-  security?: SecurityConfig,
+  security?: SecurityConfig | (() => SecurityConfig),
   credentials?: CloudflareCredentialManager,
   options: NodeHandlerOptions = {},
+  administration: AdministrationServices = {},
 ): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
-  const handler = createApiHandler(controlPlane, security, credentials);
+  const handler = createApiHandler(controlPlane, security, credentials, administration);
   return async (request, response) => {
     const origin = requestOrigin(request, options);
     let body: Buffer;
@@ -93,7 +107,12 @@ function firstHeaderValue(value: string | string[] | undefined): string | undefi
   return raw?.split(",")[0]?.trim() || undefined;
 }
 
-async function route(controlPlane: ControlPlane, request: Request, credentials?: CloudflareCredentialManager): Promise<Response> {
+async function route(
+  controlPlane: ControlPlane,
+  request: Request,
+  credentials: CloudflareCredentialManager | undefined,
+  administration: AdministrationServices,
+): Promise<Response> {
   const url = new URL(request.url);
   const segments = decodeSegments(url.pathname);
   // HEAD must resolve exactly like GET; the body is dropped by the transport.
@@ -102,6 +121,8 @@ async function route(controlPlane: ControlPlane, request: Request, credentials?:
     throw new NotFoundError("route was not found");
   }
   if (segments[2] === "credentials") return credentialRoute(credentials, segments, request, method);
+  if (segments[2] === "settings") return settingsRoute(administration.settings, segments, request, method);
+  if (segments[2] === "tokens") return tokenRoute(administration.accessTokens, segments, request, method);
   if (segments[2] !== "zones") throw new NotFoundError("route was not found");
   const actor = request.headers.get("x-parallax-actor") ?? "web-console";
 
@@ -158,6 +179,40 @@ async function route(controlPlane: ControlPlane, request: Request, credentials?:
     if (method === "DELETE") {
       return revisionJson(await controlPlane.deleteRecord(zone, view, recordId, actor, readExpectedRevision(request)));
     }
+  }
+  throw new NotFoundError("route was not found");
+}
+
+async function settingsRoute(
+  settings: SettingsService | undefined,
+  segments: string[],
+  request: Request,
+  method: string,
+): Promise<Response> {
+  if (!settings || segments.length !== 3) throw new NotFoundError("route was not found");
+  if (method === "GET") return json({ settings: settings.current() });
+  if (method === "PUT") return json({ settings: await settings.update(await parseJson(request)) });
+  throw new NotFoundError("route was not found");
+}
+
+async function tokenRoute(
+  accessTokens: AccessTokenService | undefined,
+  segments: string[],
+  request: Request,
+  method: string,
+): Promise<Response> {
+  if (!accessTokens) throw new NotFoundError("route was not found");
+  if (segments.length === 3 && method === "GET") return json({ tokens: accessTokens.list() });
+  if (segments.length === 3 && method === "POST") {
+    const body = await parseJson(request);
+    // The generated token is returned exactly once and never stored in full.
+    const issued = await accessTokens.issue(body.subject, body.role);
+    return json(issued, 201);
+  }
+  const id = segments[3];
+  if (segments.length === 4 && id && method === "DELETE") {
+    if (!await accessTokens.revoke(id)) throw new NotFoundError("access token was not found");
+    return new Response(null, { status: 204 });
   }
   throw new NotFoundError("route was not found");
 }

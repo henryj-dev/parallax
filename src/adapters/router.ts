@@ -10,14 +10,24 @@ export interface RoutingProviderAdapterOptions {
 /** Dispatches split-horizon targets to their configured provider implementations. */
 export class RoutingProviderAdapter implements ProviderAdapter {
   readonly #external = new Map<string, ProviderAdapter>();
-  readonly #internal?: ProviderAdapter;
-  readonly #fallback?: ProviderAdapter;
+  #internal?: ProviderAdapter;
+  #fallback?: ProviderAdapter;
 
   constructor(options: RoutingProviderAdapterOptions = {}) {
     this.#internal = options.internal;
     this.#fallback = options.fallback;
     const entries = options.external instanceof Map ? options.external.entries() : Object.entries(options.external ?? {});
     for (const [zone, adapter] of entries) this.registerExternal(zone, adapter);
+  }
+
+  /** Swaps the internal-view adapter, so a settings change needs no restart. */
+  setInternal(adapter: ProviderAdapter | undefined): void {
+    this.#internal = adapter;
+  }
+
+  /** Swaps the adapter used when no specific one is configured for a target. */
+  setFallback(adapter: ProviderAdapter | undefined): void {
+    this.#fallback = adapter;
   }
 
   registerExternal(zone: string, adapter: ProviderAdapter): void {

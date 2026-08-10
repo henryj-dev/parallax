@@ -1,93 +1,90 @@
-import { MIN_TOKEN_BYTES, type Role, type SecurityConfig, type TokenRecord } from "./security/http-authorization.ts";
+import { MIN_TOKEN_BYTES, type Role, type TokenRecord } from "./security/http-authorization.ts";
 
+/**
+ * The environment carries only what cannot be read out of the store: where to
+ * bind, how to reach the store, and the keys that protect what is stored.
+ * Everything an administrator tunes -- provider wiring, retention, proxy
+ * origin, access tokens, credentials -- lives in the store and is managed
+ * through the portal.
+ */
 export interface ParallaxConfig {
   host: string;
   port: number;
+  /** Durable zone state file used when no database is configured. */
   stateFile: string;
+  /** Local provider state file, used only when the local provider is enabled. */
   providerStateFile: string;
+  /** Settings, credentials and tokens file used when no database is configured. */
+  configurationFile: string;
   databaseUrl?: string;
-  coreDnsDirectory?: string;
+  /** Signs managed-record ownership markers. Rotating it orphans existing records. */
   ownershipSecret?: string;
-  credentialFile?: string;
+  /** Encrypts stored provider credentials. Without it, credentials cannot be used. */
   credentialMasterKey?: Buffer;
-  allowLocalProvider: boolean;
-  cloudflareZones: Array<{ zone: string; zoneId: string; token: string }>;
-  security: SecurityConfig;
-  /** Absolute origin browsers reach the portal at, used to prove same-origin. */
-  publicOrigin?: string;
-  trustForwardedHeaders: boolean;
-  /** Newest revision snapshots kept per zone; 0 keeps every one. */
-  revisionRetention: number;
-  /** Days of audit history kept per zone; 0 keeps every entry. */
-  auditRetentionDays: number;
+  /** Optional break-glass tokens; normal tokens are issued through the portal. */
+  bootstrapTokens: TokenRecord[];
 }
 
-export const DEFAULT_REVISION_RETENTION = 100;
-export const DEFAULT_AUDIT_RETENTION_DAYS = 365;
-
 export function readConfig(environment: NodeJS.ProcessEnv = process.env): ParallaxConfig {
-  const host = environment.HOST?.trim() || "127.0.0.1";
-  const security = readSecurity(environment.PARALLAX_AUTH_TOKENS);
-  if (!security.enabled && !isLoopbackHost(host)) {
-    throw new Error("PARALLAX_AUTH_TOKENS is required when HOST is not loopback");
+  const ownershipSecret = environment.PARALLAX_OWNERSHIP_SECRET?.trim() || undefined;
+  if (ownershipSecret !== undefined && Buffer.byteLength(ownershipSecret, "utf8") < 32) {
+    throw new Error("PARALLAX_OWNERSHIP_SECRET must contain at least 32 bytes");
   }
-  const cloudflareZones = readCloudflareZones(environment.PARALLAX_CLOUDFLARE_ZONES);
-  const coreDnsDirectory = environment.PARALLAX_COREDNS_DIRECTORY?.trim();
-  const ownershipSecret = environment.PARALLAX_OWNERSHIP_SECRET;
-  const credentialFile = environment.PARALLAX_CREDENTIAL_FILE?.trim();
   const credentialMasterKey = readCredentialMasterKey(environment.PARALLAX_CREDENTIAL_MASTER_KEY);
-  // A configured deployment must fail loudly instead of writing DNS changes to a
-  // local file and reporting them as applied.
-  const hasRealProvider = cloudflareZones.length > 0 || Boolean(coreDnsDirectory) || Boolean(credentialFile);
-  const allowLocalProvider = readBoolean(
-    environment.PARALLAX_ALLOW_LOCAL_PROVIDER,
-    isLoopbackHost(host) && !hasRealProvider,
-  );
-  if (Boolean(credentialFile) !== Boolean(credentialMasterKey)) {
-    throw new Error("PARALLAX_CREDENTIAL_FILE and PARALLAX_CREDENTIAL_MASTER_KEY must be configured together");
-  }
-  const publicOrigin = readPublicOrigin(environment.PARALLAX_PUBLIC_ORIGIN);
-  const revisionRetention = readCount(environment.PARALLAX_REVISION_RETENTION, DEFAULT_REVISION_RETENTION, "PARALLAX_REVISION_RETENTION");
-  const auditRetentionDays = readCount(environment.PARALLAX_AUDIT_RETENTION_DAYS, DEFAULT_AUDIT_RETENTION_DAYS, "PARALLAX_AUDIT_RETENTION_DAYS");
-  const trustForwardedHeaders = readBoolean(environment.PARALLAX_TRUST_FORWARDED_HEADERS, false);
-  if ((cloudflareZones.length > 0 || coreDnsDirectory || credentialFile) && Buffer.byteLength(ownershipSecret ?? "", "utf8") < 32) {
-    throw new Error("PARALLAX_OWNERSHIP_SECRET must contain at least 32 bytes when an external provider is configured");
-  }
   return {
-    host,
+    host: environment.HOST?.trim() || "127.0.0.1",
     port: readPort(environment.PORT),
     stateFile: environment.PARALLAX_STATE_FILE?.trim() || "data/parallax-state.json",
     providerStateFile: environment.PARALLAX_PROVIDER_STATE_FILE?.trim() || "data/provider-state.json",
+    configurationFile: environment.PARALLAX_CONFIG_FILE?.trim() || "data/parallax-config.json",
     ...(environment.DATABASE_URL?.trim() ? { databaseUrl: environment.DATABASE_URL.trim() } : {}),
-    ...(coreDnsDirectory ? { coreDnsDirectory } : {}),
     ...(ownershipSecret ? { ownershipSecret } : {}),
-    ...(credentialFile ? { credentialFile } : {}),
     ...(credentialMasterKey ? { credentialMasterKey } : {}),
-    allowLocalProvider,
-    cloudflareZones,
-    security,
-    ...(publicOrigin ? { publicOrigin } : {}),
-    trustForwardedHeaders,
-    revisionRetention,
-    auditRetentionDays,
+    bootstrapTokens: readBootstrapTokens(environment.PARALLAX_AUTH_TOKENS),
   };
 }
 
-function readBoolean(source: string | undefined, defaultValue: boolean): boolean {
-  if (source === undefined || source.trim() === "") return defaultValue;
+function readCredentialMasterKey(source: string | undefined): Buffer | undefined {
+  if (source === undefined || source.trim() === "") return undefined;
   const value = source.trim();
-  if (value === "true") return true;
-  if (value === "false") return false;
-  throw new Error("boolean settings must be true or false");
+  let key: Buffer;
+  if (/^[a-f0-9]{64}$/iu.test(value)) key = Buffer.from(value, "hex");
+  else {
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)) {
+      throw new Error("PARALLAX_CREDENTIAL_MASTER_KEY must encode exactly 32 bytes as base64 or hexadecimal");
+    }
+    key = Buffer.from(value, "base64");
+  }
+  if (key.byteLength !== 32) throw new Error("PARALLAX_CREDENTIAL_MASTER_KEY must encode exactly 32 bytes as base64 or hexadecimal");
+  return key;
 }
 
-/** A non-negative bound where 0 means "keep everything". */
-function readCount(source: string | undefined, defaultValue: number, name: string): number {
-  const value = source?.trim();
-  if (value === undefined || value === "") return defaultValue;
-  if (!/^\d+$/.test(value)) throw new Error(`${name} must be a non-negative integer`);
+function readBootstrapTokens(source: string | undefined): TokenRecord[] {
+  if (source === undefined || source.trim() === "") return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    throw new Error("PARALLAX_AUTH_TOKENS must be a valid JSON array");
+  }
+  if (!Array.isArray(parsed)) throw new Error("PARALLAX_AUTH_TOKENS must be a valid JSON array");
+  return parsed.map((item) => {
+    if (!isObject(item) || typeof item.token !== "string" || typeof item.subject !== "string" || !isRole(item.role)) {
+      throw new Error("PARALLAX_AUTH_TOKENS contains an invalid token record");
+    }
+    if (Buffer.byteLength(item.token, "utf8") < MIN_TOKEN_BYTES) {
+      throw new Error(`PARALLAX_AUTH_TOKENS entries must contain at least ${MIN_TOKEN_BYTES} bytes; generate one with: openssl rand -base64 32`);
+    }
+    return { token: item.token, subject: item.subject, role: item.role };
+  });
+}
+
+function readPort(value: string | undefined): number {
+  if (!value) return 3000;
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a non-negative integer`);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) {
+    throw new Error("PORT must be an integer between 1 and 65535");
+  }
   return parsed;
 }
 
@@ -107,84 +104,8 @@ export function usesPlaintextPostgres(connectionString: string): boolean {
   }
 }
 
-/** The absolute origin a browser reaches the portal at, without a path or query. */
-function readPublicOrigin(source: string | undefined): string | undefined {
-  const value = source?.trim();
-  if (!value) return undefined;
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error("PARALLAX_PUBLIC_ORIGIN must be an absolute http or https origin");
-  }
-  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.origin !== value.replace(/\/$/, "")) {
-    throw new Error("PARALLAX_PUBLIC_ORIGIN must be an absolute http or https origin");
-  }
-  return url.origin;
-}
-
-function readCredentialMasterKey(source: string | undefined): Buffer | undefined {
-  if (source === undefined || source.trim() === "") return undefined;
-  const value = source.trim();
-  let key: Buffer;
-  if (/^[a-f0-9]{64}$/iu.test(value)) key = Buffer.from(value, "hex");
-  else {
-    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)) {
-      throw new Error("PARALLAX_CREDENTIAL_MASTER_KEY must encode exactly 32 bytes as base64 or hexadecimal");
-    }
-    key = Buffer.from(value, "base64");
-  }
-  if (key.byteLength !== 32) throw new Error("PARALLAX_CREDENTIAL_MASTER_KEY must encode exactly 32 bytes as base64 or hexadecimal");
-  return key;
-}
-
-function readCloudflareZones(source: string | undefined): ParallaxConfig["cloudflareZones"] {
-  if (source === undefined || source.trim() === "") return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(source);
-  } catch {
-    throw new Error("PARALLAX_CLOUDFLARE_ZONES must be a valid JSON object");
-  }
-  if (!isObject(parsed)) throw new Error("PARALLAX_CLOUDFLARE_ZONES must be a valid JSON object");
-  return Object.entries(parsed).map(([rawZone, value]) => {
-    const zone = rawZone.trim().toLowerCase().replace(/\.$/, "");
-    if (!isValidZone(zone) || !isObject(value) || typeof value.zoneId !== "string" || !value.zoneId.trim() || typeof value.token !== "string" || !value.token.trim()) {
-      throw new Error("PARALLAX_CLOUDFLARE_ZONES contains an invalid zone configuration");
-    }
-    return { zone, zoneId: value.zoneId.trim(), token: value.token };
-  });
-}
-
-function readSecurity(source: string | undefined): SecurityConfig {
-  if (source === undefined || source.trim() === "") return { enabled: false, tokens: [] };
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(source);
-  } catch {
-    throw new Error("PARALLAX_AUTH_TOKENS must be a valid JSON array");
-  }
-  if (!Array.isArray(parsed)) throw new Error("PARALLAX_AUTH_TOKENS must be a valid JSON array");
-  const tokens: TokenRecord[] = parsed.map((item) => {
-    if (!isObject(item) || typeof item.token !== "string" || typeof item.subject !== "string" || !isRole(item.role)) {
-      throw new Error("PARALLAX_AUTH_TOKENS contains an invalid token record");
-    }
-    if (Buffer.byteLength(item.token, "utf8") < MIN_TOKEN_BYTES) {
-      throw new Error(`PARALLAX_AUTH_TOKENS entries must contain at least ${MIN_TOKEN_BYTES} bytes; generate one with: openssl rand -base64 32`);
-    }
-    return { token: item.token, subject: item.subject, role: item.role };
-  });
-  if (tokens.length === 0) throw new Error("PARALLAX_AUTH_TOKENS must contain at least one token record");
-  return { enabled: true, tokens };
-}
-
-function readPort(value: string | undefined): number {
-  if (!value) return 3000;
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) {
-    throw new Error("PORT must be an integer between 1 and 65535");
-  }
-  return parsed;
+export function isLoopbackHost(value: string): boolean {
+  return value === "127.0.0.1" || value === "localhost" || value === "::1" || value === "[::1]";
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -193,12 +114,4 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function isRole(value: unknown): value is Role {
   return value === "admin" || value === "editor" || value === "viewer";
-}
-
-function isValidZone(value: string): boolean {
-  return value.length <= 253 && value.includes(".") && value.split(".").every((label) => /^(?!-)[a-z0-9-]{1,63}(?<!-)$/.test(label));
-}
-
-function isLoopbackHost(value: string): boolean {
-  return value === "127.0.0.1" || value === "localhost" || value === "::1" || value === "[::1]";
 }

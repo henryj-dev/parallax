@@ -1,88 +1,73 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { readConfig, usesPlaintextPostgres } from "../src/config.ts";
+import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "../src/config.ts";
 
 describe("configuration", () => {
-  it("uses local safe defaults with authentication explicitly disabled", () => {
+  it("carries only bind address, storage location, and keys", () => {
     assert.deepEqual(readConfig({}), {
       host: "127.0.0.1",
       port: 3000,
       stateFile: "data/parallax-state.json",
       providerStateFile: "data/provider-state.json",
-      allowLocalProvider: true,
-      cloudflareZones: [],
-      security: { enabled: false, tokens: [] },
-      trustForwardedHeaders: false,
-      revisionRetention: 100,
-      auditRetentionDays: 365,
+      configurationFile: "data/parallax-config.json",
+      bootstrapTokens: [],
     });
   });
 
-  it("parses provider configuration while redacting invalid secrets", () => {
-    const source = JSON.stringify({ "Example.COM.": { zoneId: "zone-1", token: "cf-secret" } });
-    assert.deepEqual(readConfig({
-      PARALLAX_CLOUDFLARE_ZONES: source,
-      PARALLAX_COREDNS_DIRECTORY: "/srv/coredns/zones",
-      PARALLAX_OWNERSHIP_SECRET: "test-ownership-secret-that-is-at-least-32-bytes",
+  it("reads the database connection and the keys that protect stored data", () => {
+    const key = Buffer.alloc(32, 7);
+    const config = readConfig({
       DATABASE_URL: "postgres://parallax:test@db/parallax",
-    }), {
-      host: "127.0.0.1",
-      port: 3000,
-      stateFile: "data/parallax-state.json",
-      providerStateFile: "data/provider-state.json",
-      databaseUrl: "postgres://parallax:test@db/parallax",
-      coreDnsDirectory: "/srv/coredns/zones",
-      ownershipSecret: "test-ownership-secret-that-is-at-least-32-bytes",
-      cloudflareZones: [{ zone: "example.com", zoneId: "zone-1", token: "cf-secret" }],
-      // A configured provider turns off the local fallback so a missing adapter
-      // fails loudly instead of quietly writing to a file.
-      allowLocalProvider: false,
-      security: { enabled: false, tokens: [] },
-      trustForwardedHeaders: false,
-      revisionRetention: 100,
-      auditRetentionDays: 365,
+      PARALLAX_OWNERSHIP_SECRET: "test-ownership-secret-that-is-at-least-32-bytes",
+      PARALLAX_CREDENTIAL_MASTER_KEY: key.toString("base64"),
     });
-    assert.throws(
-      () => readConfig({ PARALLAX_CLOUDFLARE_ZONES: '{"example.com":{"token":"do-not-echo"}}' }),
-      (error: unknown) => error instanceof Error && !error.message.includes("do-not-echo"),
-    );
-    assert.throws(() => readConfig({ PARALLAX_CLOUDFLARE_ZONES: source }), /PARALLAX_OWNERSHIP_SECRET/);
+    assert.equal(config.databaseUrl, "postgres://parallax:test@db/parallax");
+    assert.equal(config.ownershipSecret, "test-ownership-secret-that-is-at-least-32-bytes");
+    assert.deepEqual(config.credentialMasterKey, key);
+    assert.deepEqual(readConfig({ PARALLAX_CREDENTIAL_MASTER_KEY: key.toString("hex") }).credentialMasterKey, key);
   });
 
-  it("parses role token records without returning them in errors", () => {
-    const token = "admin-secret-00000000000000000000";
-    const source = JSON.stringify([{ token, role: "admin", subject: "owner" }]);
-    assert.deepEqual(readConfig({ PARALLAX_AUTH_TOKENS: source }).security, {
-      enabled: true,
-      tokens: [{ token, role: "admin", subject: "owner" }],
+  it("rejects keys that are too short to do their job", () => {
+    assert.throws(() => readConfig({ PARALLAX_OWNERSHIP_SECRET: "too-short" }), /at least 32 bytes/);
+    assert.throws(
+      () => readConfig({ PARALLAX_CREDENTIAL_MASTER_KEY: Buffer.alloc(31).toString("base64") }),
+      /exactly 32 bytes/,
+    );
+  });
+
+  it("no longer reads operational settings from the environment", () => {
+    // These are stored and edited through the portal; a leftover value in the
+    // environment must not quietly take effect.
+    const config = readConfig({
+      PARALLAX_ALLOW_LOCAL_PROVIDER: "true",
+      PARALLAX_COREDNS_DIRECTORY: "/srv/coredns/zones",
+      PARALLAX_PUBLIC_ORIGIN: "https://dns.example.com",
+      PARALLAX_TRUST_FORWARDED_HEADERS: "true",
+      PARALLAX_REVISION_RETENTION: "5",
+      PARALLAX_AUDIT_RETENTION_DAYS: "5",
+      PARALLAX_CLOUDFLARE_ZONES: '{"example.com":{"zoneId":"z","token":"t"}}',
+      PARALLAX_CREDENTIAL_FILE: "data/credentials.enc",
     });
+    assert.deepEqual(Object.keys(config).sort(), [
+      "bootstrapTokens", "configurationFile", "host", "port", "providerStateFile", "stateFile",
+    ]);
+  });
+
+  it("parses break-glass tokens without returning them in errors", () => {
+    const token = "admin-secret-00000000000000000000";
+    assert.deepEqual(readConfig({
+      PARALLAX_AUTH_TOKENS: JSON.stringify([{ token, role: "admin", subject: "owner" }]),
+    }).bootstrapTokens, [{ token, subject: "owner", role: "admin" }]);
+
     assert.throws(
       () => readConfig({ PARALLAX_AUTH_TOKENS: '[{"token":"do-not-echo"}]' }),
       (error: unknown) => error instanceof Error && !error.message.includes("do-not-echo"),
     );
-    // A guessable token opens the whole control plane, so it is a startup error.
     assert.throws(
       () => readConfig({ PARALLAX_AUTH_TOKENS: '[{"token":"a","role":"admin","subject":"owner"}]' }),
       /at least 32 bytes/,
     );
-    assert.throws(() => readConfig({ PARALLAX_AUTH_TOKENS: "[]" }), /at least one token record/);
-  });
-
-  it("parses encrypted credential configuration only as a complete, exact 32-byte pair", () => {
-    const key = Buffer.alloc(32, 7);
-    const config = readConfig({
-      PARALLAX_CREDENTIAL_FILE: "data/credentials.enc",
-      PARALLAX_CREDENTIAL_MASTER_KEY: key.toString("base64"),
-      PARALLAX_OWNERSHIP_SECRET: "test-ownership-secret-that-is-at-least-32-bytes",
-    });
-    assert.equal(config.credentialFile, "data/credentials.enc");
-    assert.deepEqual(config.credentialMasterKey, key);
-    assert.throws(() => readConfig({ PARALLAX_CREDENTIAL_FILE: "data/credentials.enc" }), /configured together/);
-    assert.throws(() => readConfig({ PARALLAX_CREDENTIAL_MASTER_KEY: Buffer.alloc(31).toString("base64") }), /exactly 32 bytes/);
-    assert.throws(() => readConfig({
-      PARALLAX_CREDENTIAL_FILE: "data/credentials.enc",
-      PARALLAX_CREDENTIAL_MASTER_KEY: key.toString("hex"),
-    }), /PARALLAX_OWNERSHIP_SECRET/);
+    assert.deepEqual(readConfig({ PARALLAX_AUTH_TOKENS: "[]" }).bootstrapTokens, []);
   });
 
   it("rejects invalid ports", () => {
@@ -90,43 +75,14 @@ describe("configuration", () => {
     assert.throws(() => readConfig({ PORT: "abc" }), /PORT/);
   });
 
-  it("refuses a non-loopback bind without authentication", () => {
-    assert.throws(() => readConfig({ HOST: "0.0.0.0" }), /PARALLAX_AUTH_TOKENS/);
-    assert.equal(readConfig({
-      HOST: "0.0.0.0",
-      PARALLAX_AUTH_TOKENS: '[{"token":"admin-secret-00000000000000000000","role":"admin","subject":"owner"}]',
-    }).security.enabled, true);
-    assert.equal(readConfig({
-      HOST: "0.0.0.0",
-      PARALLAX_AUTH_TOKENS: '[{"token":"admin-secret-00000000000000000000","role":"admin","subject":"owner"}]',
-    }).allowLocalProvider, false);
-  });
-
-  it("requires an explicit boolean for local provider mode", () => {
-    assert.equal(readConfig({ PARALLAX_ALLOW_LOCAL_PROVIDER: "false" }).allowLocalProvider, false);
-    assert.throws(() => readConfig({ PARALLAX_ALLOW_LOCAL_PROVIDER: "yes" }), /true or false/);
-  });
-
-  it("bounds stored history and detects a cleartext PostgreSQL session", () => {
-    assert.equal(readConfig({}).revisionRetention, 100);
-    assert.equal(readConfig({}).auditRetentionDays, 365);
-    assert.equal(readConfig({ PARALLAX_REVISION_RETENTION: "0" }).revisionRetention, 0);
-    assert.equal(readConfig({ PARALLAX_AUDIT_RETENTION_DAYS: "30" }).auditRetentionDays, 30);
-    assert.throws(() => readConfig({ PARALLAX_REVISION_RETENTION: "-1" }), /non-negative integer/);
-    assert.throws(() => readConfig({ PARALLAX_AUDIT_RETENTION_DAYS: "many" }), /non-negative integer/);
-
+  it("detects a cleartext PostgreSQL session and loopback binds", () => {
     assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax"), true);
     assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?sslmode=prefer"), true);
     assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?sslmode=verify-full"), false);
     assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?ssl=true"), false);
-  });
 
-  it("reads the public origin used to prove same-origin behind a TLS-terminating proxy", () => {
-    assert.equal(readConfig({ PARALLAX_PUBLIC_ORIGIN: "https://dns.example.com" }).publicOrigin, "https://dns.example.com");
-    assert.equal(readConfig({ PARALLAX_PUBLIC_ORIGIN: "https://dns.example.com/" }).publicOrigin, "https://dns.example.com");
-    assert.equal(readConfig({ PARALLAX_TRUST_FORWARDED_HEADERS: "true" }).trustForwardedHeaders, true);
-    for (const value of ["dns.example.com", "https://dns.example.com/portal", "ftp://dns.example.com"]) {
-      assert.throws(() => readConfig({ PARALLAX_PUBLIC_ORIGIN: value }), /absolute http or https origin/, value);
-    }
+    assert.equal(isLoopbackHost("127.0.0.1"), true);
+    assert.equal(isLoopbackHost("localhost"), true);
+    assert.equal(isLoopbackHost("0.0.0.0"), false);
   });
 });
