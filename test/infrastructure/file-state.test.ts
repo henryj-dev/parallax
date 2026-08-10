@@ -200,7 +200,7 @@ describe("FileStateRepository", () => {
     assert.equal(await restarted.get("example.com"), undefined);
     assert.deepEqual(await restarted.listRevisions("example.com"), []);
     assert.deepEqual(await restarted.list("example.com"), []);
-    assert.deepEqual((await restarted.audit("example.com")).map((entry) => entry.action), ["zone.created", "zone.deleted"]);
+    assert.deepEqual((await restarted.audit("example.com")).map((entry) => entry.action), ["zone.deleted", "zone.created"]);
   });
 
   it("leaves the complete file state unchanged when deletion has a stale expected revision", async () => {

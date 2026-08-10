@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ConflictError, ControlPlane } from "../../src/application/control-plane.ts";
+import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE } from "../../src/application/control-plane.ts";
 import { RevisionConflictError, type DesiredChange, type ZoneDeletion } from "../../src/application/ports.ts";
 import type { ReconcileOperation } from "../../src/domain/reconciliation.ts";
 import { createInMemoryAdapters, InMemoryApplyLock, InMemoryProvider, InMemoryStatusRepository, InMemoryZoneRepository } from "../../src/infrastructure/in-memory.ts";
@@ -125,8 +125,9 @@ describe("ControlPlane", () => {
     }, "bob")).revision, 3);
 
     const history = await service.audit("example.com");
-    assert.deepEqual(history.map((entry) => entry.revision), [1, 2, 3]);
-    assert.deepEqual(history.map((entry) => entry.actor), ["alice", "alice", "bob"]);
+    assert.deepEqual(history.entries.map((entry) => entry.revision), [3, 2, 1]);
+    assert.deepEqual(history.entries.map((entry) => entry.actor), ["bob", "alice", "alice"]);
+    assert.deepEqual([history.limit, history.offset, history.hasMore], [DEFAULT_HISTORY_PAGE_SIZE, 0, false]);
   });
 
   it("captures immutable snapshots for every desired revision and restores one as a new revision", async () => {
@@ -139,7 +140,7 @@ describe("ControlPlane", () => {
       name: "@", type: "A", content: "8.8.8.20", ttl: 300,
     }, "bob");
 
-    const revisions = await service.listRevisions("example.com");
+    const { revisions } = await service.listRevisions("example.com");
     assert.deepEqual(revisions.map((snapshot) => snapshot.revision), [1, 2, 3]);
     assert.equal(revisions[1]?.views[0]?.records[0]?.content, "8.8.8.10");
     revisions[1]!.views[0]!.records[0]!.content = "mutated";
@@ -150,11 +151,11 @@ describe("ControlPlane", () => {
     assert.equal(restored.views[0]?.records[0]?.content, "8.8.8.10");
     assert.equal((await service.getRevision("example.com", 4)).revision, 4);
     assert.equal((await service.status("example.com")).statuses[0]?.state, "pending");
-    const audit = await service.audit("example.com");
-    assert.equal(audit.at(-1)?.action, "desired.restored");
-    assert.equal(audit.at(-1)?.detail.restoredRevision, 2);
-    assert.equal(((audit.at(-1)?.detail.before as { views: Array<{ records: Array<{ content: string }> }> }).views[0]?.records[0]?.content), "8.8.8.20");
-    assert.equal(((audit.at(-1)?.detail.after as { views: Array<{ records: Array<{ content: string }> }> }).views[0]?.records[0]?.content), "8.8.8.10");
+    const audit = (await service.audit("example.com")).entries;
+    assert.equal(audit.at(0)?.action, "desired.restored");
+    assert.equal(audit.at(0)?.detail.restoredRevision, 2);
+    assert.equal(((audit.at(0)?.detail.before as { views: Array<{ records: Array<{ content: string }> }> }).views[0]?.records[0]?.content), "8.8.8.20");
+    assert.equal(((audit.at(0)?.detail.after as { views: Array<{ records: Array<{ content: string }> }> }).views[0]?.records[0]?.content), "8.8.8.10");
   });
 
   it("serializes concurrent restore and mutation without reusing a revision", async () => {
@@ -170,7 +171,7 @@ describe("ControlPlane", () => {
       }),
     ]);
     assert.deepEqual([restored.revision, changed.revision], [3, 4]);
-    assert.deepEqual((await service.listRevisions("example.com")).map((item) => item.revision), [1, 2, 3, 4]);
+    assert.deepEqual((await service.listRevisions("example.com")).revisions.map((item) => item.revision), [1, 2, 3, 4]);
   });
 
   it("previews, applies and converges without duplicate provider changes", async () => {
@@ -335,7 +336,7 @@ describe("ControlPlane", () => {
     assert.deepEqual([first.revision, second.revision], [2, 3]);
     const zone = await service.getZone("example.com");
     assert.equal(zone.views[0]?.records.length, 2);
-    assert.deepEqual((await service.audit("example.com")).map((entry) => entry.revision), [1, 2, 3]);
+    assert.deepEqual((await service.audit("example.com")).entries.map((entry) => entry.revision), [3, 2, 1]);
   });
 
   it("rejects a desired-state mutation when its expected revision is stale", async () => {
@@ -350,7 +351,7 @@ describe("ControlPlane", () => {
       (error: unknown) => error instanceof ConflictError && /expected revision 1.*current revision is 2/i.test(error.message),
     );
     assert.equal((await service.getZone("example.com")).revision, 2);
-    assert.equal((await service.audit("example.com")).length, 2);
+    assert.equal((await service.audit("example.com")).entries.length, 2);
   });
 
   it("lets only one concurrent writer commit against the same expected revision", async () => {
@@ -395,7 +396,7 @@ describe("ControlPlane", () => {
       }, "alice"), failure);
 
       assert.equal((await service.getZone("example.com")).revision, 1);
-      assert.equal((await service.audit("example.com")).length, 1);
+      assert.equal((await service.audit("example.com")).entries.length, 1);
       assert.deepEqual((await service.status("example.com")).statuses, []);
     }
   });
@@ -417,7 +418,7 @@ describe("ControlPlane", () => {
     assert.equal((await state.get("example.com"))?.revision, 2);
     assert.deepEqual((await state.listRevisions("example.com")).map((revision) => revision.revision), [1, 2]);
     assert.ok((await state.list("example.com")).length > 0);
-    assert.deepEqual((await state.audit("example.com")).map((entry) => entry.action), ["zone.created", "record.upserted"]);
+    assert.deepEqual((await state.audit("example.com")).map((entry) => entry.action), ["record.upserted", "zone.created"]);
   });
 
   it("atomically deletes current state and records a secret-free before snapshot", async () => {
@@ -435,7 +436,7 @@ describe("ControlPlane", () => {
     assert.equal(await state.get("example.com"), undefined);
     assert.deepEqual(await state.listRevisions("example.com"), []);
     assert.deepEqual(await state.list("example.com"), []);
-    const deleted = (await state.audit("example.com")).at(-1);
+    const deleted = (await state.audit("example.com")).at(0);
     assert.equal(deleted?.action, "zone.deleted");
     assert.equal(deleted?.actor, "bob");
     assert.equal(deleted?.revision, 3);
@@ -444,6 +445,56 @@ describe("ControlPlane", () => {
       views: [{ name: "external", records: [{ id: "root", name: "@", type: "A", content: "8.8.8.8", ttl: 60 }] }],
     });
     assert.doesNotMatch(JSON.stringify(deleted?.detail), /credential|secret|token/i);
+  });
+
+  it("withdraws its own published records when a zone is deleted and leaves foreign records alone", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com", "alice");
+    await service.upsertRecord("example.com", "external", "root", {
+      name: "@", type: "A", content: "8.8.8.8", ttl: 60,
+    }, "alice");
+    await service.apply("example.com");
+    provider.seed("example.com/external", [
+      ...await provider.list("example.com/external"),
+      { id: "foreign", providerId: "foreign-1", managed: false, name: "legacy", type: "A", content: "8.8.4.4", ttl: 60 },
+    ]);
+
+    const result = await service.deleteZone("example.com", "bob");
+
+    assert.deepEqual(result.removedProviderRecords.map((record) => `${record.view}/${record.name}/${record.content}`), [
+      "external/@/8.8.8.8",
+      "internal/@/8.8.8.8",
+    ]);
+    assert.deepEqual((await provider.list("example.com/external")).map((record) => record.id), ["foreign"]);
+    assert.deepEqual(await provider.list("example.com/internal"), []);
+  });
+
+  it("keeps the zone when provider records cannot be withdrawn so the deletion can be retried", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "root", { name: "@", type: "A", content: "8.8.8.8", ttl: 60 });
+    await service.apply("example.com");
+    provider.failure = new Error("provider is unreachable");
+
+    await assert.rejects(() => service.deleteZone("example.com"), /provider is unreachable/);
+    assert.equal((await service.getZone("example.com")).revision, 2);
+    assert.equal((await provider.list("example.com/external")).length, 1);
+
+    provider.failure = undefined;
+    await service.deleteZone("example.com");
+    assert.deepEqual(await provider.list("example.com/external"), []);
+  });
+
+  it("abandons provider records only when the caller asks for it explicitly", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "root", { name: "@", type: "A", content: "8.8.8.8", ttl: 60 });
+    await service.apply("example.com");
+
+    const result = await service.deleteZone("example.com", "bob", undefined, { abandonProviderRecords: true });
+
+    assert.deepEqual(result.removedProviderRecords, []);
+    assert.equal((await provider.list("example.com/external")).length, 1);
   });
 
   it("reports mismatched or impossible applied revisions as pending without a future applied state", async () => {

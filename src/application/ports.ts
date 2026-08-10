@@ -18,6 +18,12 @@ export interface ZoneDeletion {
   audit: Omit<AuditEntry, "id">;
 }
 
+/** A bounded window over an otherwise unbounded history listing. */
+export interface PageRequest {
+  readonly limit: number;
+  readonly offset: number;
+}
+
 export interface ZoneRepository {
   list(): Promise<Zone[]>;
   get(name: string): Promise<Zone | undefined>;
@@ -28,11 +34,13 @@ export interface ZoneRepository {
   commitDesiredChange(change: DesiredChange): Promise<void>;
   /** Atomically records the deletion audit event and removes the zone, revisions, and apply statuses. */
   commitZoneDeletion(deletion: ZoneDeletion): Promise<void>;
-  listRevisions(zone: string): Promise<ZoneRevision[]>;
+  /** Ascending by revision. With a page, returns the newest window, still ascending. */
+  listRevisions(zone: string, page?: PageRequest): Promise<ZoneRevision[]>;
   getRevision(zone: string, revision: number): Promise<ZoneRevision | undefined>;
   delete(name: string): Promise<void>;
   appendAudit(entry: Omit<AuditEntry, "id">): Promise<AuditEntry>;
-  audit(zone?: string): Promise<AuditEntry[]>;
+  /** Newest first. Without a page the complete history is returned. */
+  audit(zone?: string, page?: PageRequest): Promise<AuditEntry[]>;
 }
 
 export interface ProviderAdapter {

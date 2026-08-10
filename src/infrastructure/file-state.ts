@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { RevisionConflictError, type ApplyStatus, type DesiredChange, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { RevisionConflictError, type ApplyStatus, type DesiredChange, type PageRequest, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
 import { InMemoryApplyLock } from "./in-memory.ts";
 
@@ -121,9 +121,12 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
     });
   }
 
-  async listRevisions(zone: string): Promise<ZoneRevision[]> {
+  async listRevisions(zone: string, page?: PageRequest): Promise<ZoneRevision[]> {
     const state = await this.#readState();
-    return Object.values(state.revisions[zone] ?? {}).map(clone).sort((left, right) => left.revision - right.revision);
+    const ascending = Object.values(state.revisions[zone] ?? {}).map(clone).sort((left, right) => left.revision - right.revision);
+    if (!page) return ascending;
+    const end = Math.max(0, ascending.length - page.offset);
+    return ascending.slice(Math.max(0, end - page.limit), end);
   }
 
   async getRevision(zone: string, revision: number): Promise<ZoneRevision | undefined> {
@@ -148,9 +151,13 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
     });
   }
 
-  async audit(zone?: string): Promise<AuditEntry[]> {
+  async audit(zone?: string, page?: PageRequest): Promise<AuditEntry[]> {
     const state = await this.#readState();
-    return state.audit.filter((entry) => zone === undefined || entry.zone === zone).map(clone);
+    const newestFirst = state.audit
+      .filter((entry) => zone === undefined || entry.zone === zone)
+      .map(clone)
+      .sort((left, right) => right.id - left.id);
+    return page ? newestFirst.slice(page.offset, page.offset + page.limit) : newestFirst;
   }
 
   async deleteZone(zone: string): Promise<void> {
@@ -210,8 +217,22 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
     await mkdir(directory, { recursive: true });
     const temporaryPath = join(directory, `.${basename(this.#path)}.${process.pid}.${randomUUID()}.tmp`);
     try {
-      await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      // Flush the replacement and the directory entry so a crash after this
+      // call cannot leave a truncated or missing state file behind.
+      const file = await open(temporaryPath, "wx", 0o600);
+      try {
+        await file.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+        await file.sync();
+      } finally {
+        await file.close();
+      }
       await rename(temporaryPath, this.#path);
+      const directoryHandle = await open(directory, "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
     } catch (error) {
       await unlink(temporaryPath).catch(() => undefined);
       throw error;

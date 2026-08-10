@@ -46,6 +46,9 @@ export class FileProviderAdapter implements ProviderAdapter {
         if (operation.kind === "delete" && !operation.actual.managed) {
           throw new Error(`refusing to delete unmanaged file provider record ${operation.providerId}`);
         }
+        if (records.some((record) => record.providerId === operation.providerId && !record.managed)) {
+          throw new Error(`refusing to modify unmanaged file provider record ${operation.providerId}`);
+        }
         const index = records.findIndex((record) => record.providerId === operation.providerId && record.managed);
         if (index < 0) throw new Error(`managed file provider record ${operation.providerId} does not exist`);
         if (operation.kind === "update") records[index] = asManaged(operation.desired, operation.providerId);
@@ -105,7 +108,9 @@ function parseState(value: unknown): FileProviderState {
 }
 
 function parseProviderRecord(value: unknown): ProviderRecord {
-  if (!isObject(value) || typeof value.id !== "string" || typeof value.providerId !== "string" || value.managed !== true ||
+  // Unmanaged records are representable so drift, conflicts, and adoption behave
+  // here exactly as they do against a real provider.
+  if (!isObject(value) || typeof value.id !== "string" || typeof value.providerId !== "string" || typeof value.managed !== "boolean" ||
       typeof value.name !== "string" || !["A", "AAAA", "CNAME", "TXT"].includes(String(value.type)) ||
       typeof value.content !== "string" || !Number.isInteger(value.ttl) ||
       (value.proxied !== undefined && typeof value.proxied !== "boolean")) {
@@ -114,7 +119,7 @@ function parseProviderRecord(value: unknown): ProviderRecord {
   const record: ProviderRecord = {
     id: value.id,
     providerId: value.providerId,
-    managed: true,
+    managed: value.managed,
     name: value.name,
     type: value.type as ProviderRecord["type"],
     content: value.content,

@@ -1,10 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
-import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type PageRequest, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import {
   createDesiredRecord,
   normalizeZoneName,
-  validateViewName,
+  readPersistedViewName,
   type AuditEntry,
   type Zone,
   type ZoneRevision,
@@ -207,12 +207,21 @@ export class PostgresZoneRepository implements ZoneRepository {
     }
   }
 
-  async listRevisions(zone: string): Promise<ZoneRevision[]> {
+  async listRevisions(zone: string, page?: PageRequest): Promise<ZoneRevision[]> {
+    if (!page) {
+      const all = await this.#pool.query<SnapshotRow>(
+        "SELECT snapshot FROM parallax_zone_revisions WHERE zone_name = $1 ORDER BY revision",
+        [zone],
+      );
+      return all.rows.map((row) => readZone(row.snapshot));
+    }
+    // Page from the newest revision backwards, then restore ascending order.
     const result = await this.#pool.query<SnapshotRow>(
-      "SELECT snapshot FROM parallax_zone_revisions WHERE zone_name = $1 ORDER BY revision",
-      [zone],
+      `SELECT snapshot FROM parallax_zone_revisions WHERE zone_name = $1
+       ORDER BY revision DESC LIMIT $2 OFFSET $3`,
+      [zone, page.limit, page.offset],
     );
-    return result.rows.map((row) => readZone(row.snapshot));
+    return result.rows.map((row) => readZone(row.snapshot)).reverse();
   }
 
   async getRevision(zone: string, revision: number): Promise<ZoneRevision | undefined> {
@@ -239,15 +248,8 @@ export class PostgresZoneRepository implements ZoneRepository {
     return readAudit(result.rows[0]);
   }
 
-  async audit(zone?: string): Promise<AuditEntry[]> {
-    const result = zone === undefined
-      ? await this.#pool.query<AuditRow>(
-        "SELECT id, zone_name, revision, action, actor, occurred_at, detail FROM parallax_audit ORDER BY id",
-      )
-      : await this.#pool.query<AuditRow>(
-        "SELECT id, zone_name, revision, action, actor, occurred_at, detail FROM parallax_audit WHERE zone_name = $1 ORDER BY id",
-        [zone],
-      );
+  async audit(zone?: string, page?: PageRequest): Promise<AuditEntry[]> {
+    const result = await this.#pool.query<AuditRow>(...auditQuery(zone, page));
     return result.rows.map(readAudit);
   }
 }
@@ -387,6 +389,20 @@ interface StatusRow {
 const STATUS_COLUMNS = `SELECT zone_name, view_name, desired_revision, applied_revision,
   state, last_attempt_at, error FROM parallax_apply_statuses`;
 
+const AUDIT_COLUMNS = "SELECT id, zone_name, revision, action, actor, occurred_at, detail FROM parallax_audit";
+
+/** Newest first, so a bounded page is the most recent history rather than the oldest. */
+function auditQuery(zone: string | undefined, page: PageRequest | undefined): [string, unknown[]] {
+  if (zone === undefined) {
+    return page
+      ? [`${AUDIT_COLUMNS} ORDER BY id DESC LIMIT $1 OFFSET $2`, [page.limit, page.offset]]
+      : [`${AUDIT_COLUMNS} ORDER BY id DESC`, []];
+  }
+  return page
+    ? [`${AUDIT_COLUMNS} WHERE zone_name = $1 ORDER BY id DESC LIMIT $2 OFFSET $3`, [zone, page.limit, page.offset]]
+    : [`${AUDIT_COLUMNS} WHERE zone_name = $1 ORDER BY id DESC`, [zone]];
+}
+
 const AUDIT_ACTIONS = new Set<AuditEntry["action"]>([
   "zone.created", "zone.deleted", "record.upserted", "record.deleted", "desired.replaced", "desired.restored",
 ]);
@@ -402,7 +418,7 @@ function readZone(value: unknown): Zone {
   const viewNames = new Set<string>();
   const views = zone.views.map((candidate, viewIndex) => {
     const view = readObject(candidate, `zone view ${viewIndex}`);
-    const viewName = validateViewName(readString(view.name, "view name"));
+    const viewName = readPersistedViewName(readString(view.name, "view name"));
     if (viewNames.has(viewName)) throw new Error(`invalid PostgreSQL zone snapshot: duplicate view ${viewName}`);
     viewNames.add(viewName);
     if (!Array.isArray(view.records)) throw new Error("invalid PostgreSQL zone snapshot: records must be an array");
@@ -440,7 +456,7 @@ function readStatus(row: StatusRow): ApplyStatus {
   }
   const status: ApplyStatus = {
     zone: readString(row.zone_name, "status zone"),
-    view: validateViewName(readString(row.view_name, "status view")),
+    view: readPersistedViewName(readString(row.view_name, "status view")),
     desiredRevision: readNonNegativeInteger(row.desired_revision, "desired revision"),
     appliedRevision: readNonNegativeInteger(row.applied_revision, "applied revision"),
     state,

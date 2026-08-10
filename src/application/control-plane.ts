@@ -2,8 +2,10 @@ import {
   createDesiredRecord,
   concreteDnsTtl,
   DomainValidationError,
+  isProviderView,
   normalizeExternalRecords,
   normalizeZoneName,
+  readPersistedViewName,
   validateExternalRecords,
   validateViewName,
   type AuditEntry,
@@ -12,10 +14,47 @@ import {
   type ZoneRevision,
 } from "../domain/dns.ts";
 import { buildReconcilePlan, type ReconcilePlan } from "../domain/reconciliation.ts";
-import { RevisionConflictError, type ApplyLock, type ApplyStatus, type ProviderAdapter, type StatusRepository, type ZoneRepository } from "./ports.ts";
+import { ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type PageRequest, type ProviderAdapter, type StatusRepository, type ZoneRepository } from "./ports.ts";
 
 export class NotFoundError extends Error {}
 export class ConflictError extends Error {}
+
+export const DEFAULT_HISTORY_PAGE_SIZE = 50;
+export const MAX_HISTORY_PAGE_SIZE = 500;
+
+export interface DeleteZoneOptions {
+  /**
+   * Leave published records at the provider instead of withdrawing them. Needed
+   * only when the provider is gone for good and the zone must still be removed.
+   */
+  readonly abandonProviderRecords?: boolean;
+}
+
+export interface RemovedProviderRecord {
+  view: string;
+  id: string;
+  name: string;
+  type: string;
+  content: string;
+}
+
+export interface ZoneDeletionResult {
+  zone: string;
+  removedProviderRecords: RemovedProviderRecord[];
+}
+
+export type Paged<Key extends string, Item> = { [K in Key]: Item[] } & {
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+};
+
+/** Clamps caller-supplied paging so one request can never read an unbounded history. */
+function boundedPage(page: PageRequest | undefined): { limit: number; offset: number } {
+  const limit = Math.min(Math.max(Math.trunc(page?.limit ?? DEFAULT_HISTORY_PAGE_SIZE), 1), MAX_HISTORY_PAGE_SIZE);
+  const offset = Math.max(Math.trunc(page?.offset ?? 0), 0);
+  return { limit, offset };
+}
 
 export interface Clock {
   now(): Date;
@@ -67,13 +106,23 @@ export class ControlPlane {
     return zone;
   }
 
-  deleteZone(zoneName: string, actor = "system", expectedRevision?: number): Promise<void> {
-    return this.#exclusive(zoneName, () => this.#deleteZone(zoneName, actor, expectedRevision));
+  deleteZone(zoneName: string, actor = "system", expectedRevision?: number, options: DeleteZoneOptions = {}): Promise<ZoneDeletionResult> {
+    return this.#exclusive(zoneName, () => {
+      const zone = normalizeZoneName(zoneName);
+      // Deleting now removes provider records, so it takes the same cross-instance
+      // lock as apply and cannot interleave with a concurrent reconciliation.
+      return this.#applyLock.withZoneLock(zone, () => this.#deleteZone(zone, actor, expectedRevision, options));
+    });
   }
 
-  async #deleteZone(zoneName: string, actor: string, expectedRevision?: number): Promise<void> {
+  async #deleteZone(zoneName: string, actor: string, expectedRevision: number | undefined, options: DeleteZoneOptions): Promise<ZoneDeletionResult> {
     const zone = await this.getZone(zoneName);
     this.#assertExpectedRevision(zone, expectedRevision);
+    // Withdraw published records first: if that fails the zone stays in place so
+    // the operator can retry instead of being left with records nothing tracks.
+    const removedRecords = options.abandonProviderRecords === true
+      ? []
+      : await this.#purgeProviderRecords(zone);
     const revision = zone.revision + 1;
     try {
       await this.#zones.commitZoneDeletion({
@@ -85,9 +134,15 @@ export class ControlPlane {
           action: "zone.deleted",
           actor,
           at: this.#clock.now().toISOString(),
-          detail: { before: desiredState(zone), after: null },
+          detail: {
+            before: desiredState(zone),
+            after: null,
+            providerRecordsRemoved: removedRecords.length,
+            providerRecordsAbandoned: options.abandonProviderRecords === true,
+          },
         },
       });
+      return { zone: zone.name, removedProviderRecords: removedRecords };
     } catch (error) {
       if (!(error instanceof RevisionConflictError)) throw error;
       const current = await this.#zones.get(zone.name);
@@ -96,6 +151,37 @@ export class ControlPlane {
       }
       throw new ConflictError(`zone ${zone.name} changed while it was being deleted`);
     }
+  }
+
+  /**
+   * Reconciles every target this zone ever published to down to an empty desired
+   * state. Only records carrying Parallax's ownership marker are removed, so
+   * foreign records at the same names survive exactly as they do during apply.
+   */
+  async #purgeProviderRecords(zone: Zone): Promise<RemovedProviderRecord[]> {
+    const published = new Set<string>();
+    for (const view of reconcilableViews(materializeProviderViews(zone.views))) published.add(view.name);
+    for (const status of await this.#statuses.list(zone.name)) {
+      if (isProviderView(status.view)) published.add(status.view);
+    }
+
+    const removed: RemovedProviderRecord[] = [];
+    for (const view of [...published].sort()) {
+      const key = targetKey(zone.name, view);
+      const plan = buildReconcilePlan([], await this.#provider.list(key));
+      for (const operation of plan.operations) {
+        if (operation.kind !== "delete") continue;
+        await this.#provider.apply(key, operation);
+        removed.push({
+          view,
+          id: operation.actual.id,
+          name: operation.actual.name,
+          type: operation.actual.type,
+          content: operation.actual.content,
+        });
+      }
+    }
+    return removed;
   }
 
   upsertRecord(zoneName: string, viewName: string, id: string, input: unknown, actor = "system", expectedRevision?: number): Promise<Zone> {
@@ -161,9 +247,13 @@ export class ControlPlane {
     return updated;
   }
 
-  async listRevisions(zoneName: string): Promise<ZoneRevision[]> {
+  async listRevisions(zoneName: string, page?: PageRequest): Promise<Paged<"revisions", ZoneRevision>> {
     const zone = await this.getZone(zoneName);
-    return this.#zones.listRevisions(zone.name);
+    const bounds = boundedPage(page);
+    const fetched = await this.#zones.listRevisions(zone.name, { limit: bounds.limit + 1, offset: bounds.offset });
+    // Revisions come back ascending, so the extra probe row is the oldest one.
+    const hasMore = fetched.length > bounds.limit;
+    return { revisions: hasMore ? fetched.slice(1) : fetched, ...bounds, hasMore };
   }
 
   async getRevision(zoneName: string, revision: number): Promise<ZoneRevision> {
@@ -199,7 +289,7 @@ export class ControlPlane {
     const zone = await this.getZone(zoneName);
     const candidateViews = desiredInput === undefined ? zone.views : parseDesiredViews(desiredInput);
     validateExternalView(candidateViews);
-    const effectiveViews = materializeProviderViews(candidateViews);
+    const effectiveViews = reconcilableViews(materializeProviderViews(candidateViews));
     const selected = viewName ? [findView(effectiveViews, validateViewName(viewName))] : effectiveViews;
     const views: Record<string, ReconcilePlan> = {};
     for (const view of selected) {
@@ -222,9 +312,12 @@ export class ControlPlane {
     validateExternalView(zone.views);
     const storedStatuses = await this.#statuses.list(zone.name);
     const removedPendingViews = storedStatuses
-      .filter((status) => !zone.views.some((view) => view.name === status.view) && status.desiredRevision === zone.revision && status.state !== "applied")
+      .filter((status) => isProviderView(status.view)
+        && !zone.views.some((view) => view.name === status.view)
+        && status.desiredRevision === zone.revision
+        && status.state !== "applied")
       .map((status) => ({ name: status.view, records: [] as DesiredRecord[] }));
-    const availableViews = mergeRemovedViews(materializeProviderViews(zone.views), removedPendingViews);
+    const availableViews = mergeRemovedViews(reconcilableViews(materializeProviderViews(zone.views)), removedPendingViews);
     const selected = viewName ? [findView(availableViews, validateViewName(viewName))] : availableViews;
     const results: ApplyStatus[] = [];
     for (const view of selected) {
@@ -247,8 +340,9 @@ export class ControlPlane {
         await this.#statuses.save(status);
         results.push(status);
       } catch (error) {
-        const publicError = error instanceof ConflictError ? error.message : "provider operation failed";
-        if (!(error instanceof ConflictError)) {
+        const expected = error instanceof ConflictError || error instanceof ProviderNotConfiguredError;
+        const publicError = expected ? (error as Error).message : "provider operation failed";
+        if (!expected) {
           console.error("provider operation failed", { zone: zone.name, view: view.name, errorName: error instanceof Error ? error.name : "unknown" });
         }
         const status: ApplyStatus = {
@@ -287,8 +381,12 @@ export class ControlPlane {
     return { zone: zone.name, desiredRevision: zone.revision, statuses };
   }
 
-  audit(zoneName?: string): Promise<AuditEntry[]> {
-    return this.#zones.audit(zoneName ? normalizeZoneName(zoneName) : undefined);
+  async audit(zoneName?: string, page?: PageRequest): Promise<Paged<"entries", AuditEntry>> {
+    const bounds = boundedPage(page);
+    const zone = zoneName ? normalizeZoneName(zoneName) : undefined;
+    const fetched = await this.#zones.audit(zone, { limit: bounds.limit + 1, offset: bounds.offset });
+    const hasMore = fetched.length > bounds.limit;
+    return { entries: fetched.slice(0, bounds.limit), ...bounds, hasMore };
   }
 
   #nextRevision(zone: Zone, views: Zone["views"]): Zone {
@@ -339,12 +437,6 @@ export class ControlPlane {
       }
       throw new ConflictError(`zone ${zone.name} changed while the desired state was being saved`);
     }
-  }
-
-  #findView(zone: Zone, viewName: string): Zone["views"][number] {
-    const view = zone.views.find((candidate) => candidate.name === viewName);
-    if (!view) throw new NotFoundError(`view ${viewName} was not found`);
-    return view;
   }
 
   async #pendingStatus(zone: Zone, view: string): Promise<ApplyStatus> {
@@ -476,6 +568,15 @@ function deterministicInternalRecordId(record: DesiredRecord): string {
   }
   const suffix = `-${type.toLowerCase()}-${(hash >>> 0).toString(36)}`;
   return `internal-${owner.slice(0, 63 - suffix.length - 9)}${suffix}`;
+}
+
+/**
+ * Views a provider can actually reconcile. Snapshots written before views were
+ * restricted may still carry other names; they stay in the stored desired state
+ * so an operator can remove them, but they are never handed to a provider.
+ */
+function reconcilableViews(views: Zone["views"]): Zone["views"] {
+  return views.filter((view) => isProviderView(view.name));
 }
 
 function mergeRemovedViews(current: Zone["views"], removed: Zone["views"]): Zone["views"] {

@@ -1,6 +1,6 @@
 import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
-import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type ProviderAdapter, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type PageRequest, type ProviderAdapter, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 
 export class InMemoryApplyLock implements ApplyLock {
   readonly #tails = new Map<string, Promise<void>>();
@@ -105,10 +105,13 @@ export class InMemoryZoneRepository implements ZoneRepository, StatusRepository 
     this.#nextAuditId += 1;
   }
 
-  async listRevisions(zone: string): Promise<ZoneRevision[]> {
-    return [...(this.#revisions.get(zone)?.values() ?? [])]
+  async listRevisions(zone: string, page?: PageRequest): Promise<ZoneRevision[]> {
+    const ascending = [...(this.#revisions.get(zone)?.values() ?? [])]
       .map(cloneZone)
       .sort((left, right) => left.revision - right.revision);
+    if (!page) return ascending;
+    const end = Math.max(0, ascending.length - page.offset);
+    return ascending.slice(Math.max(0, end - page.limit), end);
   }
 
   async getRevision(zone: string, revision: number): Promise<ZoneRevision | undefined> {
@@ -127,8 +130,12 @@ export class InMemoryZoneRepository implements ZoneRepository, StatusRepository 
     return structuredClone(entry);
   }
 
-  async audit(zone?: string): Promise<AuditEntry[]> {
-    return this.#audit.filter((entry) => !zone || entry.zone === zone).map((entry) => structuredClone(entry));
+  async audit(zone?: string, page?: PageRequest): Promise<AuditEntry[]> {
+    const newestFirst = this.#audit
+      .filter((entry) => !zone || entry.zone === zone)
+      .map((entry) => structuredClone(entry))
+      .sort((left, right) => right.id - left.id);
+    return page ? newestFirst.slice(page.offset, page.offset + page.limit) : newestFirst;
   }
 
   async deleteZone(zone: string): Promise<void> {

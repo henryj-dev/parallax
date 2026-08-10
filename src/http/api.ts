@@ -88,10 +88,10 @@ async function route(controlPlane: ControlPlane, request: Request, credentials?:
     return json(await controlPlane.status(zone));
   }
   if ((segments[4] === "history" || segments[4] === "audit") && segments.length === 5 && request.method === "GET") {
-    return json({ entries: await controlPlane.audit(zone) });
+    return json(await controlPlane.audit(zone));
   }
   if (segments[4] === "revisions" && segments.length === 5 && request.method === "GET") {
-    return json({ revisions: await controlPlane.listRevisions(zone) });
+    return json(await controlPlane.listRevisions(zone));
   }
   if (segments[4] === "revisions" && segments.length === 6 && request.method === "GET") {
     return json(await controlPlane.getRevision(zone, readRevision(segments[5])));
