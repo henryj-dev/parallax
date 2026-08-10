@@ -15,6 +15,7 @@ const state = {
   previewRevision: null,
   loadingZone: false,
   authenticated: false,
+  authRequired: true,
   locale: resolveLocale({
     persistedLocale: readStoredLocale(),
     browserLocales: globalThis.navigator?.languages || [globalThis.navigator?.language],
@@ -24,6 +25,10 @@ const state = {
   planPayload: null,
   planError: "",
   credentials: [],
+  profiles: [],
+  selectedProfile: null,
+  selectedBinding: null,
+  providerPanel: "profiles",
   revisions: [],
   zonesLoadError: "",
   revisionsLoadError: "",
@@ -71,7 +76,7 @@ function renderLocalizedState() {
     if (state.revisionsLoadError) renderRevisionListError(state.revisionsLoadError);
     else renderRevisionList(state.revisions);
   }
-  if ($("#credential-dialog").open) renderCredentialList(state.credentials);
+  if ($("#credential-dialog").open) { renderProfileList(); renderCredentialList(); renderProfileOptions(); }
   if ($("#record-dialog").open) renderRecordDialogHeading();
   syncExternalTtl();
 }
@@ -733,45 +738,133 @@ async function signOut() {
 }
 
 function syncSessionControls() {
-  $("#sign-out-button").hidden = !state.authenticated;
+  // With authentication disabled there is no session to end, so the control is
+  // hidden rather than offering an action that cannot do anything.
+  $("#sign-out-button").hidden = !state.authRequired || !state.authenticated;
+}
+
+async function readAuthenticationMode() {
+  try {
+    const response = await fetch("/health/live", { credentials: "same-origin" });
+    const body = await response.json();
+    state.authRequired = body?.authentication !== "disabled";
+  } catch {
+    state.authRequired = true;
+  }
+  syncSessionControls();
 }
 
 async function openCredentialSettings() {
   const dialog = $("#credential-dialog");
-  const form = $("#credential-form");
-  form.reset();
-  form.elements.zone.value = zoneName(state.activeZone);
+  $("#profile-form").reset();
+  $("#credential-form").reset();
+  $("#profile-form-error").hidden = true;
   $("#credential-form-error").hidden = true;
-  setCredentialEditorEnabled(false);
-  $("#credential-list").innerHTML = '<div class="skeleton plan-skeleton"></div>';
   $("#credential-access-message").hidden = true;
+  state.selectedProfile = null;
+  state.selectedBinding = null;
+  $("#profile-list").innerHTML = '<div class="skeleton plan-skeleton"></div>';
+  $("#credential-list").innerHTML = '<div class="skeleton plan-skeleton"></div>';
+  selectProviderPanel("profiles");
+  setProviderEditorsEnabled(false);
   dialog.showModal();
+  await refreshProviderSettings();
+}
+
+function selectProviderPanel(panel) {
+  state.providerPanel = panel;
+  for (const tab of $$(".provider-tab")) tab.setAttribute("aria-selected", String(tab.dataset.panel === panel));
+  $("#panel-profiles").hidden = panel !== "profiles";
+  $("#panel-bindings").hidden = panel !== "bindings";
+}
+
+async function refreshProviderSettings() {
   try {
-    const payload = await api("/credentials/cloudflare");
-    const credentials = payload?.credentials || [];
-    renderCredentialList(credentials);
-    const current = credentials.find((credential) => credential.zone === zoneName(state.activeZone));
-    if (current) form.elements.zoneId.value = current.zoneId;
-    setCredentialEditorEnabled(Boolean(zoneName(state.activeZone)));
-    state.credentials = credentials;
-    if (!state.activeZone) showCredentialAccess("credentials.selectZone");
+    const [profilePayload, bindingPayload] = await Promise.all([
+      api("/credentials/profiles"),
+      api("/credentials/cloudflare"),
+    ]);
+    state.profiles = profilePayload?.profiles || [];
+    state.credentials = bindingPayload?.credentials || [];
+    $("#credential-access-message").hidden = true;
+    setProviderEditorsEnabled(true);
+    renderProfileList();
+    renderCredentialList();
+    renderProfileOptions();
+    renderZoneOptions();
   } catch (error) {
+    state.profiles = [];
     state.credentials = [];
-    renderCredentialList([]);
+    renderProfileList();
+    renderCredentialList();
     if (error.status === 403) showCredentialAccess("credentials.adminView", {}, true);
     else if (error.status === 404) showCredentialAccess("credentials.disabled");
     else showCredentialAccess("credentials.loadFailed", { error: error.message }, true);
   }
 }
 
-function renderCredentialList(credentials) {
-  $("#credential-list").innerHTML = credentials.length ? credentials.map((credential) => `<article class="credential-item"><b>${escapeHtml(credential.zone)}</b><small>${escapeHtml(t("credentials.zoneIdValue", { id: credential.zoneId }))}</small><small>${escapeHtml(t("credentials.updated", { date: formatDate(credential.updatedAt) }))}</small></article>`).join("") : `<div class="mini-empty">${escapeHtml(t("credentials.none"))}</div>`;
+function setProviderEditorsEnabled(enabled) {
+  for (const name of ["name", "accountId", "token", "probeZoneId"]) $("#profile-form").elements[name].disabled = !enabled;
+  for (const name of ["zone", "profile", "zoneId"]) $("#credential-form").elements[name].disabled = !enabled;
+  for (const id of ["#delete-profile-button", "#test-profile-button", "#save-profile-button",
+    "#delete-credential-button", "#test-credential-button", "#save-credential-button"]) $(id).disabled = !enabled;
 }
 
-function setCredentialEditorEnabled(enabled) {
+function renderProfileList() {
+  const profiles = state.profiles;
+  $("#profile-list").innerHTML = profiles.length ? profiles.map((profile) => {
+    const selected = profile.name === state.selectedProfile;
+    const zones = profile.zones?.length
+      ? `<span class="credential-zones">${profile.zones.map((zone) => `<span>${escapeHtml(zone)}</span>`).join("")}</span>`
+      : `<small>${escapeHtml(t("credentials.profileUnused"))}</small>`;
+    return `<article class="credential-item${selected ? " selected" : ""}"><button class="credential-pick" type="button" data-profile="${escapeHtml(profile.name)}"><b>${escapeHtml(profile.name)}</b><small>${escapeHtml(profile.accountId ? t("credentials.accountIdValue", { id: profile.accountId }) : t("credentials.accountIdMissing"))}</small><small>${escapeHtml(t("credentials.updated", { date: formatDate(profile.updatedAt) }))}</small>${zones}</button></article>`;
+  }).join("") : `<div class="mini-empty">${escapeHtml(t("credentials.profilesNone"))}</div>`;
+}
+
+function renderCredentialList() {
+  const bindings = state.credentials;
+  $("#credential-list").innerHTML = bindings.length ? bindings.map((binding) => {
+    const selected = binding.zone === state.selectedBinding;
+    return `<article class="credential-item${selected ? " selected" : ""}"><button class="credential-pick" type="button" data-binding="${escapeHtml(binding.zone)}"><b>${escapeHtml(binding.zone)}</b><small>${escapeHtml(t("credentials.profileValue", { name: binding.profile }))}</small><small>${escapeHtml(t("credentials.zoneIdValue", { id: binding.zoneId }))}</small><small>${escapeHtml(t("credentials.updated", { date: formatDate(binding.updatedAt) }))}</small></button></article>`;
+  }).join("") : `<div class="mini-empty">${escapeHtml(t("credentials.none"))}</div>`;
+}
+
+function renderProfileOptions() {
+  const select = $("#credential-profile-select");
+  const previous = select.value;
+  select.innerHTML = state.profiles.length
+    ? state.profiles.map((profile) => `<option value="${escapeHtml(profile.name)}">${escapeHtml(profile.name)}</option>`).join("")
+    : `<option value="">${escapeHtml(t("credentials.profilesNone"))}</option>`;
+  if (previous && state.profiles.some((profile) => profile.name === previous)) select.value = previous;
+}
+
+function renderZoneOptions() {
+  $("#credential-zone-options").innerHTML = state.zones
+    .map((zone) => `<option value="${escapeHtml(zoneName(zone))}"></option>`).join("");
+}
+
+function selectProfile(name) {
+  const profile = state.profiles.find((item) => item.name === name);
+  if (!profile) return;
+  state.selectedProfile = name;
+  const form = $("#profile-form");
+  form.elements.name.value = profile.name;
+  form.elements.accountId.value = profile.accountId || "";
+  form.elements.token.value = "";
+  $("#profile-form-error").hidden = true;
+  renderProfileList();
+}
+
+function selectBinding(zone) {
+  const binding = state.credentials.find((item) => item.zone === zone);
+  if (!binding) return;
+  state.selectedBinding = zone;
   const form = $("#credential-form");
-  for (const name of ["zoneId", "token"]) form.elements[name].disabled = !enabled;
-  for (const id of ["#delete-credential-button", "#test-credential-button", "#save-credential-button"]) $(id).disabled = !enabled;
+  form.elements.zone.value = binding.zone;
+  form.elements.zoneId.value = binding.zoneId;
+  form.elements.profile.value = binding.profile;
+  $("#credential-form-error").hidden = true;
+  renderCredentialList();
 }
 
 function showCredentialAccess(key, values = {}, denied = false) {
@@ -779,82 +872,138 @@ function showCredentialAccess(key, values = {}, denied = false) {
   setLiveMessage(element, key, values);
   element.className = `credential-access-message${denied ? " denied" : ""}`;
   element.hidden = false;
-  setCredentialEditorEnabled(false);
+  setProviderEditorsEnabled(false);
+}
+
+async function saveProfile(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.checkValidity()) { form.reportValidity(); return; }
+  const name = String(form.elements.name.value).trim().toLowerCase();
+  const accountId = String(form.elements.accountId.value).trim();
+  const token = String(form.elements.token.value);
+  if (!token.trim()) { showFormError("profile", "credentials.profileTokenRequired"); return; }
+  $("#save-profile-button").disabled = true;
+  try {
+    await api(`/credentials/profiles/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ token, ...(accountId ? { accountId } : {}) }),
+    });
+    form.elements.token.value = "";
+    $("#profile-form-error").hidden = true;
+    state.selectedProfile = name;
+    toast("credentials.profileSaved", { name });
+    await refreshProviderSettings();
+  } catch (error) {
+    showFormError("profile", error.status === 403 ? "credentials.adminSave" : "credentials.saveFailed",
+      error.status === 403 ? {} : { error: error.message });
+  } finally {
+    $("#save-profile-button").disabled = false;
+  }
+}
+
+async function testProfile() {
+  const form = $("#profile-form");
+  const name = String(form.elements.name.value).trim().toLowerCase();
+  const token = String(form.elements.token.value);
+  const zoneId = String(form.elements.probeZoneId.value).trim()
+    || state.credentials.find((binding) => binding.profile === name)?.zoneId
+    || "";
+  if (!name) { showFormError("profile", "credentials.profileNameRequired"); return; }
+  if (!zoneId) { showFormError("profile", "credentials.probeZoneIdRequired"); return; }
+  $("#test-profile-button").disabled = true;
+  try {
+    await api(`/credentials/profiles/${encodeURIComponent(name)}/test`, {
+      method: "POST",
+      body: JSON.stringify({ zoneId, ...(token.trim() ? { token } : {}) }),
+    });
+    $("#profile-form-error").hidden = true;
+    toast("credentials.profileAccepted", { name });
+  } catch (error) {
+    showFormError("profile", error.status === 403 ? "credentials.adminTest" : "credentials.testFailed",
+      error.status === 403 ? {} : { error: error.message });
+  } finally {
+    $("#test-profile-button").disabled = false;
+  }
+}
+
+async function deleteProfile() {
+  const name = String($("#profile-form").elements.name.value).trim().toLowerCase();
+  if (!name || !confirm(t("credentials.profileDeleteConfirm", { name }))) return;
+  $("#delete-profile-button").disabled = true;
+  try {
+    await api(`/credentials/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
+    $("#profile-form").reset();
+    state.selectedProfile = null;
+    toast("credentials.profileDeleted", { name });
+    await refreshProviderSettings();
+  } catch (error) {
+    showFormError("profile", error.status === 409 ? "credentials.profileInUse"
+      : error.status === 403 ? "credentials.adminDelete" : "credentials.deleteFailed",
+      error.status === 403 ? {} : { error: error.message });
+  } finally {
+    $("#delete-profile-button").disabled = false;
+  }
 }
 
 async function saveCredential(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  const zone = String(form.elements.zone.value);
+  if (!form.checkValidity()) { form.reportValidity(); return; }
+  const zone = String(form.elements.zone.value).trim().toLowerCase().replace(/\.$/, "");
   const zoneId = String(form.elements.zoneId.value).trim();
-  const token = String(form.elements.token.value);
-  if (!zoneId || !token.trim()) {
-    showFormError("credential", "credentials.required");
-    return;
-  }
+  const profile = String(form.elements.profile.value);
+  if (!profile) { showFormError("credential", "credentials.profileRequired"); return; }
   $("#save-credential-button").disabled = true;
   try {
-    await api(`/credentials/cloudflare/${encodeURIComponent(zone)}`, { method: "PUT", body: JSON.stringify({ zoneId, token }) });
-    form.elements.token.value = "";
+    await api(`/credentials/cloudflare/${encodeURIComponent(zone)}`, {
+      method: "PUT",
+      body: JSON.stringify({ zoneId, profile }),
+    });
     $("#credential-form-error").hidden = true;
+    state.selectedBinding = zone;
     toast("credentials.saved", { zone });
-    await refreshCredentialSettings();
+    await refreshProviderSettings();
   } catch (error) {
-    showFormError("credential", error.status === 403 ? "credentials.adminSave" : "credentials.saveFailed", error.status === 403 ? {} : { error: error.message });
+    showFormError("credential", error.status === 403 ? "credentials.adminSave" : "credentials.saveFailed",
+      error.status === 403 ? {} : { error: error.message });
   } finally {
     $("#save-credential-button").disabled = false;
   }
 }
 
 async function testCredential() {
-  const form = $("#credential-form");
-  const zone = String(form.elements.zone.value);
-  const zoneId = String(form.elements.zoneId.value).trim();
-  const token = String(form.elements.token.value);
-  if (token.trim() && !zoneId) {
-    showFormError("credential", "credentials.testNeedsZoneId");
-    return;
-  }
+  const zone = String($("#credential-form").elements.zone.value).trim().toLowerCase().replace(/\.$/, "");
+  if (!zone) { showFormError("credential", "credentials.selectZone"); return; }
   $("#test-credential-button").disabled = true;
   try {
-    await api(`/credentials/cloudflare/${encodeURIComponent(zone)}/test`, {
-      method: "POST",
-      ...(token.trim() ? { body: JSON.stringify({ zoneId, token }) } : {}),
-    });
-    form.elements.token.value = "";
+    await api(`/credentials/cloudflare/${encodeURIComponent(zone)}/test`, { method: "POST" });
     $("#credential-form-error").hidden = true;
     toast("credentials.accepted", { zone });
   } catch (error) {
-    showFormError("credential", error.status === 403 ? "credentials.adminTest" : "credentials.testFailed", error.status === 403 ? {} : { error: error.message });
+    showFormError("credential", error.status === 403 ? "credentials.adminTest" : "credentials.testFailed",
+      error.status === 403 ? {} : { error: error.message });
   } finally {
     $("#test-credential-button").disabled = false;
   }
 }
 
 async function deleteCredential() {
-  const zone = String($("#credential-form").elements.zone.value);
-  if (!confirm(t("credentials.deleteConfirm", { zone }))) return;
+  const zone = String($("#credential-form").elements.zone.value).trim().toLowerCase().replace(/\.$/, "");
+  if (!zone || !confirm(t("credentials.deleteConfirm", { zone }))) return;
   $("#delete-credential-button").disabled = true;
   try {
     await api(`/credentials/cloudflare/${encodeURIComponent(zone)}`, { method: "DELETE" });
-    $("#credential-form").elements.zoneId.value = "";
-    $("#credential-form").elements.token.value = "";
+    $("#credential-form").reset();
+    state.selectedBinding = null;
     toast("credentials.deleted", { zone });
-    await refreshCredentialSettings();
+    await refreshProviderSettings();
   } catch (error) {
-    showFormError("credential", error.status === 403 ? "credentials.adminDelete" : "credentials.deleteFailed", error.status === 403 ? {} : { error: error.message });
+    showFormError("credential", error.status === 403 ? "credentials.adminDelete" : "credentials.deleteFailed",
+      error.status === 403 ? {} : { error: error.message });
   } finally {
     $("#delete-credential-button").disabled = false;
   }
-}
-
-async function refreshCredentialSettings() {
-  const payload = await api("/credentials/cloudflare");
-  const credentials = payload?.credentials || [];
-  state.credentials = credentials;
-  renderCredentialList(credentials);
-  const current = credentials.find((credential) => credential.zone === zoneName(state.activeZone));
-  $("#credential-form").elements.zoneId.value = current?.zoneId || "";
 }
 
 function setLiveMessage(element, key, values = {}) {
@@ -930,6 +1079,18 @@ $("#credential-settings-button").addEventListener("click", openCredentialSetting
 $("#credential-form").addEventListener("submit", saveCredential);
 $("#test-credential-button").addEventListener("click", testCredential);
 $("#delete-credential-button").addEventListener("click", deleteCredential);
+$("#profile-form").addEventListener("submit", saveProfile);
+$("#test-profile-button").addEventListener("click", testProfile);
+$("#delete-profile-button").addEventListener("click", deleteProfile);
+for (const tab of $$(".provider-tab")) tab.addEventListener("click", () => selectProviderPanel(tab.dataset.panel));
+$("#profile-list").addEventListener("click", (event) => {
+  const pick = event.target.closest("[data-profile]");
+  if (pick) selectProfile(pick.dataset.profile);
+});
+$("#credential-list").addEventListener("click", (event) => {
+  const pick = event.target.closest("[data-binding]");
+  if (pick) selectBinding(pick.dataset.binding);
+});
 $("#add-record-button").addEventListener("click", () => openRecordDialog());
 $("#record-form").addEventListener("submit", saveRecord);
 $("#record-form [name=type]").addEventListener("change", () => { syncProxyAvailability(); syncExternalTtl(); syncAddressSafetyWarning(); });
@@ -972,4 +1133,5 @@ window.addEventListener("beforeunload", (event) => { if (state.dirty) event.prev
 setLocale(state.locale);
 syncSessionControls();
 showWelcome(true);
+readAuthenticationMode();
 loadZones();

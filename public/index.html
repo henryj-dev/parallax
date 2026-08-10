@@ -201,30 +201,58 @@
       <div id="revisions-content" class="revision-list" aria-live="polite"></div>
     </dialog>
 
-    <dialog id="credential-dialog" class="wide-dialog">
-      <form id="credential-form" method="dialog">
-        <div class="dialog-heading"><span><span class="eyebrow" data-i18n="credentials.eyebrow">Administrator settings</span><h2 data-i18n="credentials.title">Cloudflare credentials</h2></span><button class="icon-button" type="button" data-close-dialog aria-label="Close dialog" data-i18n-aria-label="dialog.close">×</button></div>
-        <p data-i18n="credentials.body">Credentials are encrypted by the server. API tokens are write-only and are never returned to this portal.</p>
-        <div id="credential-access-message" class="credential-access-message" hidden></div>
+    <dialog id="credential-dialog" class="wide-dialog provider-dialog">
+      <div class="dialog-heading"><span><span class="eyebrow" data-i18n="credentials.eyebrow">Administrator settings</span><h2 data-i18n="credentials.title">Cloudflare credentials</h2></span><button class="icon-button" type="button" data-close-dialog aria-label="Close dialog" data-i18n-aria-label="dialog.close">×</button></div>
+      <p data-i18n="credentials.body">A profile holds one account ID and API token and can be reused by any number of apex domains. Tokens are encrypted by the server and are never returned to this portal.</p>
+      <div id="credential-access-message" class="credential-access-message" hidden></div>
+
+      <div class="provider-tabs" role="tablist" aria-label="Provider settings sections" data-i18n-aria-label="credentials.sections">
+        <button class="provider-tab" id="tab-profiles" type="button" role="tab" aria-controls="panel-profiles" aria-selected="true" data-panel="profiles" data-i18n="credentials.profilesTab">Credential profiles</button>
+        <button class="provider-tab" id="tab-bindings" type="button" role="tab" aria-controls="panel-bindings" aria-selected="false" data-panel="bindings" data-i18n="credentials.bindingsTab">Apex domains</button>
+      </div>
+
+      <section id="panel-profiles" class="provider-panel" role="tabpanel" aria-labelledby="tab-profiles">
         <div class="credential-layout">
-          <section aria-labelledby="configured-credentials-title">
-            <span class="eyebrow" id="configured-credentials-title" data-i18n="credentials.configured">Configured zones</span>
+          <div>
+            <span class="eyebrow" data-i18n="credentials.profilesConfigured">Saved profiles</span>
+            <div id="profile-list" class="credential-list" aria-live="polite"><div class="skeleton plan-skeleton"></div></div>
+          </div>
+          <form id="profile-form" class="credential-editor" method="dialog">
+            <span class="eyebrow" data-i18n="credentials.profileEditor">Profile</span>
+            <label><span data-i18n="credentials.profileName">Profile name</span><input name="name" type="text" required pattern="[a-z0-9][a-z0-9_-]*" data-validation-label="credentials.profileName" autocomplete="off" spellcheck="false" placeholder="production-account" data-i18n-placeholder="credentials.profileNamePlaceholder"></label>
+            <label><span data-i18n="credentials.accountId">Cloudflare account ID</span><input name="accountId" type="text" autocomplete="off" spellcheck="false"></label>
+            <label><span data-i18n="credentials.apiToken">API token</span><input name="token" type="password" required data-validation-label="credentials.apiToken" autocomplete="new-password" spellcheck="false" placeholder="Write-only; re-enter to rotate" data-i18n-placeholder="credentials.profileTokenPlaceholder"></label>
+            <label><span data-i18n="credentials.probeZoneId">Zone ID used to test this token</span><input name="probeZoneId" type="text" autocomplete="off" spellcheck="false"></label>
+            <div class="form-error" id="profile-form-error" role="alert" hidden></div>
+            <div class="dialog-actions credential-actions">
+              <button class="button quiet danger-button" id="delete-profile-button" type="button" data-i18n="credentials.profileDelete">Delete profile</button>
+              <button class="button quiet" id="test-profile-button" type="button" data-i18n="credentials.test">Test connection</button>
+              <button class="button primary" id="save-profile-button" type="submit" data-i18n="credentials.profileSave">Save profile</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section id="panel-bindings" class="provider-panel" role="tabpanel" aria-labelledby="tab-bindings" hidden>
+        <div class="credential-layout">
+          <div>
+            <span class="eyebrow" data-i18n="credentials.configured">Configured apex domains</span>
             <div id="credential-list" class="credential-list" aria-live="polite"><div class="skeleton plan-skeleton"></div></div>
-          </section>
-          <section class="credential-editor" aria-labelledby="credential-editor-title">
-            <span class="eyebrow" id="credential-editor-title" data-i18n="credentials.current">Current zone</span>
-            <label><span data-i18n="credentials.zone">Zone</span><input name="zone" type="text" readonly></label>
+          </div>
+          <form id="credential-form" class="credential-editor" method="dialog">
+            <span class="eyebrow" data-i18n="credentials.bindingEditor">Apex domain</span>
+            <label><span data-i18n="credentials.zone">Apex domain</span><input name="zone" type="text" required list="credential-zone-options" data-validation-label="credentials.zone" autocomplete="off" spellcheck="false" placeholder="example.com"><datalist id="credential-zone-options"></datalist></label>
+            <label><span data-i18n="credentials.profile">Credential profile</span><select name="profile" id="credential-profile-select" required data-validation-label="credentials.profile"></select></label>
             <label><span data-i18n="credentials.zoneId">Cloudflare zone ID</span><input name="zoneId" type="text" required data-validation-label="credentials.zoneId" autocomplete="off" spellcheck="false"></label>
-            <label><span data-i18n="credentials.apiToken">API token</span><input name="token" type="password" placeholder="Leave empty to test the saved token" data-i18n-placeholder="credentials.tokenPlaceholder" autocomplete="new-password" spellcheck="false"></label>
             <div class="form-error" id="credential-form-error" role="alert" hidden></div>
             <div class="dialog-actions credential-actions">
-              <button class="button quiet danger-button" id="delete-credential-button" type="button" data-i18n="credentials.delete">Delete saved credential</button>
+              <button class="button quiet danger-button" id="delete-credential-button" type="button" data-i18n="credentials.delete">Remove binding</button>
               <button class="button quiet" id="test-credential-button" type="button" data-i18n="credentials.test">Test connection</button>
-              <button class="button primary" id="save-credential-button" type="submit" data-i18n="credentials.save">Save credential</button>
+              <button class="button primary" id="save-credential-button" type="submit" data-i18n="credentials.save">Save binding</button>
             </div>
-          </section>
+          </form>
         </div>
-      </form>
+      </section>
     </dialog>
 
     <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>

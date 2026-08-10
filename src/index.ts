@@ -41,7 +41,14 @@ const credentialManager = config.credentialFile && config.credentialMasterKey ? 
   environmentAdapters: externalProviders,
   ownershipSecret: config.ownershipSecret!,
 }) : undefined;
-await credentialManager?.initialize();
+try {
+  await credentialManager?.initialize();
+} catch (error) {
+  // A credential file that cannot be decrypted is usually a mismatched master
+  // key. Fail with one actionable line instead of an unhandled rejection.
+  console.error(`parallax: ${error instanceof Error ? error.message : "credential store could not be opened"}. Check PARALLAX_CREDENTIAL_MASTER_KEY matches the key that wrote ${config.credentialFile}.`);
+  process.exit(1);
+}
 const controlPlane = new ControlPlane(persisted.zones, persisted.statuses, provider, undefined, persisted.applyLock, {
   maxRevisionsPerZone: config.revisionRetention,
   auditRetentionDays: config.auditRetentionDays,
@@ -87,7 +94,13 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
   if (pathname === "/health/live") {
     response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-    response.end(JSON.stringify({ status: "ok", service: "parallax" }));
+    // Whether a token is required is not a secret -- an unauthenticated request
+    // already reveals it -- and the portal needs it to know if it can sign out.
+    response.end(JSON.stringify({
+      status: "ok",
+      service: "parallax",
+      authentication: config.security.enabled ? "required" : "disabled",
+    }));
     return;
   }
   if (pathname === "/health/ready") {
