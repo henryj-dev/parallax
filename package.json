@@ -5,13 +5,18 @@
   "description": "A split-horizon DNS control plane",
   "type": "module",
   "scripts": {
+    "audit": "pnpm audit --audit-level moderate",
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit -p tsconfig.test.json",
     "dev": "node --env-file-if-exists=.env --watch src/index.ts",
     "start": "node --env-file-if-exists=.env dist/index.js",
     "test": "node --test",
     "test:coverage": "node --test --experimental-test-coverage",
-    "test:watch": "node --test --watch"
+    "test:watch": "node --test --watch",
+    "verify:cloudflare": "bash scripts/verify-cloudflare.sh",
+    "verify:coredns": "bash scripts/verify-coredns.sh",
+    "verify:integration": "pnpm verify:postgres && pnpm verify:coredns && pnpm verify:cloudflare",
+    "verify:postgres": "bash scripts/verify-postgres.sh"
   },
   "engines": {
     "node": ">=24"
