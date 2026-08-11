@@ -185,6 +185,12 @@ PARALLAX_CONFIG_FILE="$WORK/native-configuration.json" \
 PARALLAX_AUTH_TOKENS="[{\"token\":\"${TOKEN}\",\"subject\":\"proxy-verify\",\"role\":\"admin\"}]" \
   node "$ROOT/src/index.ts" > "$WORK/native.log" 2>&1 &
 APP_PID=$!
+configure_native() {
+  curl -sk -X PUT -H "Authorization: Bearer ${TOKEN}" -H 'content-type: application/json' \
+    -d "$1" --resolve "${HOSTNAME_UNDER_TEST}:${NATIVE_PORT}:127.0.0.1" \
+    "${NATIVE_SITE}/api/v1/settings" >/dev/null \
+    || fail "could not apply settings over native TLS: $1"
+}
 native() {
   local method="$1" path="$2"; shift 2
   curl -sk -X "$method" --resolve "${HOSTNAME_UNDER_TEST}:${NATIVE_PORT}:127.0.0.1" \
@@ -212,12 +218,27 @@ CODE=$(native POST /api/v1/zones -H 'content-type: application/json' -d '{"name"
 [ "$CODE" = "201" ] || fail "cookie-authenticated write over native TLS returned $CODE"
 ok "a cookie-authenticated write reaches the control plane"
 
-REDIRECT=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
-  "http://127.0.0.1:$((NATIVE_PORT + 1))/api/v1/zones")
+redirect_of() {
+  curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
+    -H "Host: ${HOSTNAME_UNDER_TEST}" "http://127.0.0.1:$((NATIVE_PORT + 1))/api/v1/zones"
+}
+REDIRECT=$(redirect_of)
+[ "$REDIRECT" = "308 https://${HOSTNAME_UNDER_TEST}/api/v1/zones" ] \
+  || fail "expected a 308 to the requested host with no port, got: $REDIRECT"
+# The port this process bound is not the port the client reached it on -- a
+# Service or a published container port maps between them. Naming the bound port
+# here sent clients to a port nothing answered on.
 case "$REDIRECT" in
-  "308 https://"*"/api/v1/zones") ok "plain HTTP is redirected to TLS, path intact ($REDIRECT)" ;;
-  *) fail "expected a 308 to https, got: $REDIRECT" ;;
+  *":${NATIVE_PORT}"*) fail "the redirect named the bound port: $REDIRECT" ;;
 esac
+ok "plain HTTP is redirected to the requested host, path intact, no bound port ($REDIRECT)"
+
+configure_native "{\"publicOrigin\":\"${NATIVE_SITE}\"}"
+REDIRECT=$(redirect_of)
+[ "$REDIRECT" = "308 ${NATIVE_SITE}/api/v1/zones" ] \
+  || fail "publicOrigin was ignored by the redirect: $REDIRECT"
+ok "a configured publicOrigin is what the redirect sends clients to"
+configure_native '{"publicOrigin":""}'
 
 echo "== a renewed certificate is picked up without a restart =="
 # The failure this prevents arrives months later: a pod presenting a certificate

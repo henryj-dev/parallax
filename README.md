@@ -115,9 +115,12 @@ HOST=0.0.0.0 PORT=443 parallax-server
 
 Nothing else changes. The server knows it ended the connection, so the same
 proof of same-origin that `publicOrigin` supplies behind a proxy is derived
-without configuration, and cookies carry `Secure`. Setting `publicOrigin` is
-still worthwhile when the hostname is fixed, because it is what the redirect
-listener sends clients to.
+without configuration, and cookies carry `Secure`. Set `publicOrigin` when the address is fixed. It is what the redirect listener
+sends clients to, and without it the redirect can only assume TLS on 443 at the
+host the client asked for -- the port this process bound is not the port a
+client reached it on once a Service or a published container port maps between
+them. The server says so at startup when a redirect listener is running without
+one.
 
 A certificate replaced on disk is picked up without a restart. The directory is
 watched rather than the file, because a Kubernetes secret mount is renewed by

@@ -227,19 +227,21 @@ server.keepAliveTimeout = 10_000;
  * Answers plaintext with the address the client should have used. It carries no
  * application behaviour on purpose: this listener exists so a typed hostname
  * arrives over TLS, and anything else it could do would be reachable without
- * one. The target comes from `publicOrigin` when an administrator set it, and
- * otherwise from the host the client asked for, so a deployment that has not
- * configured an origin still redirects to itself rather than nowhere.
+ * one.
+ *
+ * `publicOrigin` is the answer when an administrator set one. Without it the
+ * host the client asked for is used and the port is left implied, because the
+ * port this process bound is not the port the client reached it on: a Kubernetes
+ * Service or a published container port maps one to the other, and that mapping
+ * is invisible from in here. Naming the bound port would send clients to a port
+ * nothing answers on -- in exactly the deployments this listener exists for.
  */
 if (config.httpRedirectPort !== undefined) {
   const redirector = createServer((request, response) => {
     setSecurityHeaders(response);
     const configured = settingsService.current().publicOrigin;
-    // The TLS port is only implied when it is the default one; anywhere else the
-    // redirect has to carry it or it points at a port nothing is listening on.
-    const suffix = config.port === 443 ? "" : `:${config.port}`;
     const host = (request.headers.host ?? "").split(":")[0] || config.host;
-    const origin = configured || `https://${host}${suffix}`;
+    const origin = configured || `https://${host}`;
     response.writeHead(308, { location: `${origin}${request.url ?? "/"}`, "cache-control": "no-store" });
     response.end();
   });
@@ -247,6 +249,9 @@ if (config.httpRedirectPort !== undefined) {
   redirector.requestTimeout = 15_000;
   redirector.listen(config.httpRedirectPort, config.host, () => {
     console.log(`parallax: redirecting http://${config.host}:${config.httpRedirectPort} to TLS`);
+    if (!settingsService.current().publicOrigin) {
+      console.warn("parallax: no publicOrigin is set, so redirects assume TLS on 443 at the requested host. Set it if clients reach this deployment at any other address.");
+    }
   });
 }
 
