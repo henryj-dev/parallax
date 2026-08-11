@@ -20,7 +20,7 @@ export interface CoreDnsFileAdapterOptions {
 interface ParsedLine {
   lineIndex: number;
   record: ProviderRecord;
-  ownership?: { target: string; recordId: string };
+  ownership?: { recordId: string };
 }
 
 /** Provider-compatible adapter for CoreDNS's RFC 1035 file plugin. */
@@ -97,8 +97,8 @@ function parseDocument(contents: string, target: string, ownershipSecret: string
       throw new Error(`CoreDNS zone file line ${logical.startLine + 1} has ${fields.type} data this adapter cannot read`);
     }
 
-    const ownership = readOwnershipComment(logical.comment?.trim(), ownershipSecret);
-    const managed = ownership?.target === target;
+    const ownership = readOwnershipComment(logical.comment?.trim(), ownershipSecret, target);
+    const managed = ownership !== undefined;
     const lineNumber = logical.startLine + 1;
     result.push({
       lineIndex: logical.startLine,

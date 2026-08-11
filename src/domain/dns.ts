@@ -61,7 +61,7 @@ export class DomainValidationError extends Error {
 const DNS_LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
 /** RFC 8552 underscored names (`_dmarc`, `_acme-challenge`, `sel._domainkey`). */
 const UNDERSCORED_LABEL = /^_(?!-)[a-z0-9-]{1,62}(?<!-)$/;
-const IDENTIFIER = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+const IDENTIFIER = /^[a-z0-9][a-z0-9_-]{0,35}$/;
 
 export function normalizeZoneName(value: string): string {
   const zone = value.trim().toLowerCase().replace(/\.$/, "");
@@ -101,7 +101,12 @@ export function isProviderView(value: string): value is ProviderView {
 export function validateRecordId(value: string): string {
   const id = value.trim();
   if (!IDENTIFIER.test(id)) {
-    throw new DomainValidationError(["record id must contain only lowercase letters, digits, _ or -"]);
+    // The bound is the ownership marker's: a provider comment cannot exceed 100
+    // characters, and the id is what varies inside it. Rejecting here means a
+    // record cannot be created that only fails later, at the provider.
+    throw new DomainValidationError([
+      "record id must be 1 to 36 lowercase letters, digits, _ or -, and must start with a letter or digit",
+    ]);
   }
   return id;
 }

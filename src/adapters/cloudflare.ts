@@ -61,8 +61,8 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
         if (!record || !isSupportedType(record.type)) continue;
         const name = relativeName(record.name, zone);
         if (name === undefined) continue;
-        const ownership = readOwnershipComment(record.comment, this.#ownershipSecret);
-        const managed = ownership?.target === target;
+        const ownership = readOwnershipComment(record.comment, this.#ownershipSecret, target);
+        const managed = ownership !== undefined;
         const mapped: ProviderRecord = {
           id: managed ? ownership.recordId : record.id,
           providerId: record.id,
@@ -106,7 +106,7 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
   async #assertOwned(target: string, providerId: string): Promise<void> {
     const payload = await this.#request("GET", `/zones/${encodeURIComponent(this.#zoneId)}/dns_records/${encodeURIComponent(providerId)}`);
     const record = asCloudflareRecord(payload.result);
-    if (!record || readOwnershipComment(record.comment, this.#ownershipSecret)?.target !== target) {
+    if (!record || !readOwnershipComment(record.comment, this.#ownershipSecret, target)) {
       throw new Error(`Cloudflare record ${providerId} is not owned by target ${target}`);
     }
   }
