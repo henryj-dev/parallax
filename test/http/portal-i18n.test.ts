@@ -20,6 +20,7 @@ import {
   createSemanticMessage,
   writePersistedLocale,
 } from "../../public/i18n.js";
+import { createStore, type StoreNotice } from "../../public/store.js";
 
 describe("portal internationalization", () => {
   it("resolves a persisted choice before browser preferences", () => {
@@ -153,5 +154,43 @@ describe("portal internationalization", () => {
       assert.ok(server.includes(`file: "${file}"`), file);
     }
     assert.equal(createTranslator("ko")("meta.title"), "Parallax — DNS 관측소");
+  });
+});
+
+describe("portal store", () => {
+  it("carries a settings warning to whoever made the change", async () => {
+    const store = createStore({
+      saveSettings: async () => ({
+        settings: { publicOrigin: "" },
+        warnings: ["publicOrigin is empty, so redirects assume 443"],
+      }),
+    });
+    const notices: StoreNotice[] = [];
+    store.onNotice((notice) => { notices.push(notice); });
+
+    assert.equal(await store.saveSettings({ publicOrigin: "" }), true);
+    // The success notice alone would report a change that quietly cost something.
+    assert.deepEqual(notices.map((notice) => notice.key), ["settings.saved", "settings.warning"]);
+    const warning = notices[1]!;
+    assert.equal(warning.level, "warning");
+    assert.equal(warning.values.message, "publicOrigin is empty, so redirects assume 443");
+
+    // A key with no translation renders as the key itself, which is how this
+    // reaches a user as `settings.warning` instead of a sentence.
+    for (const locale of Object.keys(messages)) {
+      const translated = createTranslator(locale)(warning.key, warning.values);
+      assert.notEqual(translated, warning.key, locale);
+      assert.match(translated, /publicOrigin is empty/, locale);
+    }
+  });
+
+  it("says nothing extra when a change costs nothing", async () => {
+    const store = createStore({
+      saveSettings: async () => ({ settings: { publicOrigin: "https://dns.example.com" } }),
+    });
+    const keys: string[] = [];
+    store.onNotice((notice) => { keys.push(notice.key); });
+    await store.saveSettings({ publicOrigin: "https://dns.example.com" });
+    assert.deepEqual(keys, ["settings.saved"]);
   });
 });
