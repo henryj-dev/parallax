@@ -369,7 +369,17 @@ export class ControlPlane {
         const expected = error instanceof ConflictError || error instanceof ProviderNotConfiguredError;
         const publicError = expected ? (error as Error).message : "provider operation failed";
         if (!expected) {
-          console.error("provider operation failed", { zone: zone.name, view: view.name, errorName: error instanceof Error ? error.name : "unknown" });
+          // The message stays hidden -- a provider error can carry a token or a
+          // path. A system error's `code` carries neither: it names the syscall
+          // failure class, which is the difference between "read-only volume"
+          // and "provider rejected it" for whoever reads this line.
+          const code = (error as NodeJS.ErrnoException | undefined)?.code;
+          console.error("provider operation failed", {
+            zone: zone.name,
+            view: view.name,
+            errorName: error instanceof Error ? error.name : "unknown",
+            ...(typeof code === "string" ? { errorCode: code } : {}),
+          });
         }
         const status: ApplyStatus = {
           zone: zone.name,
