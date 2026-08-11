@@ -14,6 +14,7 @@ import type { ParallaxConfig } from "./config.ts";
 import { createFileStateAdapters } from "./infrastructure/file-state.ts";
 import { FileConfigurationStore } from "./infrastructure/file-settings.ts";
 import { FileProviderAdapter } from "./infrastructure/file-provider.ts";
+import { applyMigrations, findMigrationsDirectory, type MigrationRun } from "./infrastructure/migrations.ts";
 import {
   createPostgresAdapters,
   createPostgresPool,
@@ -35,6 +36,11 @@ export interface ParallaxRuntime extends CommandRuntime {
   readonly accessTokens: AccessTokenService;
   readonly credentials?: CloudflareCredentialManager;
   readonly provider: RoutingProviderAdapter;
+  close(): Promise<void>;
+}
+
+/** A runtime that has not read the store, because the store may not exist yet. */
+export interface MigrationRuntime extends CommandRuntime {
   close(): Promise<void>;
 }
 
@@ -116,6 +122,9 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     controlPlane,
     settings,
     accessTokens,
+    // Only a database has a schema to apply. With the file backend the command
+    // reports itself unavailable rather than pretending it did something.
+    ...(pool ? { migrate: () => applyMigrations(pool, findMigrationsDirectory(import.meta.dirname)) } : {}),
     ...(credentials ? { credentials } : {}),
     provider,
     close: async () => { await pool?.end().catch(() => undefined); },
@@ -141,6 +150,23 @@ async function writeFailure(path: string): Promise<string | undefined> {
       candidate = parent;
     }
   }
+}
+
+/**
+ * Just enough to apply the schema. `createRuntime` reads settings and tokens out
+ * of the store while starting, which cannot work on a database whose tables do
+ * not exist yet -- the exact situation migrating exists to resolve. This builds
+ * the connection and nothing that reads through it.
+ */
+export function createMigrationRuntime(config: ParallaxConfig): MigrationRuntime {
+  // Without a database there is no schema, and the command says so rather than
+  // this function inventing a reason to fail.
+  if (!config.databaseUrl) return { close: async () => undefined };
+  const pool = createPostgresPool(config.databaseUrl);
+  return {
+    migrate: () => applyMigrations(pool, findMigrationsDirectory(import.meta.dirname)),
+    close: async () => { await pool.end().catch(() => undefined); },
+  };
 }
 
 function message(error: unknown): string {

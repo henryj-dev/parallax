@@ -126,6 +126,35 @@ describe("command layer", () => {
     };
     await assert.rejects(runCommand(bare, "settings get"), CommandUnavailableError);
     await assert.rejects(runCommand(bare, "credential profile list"), CommandUnavailableError);
+    // The file backend has no schema, so migrating is refused rather than
+    // reported as a no-op success.
+    await assert.rejects(runCommand(bare, "migrate"), CommandUnavailableError);
+  });
+
+  it("applies the schema through the same command layer as everything else", async () => {
+    const parallax = await context();
+    const runs: number[] = [];
+    const withDatabase: CommandContext = {
+      ...parallax,
+      runtime: {
+        ...parallax.runtime,
+        migrate: async () => {
+          runs.push(1);
+          return { directory: "/app/migrations", applied: ["001_initial.sql"] };
+        },
+      },
+    };
+    assert.deepEqual(await runCommand(withDatabase, "migrate"), {
+      directory: "/app/migrations",
+      applied: ["001_initial.sql"],
+    });
+    assert.equal(runs.length, 1);
+    await assert.rejects(
+      runCommand({ ...withDatabase, role: "editor" }, "migrate"),
+      (error: unknown) => error instanceof CommandPermissionError,
+    );
+    // A refused caller must not have reached the database at all.
+    assert.equal(runs.length, 1);
   });
 
   it("coerces argv strings into the types each option declares", async () => {

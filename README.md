@@ -183,8 +183,19 @@ size the revision bound to the rollback window you actually need.
 For a PostgreSQL deployment, apply the schema before starting the service:
 
 ```sh
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
+parallax migrate
 ```
+
+It replays every file in `migrations/` in name order and is safe to re-run:
+each object is created with `IF NOT EXISTS` and each file carries its own
+transaction, so there is no version table deciding what to skip. Concurrent
+runs serialize on an advisory lock, which is what makes it usable as a
+Kubernetes init container or a pre-deploy job.
+
+It is never applied implicitly at startup. A server that reshaped the store it
+depends on while booting would carry the schema forward under an image that had
+just been rolled back; instead it refuses to start and names the missing
+relation. Migrating is a decision, so it is a command someone runs.
 
 ## One surface, three ways in
 
@@ -218,6 +229,7 @@ what a token cannot already do.
 ```sh
 pnpm cli help                 # every command
 pnpm cli help record set      # one command's options
+pnpm cli migrate                # apply the schema; safe to re-run
 pnpm cli zone list
 pnpm cli zone create --zone example.com
 pnpm cli record set --zone example.com --view external --id www \
@@ -298,6 +310,16 @@ docker run -p 3000:3000 \
 
 The image binds `0.0.0.0`, so `PARALLAX_AUTH_TOKENS` is required -- see
 [Access tokens](#access-tokens) for the shape and why.
+
+Apply the schema before the server starts, with the same image:
+
+```sh
+docker run --rm -e DATABASE_URL='postgres://...' parallax parallax migrate
+```
+
+As a Kubernetes init container that is `command: ["parallax", "migrate"]`. It
+exits non-zero when it cannot reach or apply, so the pod does not go on to start
+a server against a schema that is not there.
 
 `parallax` is on the PATH inside the image, so every operation stays available
 without a token or a network round trip:

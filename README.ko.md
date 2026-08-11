@@ -52,7 +52,7 @@ pnpm start
 | 변수 | 용도 |
 | --- | --- |
 | `HOST`, `PORT` | 서버 바인드 주소. 기본값 `127.0.0.1:3000` |
-| `DATABASE_URL` | PostgreSQL 원본 저장소. `migrations/*.sql`을 순서대로 적용. TLS는 `?sslmode=verify-full` |
+| `DATABASE_URL` | PostgreSQL 원본 저장소. 스키마는 `parallax migrate`로 적용. TLS는 `?sslmode=verify-full` |
 | `PARALLAX_STATE_FILE` | 데이터베이스가 없을 때 존·리비전·상태·감사 기록 파일 |
 | `PARALLAX_CONFIG_FILE` | 데이터베이스가 없을 때 설정·자격 증명·접근 토큰 파일 |
 | `PARALLAX_PROVIDER_STATE_FILE` | 로컬 프로바이더가 켜져 있을 때만 사용하는 상태 파일 |
@@ -180,8 +180,17 @@ CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일
 PostgreSQL을 사용할 때는 서비스를 시작하기 전에 스키마를 적용합니다.
 
 ```sh
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
+parallax migrate
 ```
+
+`migrations/`의 모든 파일을 이름 순으로 다시 적용하며 재실행해도 안전합니다. 모든 객체가
+`IF NOT EXISTS`로 만들어지고 각 파일이 자기 트랜잭션을 갖고 있어, 무엇을 건너뛸지 정하는
+버전 테이블이 필요 없습니다. 동시 실행은 advisory lock으로 직렬화되므로 쿠버네티스 init
+컨테이너나 배포 전 잡으로 쓸 수 있습니다.
+
+기동 시 자동으로 적용하지는 않습니다. 의존하는 저장소를 부팅하면서 재구성하는 서버는 방금
+롤백된 이미지에서도 스키마를 전진시켜 버립니다. 대신 기동을 거부하고 없는 릴레이션 이름을
+알려 줍니다. 마이그레이션은 판단이므로 사람이 실행하는 명령입니다.
 
 ## 하나의 표면, 세 가지 진입로
 
@@ -213,6 +222,7 @@ curl -X POST http://127.0.0.1:3000/api/v1/cli \
 ```sh
 pnpm cli help                 # 전체 명령
 pnpm cli help record set      # 특정 명령의 옵션
+pnpm cli migrate                # 스키마 적용. 재실행 안전
 pnpm cli zone list
 pnpm cli zone create --zone example.com
 pnpm cli record set --zone example.com --view external --id www \
@@ -289,6 +299,15 @@ docker run -p 3000:3000 \
 
 이미지는 `0.0.0.0`에 바인드하므로 `PARALLAX_AUTH_TOKENS`가 필요합니다. 형식과 이유는
 [접근 토큰](#접근-토큰)을 보십시오.
+
+서버가 뜨기 전에 같은 이미지로 스키마를 적용합니다:
+
+```sh
+docker run --rm -e DATABASE_URL='postgres://...' parallax parallax migrate
+```
+
+쿠버네티스에서는 `command: ["parallax", "migrate"]`인 init 컨테이너가 됩니다. 닿지 못하거나
+적용하지 못하면 0이 아닌 코드로 끝나므로, 스키마가 없는 채로 서버가 뜨는 일이 없습니다.
 
 이미지 안에서 `parallax`가 PATH에 있으므로, 토큰이나 네트워크 왕복 없이 모든 조작을
 그대로 할 수 있습니다:

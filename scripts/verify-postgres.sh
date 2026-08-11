@@ -42,20 +42,33 @@ done
 ok "server ready on ${PGPORT}"
 
 echo "== applying every migration to a fresh database =="
+# Through the command line, which is how a deployment applies them: the same
+# path an initContainer or an operator takes, not a psql loop that only this
+# script knows about.
 apply_migrations() {
-  for migration in "$ROOT"/migrations/*.sql; do
-    docker exec -i "$CONTAINER" psql -h 127.0.0.1 -v ON_ERROR_STOP=1 -U parallax -d parallax < "$migration" >/dev/null
-  done
+  DATABASE_URL="$DATABASE_URL" node "$ROOT/cmd/parallax/main.ts" migrate --json
 }
-apply_migrations
+APPLIED=$(apply_migrations | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).applied.length))')
+[ "$APPLIED" = "2" ] || fail "expected 2 migrations to be applied, reported $APPLIED"
 TABLES=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'parallax_%'")
 [ "$TABLES" = "7" ] || fail "expected 7 tables, found $TABLES"
-ok "schema applied ($TABLES tables)"
+ok "schema applied through \`parallax migrate\` ($TABLES tables)"
 
 echo "== re-applying the migrations is idempotent =="
-apply_migrations
+apply_migrations >/dev/null
 ok "second run succeeded"
+
+echo "== concurrent migration runs serialize on the advisory lock =="
+# Two instances starting together must not race each other through the schema.
+for _ in 1 2 3; do apply_migrations >/dev/null & done
+FAILED=0
+for pid in $(jobs -p); do wait "$pid" || FAILED=1; done
+[ "$FAILED" = "0" ] || fail "a concurrent migration run failed"
+TABLES=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
+  "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'parallax_%'")
+[ "$TABLES" = "7" ] || fail "concurrent runs left $TABLES tables"
+ok "three simultaneous runs all succeeded, schema unchanged"
 
 start_app() {
   DATABASE_URL="$DATABASE_URL" HOST=127.0.0.1 PORT="$APPPORT" \

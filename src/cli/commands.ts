@@ -3,6 +3,7 @@ import type { CloudflareCredentialManager } from "../application/cloudflare-cred
 import { NotFoundError, type ControlPlane } from "../application/control-plane.ts";
 import type { SettingsService } from "../application/settings.ts";
 import { DomainValidationError } from "../domain/dns.ts";
+import type { MigrationRun } from "../infrastructure/migrations.ts";
 import type { Role } from "../security/http-authorization.ts";
 
 /**
@@ -10,10 +11,13 @@ import type { Role } from "../security/http-authorization.ts";
  * deployment may omit a service, and the commands that need it say so.
  */
 export interface CommandRuntime {
-  readonly controlPlane: ControlPlane;
+  /** Absent only while bootstrapping a store that does not exist yet. */
+  readonly controlPlane?: ControlPlane;
   readonly settings?: SettingsService;
   readonly accessTokens?: AccessTokenService;
   readonly credentials?: CloudflareCredentialManager;
+  /** Present only when a database backs this process. */
+  readonly migrate?: () => Promise<MigrationRun>;
 }
 
 /**
@@ -138,6 +142,11 @@ function requireCredentials(context: CommandContext): CloudflareCredentialManage
   return credentials;
 }
 
+function requireControlPlane(runtime: CommandRuntime): ControlPlane {
+  if (!runtime.controlPlane) throw new CommandUnavailableError("the control plane is unavailable in this process");
+  return runtime.controlPlane;
+}
+
 function requireSettings(context: CommandContext): SettingsService {
   const settings = context.runtime.settings;
   if (!settings) throw new CommandUnavailableError("settings are unavailable in this process");
@@ -174,21 +183,21 @@ const COMMANDS: readonly Command[] = [
     summary: "List every zone and its desired revision",
     role: "viewer",
     options: [],
-    run: async ({ runtime }) => ({ zones: await runtime.controlPlane.listZones() }),
+    run: async ({ runtime }) => ({ zones: await requireControlPlane(runtime).listZones() }),
   },
   {
     name: "zone get",
     summary: "Show one zone's desired state",
     role: "viewer",
     options: [ZONE],
-    run: ({ runtime }, input) => runtime.controlPlane.getZone(String(input.zone)),
+    run: ({ runtime }, input) => requireControlPlane(runtime).getZone(String(input.zone)),
   },
   {
     name: "zone create",
     summary: "Create an empty zone",
     role: "editor",
     options: [ZONE],
-    run: ({ runtime, actor }, input) => runtime.controlPlane.createZone(String(input.zone), actor),
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).createZone(String(input.zone), actor),
   },
   {
     name: "zone delete",
@@ -199,7 +208,7 @@ const COMMANDS: readonly Command[] = [
       EXPECTED,
       { name: "abandonProviderRecords", summary: "Leave published records at the provider", type: "boolean" },
     ],
-    run: ({ runtime, actor }, input) => runtime.controlPlane.deleteZone(
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).deleteZone(
       String(input.zone),
       actor,
       expectedRevisionOf(input),
@@ -211,7 +220,7 @@ const COMMANDS: readonly Command[] = [
     summary: "Replace a zone's complete desired state",
     role: "editor",
     options: [ZONE, { name: "desired", summary: "Desired state as JSON", type: "json", required: true }, EXPECTED],
-    run: ({ runtime, actor }, input) => runtime.controlPlane.replaceDesiredState(
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).replaceDesiredState(
       String(input.zone), input.desired, actor, expectedRevisionOf(input),
     ),
   },
@@ -226,7 +235,7 @@ const COMMANDS: readonly Command[] = [
       { name: "record", summary: "Record body as JSON", type: "json", required: true },
       EXPECTED,
     ],
-    run: ({ runtime, actor }, input) => runtime.controlPlane.upsertRecord(
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).upsertRecord(
       String(input.zone), String(input.view), String(input.id), input.record, actor, expectedRevisionOf(input),
     ),
   },
@@ -235,7 +244,7 @@ const COMMANDS: readonly Command[] = [
     summary: "Remove one record from a view",
     role: "editor",
     options: [ZONE, { ...VIEW, required: true }, { name: "id", summary: "Record identifier", required: true }, EXPECTED],
-    run: ({ runtime, actor }, input) => runtime.controlPlane.deleteRecord(
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).deleteRecord(
       String(input.zone), String(input.view), String(input.id), actor, expectedRevisionOf(input),
     ),
   },
@@ -244,7 +253,7 @@ const COMMANDS: readonly Command[] = [
     summary: "Compare desired and actual state without changing anything",
     role: "editor",
     options: [ZONE, VIEW, { name: "desired", summary: "Preview this desired state instead", type: "json" }],
-    run: ({ runtime }, input) => runtime.controlPlane.preview(
+    run: ({ runtime }, input) => requireControlPlane(runtime).preview(
       String(input.zone),
       input.view === undefined ? undefined : String(input.view),
       input.desired,
@@ -255,7 +264,7 @@ const COMMANDS: readonly Command[] = [
     summary: "Reconcile a zone's providers with its desired state",
     role: "editor",
     options: [ZONE, VIEW, EXPECTED],
-    run: ({ runtime }, input) => runtime.controlPlane.apply(
+    run: ({ runtime }, input) => requireControlPlane(runtime).apply(
       String(input.zone),
       input.view === undefined ? undefined : String(input.view),
       expectedRevisionOf(input),
@@ -266,14 +275,14 @@ const COMMANDS: readonly Command[] = [
     summary: "Show how far each view has been applied",
     role: "viewer",
     options: [ZONE],
-    run: ({ runtime }, input) => runtime.controlPlane.status(String(input.zone)),
+    run: ({ runtime }, input) => requireControlPlane(runtime).status(String(input.zone)),
   },
   {
     name: "history",
     summary: "Read the audit trail, newest first",
     role: "viewer",
     options: [{ ...ZONE, required: false }, ...PAGING],
-    run: ({ runtime }, input) => runtime.controlPlane.audit(
+    run: ({ runtime }, input) => requireControlPlane(runtime).audit(
       input.zone === undefined ? undefined : String(input.zone),
       page(input),
     ),
@@ -283,14 +292,14 @@ const COMMANDS: readonly Command[] = [
     summary: "List stored revision snapshots",
     role: "viewer",
     options: [ZONE, ...PAGING],
-    run: ({ runtime }, input) => runtime.controlPlane.listRevisions(String(input.zone), page(input)),
+    run: ({ runtime }, input) => requireControlPlane(runtime).listRevisions(String(input.zone), page(input)),
   },
   {
     name: "revision get",
     summary: "Show one revision snapshot",
     role: "viewer",
     options: [ZONE, { name: "revision", summary: "Revision number", type: "number", required: true }],
-    run: ({ runtime }, input) => runtime.controlPlane.getRevision(String(input.zone), Number(input.revision)),
+    run: ({ runtime }, input) => requireControlPlane(runtime).getRevision(String(input.zone), Number(input.revision)),
   },
   {
     name: "revision restore",
@@ -301,9 +310,20 @@ const COMMANDS: readonly Command[] = [
       { name: "revision", summary: "Revision number", type: "number", required: true },
       { name: "expectedRevision", summary: "Fail unless the zone is at this revision", type: "number" },
     ],
-    run: ({ runtime, actor }, input) => runtime.controlPlane.restoreRevision(
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).restoreRevision(
       String(input.zone), Number(input.revision), actor, expectedRevisionOf(input),
     ),
+  },
+  {
+    name: "migrate",
+    summary: "Apply the database schema; safe to re-run",
+    role: "admin",
+    options: [],
+    run: async (context) => {
+      const migrate = context.runtime.migrate;
+      if (!migrate) throw new CommandUnavailableError("this process has no database to migrate");
+      return migrate();
+    },
   },
   {
     name: "settings get",
