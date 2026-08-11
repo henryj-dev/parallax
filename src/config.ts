@@ -23,6 +23,10 @@ export interface ParallaxConfig {
   credentialMasterKey?: Buffer;
   /** Optional break-glass tokens; normal tokens are issued through the portal. */
   bootstrapTokens: TokenRecord[];
+  /** Certificate and key that let this process end TLS itself, instead of a proxy. */
+  tls?: { certFile: string; keyFile: string };
+  /** Port answering plain HTTP with a redirect to the TLS origin; unset disables it. */
+  httpRedirectPort?: number;
 }
 
 export function readConfig(environment: NodeJS.ProcessEnv = process.env): ParallaxConfig {
@@ -31,6 +35,12 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     throw new Error("PARALLAX_OWNERSHIP_SECRET must contain at least 32 bytes");
   }
   const credentialMasterKey = readCredentialMasterKey(environment.PARALLAX_CREDENTIAL_MASTER_KEY);
+  const tls = readTls(environment);
+  const redirect = environment.PARALLAX_HTTP_REDIRECT_PORT?.trim();
+  const httpRedirectPort = redirect ? readPort(redirect, "PARALLAX_HTTP_REDIRECT_PORT") : undefined;
+  if (httpRedirectPort !== undefined && !tls) {
+    throw new Error("PARALLAX_HTTP_REDIRECT_PORT only makes sense with TLS configured on the main port");
+  }
   return {
     host: environment.HOST?.trim() || "127.0.0.1",
     port: readPort(environment.PORT),
@@ -41,7 +51,24 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     ...(ownershipSecret ? { ownershipSecret } : {}),
     ...(credentialMasterKey ? { credentialMasterKey } : {}),
     bootstrapTokens: readBootstrapTokens(environment.PARALLAX_AUTH_TOKENS),
+    ...(tls ? { tls } : {}),
+    ...(httpRedirectPort !== undefined ? { httpRedirectPort } : {}),
   };
+}
+
+/**
+ * Both halves or neither. A certificate with no key -- or the reverse -- is a
+ * deployment that meant to serve TLS, so starting in plaintext on the port a
+ * client will speak TLS to would be worse than refusing.
+ */
+function readTls(environment: NodeJS.ProcessEnv): ParallaxConfig["tls"] {
+  const certFile = environment.PARALLAX_TLS_CERT_FILE?.trim();
+  const keyFile = environment.PARALLAX_TLS_KEY_FILE?.trim();
+  if (!certFile && !keyFile) return undefined;
+  if (!certFile || !keyFile) {
+    throw new Error("PARALLAX_TLS_CERT_FILE and PARALLAX_TLS_KEY_FILE must be set together");
+  }
+  return { certFile, keyFile };
 }
 
 function readCredentialMasterKey(source: string | undefined): Buffer | undefined {
@@ -79,11 +106,11 @@ function readBootstrapTokens(source: string | undefined): TokenRecord[] {
   });
 }
 
-function readPort(value: string | undefined): number {
+function readPort(value: string | undefined, name = "PORT"): number {
   if (!value) return 3000;
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) {
-    throw new Error("PORT must be an integer between 1 and 65535");
+    throw new Error(`${name} must be an integer between 1 and 65535`);
   }
   return parsed;
 }

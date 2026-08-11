@@ -58,6 +58,8 @@ pnpm start
 | `PARALLAX_PROVIDER_STATE_FILE` | 로컬 프로바이더가 켜져 있을 때만 사용하는 상태 파일 |
 | `PARALLAX_OWNERSHIP_SECRET` | 관리 레코드 소유권 마커에 서명하는 32바이트 이상 시크릿 |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장 자격 증명을 암호화하는 정확히 32바이트 키(base64 또는 64자 16진수) |
+| `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | 이 프로세스가 직접 TLS를 끝낼 인증서와 키. 둘 다 설정하거나 둘 다 비웁니다 |
+| `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP에 TLS origin으로의 리다이렉트를 내는 포트. TLS 설정이 있어야 합니다 |
 | `PARALLAX_AUTH_TOKENS` | `{"token","subject","role"}` 객체의 JSON 배열. `role`은 `admin`·`editor`·`viewer` 중 하나이고 토큰은 32바이트 이상. 루프백에서는 선택, **그 외 주소에 바인드하려면 필수** |
 
 나머지는 전부 — 프로바이더 연결, 보관 정책, 프록시 origin, 접근 토큰, 프로바이더
@@ -98,6 +100,31 @@ API 요청도 거부합니다. `PARALLAX_AUTH_TOKENS`는 스스로 잠긴 배포
 parallax: refusing to serve a non-loopback address with no access token.
 Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.
 ```
+
+### 프로세스에서 TLS 종단하기
+
+앞단에 프록시가 없는 배포는 직접 TLS를 낼 수 있습니다. 두 변수를 인증서와 키에 맞추면
+주 포트가 HTTPS를 말합니다:
+
+```sh
+PARALLAX_TLS_CERT_FILE=/etc/tls/tls.crt \
+PARALLAX_TLS_KEY_FILE=/etc/tls/tls.key \
+PARALLAX_HTTP_REDIRECT_PORT=80 \
+HOST=0.0.0.0 PORT=443 parallax-server
+```
+
+그 외에는 아무것도 달라지지 않습니다. 서버가 연결을 자기가 끝냈다는 것을 알기 때문에,
+프록시 뒤에서 `publicOrigin`이 공급하던 same-origin 증명이 설정 없이 유도되고 쿠키에
+`Secure`가 붙습니다. 호스트 이름이 고정돼 있다면 `publicOrigin`은 여전히 설정할 만합니다 —
+리다이렉트 리스너가 클라이언트를 보내는 곳이기 때문입니다.
+
+디스크에서 교체된 인증서는 재시작 없이 반영됩니다. 파일이 아니라 디렉터리를 감시합니다.
+쿠버네티스 시크릿 마운트는 심볼릭 링크를 바꿔치는 방식으로 갱신되기 때문입니다. 교체 도중의
+반쪽 상태는 쓰던 인증서를 그대로 두고 다음 이벤트에서 다시 시도합니다. 이것이 없으면 파드가
+무언가 재시작될 때까지 만료된 인증서를 계속 내밉니다.
+
+두 변수를 모두 비우면 평문 HTTP입니다. 로컬 개발과 종단 프록시 뒤 배포가 모두 원하는
+동작입니다.
 
 ### 리버스 프록시 뒤에서 서비스하기
 

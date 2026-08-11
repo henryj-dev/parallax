@@ -164,5 +164,85 @@ FORGED=$(curl -sk -X POST --resolve "${HOSTNAME_UNDER_TEST}:${PROXYPORT}:127.0.0
 [ "$FORGED" = "403" ] || fail "a cross-site Origin was accepted with $FORGED"
 ok "a cross-site Origin is refused even with a valid session cookie"
 
+echo "== the same guarantees when Parallax ends TLS itself =="
+# A deployment with no proxy in front of it is the other supported shape, and it
+# reaches the same code by a different route: nothing sets X-Forwarded-Proto, so
+# the server has to know its own scheme.
+NATIVE_PORT=$((PROXYPORT + 1))
+NATIVE_SITE="https://${HOSTNAME_UNDER_TEST}:${NATIVE_PORT}"
+mkdir -p "$WORK/tls"
+cp "$WORK/cert.pem" "$WORK/tls/cert.pem"
+cp "$WORK/key.pem" "$WORK/tls/key.pem"
+
+kill "$APP_PID" 2>/dev/null || true
+wait "$APP_PID" 2>/dev/null || true
+HOST=127.0.0.1 PORT="$NATIVE_PORT" \
+PARALLAX_TLS_CERT_FILE="$WORK/tls/cert.pem" \
+PARALLAX_TLS_KEY_FILE="$WORK/tls/key.pem" \
+PARALLAX_HTTP_REDIRECT_PORT=$((NATIVE_PORT + 1)) \
+PARALLAX_STATE_FILE="$WORK/native-state.json" \
+PARALLAX_CONFIG_FILE="$WORK/native-configuration.json" \
+PARALLAX_AUTH_TOKENS="[{\"token\":\"${TOKEN}\",\"subject\":\"proxy-verify\",\"role\":\"admin\"}]" \
+  node "$ROOT/src/index.ts" > "$WORK/native.log" 2>&1 &
+APP_PID=$!
+native() {
+  local method="$1" path="$2"; shift 2
+  curl -sk -X "$method" --resolve "${HOSTNAME_UNDER_TEST}:${NATIVE_PORT}:127.0.0.1" \
+    -H "Origin: ${NATIVE_SITE}" -b "$JAR" -c "$JAR" "$@" "${NATIVE_SITE}${path}"
+}
+for _ in $(seq 1 60); do
+  kill -0 "$APP_PID" 2>/dev/null || { cat "$WORK/native.log" >&2; fail "app exited while starting with TLS"; }
+  [ "$(native GET /health/live -o /dev/null -w '%{http_code}')" = "200" ] && break
+  sleep 0.25
+done
+[ "$(native GET /health/live -o /dev/null -w '%{http_code}')" = "200" ] \
+  || { cat "$WORK/native.log" >&2; fail "the TLS listener did not answer"; }
+ok "serving TLS directly on ${NATIVE_PORT}, no proxy involved"
+
+: > "$JAR"
+HEADERS=$(native POST /api/v1/session -H 'content-type: application/json' -d "{\"token\":\"${TOKEN}\"}" -D - -o /dev/null)
+echo "$HEADERS" | head -1 | grep -q ' 200' || fail "sign-in over native TLS failed: $(echo "$HEADERS" | head -1)"
+# Nothing told the server it was serving https; it has to know because it is the
+# thing that ended the connection.
+echo "$HEADERS" | tr -d '\r' | grep -i '^set-cookie:' | grep -qi Secure \
+  || fail "the cookie issued over native TLS is missing Secure"
+ok "the https Origin is accepted and the cookie is Secure, with no publicOrigin set"
+
+CODE=$(native POST /api/v1/zones -H 'content-type: application/json' -d '{"name":"native.example"}' -o /dev/null -w '%{http_code}')
+[ "$CODE" = "201" ] || fail "cookie-authenticated write over native TLS returned $CODE"
+ok "a cookie-authenticated write reaches the control plane"
+
+REDIRECT=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
+  "http://127.0.0.1:$((NATIVE_PORT + 1))/api/v1/zones")
+case "$REDIRECT" in
+  "308 https://"*"/api/v1/zones") ok "plain HTTP is redirected to TLS, path intact ($REDIRECT)" ;;
+  *) fail "expected a 308 to https, got: $REDIRECT" ;;
+esac
+
+echo "== a renewed certificate is picked up without a restart =="
+# The failure this prevents arrives months later: a pod presenting a certificate
+# that expired because nothing restarted it.
+BEFORE=$(echo | openssl s_client -connect "127.0.0.1:${NATIVE_PORT}" -servername "$HOSTNAME_UNDER_TEST" 2>/dev/null \
+  | openssl x509 -noout -serial 2>/dev/null)
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  -keyout "$WORK/tls/key.new" -out "$WORK/tls/cert.new" \
+  -subj "/CN=${HOSTNAME_UNDER_TEST}" -addext "subjectAltName=DNS:${HOSTNAME_UNDER_TEST}" >/dev/null 2>&1
+mv "$WORK/tls/cert.new" "$WORK/tls/cert.pem"
+mv "$WORK/tls/key.new" "$WORK/tls/key.pem"
+AFTER=""
+for _ in $(seq 1 40); do
+  AFTER=$(echo | openssl s_client -connect "127.0.0.1:${NATIVE_PORT}" -servername "$HOSTNAME_UNDER_TEST" 2>/dev/null \
+    | openssl x509 -noout -serial 2>/dev/null)
+  [ -n "$AFTER" ] && [ "$AFTER" != "$BEFORE" ] && break
+  sleep 0.25
+done
+[ -n "$BEFORE" ] || fail "could not read the certificate the server started with"
+[ "$AFTER" != "$BEFORE" ] || fail "the server kept serving the old certificate after renewal"
+ok "the new certificate is served without restarting ($BEFORE -> $AFTER)"
+
+[ "$(native GET /health/live -o /dev/null -w '%{http_code}')" = "200" ] \
+  || fail "the server stopped answering after the certificate was replaced"
+ok "connections still succeed on the renewed certificate"
+
 echo
 echo "Reverse proxy verification passed."

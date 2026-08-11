@@ -56,6 +56,8 @@ bind, how to reach the store, and the keys that protect what is stored.
 | `PARALLAX_PROVIDER_STATE_FILE` | Local provider state, used only while the local provider is enabled |
 | `PARALLAX_OWNERSHIP_SECRET` | 32+ byte secret that signs managed-record ownership markers |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | Exactly 32 bytes as base64 or 64 hexadecimal characters; encrypts stored credentials |
+| `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | Certificate and key for this process to end TLS itself; set both or neither |
+| `PARALLAX_HTTP_REDIRECT_PORT` | Port answering plain HTTP with a redirect to the TLS origin; needs TLS configured |
 | `PARALLAX_AUTH_TOKENS` | JSON array of `{"token","subject","role"}`; `role` is `admin`, `editor` or `viewer`, and each token is at least 32 bytes. Optional on loopback, **required to bind any other address** |
 
 Everything else -- provider wiring, retention, proxy origin, access tokens and
@@ -98,6 +100,33 @@ Anything else is refused before the server binds:
 parallax: refusing to serve a non-loopback address with no access token.
 Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.
 ```
+
+### Ending TLS in the process
+
+A deployment with no proxy in front of it can serve TLS itself. Point both
+variables at a certificate and its key, and the main port speaks HTTPS:
+
+```sh
+PARALLAX_TLS_CERT_FILE=/etc/tls/tls.crt \
+PARALLAX_TLS_KEY_FILE=/etc/tls/tls.key \
+PARALLAX_HTTP_REDIRECT_PORT=80 \
+HOST=0.0.0.0 PORT=443 parallax-server
+```
+
+Nothing else changes. The server knows it ended the connection, so the same
+proof of same-origin that `publicOrigin` supplies behind a proxy is derived
+without configuration, and cookies carry `Secure`. Setting `publicOrigin` is
+still worthwhile when the hostname is fixed, because it is what the redirect
+listener sends clients to.
+
+A certificate replaced on disk is picked up without a restart. The directory is
+watched rather than the file, because a Kubernetes secret mount is renewed by
+swapping a symlink; a half-written pair during rotation leaves the running
+certificate in place and is retried. Without this a pod would present an expired
+certificate until something happened to restart it.
+
+Set neither variable and the server is plain HTTP, which is what local
+development and a deployment behind a terminating proxy both want.
 
 ### Serving the portal behind a reverse proxy
 

@@ -85,4 +85,46 @@ describe("configuration", () => {
     assert.equal(isLoopbackHost("localhost"), true);
     assert.equal(isLoopbackHost("0.0.0.0"), false);
   });
+
+  it("takes a certificate and key together or not at all", () => {
+    const base = { PARALLAX_STATE_FILE: "data/state.json" };
+    assert.equal(readConfig(base).tls, undefined);
+    assert.deepEqual(
+      readConfig({ ...base, PARALLAX_TLS_CERT_FILE: "/tls/cert.pem", PARALLAX_TLS_KEY_FILE: "/tls/key.pem" }).tls,
+      { certFile: "/tls/cert.pem", keyFile: "/tls/key.pem" },
+    );
+    // Half a pair means the deployment meant to serve TLS, so answering the
+    // port in plaintext would be worse than refusing to start.
+    assert.throws(
+      () => readConfig({ ...base, PARALLAX_TLS_CERT_FILE: "/tls/cert.pem" }),
+      /must be set together/,
+    );
+    assert.throws(
+      () => readConfig({ ...base, PARALLAX_TLS_KEY_FILE: "/tls/key.pem" }),
+      /must be set together/,
+    );
+  });
+
+  it("refuses a redirect listener with nothing to redirect to", () => {
+    assert.throws(
+      () => readConfig({ PARALLAX_HTTP_REDIRECT_PORT: "80" }),
+      /only makes sense with TLS/,
+    );
+    assert.equal(
+      readConfig({
+        PARALLAX_TLS_CERT_FILE: "/tls/cert.pem",
+        PARALLAX_TLS_KEY_FILE: "/tls/key.pem",
+        PARALLAX_HTTP_REDIRECT_PORT: "80",
+      }).httpRedirectPort,
+      80,
+    );
+    assert.throws(
+      () => readConfig({
+        PARALLAX_TLS_CERT_FILE: "/tls/cert.pem",
+        PARALLAX_TLS_KEY_FILE: "/tls/key.pem",
+        PARALLAX_HTTP_REDIRECT_PORT: "0",
+      }),
+      /PARALLAX_HTTP_REDIRECT_PORT must be an integer/,
+    );
+  });
 });

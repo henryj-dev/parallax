@@ -45,6 +45,8 @@ export interface NodeHandlerOptions {
   readonly publicOrigin?: string;
   /** Trust `X-Forwarded-Proto`/`X-Forwarded-Host` from a reverse proxy in front of this server. */
   readonly trustForwardedHeaders?: boolean;
+  /** This listener ended the TLS connection itself, so requests on it are `https`. */
+  readonly terminatesTls?: boolean;
 }
 
 export function createNodeHandler(
@@ -95,7 +97,12 @@ export function createNodeHandler(
 function requestOrigin(request: IncomingMessage, options: NodeHandlerOptions): string {
   if (options.publicOrigin) return options.publicOrigin;
   const forwarded = options.trustForwardedHeaders ? forwardedOrigin(request) : undefined;
-  return forwarded ?? `http://${request.headers.host ?? "localhost"}`;
+  // A server that ended TLS itself knows the scheme without being told. Falling
+  // back to `http` here would reject every cookie-authenticated mutation and
+  // drop `Secure` from the cookie -- the same defect as reconstructing a proxied
+  // request as plaintext, arrived at from the opposite direction.
+  const scheme = options.terminatesTls ? "https" : "http";
+  return forwarded ?? `${scheme}://${request.headers.host ?? "localhost"}`;
 }
 
 function forwardedOrigin(request: IncomingMessage): string | undefined {

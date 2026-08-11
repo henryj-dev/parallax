@@ -1,4 +1,7 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { readFileSync, watch } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse, type RequestListener } from "node:http";
+import { createServer as createTlsServer } from "node:https";
+import { dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -28,6 +31,7 @@ if (!accessTokens.security().enabled && !isLoopbackHost(config.host)) {
 const handleApi = createNodeHandler(runtime, () => accessTokens.security(), {
   get publicOrigin() { return settingsService.current().publicOrigin || undefined; },
   get trustForwardedHeaders() { return settingsService.current().trustForwardedHeaders; },
+  terminatesTls: config.tls !== undefined,
 });
 
 /**
@@ -57,7 +61,7 @@ const staticFiles = new Map([
   ["/i18n.js", { file: "i18n.js", type: "text/javascript; charset=utf-8" }],
 ]);
 
-const server = createServer((request, response) => {
+const handleRequest: RequestListener = (request, response) => {
   void route(request, response).catch((error: unknown) => {
     console.error("request failed", error);
     if (!response.headersSent) {
@@ -65,7 +69,54 @@ const server = createServer((request, response) => {
     }
     response.end(JSON.stringify({ error: "internal_error", message: "an unexpected error occurred" }));
   });
-});
+};
+
+/**
+ * A deployment with no proxy in front of it ends TLS here. The alternative --
+ * serving plaintext on the port a browser speaks TLS to -- is an address that
+ * lies about itself, so a certificate is either configured and used or absent
+ * and the server is plainly HTTP.
+ */
+function readCertificate(tls: { certFile: string; keyFile: string }): { cert: Buffer; key: Buffer } {
+  return { cert: readFileSync(tls.certFile), key: readFileSync(tls.keyFile) };
+}
+
+const tlsServer = config.tls ? createTlsServer(readCertificate(config.tls), handleRequest) : undefined;
+const server = tlsServer ?? createServer(handleRequest);
+
+if (config.tls && tlsServer) {
+  // Certificates are renewed under a running process. Node reads them once when
+  // the server is built, so without this the pod would keep presenting the
+  // expired one until something restarted it -- a failure that arrives months
+  // after the deployment that caused it.
+  //
+  // The directory is watched rather than the file: a Kubernetes secret mount is
+  // updated by swapping a symlink, which a watch on the file itself never sees.
+  const tls = config.tls;
+  const reload = debounce(() => {
+    try {
+      tlsServer.setSecureContext(readCertificate(tls));
+      console.log("parallax: reloaded the TLS certificate");
+    } catch (error) {
+      // A half-written pair during rotation must not take the server down; the
+      // context in use stays valid and the next event tries again.
+      console.error(`parallax: keeping the current certificate, the new one could not be read: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  });
+  for (const directory of new Set([dirname(tls.certFile), dirname(tls.keyFile)])) {
+    watch(directory, { persistent: false }, reload);
+  }
+}
+
+/** Rotation touches several paths at once; one reload is enough for all of them. */
+function debounce(run: () => void, delay = 250): () => void {
+  let timer: NodeJS.Timeout | undefined;
+  return () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(run, delay);
+    timer.unref();
+  };
+}
 
 async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
@@ -172,8 +223,35 @@ server.headersTimeout = 15_000;
 server.requestTimeout = 60_000;
 server.keepAliveTimeout = 10_000;
 
+/**
+ * Answers plaintext with the address the client should have used. It carries no
+ * application behaviour on purpose: this listener exists so a typed hostname
+ * arrives over TLS, and anything else it could do would be reachable without
+ * one. The target comes from `publicOrigin` when an administrator set it, and
+ * otherwise from the host the client asked for, so a deployment that has not
+ * configured an origin still redirects to itself rather than nowhere.
+ */
+if (config.httpRedirectPort !== undefined) {
+  const redirector = createServer((request, response) => {
+    setSecurityHeaders(response);
+    const configured = settingsService.current().publicOrigin;
+    // The TLS port is only implied when it is the default one; anywhere else the
+    // redirect has to carry it or it points at a port nothing is listening on.
+    const suffix = config.port === 443 ? "" : `:${config.port}`;
+    const host = (request.headers.host ?? "").split(":")[0] || config.host;
+    const origin = configured || `https://${host}${suffix}`;
+    response.writeHead(308, { location: `${origin}${request.url ?? "/"}`, "cache-control": "no-store" });
+    response.end();
+  });
+  redirector.headersTimeout = 15_000;
+  redirector.requestTimeout = 15_000;
+  redirector.listen(config.httpRedirectPort, config.host, () => {
+    console.log(`parallax: redirecting http://${config.host}:${config.httpRedirectPort} to TLS`);
+  });
+}
+
 server.listen(config.port, config.host, () => {
-  console.log(`parallax: http://${config.host}:${config.port}`);
+  console.log(`parallax: ${config.tls ? "https" : "http"}://${config.host}:${config.port}`);
   if (!accessTokens.security().enabled) {
     console.warn("parallax: no access token exists; every caller that reaches this port is an administrator. Issue one from the portal before exposing it.");
   }
