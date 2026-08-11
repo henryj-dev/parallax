@@ -306,11 +306,16 @@ without a token or a network round trip:
 docker exec <container> parallax zone list
 ```
 
-It runs as UID 10001 and the application directory is not writable. Without
-`DATABASE_URL` the file backend is used, and its files live in
-`/var/lib/parallax`, which is the volume to mount. Runtime dependencies are
-installed separately from the build, so the toolchain that compiles the sources
-is not in the final image.
+It runs as UID 10001 and the application directory is not writable. Runtime
+dependencies are installed separately from the build, so the toolchain that
+compiles the sources is not in the final image.
+
+With `DATABASE_URL` set the image needs no writable filesystem at all: it has
+been verified serving the portal, accepting API writes and running the CLI on a
+fully read-only root with nothing mounted. Without a database the file backend
+is used and its files live in `/var/lib/parallax`, which is then the path to
+mount. An ephemeral volume is enough -- nothing written there is authoritative
+while PostgreSQL is the store.
 
 ## Verifying against real dependencies
 

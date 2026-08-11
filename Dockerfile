@@ -48,8 +48,14 @@ RUN printf '#!/bin/sh\nexec node /app/dist/cmd/parallax/main.js "$@"\n' > /usr/l
 # used, and its default paths are relative -- which would put state inside the
 # application directory and fail, because that directory is deliberately not
 # writable by the user this runs as. A dedicated directory is the mount point.
+#
+# Deliberately not a VOLUME. Kubernetes ignores the instruction, so it buys
+# nothing where this actually runs; Docker honours it by creating an anonymous
+# volume, which silently defeats `--read-only` and accumulates volumes on any
+# host that runs the image. Mount something writable here only if the file
+# backend is in use -- an emptyDir is enough, because nothing written here is
+# authoritative while PostgreSQL is the store.
 RUN mkdir -p /var/lib/parallax && chown parallax:parallax /var/lib/parallax
-VOLUME ["/var/lib/parallax"]
 ENV PARALLAX_STATE_FILE=/var/lib/parallax/parallax-state.json
 ENV PARALLAX_CONFIG_FILE=/var/lib/parallax/parallax-config.json
 ENV PARALLAX_PROVIDER_STATE_FILE=/var/lib/parallax/provider-state.json
