@@ -34,6 +34,10 @@ try {
   // The command line reaches the store directly, so it acts with full rights;
   // HTTP callers are restricted by the role their token carries.
   const result = await runCommand({ runtime, actor: actorName(), role: "admin" }, invocation.name, invocation.input);
+  // Warnings go to stderr and the result to stdout, so a caveat is visible even
+  // when the output is being piped somewhere -- and, more to the point, so it is
+  // not a line buried in the middle of the data it is a caveat about.
+  for (const warning of warningsOf(result)) process.stderr.write(`parallax: warning: ${warning}\n`);
   process.stdout.write(wantsJson ? `${JSON.stringify(result, null, 2)}\n` : `${format(result)}\n`);
 } catch (error) {
   exitCode = exitCodeFor(error);
@@ -68,11 +72,17 @@ function describe(error: unknown): string {
   return `parallax: ${error instanceof Error ? error.message : String(error)}`;
 }
 
+function warningsOf(result: unknown): string[] {
+  if (result === null || typeof result !== "object") return [];
+  const warnings = (result as { warnings?: unknown }).warnings;
+  return Array.isArray(warnings) ? warnings.filter((item) => typeof item === "string") : [];
+}
+
 /** A compact rendering for a terminal; `--json` gives the untouched result. */
 function format(result: unknown): string {
   if (result === undefined || result === null) return "ok";
   if (typeof result !== "object") return String(result);
-  const record = result as Record<string, unknown>;
+  const { warnings: _reported, ...record } = result as Record<string, unknown>;
   // When a result carries exactly one array, that array is what the caller
   // asked about; any scalars beside it are context and are printed first.
   const arrays = Object.entries(record).filter(([, value]) => Array.isArray(value));

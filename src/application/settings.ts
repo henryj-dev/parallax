@@ -43,6 +43,19 @@ export type SettingsListener = (settings: ParallaxSettings, previous: ParallaxSe
 export type SettingsVerifier = (candidate: ParallaxSettings, previous: ParallaxSettings) => void | Promise<void>;
 
 /**
+ * Says what a legal change will cost. A verifier refuses what the process
+ * cannot do; this reports what it can do but probably should not, which is a
+ * different answer and belongs to the person making the change rather than to
+ * whoever reads the log later.
+ */
+export type SettingsAdvisor = (candidate: ParallaxSettings, previous: ParallaxSettings) => readonly string[];
+
+export interface SettingsUpdate {
+  readonly settings: ParallaxSettings;
+  readonly warnings: readonly string[];
+}
+
+/**
  * Reads settings once at startup and keeps the cached copy authoritative for
  * this process, so a request never waits on the store to answer a question the
  * control plane asks on every call.
@@ -51,11 +64,13 @@ export class SettingsService {
   readonly #repository: SettingsRepository;
   readonly #listeners: SettingsListener[] = [];
   readonly #verify: SettingsVerifier | undefined;
+  readonly #advise: SettingsAdvisor | undefined;
   #settings: ParallaxSettings = DEFAULT_SETTINGS;
 
-  constructor(repository: SettingsRepository, verify?: SettingsVerifier) {
+  constructor(repository: SettingsRepository, verify?: SettingsVerifier, advise?: SettingsAdvisor) {
     this.#repository = repository;
     this.#verify = verify;
+    this.#advise = advise;
   }
 
   async load(): Promise<ParallaxSettings> {
@@ -72,9 +87,9 @@ export class SettingsService {
   }
 
   /** Validates and persists a partial update, then lets the process re-wire itself. */
-  async update(patch: unknown): Promise<ParallaxSettings> {
+  async update(patch: unknown): Promise<SettingsUpdate> {
     const changes = readPatch(patch);
-    if (Object.keys(changes).length === 0) return this.#settings;
+    if (Object.keys(changes).length === 0) return { settings: this.#settings, warnings: [] };
     const previous = this.#settings;
     const candidate = parseSettings({ ...toRecord(previous), ...changes });
     // Verified before it is stored, so a setting the process cannot act on is
@@ -85,7 +100,7 @@ export class SettingsService {
     await this.#repository.write(changes);
     this.#settings = candidate;
     for (const listener of this.#listeners) await listener(this.#settings, previous);
-    return this.#settings;
+    return { settings: this.#settings, warnings: this.#advise?.(candidate, previous) ?? [] };
   }
 }
 

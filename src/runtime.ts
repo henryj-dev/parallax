@@ -71,6 +71,15 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
       if (failure) issues.push(`allowLocalProvider publishes to ${config.providerStateFile}, whose directory ${failure}`);
     }
     if (issues.length > 0) throw new DomainValidationError(issues);
+  }, (candidate) => {
+    const warnings: string[] = [];
+    // Clearing this is legal and is right on 443, so it is not refused. But the
+    // redirect target changes the moment it is cleared, and the only person who
+    // can still connect that to an address clients use is the one clearing it.
+    if (config.httpRedirectPort !== undefined && !candidate.publicOrigin) {
+      warnings.push("publicOrigin is empty, so redirects from the plain-HTTP listener assume TLS on 443 at the host the client asked for. Set it if clients reach this deployment at any other address.");
+    }
+    return warnings;
   });
   const accessTokens = new AccessTokenService(accessTokenRepository, config.bootstrapTokens);
   try {

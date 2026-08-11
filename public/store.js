@@ -466,10 +466,17 @@ export function createStore(client) {
     },
 
     async saveSettings(values) {
-      return administer("settings", "settings.saved", {}, async () => {
+      let warnings = [];
+      const saved = await administer("settings", "settings.saved", {}, async () => {
         const payload = await client.saveSettings(values);
         state.settings = payload?.settings ?? state.settings;
+        warnings = payload?.warnings ?? [];
       }, { refresh: false, failureKey: "settings.saveFailed" });
+      // A legal change can still cost something. Whoever made it is the only
+      // person who can still act on that, so it is said here rather than left
+      // in a log for somebody else to find.
+      for (const message of warnings) notice("settings.warning", { message }, "warning");
+      return saved;
     },
 
     async issueToken({ subject, role }) {

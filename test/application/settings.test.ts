@@ -112,4 +112,32 @@ describe("settings", () => {
     await service.update({ allowLocalProvider: true });
     assert.deepEqual(seen, ["/srv/zones|false", "/srv/zones|true"]);
   });
+
+  it("reports what a legal change costs instead of refusing it", async () => {
+    const repository = new MemorySettingsRepository();
+    const service = new SettingsService(repository, undefined, (candidate) =>
+      candidate.publicOrigin ? [] : ["publicOrigin is empty, so redirects assume 443"]);
+    await service.load();
+
+    const cleared = await service.update({ trustForwardedHeaders: true });
+    assert.deepEqual(cleared.warnings, ["publicOrigin is empty, so redirects assume 443"]);
+    // Advice is not refusal: the change landed.
+    assert.equal(cleared.settings.trustForwardedHeaders, true);
+    assert.equal(repository.values.trustForwardedHeaders, true);
+
+    const set = await service.update({ publicOrigin: "https://dns.example.com" });
+    assert.deepEqual(set.warnings, []);
+  });
+
+  it("says nothing when a patch changes nothing", async () => {
+    let asked = 0;
+    const service = new SettingsService(new MemorySettingsRepository(), undefined, () => {
+      asked += 1;
+      return ["never reached"];
+    });
+    await service.load();
+    const unchanged = await service.update({});
+    assert.deepEqual(unchanged.warnings, []);
+    assert.equal(asked, 0);
+  });
 });

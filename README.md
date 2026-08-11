@@ -120,7 +120,9 @@ sends clients to, and without it the redirect can only assume TLS on 443 at the
 host the client asked for -- the port this process bound is not the port a
 client reached it on once a Service or a published container port maps between
 them. The server says so at startup when a redirect listener is running without
-one.
+one, and says it again to whoever clears the value later: a settings change
+that is legal but costs something answers with `warnings` alongside the new
+settings, which the portal shows and the command line writes to stderr.
 
 A certificate replaced on disk is picked up without a restart. The directory is
 watched rather than the file, because a Kubernetes secret mount is renewed by

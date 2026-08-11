@@ -240,6 +240,7 @@ dialog input:not([type="checkbox"]), dialog select { width: 100%; min-height: 40
 .toast-region { position: fixed; right: 18px; bottom: 18px; z-index: 80; display: grid; gap: 8px; width: min(360px, calc(100vw - 36px)); }
 .toast { padding: 13px 15px; border: 1px solid var(--line-strong); border-left: 4px solid var(--success); border-radius: 7px; background: var(--surface); box-shadow: var(--shadow); font-size: 11px; line-height: 1.45; animation: toast-in .2s ease-out; }
 .toast.error { border-left-color: var(--danger); }
+.toast.warning { border-left-color: var(--amber); }
 .skeleton { position: relative; overflow: hidden; background: #dce6e8; border-radius: 6px; }
 .skeleton::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,.55), transparent); transform: translateX(-100%); animation: shimmer 1.2s infinite; }
 .zone-skeleton { height: 54px; margin: 5px 4px; }

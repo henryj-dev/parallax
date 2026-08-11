@@ -337,7 +337,7 @@ const COMMANDS: readonly Command[] = [
     summary: "Update stored settings; only the keys given change",
     role: "admin",
     options: [{ name: "values", summary: "Settings as JSON", type: "json", required: true }],
-    run: async (context, input) => ({ settings: await requireSettings(context).update(input.values) }),
+    run: async (context, input) => requireSettings(context).update(input.values),
   },
   {
     name: "token list",
