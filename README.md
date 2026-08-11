@@ -241,7 +241,7 @@ HTTP callers are limited to what their token's role allows.
 
 All control-plane routes are under `/api/v1`.
 
-- `GET|POST /zones`
+- `GET|POST /zones` (`{ "name": "example.com" }`)
 - `GET|PUT|DELETE /zones/:zone` (`DELETE ?abandonProviderRecords=true`)
 - `PUT|DELETE /zones/:zone/views/:view/records/:id`
 - `GET|POST /zones/:zone/preview`

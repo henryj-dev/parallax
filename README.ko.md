@@ -235,7 +235,7 @@ CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽
 
 모든 컨트롤 플레인 경로는 `/api/v1` 아래에 있습니다.
 
-- `GET|POST /zones`
+- `GET|POST /zones` (`{ "name": "example.com" }`)
 - `GET|PUT|DELETE /zones/:zone` (`DELETE ?abandonProviderRecords=true`)
 - `PUT|DELETE /zones/:zone/views/:view/records/:id`
 - `GET|POST /zones/:zone/preview`
