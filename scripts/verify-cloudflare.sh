@@ -60,38 +60,67 @@ done
 [ "${CF_VERIFY_ALLOW_WRITES:-}" = "true" ] \
   || { echo "skipped: set CF_VERIFY_ALLOW_WRITES=true to allow writes to ${CF_ZONE}"; exit 0; }
 
-echo "== starting Parallax with the supplied Cloudflare credential =="
+echo "== starting Parallax =="
+# Credentials reach the provider through the credential store, which is the only
+# path there is -- an earlier version of this script set PARALLAX_CLOUDFLARE_ZONES,
+# a name nothing in src/ reads, so the adapter was never configured and the run
+# died at the first apply. Storing them needs a master key.
 HOST=127.0.0.1 PORT="$APPPORT" \
 PARALLAX_STATE_FILE="$WORK/state.json" \
+PARALLAX_CONFIG_FILE="$WORK/configuration.json" \
+PARALLAX_CREDENTIAL_MASTER_KEY="$(openssl rand -base64 32)" \
 PARALLAX_OWNERSHIP_SECRET="${CF_OWNERSHIP_SECRET:-verify-ownership-secret-that-is-at-least-32-bytes}" \
-PARALLAX_CLOUDFLARE_ZONES="{\"${CF_ZONE}\":{\"zoneId\":\"${CF_ZONE_ID}\",\"token\":\"${CF_API_TOKEN}\"}}" \
   node "$ROOT/src/index.ts" > "$WORK/app.log" 2>&1 &
 APP_PID=$!
 for _ in $(seq 1 40); do curl -sf "http://127.0.0.1:${APPPORT}/health/live" >/dev/null 2>&1 && break; sleep 0.25; done
 curl -sf "http://127.0.0.1:${APPPORT}/health/live" >/dev/null || { cat "$WORK/app.log" >&2; fail "app did not start"; }
-ok "control plane running against ${CF_ZONE}"
+ok "control plane running"
 
 json() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const v=JSON.parse(d);console.log(eval(process.argv[1]))})' "$1"; }
 
-echo "== listing the live zone exercises pagination and type filtering =="
-PLAN=$(curl -sf "$API/zones" >/dev/null; curl -sf -X POST -H 'content-type: application/json' \
-  -d "{\"name\":\"${CF_ZONE}\"}" "$API/zones" >/dev/null 2>&1 || true; \
-  curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views.external.summary.create + "/" + v.views.external.summary.conflict')
-[ -n "$PLAN" ] || fail "preview against the live zone returned nothing"
-ok "preview read the live zone (create/conflict = $PLAN)"
+echo "== binding the supplied credential to ${CF_ZONE} =="
+curl -sf -X PUT -H 'content-type: application/json' \
+  -d "{\"zoneId\":\"${CF_ZONE_ID}\",\"token\":\"${CF_API_TOKEN}\"}" \
+  "$API/credentials/cloudflare/${CF_ZONE}" >/dev/null \
+  || { cat "$WORK/app.log" >&2; fail "the credential was not accepted"; }
+ok "credential stored and routed to ${CF_ZONE}/external"
 
-echo "== unmanaged records are never scheduled for deletion =="
-DELETES=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views.external.summary.delete')
-[ "$DELETES" = "0" ] || fail "an empty desired state proposed $DELETES deletions against a live zone"
-ok "no deletions proposed for records Parallax does not own"
+curl -sf -X POST -H 'content-type: application/json' -d "{\"name\":\"${CF_ZONE}\"}" "$API/zones" >/dev/null 2>&1 || true
 
 echo "== create, proxied TTL normalization, update and withdraw =="
-# Arm the cleanup before the write, not after: a failure inside the apply is
+# The record comes before the first preview on purpose. A view exists only once
+# a record is set into it, so `preview?view=external` on a zone that has none is
+# a 404 -- which an earlier version of this script walked straight into.
+#
+# The cleanup is armed before the write, not after: a failure inside the apply is
 # exactly the case where a record exists at the provider and nothing local says so.
 PUBLISHED=1
 curl -sf -X PUT -H 'content-type: application/json' \
   -d "{\"name\":\"${LABEL}\",\"type\":\"A\",\"content\":\"192.0.2.10\",\"ttl\":300,\"acknowledgeNonGlobalIp\":true}" \
-  "$API/zones/${CF_ZONE}/views/external/records/verify" >/dev/null
+  "$API/zones/${CF_ZONE}/views/external/records/verify" >/dev/null \
+  || fail "the record could not be staged"
+
+echo "== the live zone is read, and nothing unowned is scheduled for deletion =="
+PLAN=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views.external.summary.create + "/" + v.views.external.summary.conflict')
+[ -n "$PLAN" ] || { cat "$WORK/app.log" >&2; fail "preview against the live zone returned nothing"; }
+ok "preview read the live zone (create/conflict = $PLAN)"
+
+DELETES=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views.external.summary.delete')
+[ "$DELETES" = "0" ] || fail "a desired state holding one record proposed $DELETES deletions against a live zone"
+# That assertion is vacuous against an empty zone -- with nothing there, nothing
+# can be proposed for deletion. Nothing has been applied yet, so every record the
+# zone holds right now is one Parallax does not own. Counting them is what tells
+# a reader whether the check above meant anything.
+FOREIGN=$(curl -sf -H "Authorization: Bearer ${CF_API_TOKEN}" \
+  "${CF_API_BASE:-https://api.cloudflare.com/client/v4}/zones/${CF_ZONE_ID}/dns_records?per_page=1" \
+  | json 'v.result_info.total_count' 2>/dev/null || echo 0)
+if [ "${FOREIGN:-0}" = "0" ]; then
+  echo "  note: the zone holds no records of its own, so that assertion proved nothing" >&2
+  ok "no deletions proposed (vacuously -- the zone is empty)"
+else
+  ok "no deletions proposed against ${FOREIGN} records Parallax does not own"
+fi
+
 curl -sf -X POST "$API/zones/${CF_ZONE}/apply?view=external" | json 'v.statuses[0].state' | grep -qx applied \
   || { cat "$WORK/app.log" >&2; fail "apply did not report applied"; }
 ok "record ${LABEL}.${CF_ZONE} created through the Cloudflare API"

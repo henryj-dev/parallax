@@ -70,11 +70,14 @@ echo "== hand-maintained records resolve before Parallax touches the zone =="
 ok "legacy RRset resolves from the hand-written file"
 
 echo "== starting Parallax against the same directory =="
+# Provider wiring is a stored setting, not an environment variable. It used to be
+# PARALLAX_COREDNS_DIRECTORY and PARALLAX_ALLOW_LOCAL_PROVIDER; both stopped being
+# read when configuration moved into the store, and this script kept setting them
+# for months -- so it was configuring nothing and failing at the first preview.
 HOST=127.0.0.1 PORT="$APPPORT" \
 PARALLAX_STATE_FILE="$WORK/state.json" \
-PARALLAX_COREDNS_DIRECTORY="$ZONES" \
+PARALLAX_CONFIG_FILE="$WORK/configuration.json" \
 PARALLAX_OWNERSHIP_SECRET="verify-ownership-secret-that-is-at-least-32-bytes" \
-PARALLAX_ALLOW_LOCAL_PROVIDER=true \
   node "$ROOT/src/index.ts" > "$WORK/app.log" 2>&1 &
 APP_PID=$!
 for _ in $(seq 1 40); do
@@ -82,6 +85,16 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 curl -sf "http://127.0.0.1:${APPPORT}/health/live" >/dev/null || { cat "$WORK/app.log" >&2; fail "app did not start"; }
+
+curl -sf -X PUT -H 'content-type: application/json' \
+  -d "{\"coreDnsDirectory\":\"${ZONES}\",\"allowLocalProvider\":true}" \
+  "http://127.0.0.1:${APPPORT}/api/v1/settings" >/dev/null \
+  || { cat "$WORK/app.log" >&2; fail "the provider settings were not accepted"; }
+# Proves the wiring took, rather than assuming it did -- the failure this
+# replaces was silent precisely because nothing checked.
+CONFIGURED=$(curl -sf "http://127.0.0.1:${APPPORT}/api/v1/settings" \
+  | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).settings.coreDnsDirectory))')
+[ "$CONFIGURED" = "$ZONES" ] || fail "coreDnsDirectory reads back as '$CONFIGURED', not '$ZONES'"
 ok "control plane running"
 
 echo "== a desired record that collides with a hand-written answer is a conflict =="
