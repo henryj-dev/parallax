@@ -58,7 +58,7 @@ pnpm start
 | `PARALLAX_PROVIDER_STATE_FILE` | 로컬 프로바이더가 켜져 있을 때만 사용하는 상태 파일 |
 | `PARALLAX_OWNERSHIP_SECRET` | 관리 레코드 소유권 마커에 서명하는 32바이트 이상 시크릿 |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장 자격 증명을 암호화하는 정확히 32바이트 키(base64 또는 64자 16진수) |
-| `PARALLAX_AUTH_TOKENS` | 선택적 비상용 토큰. 각 32바이트 이상 |
+| `PARALLAX_AUTH_TOKENS` | `{"token","subject","role"}` 객체의 JSON 배열. `role`은 `admin`·`editor`·`viewer` 중 하나이고 토큰은 32바이트 이상. 루프백에서는 선택, **그 외 주소에 바인드하려면 필수** |
 
 나머지는 전부 — 프로바이더 연결, 보관 정책, 프록시 origin, 접근 토큰, 프로바이더
 자격 증명 — 존과 같은 저장소에 보관되며 포털의 **프로바이더 설정** 화면에서
@@ -83,6 +83,21 @@ pnpm start
 API 요청도 거부합니다. `PARALLAX_AUTH_TOKENS`는 스스로 잠긴 배포를 위한 비상
 경로로 남아 있으며, 해당 토큰은 관리형으로 표시되고 API로 폐기할 수 없습니다.
 마지막 관리자 토큰은 폐기되지 않습니다.
+
+루프백이 아닌 배포를 시작하는 유일한 방법이기도 합니다. 첫 토큰을 발급받을 루프백
+세션 자체가 없기 때문입니다. 컨테이너 이미지는 `0.0.0.0`에 바인드하므로 컨테이너
+배포에는 항상 필요합니다:
+
+```json
+[{"token": "<32바이트 이상>", "subject": "deploy", "role": "admin"}]
+```
+
+그 외의 경우 서버가 바인드하기 전에 거부합니다:
+
+```
+parallax: refusing to serve a non-loopback address with no access token.
+Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.
+```
 
 ### 리버스 프록시 뒤에서 서비스하기
 
@@ -256,6 +271,36 @@ CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽
 `?abandonProviderRecords=true`를 전달하면 회수를 의도적으로 건너뜁니다. 이는
 프로바이더가 영구히 사라진 경우에만 사용하며, 해당 레코드는 살아 있는 상태로
 남습니다.
+
+## 컨테이너 이미지
+
+리포지토리 루트의 `Dockerfile`은 세 표면 -- API, 포털, 명령줄 -- 을 모두 담은 런타임
+이미지를 만듭니다.
+
+```sh
+docker build -t parallax .
+docker run -p 3000:3000 \
+  -e DATABASE_URL='postgres://...' \
+  -e PARALLAX_OWNERSHIP_SECRET='...' \
+  -e PARALLAX_CREDENTIAL_MASTER_KEY='...' \
+  -e PARALLAX_AUTH_TOKENS='[{"token":"...","subject":"deploy","role":"admin"}]' \
+  parallax
+```
+
+이미지는 `0.0.0.0`에 바인드하므로 `PARALLAX_AUTH_TOKENS`가 필요합니다. 형식과 이유는
+[접근 토큰](#접근-토큰)을 보십시오.
+
+이미지 안에서 `parallax`가 PATH에 있으므로, 토큰이나 네트워크 왕복 없이 모든 조작을
+그대로 할 수 있습니다:
+
+```sh
+docker exec <컨테이너> parallax zone list
+```
+
+UID 10001로 실행되며 애플리케이션 디렉터리에는 쓸 수 없습니다. `DATABASE_URL`이 없으면
+파일 백엔드를 쓰고, 그 파일은 `/var/lib/parallax`에 놓이므로 볼륨은 여기에 마운트합니다.
+런타임 의존성은 빌드와 분리해 설치하므로 소스를 컴파일한 도구 사슬은 최종 이미지에
+들어가지 않습니다.
 
 ## 실제 의존성 대상 검증
 

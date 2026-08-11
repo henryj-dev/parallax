@@ -1,0 +1,24 @@
+# The build stage copies the whole context, so anything listed here is something
+# that must not reach a layer -- or that would only slow the copy down.
+
+# Secrets and live state. A developer building locally has real values in these.
+.env
+.env.*
+!.env.example
+data/
+
+# Rebuilt inside the image; copying the host's would mask a broken build.
+node_modules/
+dist/
+
+# Not part of any build input.
+.git/
+.github/
+*.out
+coverage/
+security-audits/
+docs/
+.omc/
+.claude/
+.codex/
+test/

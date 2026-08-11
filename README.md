@@ -56,7 +56,7 @@ bind, how to reach the store, and the keys that protect what is stored.
 | `PARALLAX_PROVIDER_STATE_FILE` | Local provider state, used only while the local provider is enabled |
 | `PARALLAX_OWNERSHIP_SECRET` | 32+ byte secret that signs managed-record ownership markers |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | Exactly 32 bytes as base64 or 64 hexadecimal characters; encrypts stored credentials |
-| `PARALLAX_AUTH_TOKENS` | Optional break-glass tokens, each at least 32 bytes |
+| `PARALLAX_AUTH_TOKENS` | JSON array of `{"token","subject","role"}`; `role` is `admin`, `editor` or `viewer`, and each token is at least 32 bytes. Optional on loopback, **required to bind any other address** |
 
 Everything else -- provider wiring, retention, proxy origin, access tokens and
 provider credentials -- is stored alongside the zones and managed from the
@@ -83,6 +83,21 @@ that state, and refuses API requests that arrive with proxy forwarding headers.
 `PARALLAX_AUTH_TOKENS` remains as a break-glass path for a deployment that has
 locked itself out; those tokens are listed as managed and cannot be revoked
 through the API. The last administrator token cannot be revoked.
+
+It is also the only way to start a deployment that is not on loopback, since
+there is no loopback session to issue the first token from. Any container image
+binds `0.0.0.0`, so a container always needs it:
+
+```json
+[{"token": "<32+ bytes>", "subject": "deploy", "role": "admin"}]
+```
+
+Anything else is refused before the server binds:
+
+```
+parallax: refusing to serve a non-loopback address with no access token.
+Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.
+```
 
 ### Serving the portal behind a reverse proxy
 
@@ -265,6 +280,37 @@ unreachable the zone is kept so the deletion can be retried, rather than leaving
 published records nothing tracks. Pass `?abandonProviderRecords=true` to skip
 withdrawal deliberately — that is only for a provider that is gone for good, and
 it leaves those records live.
+
+## Container image
+
+The `Dockerfile` at the repository root builds a runtime image that carries all
+three surfaces: the API, the portal, and the command line.
+
+```sh
+docker build -t parallax .
+docker run -p 3000:3000 \
+  -e DATABASE_URL='postgres://...' \
+  -e PARALLAX_OWNERSHIP_SECRET='...' \
+  -e PARALLAX_CREDENTIAL_MASTER_KEY='...' \
+  -e PARALLAX_AUTH_TOKENS='[{"token":"...","subject":"deploy","role":"admin"}]' \
+  parallax
+```
+
+The image binds `0.0.0.0`, so `PARALLAX_AUTH_TOKENS` is required -- see
+[Access tokens](#access-tokens) for the shape and why.
+
+`parallax` is on the PATH inside the image, so every operation stays available
+without a token or a network round trip:
+
+```sh
+docker exec <container> parallax zone list
+```
+
+It runs as UID 10001 and the application directory is not writable. Without
+`DATABASE_URL` the file backend is used, and its files live in
+`/var/lib/parallax`, which is the volume to mount. Runtime dependencies are
+installed separately from the build, so the toolchain that compiles the sources
+is not in the final image.
 
 ## Verifying against real dependencies
 
