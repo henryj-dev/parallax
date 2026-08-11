@@ -1,8 +1,11 @@
-import { resolve } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { access } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { AccessTokenService } from "./application/access-tokens.ts";
 import { CloudflareCredentialManager } from "./application/cloudflare-credentials.ts";
 import { ControlPlane } from "./application/control-plane.ts";
 import { SettingsService, type ParallaxSettings } from "./application/settings.ts";
+import { DomainValidationError } from "./domain/dns.ts";
 import { CoreDnsFileAdapter } from "./adapters/coredns-file.ts";
 import { NodeCoreDnsFileOperations } from "./adapters/node-coredns-files.ts";
 import { RoutingProviderAdapter } from "./adapters/router.ts";
@@ -47,7 +50,22 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
   const credentialRepository = pool ? new PostgresCredentialRepository(pool) : fileConfiguration!.credentials;
   const accessTokenRepository = pool ? new PostgresAccessTokenRepository(pool) : fileConfiguration!.accessTokens;
 
-  const settings = new SettingsService(settingsRepository);
+  // Two settings name a directory this process has to write. Whoever turns one
+  // on is the only person who can still connect it to a deployment that has to
+  // make that directory writable, so the answer is given to them now rather
+  // than to whoever is on call when the first apply fails.
+  const settings = new SettingsService(settingsRepository, async (candidate) => {
+    const issues: string[] = [];
+    if (candidate.coreDnsDirectory) {
+      const failure = await writeFailure(resolve(candidate.coreDnsDirectory));
+      if (failure) issues.push(`coreDnsDirectory ${failure}. CoreDNS zone files cannot be written there`);
+    }
+    if (candidate.allowLocalProvider) {
+      const failure = await writeFailure(dirname(resolve(config.providerStateFile)));
+      if (failure) issues.push(`allowLocalProvider publishes to ${config.providerStateFile}, whose directory ${failure}`);
+    }
+    if (issues.length > 0) throw new DomainValidationError(issues);
+  });
   const accessTokens = new AccessTokenService(accessTokenRepository, config.bootstrapTokens);
   try {
     await settings.load();
@@ -102,6 +120,27 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     provider,
     close: async () => { await pool?.end().catch(() => undefined); },
   };
+}
+
+/**
+ * Whether a directory could be written, without creating anything: the first
+ * ancestor that exists has to be writable, since everything below it would be
+ * created on the way. Returns a reason, or undefined when the path is usable.
+ */
+async function writeFailure(path: string): Promise<string | undefined> {
+  let candidate = path;
+  for (;;) {
+    try {
+      await access(candidate, fsConstants.W_OK);
+      return undefined;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") return `is not writable (${code ?? "unknown error"})`;
+      const parent = dirname(candidate);
+      if (parent === candidate) return "has no writable ancestor";
+      candidate = parent;
+    }
+  }
 }
 
 function message(error: unknown): string {

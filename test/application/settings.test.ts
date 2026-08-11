@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { DEFAULT_SETTINGS, SettingsService, parseSettings } from "../../src/application/settings.ts";
+import { DomainValidationError } from "../../src/domain/dns.ts";
 import type { SettingsRepository } from "../../src/application/ports.ts";
 import { FileConfigurationStore } from "../../src/infrastructure/file-settings.ts";
 
@@ -81,5 +82,34 @@ describe("settings", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("refuses a setting the process could not act on, and stores nothing", async () => {
+    const repository = new MemorySettingsRepository();
+    const service = new SettingsService(repository, (candidate) => {
+      if (candidate.coreDnsDirectory) throw new DomainValidationError(["coreDnsDirectory is not writable (EROFS)"]);
+    });
+    await service.load();
+
+    await assert.rejects(
+      service.update({ coreDnsDirectory: "/read-only/zones" }),
+      /coreDnsDirectory is not writable \(EROFS\)/,
+    );
+    // A refused setting must leave no trace: stored, cached, or announced.
+    assert.deepEqual(repository.values, {});
+    assert.equal(service.current().coreDnsDirectory, "");
+  });
+
+  it("verifies the merged result rather than the patch alone", async () => {
+    const seen: string[] = [];
+    const service = new SettingsService(new MemorySettingsRepository(), (candidate) => {
+      seen.push(`${candidate.coreDnsDirectory}|${candidate.allowLocalProvider}`);
+    });
+    await service.load();
+    await service.update({ coreDnsDirectory: "/srv/zones" });
+    // Turning on the second setting must show the verifier the first one too,
+    // or a combination that cannot work would be accepted one half at a time.
+    await service.update({ allowLocalProvider: true });
+    assert.deepEqual(seen, ["/srv/zones|false", "/srv/zones|true"]);
   });
 });

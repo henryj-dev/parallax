@@ -36,6 +36,13 @@ export const SETTING_KEYS = Object.freeze(Object.keys(DEFAULT_SETTINGS) as Array
 export type SettingsListener = (settings: ParallaxSettings, previous: ParallaxSettings) => void | Promise<void>;
 
 /**
+ * Rejects a candidate the process could not actually act on. Value shapes are
+ * checked here in the application layer; whether a named path can be written is
+ * a question about the machine, so the answer is injected.
+ */
+export type SettingsVerifier = (candidate: ParallaxSettings, previous: ParallaxSettings) => void | Promise<void>;
+
+/**
  * Reads settings once at startup and keeps the cached copy authoritative for
  * this process, so a request never waits on the store to answer a question the
  * control plane asks on every call.
@@ -43,10 +50,12 @@ export type SettingsListener = (settings: ParallaxSettings, previous: ParallaxSe
 export class SettingsService {
   readonly #repository: SettingsRepository;
   readonly #listeners: SettingsListener[] = [];
+  readonly #verify: SettingsVerifier | undefined;
   #settings: ParallaxSettings = DEFAULT_SETTINGS;
 
-  constructor(repository: SettingsRepository) {
+  constructor(repository: SettingsRepository, verify?: SettingsVerifier) {
     this.#repository = repository;
+    this.#verify = verify;
   }
 
   async load(): Promise<ParallaxSettings> {
@@ -66,9 +75,15 @@ export class SettingsService {
   async update(patch: unknown): Promise<ParallaxSettings> {
     const changes = readPatch(patch);
     if (Object.keys(changes).length === 0) return this.#settings;
-    await this.#repository.write(changes);
     const previous = this.#settings;
-    this.#settings = parseSettings({ ...toRecord(previous), ...changes });
+    const candidate = parseSettings({ ...toRecord(previous), ...changes });
+    // Verified before it is stored, so a setting the process cannot act on is
+    // refused to the person changing it. Left unchecked, the same mistake
+    // surfaces at the first apply instead -- as a deliberately redacted
+    // provider error, to somebody who was not there when the value changed.
+    await this.#verify?.(candidate, previous);
+    await this.#repository.write(changes);
+    this.#settings = candidate;
     for (const listener of this.#listeners) await listener(this.#settings, previous);
     return this.#settings;
   }
