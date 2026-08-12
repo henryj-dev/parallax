@@ -224,7 +224,7 @@
             <label><span data-i18n="credentials.profileName">Profile name</span><input name="name" type="text" required pattern="[a-z0-9][a-z0-9_-]*" data-validation-label="credentials.profileName" autocomplete="off" spellcheck="false" placeholder="production-account" data-i18n-placeholder="credentials.profileNamePlaceholder"></label>
             <label><span data-i18n="credentials.accountId">Cloudflare account ID</span><input name="accountId" type="text" autocomplete="off" spellcheck="false"></label>
             <label><span data-i18n="credentials.apiToken">API token</span><input name="token" type="password" required data-validation-label="credentials.apiToken" autocomplete="new-password" spellcheck="false" placeholder="Write-only; re-enter to rotate" data-i18n-placeholder="credentials.profileTokenPlaceholder"></label>
-            <label><span data-i18n="credentials.probeZoneId">Zone ID used to test this token</span><input name="probeZoneId" type="text" autocomplete="off" spellcheck="false"></label>
+            <label><span data-i18n="credentials.probeZone">Apex domain used to test this token</span><input name="probeZone" type="text" autocomplete="off" spellcheck="false"></label>
             <div class="form-error" id="profile-form-error" role="alert" hidden></div>
             <div class="dialog-actions credential-actions">
               <button class="button quiet danger-button" id="delete-profile-button" type="button" data-i18n="credentials.profileDelete">Delete profile</button>
@@ -245,7 +245,6 @@
             <span class="eyebrow" data-i18n="credentials.bindingEditor">Apex domain</span>
             <label><span data-i18n="credentials.zone">Apex domain</span><input name="zone" type="text" required list="credential-zone-options" data-validation-label="credentials.zone" autocomplete="off" spellcheck="false" placeholder="example.com"><datalist id="credential-zone-options"></datalist></label>
             <label><span data-i18n="credentials.profile">Credential profile</span><select name="profile" id="credential-profile-select" required data-validation-label="credentials.profile"></select></label>
-            <label><span data-i18n="credentials.zoneId">Cloudflare zone ID</span><input name="zoneId" type="text" required data-validation-label="credentials.zoneId" autocomplete="off" spellcheck="false"></label>
             <div class="form-error" id="credential-form-error" role="alert" hidden></div>
             <div class="dialog-actions credential-actions">
               <button class="button quiet danger-button" id="delete-credential-button" type="button" data-i18n="credentials.delete">Remove binding</button>

@@ -136,6 +136,72 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
   }
 }
 
+/** Raised when the account holds no zone by that name, or the token cannot see it. */
+export class ZoneNotFoundError extends Error {}
+
+/** Raised when the token can edit DNS but is not allowed to look zones up. */
+export class ZoneLookupForbiddenError extends Error {}
+
+export interface ResolveZoneIdOptions {
+  readonly name: string;
+  readonly token: string;
+  readonly fetch?: Fetch;
+  readonly apiBaseUrl?: string;
+  readonly timeoutMs?: number;
+}
+
+/**
+ * Finds a zone's id from its name, so an operator binds a domain by typing the
+ * domain rather than copying an identifier out of a dashboard.
+ *
+ * This is the one call Parallax makes outside `dns_records`, and it needs a
+ * permission the rest of the adapter does not: `Zone → Zone → Read`. It runs
+ * only when a binding is created -- the id is stored and every later read and
+ * write uses that -- so the extra permission is never exercised by an apply.
+ */
+export async function resolveZoneId(options: ResolveZoneIdOptions): Promise<string> {
+  const name = options.name.trim().toLowerCase();
+  if (!name) throw new Error("a zone name is required to look up its id");
+  const token = options.token;
+  if (!token.trim()) throw new Error("Cloudflare API token is required");
+  const baseUrl = (options.apiBaseUrl ?? "https://api.cloudflare.com/client/v4").replace(/\/$/, "");
+  const request = options.fetch ?? globalThis.fetch;
+
+  let response: Response;
+  try {
+    // `per_page=2` so a second match is visible rather than silently taking the
+    // first of an ambiguous answer.
+    response = await request(`${baseUrl}/zones?name=${encodeURIComponent(name)}&per_page=2`, {
+      signal: AbortSignal.timeout(positiveInteger(options.timeoutMs ?? 15_000, "Cloudflare timeout")),
+      headers: { authorization: `Bearer ${token}` },
+    });
+  } catch (error) {
+    throw new Error(`Cloudflare API transport failure: ${redact(error instanceof Error ? error.message : String(error), token)}`);
+  }
+
+  const payload = await readJson(response);
+  if (response.status === 403) {
+    // Distinct from "not found" because the operator's next step differs: grant
+    // the permission, rather than check which account holds the domain.
+    throw new ZoneLookupForbiddenError(`this token cannot look up zones. Grant it Zone -> Zone -> Read, or the zone id for ${name} cannot be found automatically`);
+  }
+  if (!response.ok || payload.success !== true) {
+    throw new Error(`Cloudflare API request failed while looking up ${name} (HTTP ${response.status})`);
+  }
+
+  const matches = (Array.isArray(payload.result) ? payload.result : [])
+    .filter(isObject)
+    .filter((zone) => typeof zone.name === "string" && zone.name.toLowerCase() === name)
+    .flatMap((zone) => (typeof zone.id === "string" && zone.id ? [zone.id] : []));
+  if (matches.length === 0) {
+    throw new ZoneNotFoundError(`no Cloudflare zone named ${name} is visible to this token`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`Cloudflare returned ${matches.length} zones named ${name}; the binding would be ambiguous`);
+  }
+  return matches[0]!;
+}
+
 function positiveInteger(value: number, field: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${field} must be a positive integer`);
   return value;

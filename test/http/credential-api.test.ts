@@ -40,13 +40,14 @@ describe("Cloudflare credential HTTP API", () => {
         store: new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) }),
         router: new RoutingProviderAdapter({ fallback: adapters.provider }),
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async (zone) => `id-for-${zone}`,
         createAdapter: () => ({ async list() { return []; }, async apply() {} }),
       });
       const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), credentials: manager }, security);
       const secret = "never-return-this-token";
 
       assert.equal((await api(request("/api/v1/credentials/cloudflare", "GET", undefined, "editor-token-00000000000000000000"))).status, 403);
-      assert.equal((await api(request("/api/v1/credentials/cloudflare/example.com", "PUT", { zoneId: "zone-1", token: secret }))).status, 200);
+      assert.equal((await api(request("/api/v1/credentials/cloudflare/example.com", "PUT", { token: secret }))).status, 200);
 
       for (const path of ["/api/v1/credentials/cloudflare", "/api/v1/credentials/cloudflare/example.com"]) {
         const response = await api(request(path));
@@ -54,7 +55,7 @@ describe("Cloudflare credential HTTP API", () => {
         const text = await response.text();
         assert.equal(text.includes(secret), false);
         assert.equal(text.includes('"token"'), false);
-        assert.match(text, /zone-1/);
+        assert.match(text, /id-for-example\.com/);
       }
 
       const tested = await api(request("/api/v1/credentials/cloudflare/example.com/test", "POST"));
@@ -78,6 +79,7 @@ describe("Cloudflare credential HTTP API", () => {
         store: new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) }),
         router: new RoutingProviderAdapter({ fallback: adapters.provider }),
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async (zone) => `id-for-${zone}`,
         createAdapter: () => ({ async list() { return []; }, async apply() {} }),
       });
       const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), credentials: manager }, security);
@@ -125,13 +127,14 @@ describe("Cloudflare credential HTTP API", () => {
         store: new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) }),
         router: new RoutingProviderAdapter(),
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async (zone) => `id-for-${zone}`,
         createAdapter: () => ({ async list() { throw new Error("leaked secret-value"); }, async apply() {} }),
       });
       const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), credentials: manager }, security);
       const response = await api(request(
         "/api/v1/credentials/cloudflare/example.com/test",
         "POST",
-        { zoneId: "zone-1", token: "secret-value" },
+        { token: "secret-value" },
       ));
       assert.equal(response.status, 502);
       const text = await response.text();

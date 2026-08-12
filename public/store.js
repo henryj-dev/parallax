@@ -410,19 +410,21 @@ export function createStore(client) {
       });
     },
 
-    async testProfile(name, { zoneId, token }) {
+    async testProfile(name, { zone, token }) {
       setError("profile", null);
       if (!name) {
         setError("profile", "credentials.profileNameRequired");
         return false;
       }
-      const probe = zoneId || state.bindings.find((binding) => binding.profile === name)?.zoneId || "";
+      // Cloudflare has no token-only probe, so the profile is exercised against a
+      // domain -- either one the operator names or one already using this profile.
+      const probe = zone || state.bindings.find((binding) => binding.profile === name)?.zone || "";
       if (!probe) {
-        setError("profile", "credentials.probeZoneIdRequired");
+        setError("profile", "credentials.probeZoneRequired");
         return false;
       }
       return administer("profile", "credentials.profileAccepted", { name }, async () => {
-        await client.testProfile(name, { zoneId: probe, ...(token.trim() ? { token } : {}) });
+        await client.testProfile(name, { zone: probe, ...(token.trim() ? { token } : {}) });
       }, { refresh: false });
     },
 
@@ -435,14 +437,14 @@ export function createStore(client) {
       });
     },
 
-    async saveBinding(zone, { zoneId, profile }) {
+    async saveBinding(zone, { profile }) {
       setError("credential", null);
       if (!profile) {
         setError("credential", "credentials.profileRequired");
         return false;
       }
       return administer("credential", "credentials.saved", { zone }, async () => {
-        await client.saveBinding(zone, { zoneId, profile });
+        await client.saveBinding(zone, { profile });
         state.selectedBinding = zone;
       });
     },

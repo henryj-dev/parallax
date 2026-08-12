@@ -31,6 +31,7 @@ describe("CloudflareCredentialManager", () => {
         router,
         environmentAdapters: new Map([["example.com", environment]]),
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async (zone) => `id-for-${zone}`,
         createAdapter: (credential) => {
           const adapter = new SpyAdapter();
           created.push({ credential, adapter });
@@ -39,7 +40,7 @@ describe("CloudflareCredentialManager", () => {
       });
 
       await manager.upsertProfile("shared", { accountId: "acct-1", token: "top-secret" });
-      const binding = await manager.bindZone("Example.COM.", { zoneId: "zone-1", profile: "shared" });
+      const binding = await manager.bindZone("Example.COM.", { profile: "shared" });
       assert.deepEqual(Object.keys(binding).sort(), ["accountId", "profile", "updatedAt", "zone", "zoneId"]);
       await router.list("example.com/external");
       assert.deepEqual(created[0]?.adapter.targets, ["example.com/external"]);
@@ -49,6 +50,7 @@ describe("CloudflareCredentialManager", () => {
         store,
         router: restartedRouter,
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async (zone) => `id-for-${zone}`,
         createAdapter: (credential) => {
           const adapter = new SpyAdapter();
           created.push({ credential, adapter });
@@ -77,12 +79,13 @@ describe("CloudflareCredentialManager", () => {
         store,
         router,
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async (zone) => `id-for-${zone}`,
         createAdapter: (credential) => { created.push(credential); return new SpyAdapter(); },
       });
 
       await manager.upsertProfile("account-a", { accountId: "acct-a", token: "first" });
       for (const zone of ["one.example", "two.example"]) {
-        await manager.bindZone(zone, { zoneId: `zone-${zone}`, profile: "account-a" });
+        await manager.bindZone(zone, { profile: "account-a" });
       }
       const summary = (await manager.listProfiles())[0];
       assert.deepEqual(summary?.zones, ["one.example", "two.example"]);
@@ -92,8 +95,8 @@ describe("CloudflareCredentialManager", () => {
       await manager.upsertProfile("account-a", { accountId: "acct-a", token: "rotated" });
       // One edit re-routes both domains with the new token and their own zone ids.
       assert.deepEqual(created.map((credential) => `${credential.zone}:${credential.zoneId}:${credential.token}`), [
-        "one.example:zone-one.example:rotated",
-        "two.example:zone-two.example:rotated",
+        "one.example:id-for-one.example:rotated",
+        "two.example:id-for-two.example:rotated",
       ]);
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -108,13 +111,14 @@ describe("CloudflareCredentialManager", () => {
         store,
         router: new RoutingProviderAdapter(),
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async (zone) => `id-for-${zone}`,
         createAdapter: () => ({
           async list() { throw new Error("transport included top-secret"); },
           async apply() {},
         }),
       });
       await assert.rejects(
-        () => manager.test("example.com", { zoneId: "zone-1", token: "top-secret" }),
+        () => manager.test("example.com", { token: "top-secret" }),
         (error: unknown) => error instanceof Error && error.message === "Cloudflare credential test failed" && !error.message.includes("top-secret"),
       );
       assert.deepEqual(await manager.listZones(), []);

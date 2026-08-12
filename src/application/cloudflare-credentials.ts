@@ -1,5 +1,5 @@
 import type { ProviderAdapter } from "./ports.ts";
-import { CloudflareProviderAdapter } from "../adapters/cloudflare.ts";
+import { CloudflareProviderAdapter, resolveZoneId } from "../adapters/cloudflare.ts";
 import { RoutingProviderAdapter } from "../adapters/router.ts";
 import {
   CredentialValidationError,
@@ -15,6 +15,8 @@ export interface CloudflareCredentialManagerOptions {
   readonly store: EncryptedCredentialStore;
   readonly router: RoutingProviderAdapter;
   readonly ownershipSecret: string;
+  /** Injected so a test can bind without reaching Cloudflare. */
+  readonly resolveZoneId?: (zone: string, token: string) => Promise<string>;
   readonly environmentAdapters?: ReadonlyMap<string, ProviderAdapter>;
   readonly createAdapter?: (credential: CloudflareCredentialSecret) => ProviderAdapter;
 }
@@ -30,6 +32,7 @@ export class CloudflareCredentialManager {
   readonly #router: RoutingProviderAdapter;
   readonly #environmentAdapters: ReadonlyMap<string, ProviderAdapter>;
   readonly #createAdapter: (credential: CloudflareCredentialSecret) => ProviderAdapter;
+  readonly #resolveZoneId: (zone: string, token: string) => Promise<string>;
 
   constructor(options: CloudflareCredentialManagerOptions) {
     this.#store = options.store;
@@ -40,6 +43,8 @@ export class CloudflareCredentialManager {
       token: credential.token,
       ownershipSecret: options.ownershipSecret,
     }));
+    this.#resolveZoneId = options.resolveZoneId
+      ?? ((zone, token) => resolveZoneId({ name: zone, token }));
   }
 
   async initialize(): Promise<void> {
@@ -88,8 +93,19 @@ export class CloudflareCredentialManager {
     return this.#store.getBinding(zone);
   }
 
-  async bindZone(zone: string, input: { zoneId: string; profile: string }): Promise<CloudflareZoneBinding> {
-    const binding = await this.#store.bindZone(zone, input);
+  /**
+   * Binds a domain to a profile. The zone id is looked up from the domain rather
+   * than typed: it is an identifier the operator would otherwise have to copy out
+   * of a dashboard, and getting it wrong points Parallax at somebody else's zone.
+   * It is resolved once here and stored, so applying never needs the permission
+   * the lookup does.
+   */
+  async bindZone(zone: string, input: { profile: string }): Promise<CloudflareZoneBinding> {
+    const profileName = normalizeProfileName(input.profile);
+    const profile = await this.#store.getProfileSecret(profileName);
+    if (!profile) throw new CredentialNotFoundError();
+    const zoneId = await this.#resolveZoneId(normalizeZone(zone), profile.token);
+    const binding = await this.#store.bindZone(zone, { zoneId, profile: profileName });
     await this.#route(binding.zone);
     return binding;
   }
@@ -104,9 +120,11 @@ export class CloudflareCredentialManager {
     return true;
   }
 
-  /** Checks a stored binding, or an unsaved zone id and token, against the live API. */
-  async test(zone: string, input?: { zoneId: string; token: string; accountId?: string }): Promise<CloudflareZoneBinding> {
-    const credential = input ? secretForTest(zone, input) : await this.#store.getSecret(zone);
+  /** Checks a stored binding, or an unsaved token, against the live API. */
+  async test(zone: string, input?: { token: string; accountId?: string }): Promise<CloudflareZoneBinding> {
+    const credential = input
+      ? secretForTest(zone, { ...input, zoneId: await this.#resolveZoneId(normalizeZone(zone), input.token) })
+      : await this.#store.getSecret(zone);
     if (!credential) throw new CredentialNotFoundError();
     await this.#probe(credential);
     return {
@@ -119,17 +137,20 @@ export class CloudflareCredentialManager {
   }
 
   /**
-   * Checks a profile before any zone uses it. Cloudflare has no token-only
-   * probe, so the caller supplies a zone id to read through.
+   * Checks a profile before any zone uses it. Cloudflare has no token-only probe,
+   * so the caller names a domain the token should be able to reach and the
+   * profile is exercised against it -- which also proves the token can look zones
+   * up, the permission binding will need.
    */
-  async testProfile(name: string, zoneId: string, token?: string): Promise<CloudflareProfileMetadata> {
+  async testProfile(name: string, zone: string, token?: string): Promise<CloudflareProfileMetadata> {
     const profileName = normalizeProfileName(name);
     const stored = token === undefined ? await this.#store.getProfileSecret(profileName) : undefined;
     const secret = token ?? stored?.token;
     if (!secret) throw new CredentialNotFoundError();
+    const zoneName = normalizeZone(zone);
     await this.#probe({
-      zone: PROBE_ZONE,
-      zoneId: validateZoneId(zoneId),
+      zone: zoneName,
+      zoneId: await this.#resolveZoneId(zoneName, secret),
       profile: profileName,
       token: secret,
       updatedAt: new Date(0).toISOString(),

@@ -278,7 +278,7 @@ async function credentialRoute(segments: string[], method: string, request: Requ
     }
     if (segments.length === 6 && segments[5] === "test" && method === "POST") {
       const body = await parseJson(request);
-      return { command: "credential profile test", input: { name, zoneId: body.zoneId, token: body.token } };
+      return { command: "credential profile test", input: { name, zone: body.zone, token: body.token } };
     }
     throw new NotFoundError("route was not found");
   }
@@ -292,7 +292,7 @@ async function credentialRoute(segments: string[], method: string, request: Requ
     const body = await parseJson(request);
     return {
       command: "credential zone set",
-      input: { zone, zoneId: body.zoneId, profile: body.profile, token: body.token, accountId: body.accountId },
+      input: { zone, profile: body.profile, token: body.token, accountId: body.accountId },
     };
   }
   if (segments.length === 5 && method === "DELETE") {
@@ -302,7 +302,7 @@ async function credentialRoute(segments: string[], method: string, request: Requ
     const body = await parseOptionalJson(request);
     return {
       command: "credential zone test",
-      input: { zone, zoneId: body?.zoneId, token: body?.token, accountId: body?.accountId },
+      input: { zone, token: body?.token, accountId: body?.accountId },
     };
   }
   throw new NotFoundError("route was not found");

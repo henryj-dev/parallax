@@ -157,7 +157,8 @@ Path=/` 쿠키를 발급하고(HTTPS 요청이면 `Secure`도 포함), `DELETE /
 
 Cloudflare 자격 증명은 계정 단위 토큰을 한 번만 입력하도록 분리되어 있습니다.
 **프로필**이 재사용 가능한 계정 ID와 API 토큰을 담고, 각 **apex 도메인**은
-프로필과 Cloudflare가 부여한 존 ID에 연결됩니다. 프로필의 토큰을 교체하면 그
+프로필에 연결되며, Cloudflare 존 ID는 도메인으로 조회합니다 — 직접 입력하지
+않습니다. 프로필의 토큰을 교체하면 그
 프로필을 쓰는 모든 도메인의 라우팅이 즉시 갱신되며, 도메인이 연결된 프로필은
 삭제할 수 없습니다.
 
@@ -169,6 +170,16 @@ Cloudflare 자격 증명은 계정 단위 토큰을 한 번만 입력하도록 �
 프로필 도입 이전에 만들어진 저장 파일은 처음 읽을 때 자동으로 변환됩니다. 서로
 다른 토큰마다 프로필 하나가 만들어지고 이름은 그 토큰을 처음 쓴 존에서 따오며,
 각 존은 자신의 존 ID를 그대로 유지합니다. 다시 입력할 것은 없습니다.
+
+토큰에는 관리할 도메인으로 범위를 좁힌 존 권한 두 개가 필요합니다.
+
+| 권한 | 이유 |
+| --- | --- |
+| `Zone` → `DNS` → `Edit` | 모든 레코드 읽기·쓰기. 런타임에 쓰는 전부입니다 |
+| `Zone` → `Zone` → `Read` | 도메인으로 존 ID를 찾을 때. 연결을 만들 때 한 번만 씁니다 |
+
+계정 레벨 권한은 필요 없습니다. 존 ID는 연결 시점에 조회해 저장하므로 apply 는 두 번째
+권한을 쓰지 않습니다 — 프로세스가 장악돼도 그 권한으로 할 수 있는 일이 늘지 않습니다.
 
 Cloudflare에는 최소 권한 API 토큰을 사용합니다. 인증이 설정되면 포털에서
 액세스 토큰을 요청하며 현재 브라우저 탭의 메모리에만 보관합니다. 자격 증명
@@ -286,9 +297,12 @@ CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽
 - `GET /zones/:zone/revisions` (`?limit=&offset=`, 최신 구간을 오름차순으로)
 - `GET /zones/:zone/revisions/:revision`
 - `POST /zones/:zone/revisions/:revision/restore`
+- `GET /credentials/profiles`
+- `GET|PUT|DELETE /credentials/profiles/:name`
+- `POST /credentials/profiles/:name/test` — 읽어볼 `{ zone }` 필요
 - `GET /credentials/cloudflare`
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
-- `POST /credentials/cloudflare/:zone/test` — 저장하지 않은 `{ zoneId, token }`도 선택적으로 테스트
+- `POST /credentials/cloudflare/:zone/test` — 저장하지 않은 `{ token }`도 선택적으로 테스트
 - `POST /cli` (모든 명령 실행. `{ "argv": ["zone", "list"] }`)
 - `GET /health/live`, `GET /health/ready`
 

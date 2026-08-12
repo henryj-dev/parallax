@@ -162,7 +162,8 @@ keep using `Authorization: Bearer` and skip sessions entirely.
 
 Cloudflare credentials are split so an account-wide token is entered once. A
 **profile** holds the reusable account ID and API token; each **apex domain**
-binds to a profile plus the zone ID Cloudflare assigned it. Rotating a token on
+binds to a profile, and its Cloudflare zone ID is looked up from the domain
+rather than typed. Rotating a token on
 one profile immediately re-routes every domain that uses it, and a profile
 cannot be deleted while a domain still points at it.
 
@@ -174,6 +175,17 @@ to the portal, so the field is blank until you type a replacement.
 Store files written before profiles existed are migrated on first read: each
 distinct token becomes one profile, named after the first zone that used it, and
 every zone keeps its own zone ID. Nothing has to be re-entered.
+
+The token needs two zone permissions, scoped to the domains it manages:
+
+| Permission | Why |
+| --- | --- |
+| `Zone` → `DNS` → `Edit` | every record read and write; this is the whole runtime surface |
+| `Zone` → `Zone` → `Read` | resolving a domain to its zone ID, once, when a binding is created |
+
+No account-level permission is needed. The zone ID is resolved at bind time and
+stored, so applying never exercises the second permission -- a compromised
+process can do no more with it than one without it.
 
 Use a minimum-scope Cloudflare API token. When authentication is configured,
 the portal asks for an access token and keeps it only in the current browser
@@ -299,10 +311,10 @@ All control-plane routes are under `/api/v1`.
 - `POST /zones/:zone/revisions/:revision/restore`
 - `GET /credentials/profiles`
 - `GET|PUT|DELETE /credentials/profiles/:name`
-- `POST /credentials/profiles/:name/test` (needs a `{ zoneId }` to read through)
+- `POST /credentials/profiles/:name/test` (needs a `{ zone }` to read through)
 - `GET /credentials/cloudflare`
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
-- `POST /credentials/cloudflare/:zone/test` (optionally tests an unsaved `{ zoneId, token }`)
+- `POST /credentials/cloudflare/:zone/test` (optionally tests an unsaved `{ token }`)
 - `POST /cli` (runs any command; `{ "argv": ["zone", "list"] }`)
 - `GET /health/live` and `GET /health/ready`
 

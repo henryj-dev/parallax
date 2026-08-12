@@ -363,8 +363,8 @@ function renderAdministration(state) {
 }
 
 function setEditorsEnabled(enabled) {
-  for (const name of ["name", "accountId", "token", "probeZoneId"]) $("#profile-form").elements[name].disabled = !enabled;
-  for (const name of ["zone", "profile", "zoneId"]) $("#credential-form").elements[name].disabled = !enabled;
+  for (const name of ["name", "accountId", "token", "probeZone"]) $("#profile-form").elements[name].disabled = !enabled;
+  for (const name of ["zone", "profile"]) $("#credential-form").elements[name].disabled = !enabled;
   for (const id of ["#delete-profile-button", "#test-profile-button", "#save-profile-button",
     "#delete-credential-button", "#test-credential-button", "#save-credential-button"]) $(id).disabled = !enabled;
 }
@@ -661,7 +661,6 @@ $("#credential-list").addEventListener("click", (event) => {
   store.selectBinding(binding.zone);
   const form = $("#credential-form");
   form.elements.zone.value = binding.zone;
-  form.elements.zoneId.value = binding.zoneId;
   form.elements.profile.value = binding.profile;
   render(store.getState());
 });
@@ -679,7 +678,7 @@ $("#profile-form").addEventListener("submit", async (event) => {
 $("#test-profile-button").addEventListener("click", () => {
   const form = $("#profile-form");
   void store.testProfile(String(form.elements.name.value).trim().toLowerCase(), {
-    zoneId: String(form.elements.probeZoneId.value).trim(),
+    zone: String(form.elements.probeZone.value).trim(),
     token: String(form.elements.token.value),
   });
 });
@@ -695,7 +694,6 @@ $("#credential-form").addEventListener("submit", async (event) => {
   const form = event.currentTarget;
   if (!form.checkValidity()) return form.reportValidity();
   await store.saveBinding(String(form.elements.zone.value).trim().toLowerCase().replace(/\.$/u, ""), {
-    zoneId: String(form.elements.zoneId.value).trim(),
     profile: String(form.elements.profile.value),
   });
 });

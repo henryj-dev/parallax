@@ -418,14 +418,14 @@ const COMMANDS: readonly Command[] = [
     role: "admin",
     options: [
       { name: "name", summary: "Profile name", required: true },
-      { name: "zoneId", summary: "Zone id to read through", required: true },
+      { name: "zone", summary: "Apex domain to read through", required: true },
       { name: "token", summary: "Test this token instead of the stored one" },
     ],
     run: async (context, input) => ({
       ok: true,
       profile: await requireCredentials(context).testProfile(
         String(input.name),
-        String(input.zoneId),
+        String(input.zone),
         input.token === undefined ? undefined : String(input.token),
       ),
     }),
@@ -454,7 +454,6 @@ const COMMANDS: readonly Command[] = [
     role: "admin",
     options: [
       ZONE,
-      { name: "zoneId", summary: "Provider zone identifier", required: true },
       { name: "profile", summary: "Credential profile to reuse" },
       { name: "token", summary: "Inline token, stored as a profile named after the zone" },
       { name: "accountId", summary: "Account identifier for an inline token" },
@@ -463,7 +462,7 @@ const COMMANDS: readonly Command[] = [
       const credentials = requireCredentials(context);
       const zone = String(input.zone);
       if (input.profile !== undefined) {
-        return credentials.bindZone(zone, { zoneId: String(input.zoneId), profile: String(input.profile) });
+        return credentials.bindZone(zone, { profile: String(input.profile) });
       }
       if (input.token === undefined) {
         throw new DomainValidationError(["--profile or --token is required"]);
@@ -475,7 +474,7 @@ const COMMANDS: readonly Command[] = [
         token: String(input.token),
         ...(input.accountId === undefined ? {} : { accountId: String(input.accountId) }),
       });
-      return credentials.bindZone(zone, { zoneId: String(input.zoneId), profile });
+      return credentials.bindZone(zone, { profile });
     },
   },
   {
@@ -496,7 +495,6 @@ const COMMANDS: readonly Command[] = [
     role: "admin",
     options: [
       ZONE,
-      { name: "zoneId", summary: "Test this zone id instead of the stored one" },
       { name: "token", summary: "Test this token instead of the stored one" },
       { name: "accountId", summary: "Account identifier for an unsaved credential" },
     ],
@@ -504,11 +502,10 @@ const COMMANDS: readonly Command[] = [
       ok: true,
       credential: await requireCredentials(context).test(
         String(input.zone),
-        input.zoneId === undefined && input.token === undefined
+        input.token === undefined
           ? undefined
           : {
-            zoneId: String(input.zoneId ?? ""),
-            token: String(input.token ?? ""),
+            token: String(input.token),
             ...(input.accountId === undefined ? {} : { accountId: String(input.accountId) }),
           },
       ),
