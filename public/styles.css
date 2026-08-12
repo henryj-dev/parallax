@@ -237,7 +237,10 @@ dialog input:not([type="checkbox"]), dialog select { width: 100%; min-height: 40
 .plan-operation b, .plan-operation small { display: block; }
 .plan-operation b { font: 11px var(--mono); }
 .plan-operation small { margin-top: 5px; color: var(--muted); font-size: 10px; line-height: 1.4; }
-.toast-region { position: fixed; right: 18px; bottom: 18px; z-index: 80; display: grid; gap: 8px; width: min(360px, calc(100vw - 36px)); }
+/* `inset` and the resets override what a browser applies to an open popover,
+   which would otherwise centre the region and give it a border and a padding. */
+.toast-region { position: fixed; inset: auto 18px 18px auto; margin: 0; border: 0; padding: 0; background: none; overflow: visible; z-index: 80; display: grid; gap: 8px; width: min(360px, calc(100vw - 36px)); }
+.toast-region:not(:popover-open) { display: grid; }
 .toast { padding: 13px 15px; border: 1px solid var(--line-strong); border-left: 4px solid var(--success); border-radius: 7px; background: var(--surface); box-shadow: var(--shadow); font-size: 11px; line-height: 1.45; animation: toast-in .2s ease-out; }
 .toast.error { border-left-color: var(--danger); }
 .toast.warning { border-left-color: var(--amber); }

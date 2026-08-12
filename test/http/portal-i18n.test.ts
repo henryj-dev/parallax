@@ -197,6 +197,31 @@ describe("portal store", () => {
 });
 
 describe("portal form validation", () => {
+
+  it("keeps notices visible whether or not the top layer is available", async () => {
+    const [html, css, app] = await Promise.all([
+      readFile(new URL("../../public/index.html", import.meta.url), "utf8"),
+      readFile(new URL("../../public/styles.css", import.meta.url), "utf8"),
+      readFile(new URL("../../public/app.js", import.meta.url), "utf8"),
+    ]);
+
+    // A modal dialog is in the top layer, which no stacking order reaches past,
+    // so a notice raised while one is open is painted under its backdrop. The
+    // region joins the top layer as a popover to sit above it.
+    assert.match(app, /setAttribute\("popover"/);
+    assert.match(app, /showPopover/);
+
+    // The attribute must not be in the markup. A popover is hidden until it is
+    // shown, so declaring it where the API is missing would hide every notice --
+    // worse than the backdrop dimming them.
+    assert.doesNotMatch(html, /id="toast-region"[^>]*popover/);
+    assert.match(app, /typeof toastRegion\.showPopover === "function"/);
+
+    // And if showing ever fails, the region still lays out, so notices degrade
+    // to dimmed rather than disappearing.
+    assert.match(css, /\.toast-region:not\(:popover-open\)\s*\{[^}]*display:\s*grid/);
+  });
+
   it("compiles every pattern the way a browser does, and agrees with the server", async () => {
     const html = await readFile(new URL("../../public/index.html", import.meta.url), "utf8");
     const patterns = [...html.matchAll(/pattern="([^"]*)"/g)].map((match) => match[1]!);

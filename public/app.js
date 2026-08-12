@@ -66,12 +66,46 @@ function setLiveMessage(element, key, values = {}) {
   element.textContent = renderSemanticMessage(message, t);
 }
 
+/**
+ * A modal dialog lives in the top layer, which no stacking order can reach past,
+ * so a notice raised while one is open was painted under its backdrop -- and the
+ * notices that matter most are the ones a dialog's own buttons produce.
+ *
+ * The region joins the top layer too, as a popover, and re-enters it for each
+ * notice so it sits above whatever was opened in the meantime. The attribute is
+ * set here rather than in the markup: a `popover` element is hidden until it is
+ * shown, so declaring it where the API is missing would hide the notices
+ * entirely -- worse than the backdrop covering them.
+ */
+const toastRegion = $("#toast-region");
+const toastsCanRise = typeof toastRegion.showPopover === "function";
+if (toastsCanRise) toastRegion.setAttribute("popover", "manual");
+
+function raiseToasts(show) {
+  if (!toastsCanRise) return;
+  try {
+    if (show) {
+      toastRegion.hidePopover();
+      toastRegion.showPopover();
+    } else {
+      toastRegion.hidePopover();
+    }
+  } catch {
+    // Already in the state asked for, which is not a failure worth reporting.
+  }
+}
+
 function toast({ key, values, level }) {
   const element = document.createElement("div");
   element.className = `toast ${level}`;
   setLiveMessage(element, key, values);
-  $("#toast-region").append(element);
-  setTimeout(() => { liveMessages.delete(element); element.remove(); }, 5200);
+  toastRegion.append(element);
+  raiseToasts(true);
+  setTimeout(() => {
+    liveMessages.delete(element);
+    element.remove();
+    if (!toastRegion.firstChild) raiseToasts(false);
+  }, 5200);
 }
 
 // ---- shared formatting ----------------------------------------------------
