@@ -164,6 +164,7 @@ tr:last-child td { border-bottom: 0; }
 .history-list b, .history-list time, .history-list small { display: block; }
 .history-list b { font-size: 10px; line-height: 1.4; }
 .history-list time, .history-list small { margin-top: 3px; color: var(--muted); font: 9px var(--mono); }
+.plan-unreadable { margin-bottom: 10px; padding: 10px 12px; border: 1px solid #e4b9b5; border-left-width: 4px; border-radius: 6px; background: #fff0ef; color: var(--danger); font-size: 11px; line-height: 1.45; }
 .empty-state, .mini-empty { padding: 34px; text-align: center; color: var(--muted); }
 .empty-state b { color: var(--ink); }
 .empty-state p { max-width: 420px; margin: 8px auto 16px; font-size: 12px; line-height: 1.55; }

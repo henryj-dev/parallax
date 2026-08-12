@@ -19,6 +19,15 @@ import { ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type
 export class NotFoundError extends Error {}
 export class ConflictError extends Error {}
 
+/**
+ * A view's plan, or the reason there is none. An empty plan with no error means
+ * nothing to do; an empty plan with one means nothing could be read -- which
+ * must never be mistaken for the first.
+ */
+export interface PreviewPlan extends ReconcilePlan {
+  error?: string;
+}
+
 export const DEFAULT_HISTORY_PAGE_SIZE = 50;
 export const MAX_HISTORY_PAGE_SIZE = 500;
 
@@ -331,17 +340,45 @@ export class ControlPlane {
     return updated;
   }
 
-  async preview(zoneName: string, viewName?: string, desiredInput?: unknown): Promise<{ zone: string; revision: number; views: Record<string, ReconcilePlan> }> {
+  /**
+   * Reports what applying would do, one view at a time.
+   *
+   * A view whose provider cannot be read reports why instead of failing the
+   * whole preview. Split-horizon materializes `internal` from `external`
+   * whether or not a provider backs it, so on a deployment that publishes to
+   * Cloudflare alone one unreadable view would otherwise hide the plan for the
+   * one the operator came to look at -- and preview is the step that exists so
+   * nothing is applied unseen.
+   */
+  async preview(zoneName: string, viewName?: string, desiredInput?: unknown): Promise<{ zone: string; revision: number; views: Record<string, PreviewPlan> }> {
     const zone = await this.getZone(zoneName);
     const candidateViews = desiredInput === undefined ? zone.views : parseDesiredViews(desiredInput);
     validateExternalView(candidateViews);
     const effectiveViews = reconcilableViews(materializeProviderViews(candidateViews));
     const selected = viewName ? [findView(effectiveViews, validateViewName(viewName))] : effectiveViews;
-    const views: Record<string, ReconcilePlan> = {};
+    const views: Record<string, PreviewPlan> = {};
+    let firstFailure: unknown;
     for (const view of selected) {
-      const actual = await this.#provider.list(targetKey(zone.name, view.name));
-      views[view.name] = buildReconcilePlan(view.records, actual);
+      try {
+        const actual = await this.#provider.list(targetKey(zone.name, view.name));
+        views[view.name] = buildReconcilePlan(view.records, actual);
+      } catch (error) {
+        // Asking for one view by name is asking about that view, so a failure
+        // there is the answer to the question and belongs to the caller.
+        if (viewName) throw error;
+        firstFailure ??= error;
+        const expected = error instanceof ConflictError || error instanceof ProviderNotConfiguredError;
+        views[view.name] = {
+          operations: [],
+          summary: { create: 0, update: 0, delete: 0, conflict: 0 },
+          error: expected ? (error as Error).message : "provider could not be read",
+        };
+      }
     }
+    // Nothing was read, so there is no plan to report. Answering with empty
+    // summaries would read as "no changes needed" to anything that checks the
+    // counts before the errors -- which is most things.
+    if (firstFailure !== undefined && Object.values(views).every((plan) => plan.error)) throw firstFailure;
     return { zone: zone.name, revision: zone.revision, views };
   }
 

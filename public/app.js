@@ -315,18 +315,28 @@ function renderPlan(state) {
     $("#apply-from-plan").disabled = true;
     return;
   }
-  const operations = Object.entries(state.plan.views ?? {})
+  const entries = Object.entries(state.plan.views ?? {});
+  const operations = entries
     .flatMap(([target, plan]) => (plan?.operations ?? []).map((operation) => ({ ...operation, target })));
-  summary.textContent = operations.length
-    ? t(pluralKey("plan.operations", operations.length), { count: operations.length })
-    : t("plan.noChanges");
-  content.innerHTML = operations.length
+  // A view that could not be read produces an empty plan, which would otherwise
+  // be indistinguishable from one with nothing to do -- the reading that would
+  // let an operator apply believing they had seen everything.
+  const unreadable = entries.filter(([, plan]) => plan?.error);
+  summary.textContent = unreadable.length
+    ? t(pluralKey("plan.unreadable", unreadable.length), { count: unreadable.length })
+    : operations.length
+      ? t(pluralKey("plan.operations", operations.length), { count: operations.length })
+      : t("plan.noChanges");
+  const warnings = unreadable
+    .map(([target, plan]) => `<div class="plan-unreadable" role="alert">${escapeHtml(t("plan.viewUnreadable", { view: localizeViewName(target, t), error: String(plan.error) }))}</div>`)
+    .join("");
+  content.innerHTML = warnings + (operations.length
     ? operations.map((operation) => {
       const kind = String(operation.kind ?? "update").toLowerCase();
       const record = operation.desired ?? operation.actual ?? {};
       return `<article class="plan-operation"><span class="operation-kind ${escapeHtml(kind)}">${escapeHtml(t(`operation.${kind}`))}</span><div><b>${escapeHtml(displayName(record.name ?? t("plan.record")))} ${escapeHtml(record.type ?? "")}</b><small>${escapeHtml(localizeViewName(operation.target, t))} · ${escapeHtml(record.content ?? t("plan.reconciled"))}</small></div></article>`;
     }).join("")
-    : `<div class="mini-empty">${escapeHtml(t("plan.noDrift"))}</div>`;
+    : `<div class="mini-empty">${escapeHtml(t("plan.noDrift"))}</div>`);
   $("#apply-from-plan").disabled = operations.length === 0 && !state.dirty;
 }
 

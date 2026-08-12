@@ -322,7 +322,9 @@ Supply `Authorization: Bearer <token>` when authentication is enabled. Desired
 state is stored before provider changes; preview never mutates a provider, and
 apply reports each view independently. Preview queries the live provider on every
 call, so it requires an editor or administrator token even though it changes
-nothing. History and revision listings are paged: both accept `limit` (up to 500,
+nothing. A view whose provider cannot be read reports why instead of failing
+the whole preview, and carries that reason beside an empty plan so it is never
+read as nothing to do; when no view can be read at all, the request fails. History and revision listings are paged: both accept `limit` (up to 500,
 default 50) and `offset`, and return `limit`, `offset`, and `hasMore` alongside
 the items.
 

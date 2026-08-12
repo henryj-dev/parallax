@@ -88,6 +88,42 @@ describe("HTTP API", () => {
     });
   });
 
+
+  it("previews the views it can read and names the ones it cannot", async () => {
+    // Split-horizon materializes `internal` from `external` whether or not a
+    // provider backs it, so on a deployment publishing to Cloudflare alone one
+    // unreadable view used to fail the whole preview -- and preview is the step
+    // that exists so nothing is applied unseen.
+    const adapters = createInMemoryAdapters();
+    const api = createApiHandler({
+      controlPlane: new ControlPlane(adapters.zones, adapters.statuses, {
+        list: async (target: string) => {
+          if (target.endsWith("/internal")) throw new ProviderNotConfiguredError(`no provider is configured for ${target}`);
+          return [];
+        },
+        apply: async () => undefined,
+      }),
+    });
+    await api(request("/api/v1/zones", "POST", { name: "example.com" }));
+    await api(request("/api/v1/zones/example.com/views/external/records/web", "PUT", {
+      name: "www", type: "A", content: "8.8.8.8", ttl: 300,
+    }));
+
+    const response = await api(request("/api/v1/zones/example.com/preview"));
+    assert.equal(response.status, 200);
+    const body = await response.json() as { views: Record<string, { summary: { create: number }; operations: unknown[]; error?: string }> };
+
+    assert.equal(body.views.external?.summary.create, 1, "the readable view still reports its plan");
+    assert.equal(body.views.external?.error, undefined);
+    // An empty plan with an error must never be mistaken for one with nothing
+    // to do, so the reason is carried beside the empty counts.
+    assert.deepEqual(body.views.internal?.operations, []);
+    assert.match(String(body.views.internal?.error), /no provider is configured for example\.com\/internal/);
+
+    // Asking for that view by name is asking about it, so the failure is the answer.
+    assert.equal((await api(request("/api/v1/zones/example.com/preview?view=internal"))).status, 409);
+  });
+
   it("bounds history and revision pages and reports whether more remain", async () => {
     const api = setup();
     await api(request("/api/v1/zones", "POST", { name: "example.com" }));
