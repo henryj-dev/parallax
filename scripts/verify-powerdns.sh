@@ -63,6 +63,11 @@ local-port=53
 cache-ttl=0
 query-cache-ttl=0
 negquery-cache-ttl=0
+# The list of zones is cached separately, for 300 seconds by default, and a zone
+# added while PowerDNS is running is answered REFUSED until that expires. Records
+# reach zones an operator creates whenever they like, so this belongs at 0 in a
+# deployment too -- not just here to keep the test quick.
+zone-cache-refresh-interval=0
 EOF
 
 # The image carries its own schema, so this never drifts from the version under

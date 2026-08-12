@@ -251,6 +251,21 @@ Either way the zone must already exist in the DNS engine: PowerDNS serves what
 its `domains` table lists, and Parallax publishes records into a zone rather
 than creating one.
 
+Two things about running PowerDNS are worth knowing before the first zone,
+because both look like Parallax failing when they are not:
+
+**PowerDNS caches the list of zones for `zone-cache-refresh-interval` seconds,
+300 by default.** A zone added while it is running is answered with `REFUSED`
+until that expires -- `apply` reports `applied`, the rows are in the database,
+and the name does not resolve. Parallax adds records to zones an operator
+creates whenever they like, so set the interval to `0` for this use. Measured:
+with the default a zone added after startup is `REFUSED`; with `0` the same
+zone resolves at once.
+
+**It writes a control socket at startup**, so `readOnlyRootFilesystem: true`
+needs a writable `/var/run/pdns`. An ephemeral volume is right -- a control
+socket has no reason to survive a restart.
+
 ### Retention
 
 Every desired-state change stores an immutable snapshot and an audit entry, so
