@@ -185,16 +185,36 @@ export class ControlPlane {
    * foreign records at the same names survive exactly as they do during apply.
    */
   async #purgeProviderRecords(zone: Zone): Promise<RemovedProviderRecord[]> {
-    const published = new Set<string>();
-    for (const view of reconcilableViews(materializeProviderViews(zone.views))) published.add(view.name);
-    for (const status of await this.#statuses.list(zone.name)) {
-      if (isProviderView(status.view)) published.add(status.view);
+    // Only the views an apply was actually attempted against. `lastAttemptAt` is
+    // written by an attempt and by nothing else -- a view that merely has desired
+    // state carries a pending status without one -- so it marks exactly the
+    // targets that can be holding records to withdraw, including a first attempt
+    // that failed part-way through.
+    //
+    // Deriving the set from the zone's views instead would always include
+    // `internal`, because split-horizon materializes it from `external` whether
+    // or not a provider backs it. Asking an unconfigured provider to list its
+    // records is how deleting a zone came to fail outright on any deployment
+    // that publishes to Cloudflare alone.
+    const published = [...new Set(
+      (await this.#statuses.list(zone.name))
+        .filter((status) => status.lastAttemptAt !== undefined && isProviderView(status.view))
+        .map((status) => status.view),
+    )].sort();
+
+    // Every target is read before any is written. The ordering above promises
+    // that a failure leaves the zone in place to retry, and that promise is only
+    // kept if nothing has been withdrawn by the time it breaks -- withdrawing
+    // one view and then failing on the next reports failure over records that
+    // are already gone.
+    const planned: Array<{ view: string; key: string; plan: ReconcilePlan }> = [];
+    for (const view of published) {
+      const key = targetKey(zone.name, view);
+      planned.push({ view, key, plan: buildReconcilePlan([], await this.#provider.list(key)) });
     }
 
     const removed: RemovedProviderRecord[] = [];
-    for (const view of [...published].sort()) {
-      const key = targetKey(zone.name, view);
-      const plan = buildReconcilePlan([], await this.#provider.list(key));
+    for (const { view, key, plan } of planned) {
       for (const operation of plan.operations) {
         if (operation.kind !== "delete") continue;
         await this.#provider.apply(key, operation);

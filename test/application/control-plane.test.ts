@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE } from "../../src/application/control-plane.ts";
-import { RevisionConflictError, type DesiredChange, type ZoneDeletion } from "../../src/application/ports.ts";
-import type { ReconcileOperation } from "../../src/domain/reconciliation.ts";
+import { ProviderNotConfiguredError, RevisionConflictError, type DesiredChange, type ZoneDeletion } from "../../src/application/ports.ts";
+import type { ProviderRecord, ReconcileOperation } from "../../src/domain/reconciliation.ts";
 import { createInMemoryAdapters, InMemoryApplyLock, InMemoryProvider, InMemoryStatusRepository, InMemoryZoneRepository } from "../../src/infrastructure/in-memory.ts";
 
 class DelayedProvider extends InMemoryProvider {
@@ -54,6 +54,28 @@ class FailingZoneDeletionRepository extends InMemoryZoneRepository {
   override async commitZoneDeletion(deletion: ZoneDeletion): Promise<void> {
     if (this.failure) throw this.failure;
     await super.commitZoneDeletion(deletion);
+  }
+}
+
+/** A deployment that publishes to one provider only, as Cloudflare-only ones do. */
+class SingleViewProvider extends InMemoryProvider {
+  readonly #served: string;
+  constructor(served: string) {
+    super();
+    this.#served = served;
+  }
+  #assertServed(target: string): void {
+    if (!target.endsWith(`/${this.#served}`)) {
+      throw new ProviderNotConfiguredError(`no provider is configured for ${target}`);
+    }
+  }
+  override async list(target: string): Promise<ProviderRecord[]> {
+    this.#assertServed(target);
+    return super.list(target);
+  }
+  override async apply(target: string, operation: Exclude<ReconcileOperation, { kind: "conflict" }>): Promise<void> {
+    this.#assertServed(target);
+    return super.apply(target, operation);
   }
 }
 
@@ -510,6 +532,51 @@ describe("ControlPlane", () => {
     ]);
     assert.deepEqual((await provider.list("example.com/external")).map((record) => record.id), ["foreign"]);
     assert.deepEqual(await provider.list("example.com/internal"), []);
+  });
+
+  it("deletes a zone that only ever published to one provider", async () => {
+    // Split-horizon materializes `internal` from `external` whether or not a
+    // provider backs it, so purging every view a zone could reach asked an
+    // unconfigured provider to list its records -- and deleting a zone failed
+    // outright on any deployment that publishes to Cloudflare alone.
+    const adapters = createInMemoryAdapters();
+    const provider = new SingleViewProvider("external");
+    const service = new ControlPlane(adapters.zones, adapters.statuses, provider);
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "root", { name: "@", type: "A", content: "8.8.8.8", ttl: 60 });
+    await service.apply("example.com", "external");
+
+    const result = await service.deleteZone("example.com");
+
+    assert.deepEqual(result.removedProviderRecords.map((record) => `${record.view}/${record.name}`), ["external/@"]);
+    assert.deepEqual(await provider.list("example.com/external"), []);
+    await assert.rejects(() => service.getZone("example.com"));
+  });
+
+  it("withdraws nothing when a later view cannot be read", async () => {
+    // The zone is kept so the deletion can be retried, which is only true if the
+    // retry has the same work to do -- reporting failure over records that are
+    // already gone would leave the operator repairing instead of retrying.
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "root", { name: "@", type: "A", content: "8.8.8.8", ttl: 60 });
+    await service.apply("example.com");
+    assert.equal((await provider.list("example.com/external")).length, 1);
+    assert.equal((await provider.list("example.com/internal")).length, 1);
+
+    let reads = 0;
+    const original = provider.list.bind(provider);
+    provider.list = async (target: string) => {
+      reads += 1;
+      if (reads === 2) throw new Error("provider is unreachable");
+      return original(target);
+    };
+
+    await assert.rejects(() => service.deleteZone("example.com"), /provider is unreachable/);
+    provider.list = original;
+    assert.equal((await provider.list("example.com/external")).length, 1, "the first view was withdrawn before the failure");
+    assert.equal((await provider.list("example.com/internal")).length, 1);
+    assert.equal((await service.getZone("example.com")).revision, 2);
   });
 
   it("keeps the zone when provider records cannot be withdrawn so the deletion can be retried", async () => {
