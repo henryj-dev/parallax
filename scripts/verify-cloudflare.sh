@@ -9,6 +9,9 @@
 # It creates and removes records under a dedicated `parallax-verify-*` name and
 # never touches anything else. Records without Parallax's ownership marker are
 # left alone by construction; the run asserts that.
+#
+# The token needs `Zone -> DNS -> Edit` for the records and `Zone -> Zone -> Read`,
+# which Parallax uses once to resolve the domain to its zone id.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -79,10 +82,12 @@ ok "control plane running"
 json() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const v=JSON.parse(d);console.log(eval(process.argv[1]))})' "$1"; }
 
 echo "== binding the supplied credential to ${CF_ZONE} =="
+# No zone id in the body: Parallax resolves it from the domain. CF_ZONE_ID is
+# still needed below, where this script talks to Cloudflare directly.
 curl -sf -X PUT -H 'content-type: application/json' \
-  -d "{\"zoneId\":\"${CF_ZONE_ID}\",\"token\":\"${CF_API_TOKEN}\"}" \
+  -d "{\"token\":\"${CF_API_TOKEN}\"}" \
   "$API/credentials/cloudflare/${CF_ZONE}" >/dev/null \
-  || { cat "$WORK/app.log" >&2; fail "the credential was not accepted"; }
+  || { cat "$WORK/app.log" >&2; fail "the credential was not accepted -- if the token cannot list zones, grant it Zone -> Zone -> Read"; }
 ok "credential stored and routed to ${CF_ZONE}/external"
 
 curl -sf -X POST -H 'content-type: application/json' -d "{\"name\":\"${CF_ZONE}\"}" "$API/zones" >/dev/null 2>&1 || true
