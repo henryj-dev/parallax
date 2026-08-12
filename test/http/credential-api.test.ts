@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { CloudflareCredentialManager } from "../../src/application/cloudflare-credentials.ts";
+import { ZoneLookupForbiddenError, ZoneNotFoundError } from "../../src/adapters/cloudflare.ts";
 import { ControlPlane } from "../../src/application/control-plane.ts";
 import { RoutingProviderAdapter } from "../../src/adapters/router.ts";
 import { createApiHandler } from "../../src/http/api.ts";
@@ -32,6 +33,56 @@ function request(path: string, method = "GET", body?: unknown, token = "admin-to
 }
 
 describe("Cloudflare credential HTTP API", () => {
+
+  it("answers a failed zone lookup with what the operator has to change", async () => {
+    // These reach the HTTP layer only through the credential paths, so a claim
+    // that the message "is not silent" is about this mapping, not about the
+    // error being thrown. Unmapped, all three arrived as 500 internal_error.
+    const directory = await mkdtemp(join(tmpdir(), "parallax-lookup-"));
+    try {
+      const store = new EncryptedCredentialStore({
+        repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials,
+        masterKey: randomBytes(32),
+      });
+      let failure: Error = new ZoneLookupForbiddenError("grant it Zone -> Zone -> Read");
+      const manager = new CloudflareCredentialManager({
+        store,
+        router: new RoutingProviderAdapter({}),
+        ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async () => { throw failure; },
+        createAdapter: () => ({ async list() { return []; }, async apply() {} }),
+      });
+      await manager.upsertProfile("shared", { token: "top-secret" });
+      const adapters = createInMemoryAdapters();
+      const api = createApiHandler({
+        controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider),
+        credentials: manager,
+      }, { enabled: false, tokens: [] });
+      const test = () => api(new Request("http://localhost/api/v1/credentials/cloudflare/example.com/test", {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "http://localhost" },
+        body: JSON.stringify({ profile: "shared" }),
+      }));
+
+      let response = await test();
+      assert.equal(response.status, 403);
+      assert.match((await response.json() as { message: string }).message, /Zone -> Zone -> Read/);
+
+      failure = new ZoneNotFoundError("no Cloudflare zone named example.com is visible to this token");
+      response = await test();
+      assert.equal(response.status, 404);
+
+      // Anything else is the provider refusing the credential, which is what a
+      // test reports -- not an internal fault.
+      failure = new Error("Cloudflare API request failed while looking up example.com (HTTP 400)");
+      response = await test();
+      assert.equal(response.status, 502);
+      assert.equal((await response.json() as { error: string }).error, "provider_test_failed");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("is admin-only and never returns a token while supporting list, metadata, test, update, and delete", async () => {
     const directory = await mkdtemp(join(tmpdir(), "parallax-credential-api-"));
     try {

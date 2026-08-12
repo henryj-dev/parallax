@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ConflictError, NotFoundError } from "../application/control-plane.ts";
 import { CredentialNotFoundError, CredentialTestError } from "../application/cloudflare-credentials.ts";
+import { ZoneLookupForbiddenError, ZoneNotFoundError } from "../adapters/cloudflare.ts";
 import { ProviderNotConfiguredError } from "../application/ports.ts";
 import { parseInvocation, UsageError } from "../cli/argv.ts";
 import {
@@ -330,6 +331,10 @@ function errorResponse(error: unknown): Response {
   if (error instanceof NotFoundError) return json({ error: "not_found", message: error.message }, 404);
   if (error instanceof CredentialNotFoundError) return json({ error: "not_found", message: error.message }, 404);
   if (error instanceof CredentialTestError) return json({ error: "provider_test_failed", message: error.message }, 502);
+  // Both name what the operator has to change, and neither carries a secret --
+  // one names a permission, the other a domain the caller already supplied.
+  if (error instanceof ZoneLookupForbiddenError) return json({ error: "zone_lookup_forbidden", message: error.message }, 403);
+  if (error instanceof ZoneNotFoundError) return json({ error: "zone_not_found", message: error.message }, 404);
   if (error instanceof ConflictError) return json({ error: "conflict", message: error.message }, 409);
   if (error instanceof ProviderNotConfiguredError) return json({ error: "provider_not_configured", message: error.message }, 409);
   if (error instanceof UnknownCommandError || error instanceof UsageError) {

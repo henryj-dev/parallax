@@ -1,5 +1,5 @@
 import type { ProviderAdapter } from "./ports.ts";
-import { CloudflareProviderAdapter, resolveZoneId } from "../adapters/cloudflare.ts";
+import { CloudflareProviderAdapter, resolveZoneId, ZoneLookupForbiddenError, ZoneNotFoundError } from "../adapters/cloudflare.ts";
 import { RoutingProviderAdapter } from "../adapters/router.ts";
 import {
   CredentialValidationError,
@@ -104,7 +104,7 @@ export class CloudflareCredentialManager {
     const profileName = normalizeProfileName(input.profile);
     const profile = await this.#store.getProfileSecret(profileName);
     if (!profile) throw new CredentialNotFoundError();
-    const zoneId = await this.#resolveZoneId(normalizeZone(zone), profile.token);
+    const zoneId = await this.#zoneIdFor(normalizeZone(zone), profile.token);
     const binding = await this.#store.bindZone(zone, { zoneId, profile: profileName });
     await this.#route(binding.zone);
     return binding;
@@ -156,7 +156,7 @@ export class CloudflareCredentialManager {
     const zoneName = normalizeZone(zone);
     await this.#probe({
       zone: zoneName,
-      zoneId: await this.#resolveZoneId(zoneName, secret),
+      zoneId: await this.#zoneIdFor(zoneName, secret),
       profile: profileName,
       token: secret,
       updatedAt: new Date(0).toISOString(),
@@ -168,19 +168,33 @@ export class CloudflareCredentialManager {
   async #unsavedSecret(zone: string, input: { token: string; accountId?: string } | { profile: string }): Promise<CloudflareCredentialSecret> {
     const normalizedZone = normalizeZone(zone);
     if (!("profile" in input)) {
-      return secretForTest(zone, { ...input, zoneId: await this.#resolveZoneId(normalizedZone, input.token) });
+      return secretForTest(zone, { ...input, zoneId: await this.#zoneIdFor(normalizedZone, input.token) });
     }
     const profileName = normalizeProfileName(input.profile);
     const profile = await this.#store.getProfileSecret(profileName);
     if (!profile) throw new CredentialNotFoundError();
     return {
       zone: normalizedZone,
-      zoneId: await this.#resolveZoneId(normalizedZone, profile.token),
+      zoneId: await this.#zoneIdFor(normalizedZone, profile.token),
       profile: profileName,
       ...(profile.accountId ? { accountId: profile.accountId } : {}),
       token: profile.token,
       updatedAt: new Date(0).toISOString(),
     };
+  }
+
+  /**
+   * Resolves a zone id, keeping the two failures an operator can act on and
+   * turning anything else into the same answer a failed probe gives. A token
+   * the provider rejects is a rejected credential, not an internal fault.
+   */
+  async #zoneIdFor(zone: string, token: string): Promise<string> {
+    try {
+      return await this.#resolveZoneId(zone, token);
+    } catch (error) {
+      if (error instanceof ZoneLookupForbiddenError || error instanceof ZoneNotFoundError) throw error;
+      throw new CredentialTestError();
+    }
   }
 
   async #probe(credential: CloudflareCredentialSecret): Promise<void> {
