@@ -375,7 +375,13 @@ pnpm audit              # 의존성 취약점 점검
 Origin은 여전히 거부되는지 확인합니다.
 
 `verify:postgres`, `verify:coredns`, `verify:proxy`는 Docker가 필요하며 종료 시
-컨테이너를 제거합니다. `verify:cloudflare`는 실제 존에 쓰기를 하므로 `CF_ZONE`,
+컨테이너를 제거합니다.
+
+통과한 실행은 그 실행이 돈 커밋에 대한 증거일 뿐입니다. Cloudflare 검증은 `ef61201`에서
+실제 존을 대상으로 처음 통과했고, 그 앞의 세 번은 각각 결함을 하나씩 찾았습니다 — 앞의 것이
+뒤의 것을 가리고 있었습니다. 그중에는 소유권 마커가 Cloudflare 주석 상한을 넘어 이름이 열한
+자를 넘는 존에는 레코드를 하나도 발행할 수 없던 것도 있습니다. 이런 것은 로컬에서 보이지
+않습니다 — 스텁 프로바이더는 보내는 것을 그대로 받습니다. `verify:cloudflare`는 실제 존에 쓰기를 하므로 `CF_ZONE`,
 `CF_ZONE_ID`, `CF_API_TOKEN`, `CF_VERIFY_ALLOW_WRITES=true`가 모두 설정되지
 않으면 실행을 거부합니다. 작업은 `parallax-verify-*` 이름으로 제한되며, Parallax가
 소유하지 않은 레코드가 삭제 대상이 되지 않는지도 함께 확인합니다.

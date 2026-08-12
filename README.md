@@ -392,7 +392,15 @@ follow cannot pass vacuously; then it proves `trustForwardedHeaders` and
 `publicOrigin` each repair it, and that a cross-site Origin is still refused.
 
 `verify:postgres`, `verify:coredns`, and `verify:proxy` need Docker and remove
-their containers on exit. `verify:cloudflare` writes to a live zone, so it refuses to run unless
+their containers on exit.
+
+A passing run is evidence about the commit it ran on and nothing else. The
+Cloudflare one first passed at `ef61201`, against a live zone, and the three
+runs before it each found a defect that the previous one had been hiding --
+including an ownership marker that exceeded Cloudflare's comment limit, so no
+record could be published to any zone with a name of more than about eleven
+characters. None of that is visible locally: a stubbed provider accepts
+whatever it is sent. `verify:cloudflare` writes to a live zone, so it refuses to run unless
 `CF_ZONE`, `CF_ZONE_ID`, `CF_API_TOKEN`, and `CF_VERIFY_ALLOW_WRITES=true` are
 all set; it confines itself to a `parallax-verify-*` name and asserts that
 records Parallax does not own are never scheduled for deletion.

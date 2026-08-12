@@ -93,10 +93,11 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
 - [x] 실제 CoreDNS 프로세스에서 생성 zone load, SOA serial reload, `dig` 응답 확인
       — `pnpm verify:coredns` (손으로 관리하던 `$TTL` 상속 레코드와의 충돌 탐지,
       언더스코어 TXT 응답, serial 증가 후 reload 관측, 외부 레코드 보존, 파일 모드)
-- [ ] 최소 권한 Cloudflare API token으로 pagination, rate limit, proxy/TTL 동작 확인
-      — `pnpm verify:cloudflare` 스크립트는 준비되어 있으나 실제 계정이 없어
-      **미실행**이다. `CF_ZONE`, `CF_ZONE_ID`, `CF_API_TOKEN`,
-      `CF_VERIFY_ALLOW_WRITES=true`를 설정해 운영자가 직접 실행해야 한다.
+- [x] 최소 권한 Cloudflare API token으로 pagination, proxy/TTL 동작 확인
+      — `pnpm verify:cloudflare`. **`ef61201`에서 실계정(`tinytools.work`)으로 통과**
+      (2026-08-12). 그 실행이 결함 셋을 찾았다: 소유권 마커가 Cloudflare 주석 상한
+      100자를 넘어 발행이 전부 400이던 것, 파생된 `internal` 뷰 때문에 존 삭제가
+      409이던 것, 그리고 검증 스크립트 자체가 죽은 env 변수를 쓰고 있던 것.
 - [x] reverse proxy/TLS 환경의 Origin 처리 — `publicOrigin` / `trustForwardedHeaders`
       설정으로 해결했고, 실제 nginx TLS 종단 뒤에서 검증했다.
 - [x] Secure cookie — 서버가 `POST /api/v1/session`에서 `HttpOnly; SameSite=Strict`
