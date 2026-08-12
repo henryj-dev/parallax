@@ -7,7 +7,8 @@ const ALGORITHM = "aes-256-gcm";
 const NONCE_BYTES = 12;
 const AUTHENTICATION_TAG_BYTES = 16;
 const AAD = Buffer.from("parallax:credential-store:v1", "utf8");
-const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/u;
+/** Exported so the portal's `pattern` attribute can be checked against it. */
+export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/u;
 
 /** A caller supplied an unusable zone, zone id, profile, or token. Safe to report as a 400. */
 export class CredentialValidationError extends TypeError {

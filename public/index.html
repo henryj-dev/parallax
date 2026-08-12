@@ -221,7 +221,7 @@
           </div>
           <form id="profile-form" class="credential-editor" method="dialog">
             <span class="eyebrow" data-i18n="credentials.profileEditor">Profile</span>
-            <label><span data-i18n="credentials.profileName">Profile name</span><input name="name" type="text" required pattern="[a-z0-9][a-z0-9_-]*" data-validation-label="credentials.profileName" autocomplete="off" spellcheck="false" placeholder="production-account" data-i18n-placeholder="credentials.profileNamePlaceholder"></label>
+            <label><span data-i18n="credentials.profileName">Profile name</span><input name="name" type="text" required pattern="[a-z0-9][a-z0-9_\-]{0,62}" data-validation-label="credentials.profileName" autocomplete="off" spellcheck="false" placeholder="production-account" data-i18n-placeholder="credentials.profileNamePlaceholder"></label>
             <label><span data-i18n="credentials.accountId">Cloudflare account ID</span><input name="accountId" type="text" autocomplete="off" spellcheck="false"></label>
             <label><span data-i18n="credentials.apiToken">API token</span><input name="token" type="password" required data-validation-label="credentials.apiToken" autocomplete="new-password" spellcheck="false" placeholder="Write-only; re-enter to rotate" data-i18n-placeholder="credentials.profileTokenPlaceholder"></label>
             <label><span data-i18n="credentials.probeZone">Apex domain used to test this token</span><input name="probeZone" type="text" autocomplete="off" spellcheck="false"></label>

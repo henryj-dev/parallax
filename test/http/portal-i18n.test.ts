@@ -21,6 +21,7 @@ import {
   writePersistedLocale,
 } from "../../public/i18n.js";
 import { createStore, type StoreNotice } from "../../public/store.js";
+import { PROFILE_NAME_PATTERN } from "../../src/security/credential-store.ts";
 
 describe("portal internationalization", () => {
   it("resolves a persisted choice before browser preferences", () => {
@@ -192,5 +193,37 @@ describe("portal store", () => {
     store.onNotice((notice) => { keys.push(notice.key); });
     await store.saveSettings({ publicOrigin: "https://dns.example.com" });
     assert.deepEqual(keys, ["settings.saved"]);
+  });
+});
+
+describe("portal form validation", () => {
+  it("compiles every pattern the way a browser does, and agrees with the server", async () => {
+    const html = await readFile(new URL("../../public/index.html", import.meta.url), "utf8");
+    const patterns = [...html.matchAll(/pattern="([^"]*)"/g)].map((match) => match[1]!);
+    assert.ok(patterns.length > 0, "no pattern attributes were found to check");
+
+    for (const pattern of patterns) {
+      // Browsers compile `pattern` with the `v` flag, where a literal `-` inside
+      // a character class is a syntax error. `new RegExp(pattern)` accepts what
+      // the browser rejects, so checking it the ordinary way proves nothing --
+      // the attribute was invalid in production while every test passed, and an
+      // invalid pattern means the field is not validated at all.
+      assert.doesNotThrow(() => new RegExp(pattern, "v"), `pattern is invalid in a browser: ${pattern}`);
+    }
+
+    const profilePattern = patterns.find((pattern) => pattern.startsWith("[a-z0-9]"));
+    assert.ok(profilePattern, "the profile name pattern was not found");
+    const client = new RegExp(`^(?:${profilePattern})$`, "v");
+    for (const [value, allowed] of [
+      ["production-account", true], ["my_profile", true], ["a", true],
+      ["a".repeat(63), true], ["a".repeat(64), false],
+      ["-leading", false], ["Upper", false], ["has space", false],
+    ] as const) {
+      // The server is the authority; the attribute only spares a round trip.
+      // Disagreeing in either direction is a defect: rejecting what the server
+      // accepts is as wrong as accepting what it refuses.
+      assert.equal(client.test(value), allowed, value);
+      assert.equal(PROFILE_NAME_PATTERN.test(value), allowed, `server: ${value}`);
+    }
   });
 });

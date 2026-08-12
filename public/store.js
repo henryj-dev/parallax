@@ -457,7 +457,14 @@ export function createStore(client) {
       }
       return administer("credential", "credentials.accepted", { zone }, async () => {
         await client.testBinding(zone);
-      }, { refresh: false });
+      }, {
+        refresh: false,
+        failureKey: "credentials.testFailed",
+        // Testing a domain that was never bound is the ordinary mistake here --
+        // the form is filled in and the button is right there -- so it gets an
+        // answer that says what to do rather than one that reads like a fault.
+        errorKeyFor: (error) => (error.status === 404 ? "credentials.testNeedsBinding" : undefined),
+      });
     },
 
     async deleteBinding(zone) {
