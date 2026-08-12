@@ -9,6 +9,7 @@ import { ConflictError, NotFoundError } from "../../src/application/control-plan
 import { readConfig } from "../../src/config.ts";
 import { DomainValidationError } from "../../src/domain/dns.ts";
 import { createMigrationRuntime, createRuntime, RuntimeStartupError } from "../../src/runtime.ts";
+import { MIGRATION_TARGETS, type MigrationTarget } from "../../src/infrastructure/migrations.ts";
 
 const argv = process.argv.slice(2);
 
@@ -29,7 +30,7 @@ try {
   // Migrating is the one command that runs against a store it cannot read yet,
   // so it gets a connection and nothing that would read through it.
   runtime = invocation.name === "migrate"
-    ? createMigrationRuntime(readConfig())
+    ? createMigrationRuntime(readConfig(), migrationTarget(invocation.input))
     : await createRuntime(readConfig());
   // The command line reaches the store directly, so it acts with full rights;
   // HTTP callers are restricted by the role their token carries.
@@ -50,6 +51,14 @@ try {
 }
 
 process.exit(exitCode);
+
+function migrationTarget(input: Record<string, unknown>): MigrationTarget {
+  const target = input.target === undefined ? "parallax" : String(input.target);
+  if (!MIGRATION_TARGETS.includes(target as MigrationTarget)) {
+    throw new UsageError(`--target must be one of: ${MIGRATION_TARGETS.join(", ")}`);
+  }
+  return target as MigrationTarget;
+}
 
 /** Records who ran the command so the audit trail is not just "system". */
 function actorName(): string {

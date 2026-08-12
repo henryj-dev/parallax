@@ -3,7 +3,7 @@ import type { CloudflareCredentialManager } from "../application/cloudflare-cred
 import { NotFoundError, type ControlPlane } from "../application/control-plane.ts";
 import type { SettingsService } from "../application/settings.ts";
 import { DomainValidationError } from "../domain/dns.ts";
-import type { MigrationRun } from "../infrastructure/migrations.ts";
+import { MIGRATION_TARGETS, type MigrationRun } from "../infrastructure/migrations.ts";
 import type { Role } from "../security/http-authorization.ts";
 
 /**
@@ -332,7 +332,7 @@ const COMMANDS: readonly Command[] = [
     name: "migrate",
     summary: "Apply the database schema; safe to re-run",
     role: "admin",
-    options: [],
+    options: [{ name: "target", summary: `Which database: ${MIGRATION_TARGETS.join(" or ")}` }],
     run: async (context) => {
       const migrate = context.runtime.migrate;
       if (!migrate) throw new CommandUnavailableError("this process has no database to migrate");

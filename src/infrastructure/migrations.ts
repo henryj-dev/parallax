@@ -21,6 +21,11 @@ import type { CloseablePgPool } from "./postgres.ts";
 /** A distinct key, so a migration run cannot be confused with a zone's apply lock. */
 const MIGRATION_LOCK = "parallax:migrations";
 
+/** Which database a run targets. PowerDNS keeps its records in its own. */
+export type MigrationTarget = "parallax" | "powerdns";
+
+export const MIGRATION_TARGETS: readonly MigrationTarget[] = ["parallax", "powerdns"];
+
 export interface MigrationRun {
   readonly directory: string;
   readonly applied: readonly string[];
@@ -30,11 +35,11 @@ export interface MigrationRun {
  * Where the `.sql` files ended up relative to the running code: beside the
  * sources in a checkout, and one directory above `dist` in the image.
  */
-export function findMigrationsDirectory(start: string): string {
+export function findMigrationsDirectory(start: string, subdirectory?: string): string {
   let directory = start;
   for (let depth = 0; depth < 4; depth += 1) {
     const candidate = resolve(directory, "migrations");
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(candidate)) return subdirectory ? resolve(candidate, subdirectory) : candidate;
     directory = resolve(directory, "..");
   }
   throw new Error("the migrations directory could not be located");

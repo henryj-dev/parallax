@@ -58,6 +58,7 @@ pnpm start
 | `PARALLAX_PROVIDER_STATE_FILE` | 로컬 프로바이더가 켜져 있을 때만 사용하는 상태 파일 |
 | `PARALLAX_OWNERSHIP_SECRET` | 관리 레코드 소유권 마커에 서명하는 32바이트 이상 시크릿 |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장 자격 증명을 암호화하는 정확히 32바이트 키(base64 또는 64자 16진수) |
+| `PARALLAX_POWERDNS_DATABASE_URL` | PowerDNS 자체 데이터베이스. CoreDNS 존 파일 대신 여기로 내부 뷰를 발행할 때 |
 | `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | 이 프로세스가 직접 TLS를 끝낼 인증서와 키. 둘 다 설정하거나 둘 다 비웁니다 |
 | `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP에 TLS origin으로의 리다이렉트를 내는 포트. TLS 설정이 있어야 합니다 |
 | `PARALLAX_AUTH_TOKENS` | `{"token","subject","role"}` 객체의 JSON 배열. `role`은 `admin`·`editor`·`viewer` 중 하나이고 토큰은 32바이트 이상. 루프백에서는 선택, **그 외 주소에 바인드하려면 필수** |
@@ -209,6 +210,38 @@ CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일
 괄호로 여러 줄에 걸친 레코드가 포함됩니다. 읽을 수 없는 레코드 줄은 "레코드
 없음"이 아니라 오류로 처리합니다. 없는 것으로 간주하면 보지 못한 응답 옆에
 두 번째 응답을 게시하게 되기 때문입니다.
+
+### 내부 뷰를 발행하는 두 가지 방법
+
+내부 뷰는 두 형태가 있고 배포가 설정으로 하나를 고릅니다. 둘 다 설정하면 기동을
+거부합니다 — 잘못된 쪽이 서비스 중이라는 걸 알게 됐을 때 아무도 기억하지 못할 우선순위
+규칙으로 푸는 대신에.
+
+| | `coreDnsDirectory` | `PARALLAX_POWERDNS_DATABASE_URL` |
+| --- | --- | --- |
+| 발행 형태 | RFC 1035 존 파일 | PowerDNS 데이터베이스의 행 |
+| 필요한 것 | 두 프로세스가 닿는 파일시스템 | 데이터베이스 외에 없음 |
+| 클러스터에서는 | 재시작을 견디는 볼륨 | 볼륨 불필요 |
+| 변경이 응답되기까지 | `reload` 주기, 약 1초 | 리졸버의 캐시 TTL |
+
+존 파일 쪽은 **휘발성 볼륨이 아니라 영속 저장소**가 필요합니다. 존 파일에는 아무도 사본을
+갖고 있지 않은 레코드 — 운영자가 손으로 관리하는 것 — 도 함께 있기 때문입니다. 잃으면
+그것들이 사라집니다.
+
+PowerDNS에는 레코드마다 소유권을 적을 자리가 없어서, Parallax가 PowerDNS 데이터베이스에
+테이블 하나를 추가합니다:
+
+```sh
+parallax migrate --target powerdns
+```
+
+Parallax 데이터베이스가 아니라 거기에 두는 이유는, **소유권이 프로바이더만 보고도 답해질 수
+있어야** 하기 때문입니다 — Cloudflare 코멘트나 존 파일 주석이 주는 것과 같은 성질입니다.
+PowerDNS에서 레코드를 직접 지우면 마커도 함께 사라지므로, 없는 행을 소유했다고 주장하는
+일이 생기지 않습니다.
+
+어느 쪽이든 존은 DNS 엔진에 이미 있어야 합니다. PowerDNS는 `domains` 테이블에 있는 것을
+서비스하고, Parallax는 존을 만드는 것이 아니라 존에 레코드를 발행합니다.
 
 ### 보관 정책
 
@@ -377,6 +410,7 @@ UID 10001로 실행되며 애플리케이션 디렉터리에는 쓸 수 없습�
 ```sh
 pnpm verify:postgres    # Docker PostgreSQL: 마이그레이션, 재시작, 잠금, 보관 정책
 pnpm verify:coredns     # Docker CoreDNS + dig: 존 로드, SOA reload, 충돌 탐지
+pnpm verify:powerdns    # Docker PowerDNS + PostgreSQL + dig: 발행, 충돌, 회수
 pnpm verify:proxy       # Docker nginx TLS 종단: Origin, 쿠키, HSTS, readiness
 pnpm verify:cloudflare  # 옵트인. 실제 토큰이 필요하며 없으면 건너뜀
 pnpm audit              # 의존성 취약점 점검

@@ -17,6 +17,8 @@ export interface ParallaxConfig {
   /** Settings, credentials and tokens file used when no database is configured. */
   configurationFile: string;
   databaseUrl?: string;
+  /** PowerDNS's own database, when the internal view is published into it. */
+  powerDnsDatabaseUrl?: string;
   /** Signs managed-record ownership markers. Rotating it orphans existing records. */
   ownershipSecret?: string;
   /** Encrypts stored provider credentials. Without it, credentials cannot be used. */
@@ -48,6 +50,9 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     providerStateFile: environment.PARALLAX_PROVIDER_STATE_FILE?.trim() || "data/provider-state.json",
     configurationFile: environment.PARALLAX_CONFIG_FILE?.trim() || "data/parallax-config.json",
     ...(environment.DATABASE_URL?.trim() ? { databaseUrl: environment.DATABASE_URL.trim() } : {}),
+    ...(environment.PARALLAX_POWERDNS_DATABASE_URL?.trim()
+      ? { powerDnsDatabaseUrl: environment.PARALLAX_POWERDNS_DATABASE_URL.trim() }
+      : {}),
     ...(ownershipSecret ? { ownershipSecret } : {}),
     ...(credentialMasterKey ? { credentialMasterKey } : {}),
     bootstrapTokens: readBootstrapTokens(environment.PARALLAX_AUTH_TOKENS),

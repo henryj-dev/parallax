@@ -56,6 +56,7 @@ bind, how to reach the store, and the keys that protect what is stored.
 | `PARALLAX_PROVIDER_STATE_FILE` | Local provider state, used only while the local provider is enabled |
 | `PARALLAX_OWNERSHIP_SECRET` | 32+ byte secret that signs managed-record ownership markers |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | Exactly 32 bytes as base64 or 64 hexadecimal characters; encrypts stored credentials |
+| `PARALLAX_POWERDNS_DATABASE_URL` | PowerDNS's own database, when the internal view is published into it instead of CoreDNS zone files |
 | `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | Certificate and key for this process to end TLS itself; set both or neither |
 | `PARALLAX_HTTP_REDIRECT_PORT` | Port answering plain HTTP with a redirect to the TLS origin; needs TLS configured |
 | `PARALLAX_AUTH_TOKENS` | JSON array of `{"token","subject","role"}`; `role` is `admin`, `editor` or `viewer`, and each token is at least 32 bytes. Optional on loopback, **required to bind any other address** |
@@ -216,6 +217,39 @@ inherit `$TTL`, records that inherit the previous owner name, an optional class
 field, and parenthesized multi-line records. A record line Parallax cannot read
 is an error rather than an absent record, because treating it as absent would let
 reconciliation publish a second answer beside one it never saw.
+
+### Publishing the internal view
+
+The internal view has two shapes, and a deployment picks one by configuring it.
+Configuring both is refused at startup rather than resolved by a precedence
+rule nobody would remember when the wrong one turned out to be serving.
+
+| | `coreDnsDirectory` | `PARALLAX_POWERDNS_DATABASE_URL` |
+| --- | --- | --- |
+| Published as | RFC 1035 zone files | rows in PowerDNS's database |
+| Needs | a filesystem both processes reach | nothing beyond the database |
+| In a cluster | a volume that must survive restarts | no volume |
+| Change is served after | `reload` interval, about a second | the resolver's cache TTL |
+
+The zone-file shape needs persistent storage and not an ephemeral volume,
+because a zone file also holds records nobody else has a copy of -- the ones an
+operator maintains by hand. Losing it loses those.
+
+PowerDNS has no per-record field to mark ownership with, so Parallax adds one
+table to PowerDNS's own database:
+
+```sh
+parallax migrate --target powerdns
+```
+
+It lives there, not in Parallax's database, because ownership has to be
+answerable from the provider alone -- the same property a Cloudflare comment or
+a zone-file comment gives. A record deleted directly in PowerDNS takes its
+marker with it, so the table can never claim a row that is no longer there.
+
+Either way the zone must already exist in the DNS engine: PowerDNS serves what
+its `domains` table lists, and Parallax publishes records into a zone rather
+than creating one.
 
 ### Retention
 
@@ -394,6 +428,7 @@ Unit and HTTP tests use in-memory fakes. These scripts exercise the real thing:
 ```sh
 pnpm verify:postgres    # Docker PostgreSQL: migration, restart, locks, retention
 pnpm verify:coredns     # Docker CoreDNS + dig: zone load, SOA reload, conflicts
+pnpm verify:powerdns    # Docker PowerDNS + PostgreSQL + dig: publish, conflict, withdraw
 pnpm verify:proxy       # Docker nginx over TLS: origin, cookies, HSTS, readiness
 pnpm verify:cloudflare  # opt-in; needs a real scoped token, skips without one
 pnpm audit              # dependency advisories

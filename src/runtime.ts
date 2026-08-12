@@ -7,14 +7,16 @@ import { ControlPlane } from "./application/control-plane.ts";
 import { SettingsService, type ParallaxSettings } from "./application/settings.ts";
 import { DomainValidationError } from "./domain/dns.ts";
 import { CoreDnsFileAdapter } from "./adapters/coredns-file.ts";
+import { PowerDnsProviderAdapter } from "./adapters/powerdns.ts";
 import { NodeCoreDnsFileOperations } from "./adapters/node-coredns-files.ts";
 import { RoutingProviderAdapter } from "./adapters/router.ts";
+import type { ProviderAdapter } from "./application/ports.ts";
 import type { CommandRuntime } from "./cli/commands.ts";
 import type { ParallaxConfig } from "./config.ts";
 import { createFileStateAdapters } from "./infrastructure/file-state.ts";
 import { FileConfigurationStore } from "./infrastructure/file-settings.ts";
 import { FileProviderAdapter } from "./infrastructure/file-provider.ts";
-import { applyMigrations, findMigrationsDirectory, type MigrationRun } from "./infrastructure/migrations.ts";
+import { applyMigrations, findMigrationsDirectory, type MigrationRun, type MigrationTarget } from "./infrastructure/migrations.ts";
 import {
   createPostgresAdapters,
   createPostgresPool,
@@ -90,6 +92,9 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     throw new RuntimeStartupError(`configuration could not be read: ${message(error)}`);
   }
 
+  const powerDnsPool: CloseablePgPool | undefined = config.powerDnsDatabaseUrl
+    ? createPostgresPool(config.powerDnsDatabaseUrl)
+    : undefined;
   const provider = new RoutingProviderAdapter();
   const credentials = config.credentialMasterKey
     ? new CloudflareCredentialManager({
@@ -103,13 +108,14 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     provider.setFallback(current.allowLocalProvider
       ? new FileProviderAdapter({ path: resolve(config.providerStateFile) })
       : undefined);
-    provider.setInternal(current.coreDnsDirectory && config.ownershipSecret
-      ? new CoreDnsFileAdapter({
-        files: new NodeCoreDnsFileOperations({ root: resolve(current.coreDnsDirectory) }),
-        pathForTarget: (target) => `${target.slice(0, target.lastIndexOf("/"))}.zone`,
-        ownershipSecret: config.ownershipSecret,
-      })
-      : undefined);
+    // Two ways to publish the internal view, and the deployment picks one by
+    // configuring it. Both at once is refused rather than resolved by a
+    // precedence rule nobody would remember when the wrong one turned out to be
+    // serving.
+    if (current.coreDnsDirectory && powerDnsPool) {
+      throw new RuntimeStartupError("both coreDnsDirectory and PARALLAX_POWERDNS_DATABASE_URL are configured; the internal view can have only one publisher");
+    }
+    provider.setInternal(internalAdapter(current, config, powerDnsPool));
   };
   applyProviderSettings(settings.current());
   settings.onChange((current) => { applyProviderSettings(current); });
@@ -136,7 +142,10 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     ...(pool ? { migrate: () => applyMigrations(pool, findMigrationsDirectory(import.meta.dirname)) } : {}),
     ...(credentials ? { credentials } : {}),
     provider,
-    close: async () => { await pool?.end().catch(() => undefined); },
+    close: async () => {
+      await pool?.end().catch(() => undefined);
+      await powerDnsPool?.end().catch(() => undefined);
+    },
   };
 }
 
@@ -167,15 +176,36 @@ async function writeFailure(path: string): Promise<string | undefined> {
  * not exist yet -- the exact situation migrating exists to resolve. This builds
  * the connection and nothing that reads through it.
  */
-export function createMigrationRuntime(config: ParallaxConfig): MigrationRuntime {
+export function createMigrationRuntime(config: ParallaxConfig, target: MigrationTarget = "parallax"): MigrationRuntime {
   // Without a database there is no schema, and the command says so rather than
   // this function inventing a reason to fail.
-  if (!config.databaseUrl) return { close: async () => undefined };
-  const pool = createPostgresPool(config.databaseUrl);
+  const url = target === "powerdns" ? config.powerDnsDatabaseUrl : config.databaseUrl;
+  if (!url) return { close: async () => undefined };
+  const pool = createPostgresPool(url);
+  // PowerDNS owns its schema; Parallax only adds the table its ownership marker
+  // lives in, which is why that target has a directory of its own.
+  const directory = findMigrationsDirectory(import.meta.dirname, target === "powerdns" ? "powerdns" : undefined);
   return {
-    migrate: () => applyMigrations(pool, findMigrationsDirectory(import.meta.dirname)),
+    migrate: () => applyMigrations(pool, directory),
     close: async () => { await pool.end().catch(() => undefined); },
   };
+}
+
+function internalAdapter(
+  settings: ParallaxSettings,
+  config: ParallaxConfig,
+  powerDnsPool: CloseablePgPool | undefined,
+): ProviderAdapter | undefined {
+  // Both shapes sign the same ownership marker, so neither works without the
+  // secret that signs it.
+  if (!config.ownershipSecret) return undefined;
+  if (powerDnsPool) return new PowerDnsProviderAdapter({ pool: powerDnsPool, ownershipSecret: config.ownershipSecret });
+  if (!settings.coreDnsDirectory) return undefined;
+  return new CoreDnsFileAdapter({
+    files: new NodeCoreDnsFileOperations({ root: resolve(settings.coreDnsDirectory) }),
+    pathForTarget: (target) => `${target.slice(0, target.lastIndexOf("/"))}.zone`,
+    ownershipSecret: config.ownershipSecret,
+  });
 }
 
 function message(error: unknown): string {

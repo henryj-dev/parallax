@@ -16,8 +16,9 @@
     "test:watch": "node --test --watch",
     "verify:cloudflare": "bash scripts/verify-cloudflare.sh",
     "verify:coredns": "bash scripts/verify-coredns.sh",
-    "verify:integration": "pnpm verify:postgres && pnpm verify:coredns && pnpm verify:proxy && pnpm verify:cloudflare",
+    "verify:integration": "pnpm verify:postgres && pnpm verify:coredns && pnpm verify:powerdns && pnpm verify:proxy && pnpm verify:cloudflare",
     "verify:postgres": "bash scripts/verify-postgres.sh",
+    "verify:powerdns": "bash scripts/verify-powerdns.sh",
     "verify:proxy": "bash scripts/verify-proxy.sh"
   },
   "engines": {
