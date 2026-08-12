@@ -449,14 +449,16 @@ export function createStore(client) {
       });
     },
 
-    async testBinding(zone) {
+    async testBinding(zone, { profile } = {}) {
       setError("credential", null);
       if (!zone) {
         setError("credential", "credentials.selectZone");
         return false;
       }
+      // With a profile the check runs against an unsaved pairing, which is the
+      // order an operator expects: find out it works, then commit it.
       return administer("credential", "credentials.accepted", { zone }, async () => {
-        await client.testBinding(zone);
+        await client.testBinding(zone, profile ? { profile } : undefined);
       }, {
         refresh: false,
         failureKey: "credentials.testFailed",

@@ -302,7 +302,7 @@ CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽
 - `POST /credentials/profiles/:name/test` — 읽어볼 `{ zone }` 필요
 - `GET /credentials/cloudflare`
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
-- `POST /credentials/cloudflare/:zone/test` — 저장하지 않은 `{ token }`도 선택적으로 테스트
+- `POST /credentials/cloudflare/:zone/test` — 저장된 연결, 또는 아직 저장하지 않은 `{ profile }`·`{ token }` 테스트
 - `POST /cli` (모든 명령 실행. `{ "argv": ["zone", "list"] }`)
 - `GET /health/live`, `GET /health/ready`
 

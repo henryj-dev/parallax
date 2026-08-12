@@ -698,7 +698,12 @@ $("#credential-form").addEventListener("submit", async (event) => {
   });
 });
 $("#test-credential-button").addEventListener("click", () => {
-  void store.testBinding(String($("#credential-form").elements.zone.value).trim().toLowerCase().replace(/\.$/u, ""));
+  const form = $("#credential-form");
+  // The selected profile is sent so a domain can be checked before it is bound.
+  void store.testBinding(
+    String(form.elements.zone.value).trim().toLowerCase().replace(/\.$/u, ""),
+    { profile: String(form.elements.profile.value) },
+  );
 });
 $("#delete-credential-button").addEventListener("click", async () => {
   const form = $("#credential-form");

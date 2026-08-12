@@ -142,6 +142,20 @@ function requireCredentials(context: CommandContext): CloudflareCredentialManage
   return credentials;
 }
 
+/**
+ * What to probe with when the caller does not want the stored binding: a
+ * profile it has not bound yet, or a token it has not saved. Neither means the
+ * stored one.
+ */
+function unsavedCredentialFor(input: Record<string, unknown>): { profile: string } | { token: string; accountId?: string } | undefined {
+  if (input.profile !== undefined) return { profile: String(input.profile) };
+  if (input.token === undefined) return undefined;
+  return {
+    token: String(input.token),
+    ...(input.accountId === undefined ? {} : { accountId: String(input.accountId) }),
+  };
+}
+
 function requireControlPlane(runtime: CommandRuntime): ControlPlane {
   if (!runtime.controlPlane) throw new CommandUnavailableError("the control plane is unavailable in this process");
   return runtime.controlPlane;
@@ -495,6 +509,7 @@ const COMMANDS: readonly Command[] = [
     role: "admin",
     options: [
       ZONE,
+      { name: "profile", summary: "Test this profile before binding the domain to it" },
       { name: "token", summary: "Test this token instead of the stored one" },
       { name: "accountId", summary: "Account identifier for an unsaved credential" },
     ],
@@ -502,12 +517,7 @@ const COMMANDS: readonly Command[] = [
       ok: true,
       credential: await requireCredentials(context).test(
         String(input.zone),
-        input.token === undefined
-          ? undefined
-          : {
-            token: String(input.token),
-            ...(input.accountId === undefined ? {} : { accountId: String(input.accountId) }),
-          },
+        unsavedCredentialFor(input),
       ),
     }),
   },

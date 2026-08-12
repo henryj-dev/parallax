@@ -314,7 +314,7 @@ All control-plane routes are under `/api/v1`.
 - `POST /credentials/profiles/:name/test` (needs a `{ zone }` to read through)
 - `GET /credentials/cloudflare`
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
-- `POST /credentials/cloudflare/:zone/test` (optionally tests an unsaved `{ token }`)
+- `POST /credentials/cloudflare/:zone/test` (tests the stored binding, or an unsaved `{ profile }` or `{ token }`)
 - `POST /cli` (runs any command; `{ "argv": ["zone", "list"] }`)
 - `GET /health/live` and `GET /health/ready`
 

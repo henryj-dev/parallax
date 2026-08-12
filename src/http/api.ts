@@ -302,7 +302,7 @@ async function credentialRoute(segments: string[], method: string, request: Requ
     const body = await parseOptionalJson(request);
     return {
       command: "credential zone test",
-      input: { zone, token: body?.token, accountId: body?.accountId },
+      input: { zone, profile: body?.profile, token: body?.token, accountId: body?.accountId },
     };
   }
   throw new NotFoundError("route was not found");

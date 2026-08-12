@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { CloudflareCredentialManager } from "../../src/application/cloudflare-credentials.ts";
+import { CloudflareCredentialManager, CredentialNotFoundError } from "../../src/application/cloudflare-credentials.ts";
 import type { ProviderAdapter } from "../../src/application/ports.ts";
 import { RoutingProviderAdapter } from "../../src/adapters/router.ts";
 import type { ProviderRecord, ReconcileOperation } from "../../src/domain/reconciliation.ts";
@@ -18,6 +18,47 @@ class SpyAdapter implements ProviderAdapter {
 }
 
 describe("CloudflareCredentialManager", () => {
+
+  it("checks a profile against a domain before the domain is bound to it", async () => {
+    // Profiles are write-only, so the portal has no token to send. Without this
+    // the only testable binding is one that already exists, and the operator has
+    // to commit before finding out whether the credential works.
+    const directory = await mkdtemp(join(tmpdir(), "parallax-untested-"));
+    try {
+      const store = new EncryptedCredentialStore({
+        repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials,
+        masterKey: randomBytes(32),
+      });
+      const probed: CloudflareCredentialSecret[] = [];
+      const manager = new CloudflareCredentialManager({
+        store,
+        router: new RoutingProviderAdapter({}),
+        ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async (zone) => `id-for-${zone}`,
+        createAdapter: (credential) => {
+          probed.push(credential);
+          return { async list() { return []; }, async apply() {} };
+        },
+      });
+      await manager.upsertProfile("shared", { token: "top-secret" });
+
+      const checked = await manager.test("Example.COM.", { profile: "shared" });
+
+      assert.equal(checked.zone, "example.com");
+      assert.equal(checked.zoneId, "id-for-example.com");
+      assert.equal(probed.at(-1)?.token, "top-secret");
+      // Checking must not create the binding it was checking.
+      assert.deepEqual(await manager.listZones(), []);
+
+      await assert.rejects(manager.test("example.com", { profile: "absent" }), CredentialNotFoundError);
+      // And with nothing supplied it still means the stored binding, which
+      // there is not one of.
+      await assert.rejects(manager.test("example.com"), CredentialNotFoundError);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("loads encrypted credentials, updates live routing, and restores environment routing after deletion", async () => {
     const directory = await mkdtemp(join(tmpdir(), "parallax-manager-"));
     try {

@@ -120,11 +120,17 @@ export class CloudflareCredentialManager {
     return true;
   }
 
-  /** Checks a stored binding, or an unsaved token, against the live API. */
-  async test(zone: string, input?: { token: string; accountId?: string }): Promise<CloudflareZoneBinding> {
-    const credential = input
-      ? secretForTest(zone, { ...input, zoneId: await this.#resolveZoneId(normalizeZone(zone), input.token) })
-      : await this.#store.getSecret(zone);
+  /**
+   * Checks a binding against the live API before or after it is saved.
+   *
+   * A profile can be named instead of a token, which is what makes testing
+   * first possible: profiles are write-only, so the portal never holds the
+   * token it would otherwise have to send. Without this the only testable
+   * binding is one that already exists, and the operator has to commit before
+   * finding out whether the credential works.
+   */
+  async test(zone: string, input?: { token: string; accountId?: string } | { profile: string }): Promise<CloudflareZoneBinding> {
+    const credential = input ? await this.#unsavedSecret(zone, input) : await this.#store.getSecret(zone);
     if (!credential) throw new CredentialNotFoundError();
     await this.#probe(credential);
     return {
@@ -156,6 +162,25 @@ export class CloudflareCredentialManager {
       updatedAt: new Date(0).toISOString(),
     });
     return (await this.#store.getProfile(profileName)) ?? { name: profileName, updatedAt: new Date(0).toISOString() };
+  }
+
+  /** Builds a credential to probe with, without storing anything. */
+  async #unsavedSecret(zone: string, input: { token: string; accountId?: string } | { profile: string }): Promise<CloudflareCredentialSecret> {
+    const normalizedZone = normalizeZone(zone);
+    if (!("profile" in input)) {
+      return secretForTest(zone, { ...input, zoneId: await this.#resolveZoneId(normalizedZone, input.token) });
+    }
+    const profileName = normalizeProfileName(input.profile);
+    const profile = await this.#store.getProfileSecret(profileName);
+    if (!profile) throw new CredentialNotFoundError();
+    return {
+      zone: normalizedZone,
+      zoneId: await this.#resolveZoneId(normalizedZone, profile.token),
+      profile: profileName,
+      ...(profile.accountId ? { accountId: profile.accountId } : {}),
+      token: profile.token,
+      updatedAt: new Date(0).toISOString(),
+    };
   }
 
   async #probe(credential: CloudflareCredentialSecret): Promise<void> {
