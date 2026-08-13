@@ -11,6 +11,7 @@ import {
   validateViewName,
   type AuditEntry,
   type DesiredRecord,
+  type DnsView,
   type Zone,
   type ZoneRevision,
 } from "../domain/dns.ts";
@@ -534,7 +535,8 @@ export class ControlPlane {
     const zone = zoneName ? normalizeZoneName(zoneName) : undefined;
     const fetched = await this.#zones.audit(zone, { limit: bounds.limit + 1, offset: bounds.offset });
     const hasMore = fetched.length > bounds.limit;
-    return { entries: fetched.slice(0, bounds.limit), ...bounds, hasMore };
+    const entries = fetched.slice(0, bounds.limit).map((entry) => ({ ...entry, ...summarizeDesiredChange(entry) }));
+    return { entries, ...bounds, hasMore };
   }
 
   #nextRevision(zone: Zone, views: Zone["views"]): Zone {
@@ -623,6 +625,45 @@ function targetKey(zone: string, view: string): string {
 
 function cloneView(view: Zone["views"][number]): Zone["views"][number] {
   return { name: view.name, records: view.records.map((record) => ({ ...record })) };
+}
+
+/**
+ * Counts what a revision did to the desired state, by view and record id:
+ * records that appeared, records that are gone, and records that kept their id
+ * while saying something else.
+ *
+ * Read from the before and after snapshots the entry already carries, so an
+ * entry written before this existed still reports it. An entry that carries no
+ * snapshots -- a zone deletion -- reports nothing rather than zeroes, which
+ * would read as "this changed nothing".
+ */
+function summarizeDesiredChange(entry: AuditEntry): { added: number; removed: number; changed: number } | undefined {
+  const detail = entry.detail as { before?: { views?: DnsView[] } | null; after?: { views?: DnsView[] } } | undefined;
+  if (!detail || typeof detail !== "object" || !("after" in detail)) return undefined;
+  const index = (views: DnsView[] | undefined): Map<string, DesiredRecord> => {
+    const records = new Map<string, DesiredRecord>();
+    for (const view of views ?? []) {
+      for (const record of view.records) records.set(`${view.name}/${record.id}`, record);
+    }
+    return records;
+  };
+  const previous = index(detail.before?.views);
+  const current = index(detail.after?.views);
+  let added = 0;
+  let changed = 0;
+  for (const [key, record] of current) {
+    const was = previous.get(key);
+    if (!was) added += 1;
+    else if (!sameDesiredRecord(was, record)) changed += 1;
+  }
+  let removed = 0;
+  for (const key of previous.keys()) if (!current.has(key)) removed += 1;
+  return { added, removed, changed };
+}
+
+function sameDesiredRecord(left: DesiredRecord, right: DesiredRecord): boolean {
+  return left.name === right.name && left.type === right.type && left.content === right.content
+    && left.ttl === right.ttl && (left.proxied ?? false) === (right.proxied ?? false);
 }
 
 function desiredState(zone: Zone): { views: Zone["views"] } {

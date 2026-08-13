@@ -279,6 +279,21 @@ zone resolves at once.
 needs a writable `/var/run/pdns`. An ephemeral volume is right -- a control
 socket has no reason to survive a restart.
 
+### Reading the history
+
+Every audit entry carries `added`, `removed` and `changed`: how many records
+that revision brought into the desired state, took out of it, and rewrote under
+the same id. They are what separates a revision that emptied a zone from any
+other line in the list, which otherwise differ only by an actor and a time.
+
+The counts are worked out from the snapshots the entry already holds rather than
+recorded next to them, so entries written before the counts existed report them
+too. That is usually the history someone is reading: nobody asks what a revision
+did until after it has happened.
+
+The actor is the token's subject, so what the history can tell you about *who*
+depends on how many tokens exist. See [Access tokens](#access-tokens).
+
 ### Retention
 
 Every desired-state change stores an immutable snapshot and an audit entry, so

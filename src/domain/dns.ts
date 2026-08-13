@@ -50,6 +50,15 @@ export interface Zone {
 export type ZoneRevision = Zone;
 
 export interface AuditEntry {
+  /**
+   * How many records this revision added, removed and changed. Derived from the
+   * snapshots the entry already carries rather than stored beside them, so
+   * history written before these existed reports them too -- which is the
+   * history somebody is reading when they want to know what happened.
+   */
+  added?: number;
+  removed?: number;
+  changed?: number;
   id: number;
   zone: string;
   revision: number;

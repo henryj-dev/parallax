@@ -257,6 +257,47 @@ describe("ControlPlane", () => {
     await first;
   });
 
+  it("says in the audit line how many records a revision added, removed and changed", async () => {
+    const { service } = setup();
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+    await service.upsertRecord("example.com", "external", "api", { name: "api", type: "A", content: "8.8.8.11", ttl: 300 });
+    await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.12", ttl: 300 });
+    // The change that emptied the zone, which is the one worth spotting.
+    await service.replaceDesiredState("example.com", { views: [{ name: "external", records: [] }] }, "someone");
+
+    const entries = (await service.audit("example.com")).entries;
+    const summary = (action: string): unknown => {
+      const entry = entries.find((candidate) => candidate.action === action);
+      assert.ok(entry, `no ${action} entry`);
+      return { added: entry.added, removed: entry.removed, changed: entry.changed };
+    };
+    assert.deepEqual(summary("desired.replaced"), { added: 0, removed: 2, changed: 0 },
+      "a revision that emptied the zone must not read like any other revision");
+    assert.deepEqual(summary("record.upserted"), { added: 0, removed: 0, changed: 1 },
+      "rewriting a record under the same id is a change, not an addition");
+  });
+
+  it("reports the counts for history written before they existed", async () => {
+    // The entries that matter most are the ones already in the store: nobody
+    // asks what a revision did until after it has happened.
+    const adapters = createInMemoryAdapters();
+    const service = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider);
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+    await service.replaceDesiredState("example.com", { views: [{ name: "external", records: [] }] }, "someone");
+
+    // Nothing about the stored rows carries the counts; they hold snapshots.
+    const stored = await adapters.zones.audit("example.com", { limit: 10, offset: 0 });
+    const replaced = stored.find((entry) => entry.action === "desired.replaced");
+    assert.equal((replaced as { added?: number }).added, undefined, "the store holds no counts");
+
+    const read = (await service.audit("example.com")).entries
+      .find((entry) => entry.action === "desired.replaced");
+    assert.deepEqual({ added: read?.added, removed: read?.removed, changed: read?.changed },
+      { added: 0, removed: 1, changed: 0 });
+  });
+
   it("adopts records that exist at the provider without taking them over", async () => {
     const { service, provider } = setup();
     await service.createZone("example.com");
