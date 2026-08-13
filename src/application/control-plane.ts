@@ -662,9 +662,32 @@ function summarizeDesiredChange(entry: AuditEntry): { added: number; removed: nu
   return { added, removed, changed };
 }
 
+/**
+ * Whether two records with the same id say the same thing.
+ *
+ * Compares every field rather than a list of them. A list has to be extended
+ * whenever the record gains one, and nothing makes that happen: the version
+ * that named its fields would have reported `changed: 0` for a revision that
+ * altered a field added later -- a wrong zero, which is worse than no number,
+ * because a wrong zero is read as "nothing happened".
+ *
+ * Absent and `false` are the same answer for the optional booleans, so they are
+ * normalized before comparing; without that, rewriting a record with an
+ * explicit `proxied: false` would look like a change to a record that had left
+ * it out.
+ */
 function sameDesiredRecord(left: DesiredRecord, right: DesiredRecord): boolean {
-  return left.name === right.name && left.type === right.type && left.content === right.content
-    && left.ttl === right.ttl && (left.proxied ?? false) === (right.proxied ?? false);
+  return comparableRecord(left) === comparableRecord(right);
+}
+
+function comparableRecord(record: DesiredRecord): string {
+  const { id: _matchedOn, proxied, acknowledgeNonGlobalIp, ...rest } = record;
+  const fields: Record<string, unknown> = {
+    ...rest,
+    proxied: proxied ?? false,
+    acknowledgeNonGlobalIp: acknowledgeNonGlobalIp ?? false,
+  };
+  return JSON.stringify(Object.keys(fields).sort().map((key) => [key, fields[key]]));
 }
 
 function desiredState(zone: Zone): { views: Zone["views"] } {

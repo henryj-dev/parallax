@@ -294,6 +294,17 @@ did until after it has happened.
 The actor is the token's subject, so what the history can tell you about *who*
 depends on how many tokens exist. See [Access tokens](#access-tokens).
 
+### Restoring a revision
+
+Restoring does not undo the past. It makes that revision's intent the current
+desired state, and the next `apply` carries it out. Whether a restore is safe
+therefore does not turn on how old it is, but on whether what it says should
+happen now: a snapshot holding a record that was a demonstration at the time
+will be published for real the next time the view is applied.
+
+Read the snapshot before restoring it, and prefer the newest revision that says
+only what you still mean.
+
 ### Retention
 
 Every desired-state change stores an immutable snapshot and an audit entry, so

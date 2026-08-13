@@ -257,6 +257,32 @@ describe("ControlPlane", () => {
     await first;
   });
 
+  it("counts a revision as changed whichever field of the record moved", async () => {
+    // Enumerated from the record itself rather than listed here: a field added
+    // to DesiredRecord joins this test without anyone remembering to add it,
+    // which is the only way the count keeps up with the shape it describes.
+    const base = { name: "www", type: "A" as const, content: "8.8.8.10", ttl: 300, proxied: false };
+    const moved: Record<string, unknown> = {
+      name: "web", type: "AAAA", content: "8.8.8.11", ttl: 600, proxied: true,
+      acknowledgeNonGlobalIp: true,
+    };
+    for (const field of [...Object.keys(base), "acknowledgeNonGlobalIp"]) {
+      const { service } = setup();
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", base);
+      const after = { ...base, [field]: moved[field] };
+      // AAAA needs an address of its own family; the point is the field moved.
+      if (field === "type") { after.content = "2001:4860:4860::8888"; }
+      await service.upsertRecord("example.com", "external", "web", after);
+
+      const entry = (await service.audit("example.com")).entries
+        .find((candidate) => candidate.action === "record.upserted");
+      assert.equal(entry?.changed, 1, `moving ${field} must count as a change`);
+      assert.equal(entry?.added, 0, `moving ${field} must not read as a new record`);
+      assert.equal(entry?.removed, 0, `moving ${field} must not read as a deletion`);
+    }
+  });
+
   it("says in the audit line how many records a revision added, removed and changed", async () => {
     const { service } = setup();
     await service.createZone("example.com");
