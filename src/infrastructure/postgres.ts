@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { RevisionConflictError, type AccessTokenRepository, type ApplyLock, type ApplyStatus, type CredentialRepository, type DesiredChange, type PageRequest, type RetentionPolicy, type SettingsRepository, type StatusRepository, type StoredAccessToken, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
-import {
+import { AUDIT_ACTIONS,
   createDesiredRecord,
   normalizeZoneName,
   readPersistedViewName,
@@ -525,9 +525,7 @@ function auditQuery(zone: string | undefined, page: PageRequest | undefined): [s
     : [`${AUDIT_COLUMNS} WHERE zone_name = $1 ORDER BY id DESC`, [zone]];
 }
 
-const AUDIT_ACTIONS = new Set<AuditEntry["action"]>([
-  "zone.created", "zone.deleted", "record.upserted", "record.deleted", "desired.replaced", "desired.restored",
-]);
+const KNOWN_AUDIT_ACTIONS: ReadonlySet<AuditEntry["action"]> = new Set(AUDIT_ACTIONS);
 
 function readZone(value: unknown): Zone {
   const zone = readObject(value, "zone snapshot");
@@ -559,7 +557,7 @@ function readZone(value: unknown): Zone {
 
 function readAudit(row: AuditRow): AuditEntry {
   const action = readString(row.action, "audit action");
-  if (!AUDIT_ACTIONS.has(action as AuditEntry["action"])) throw new Error(`invalid PostgreSQL audit action: ${action}`);
+  if (!KNOWN_AUDIT_ACTIONS.has(action as AuditEntry["action"])) throw new Error(`invalid PostgreSQL audit action: ${action}`);
   return {
     id: readPositiveInteger(row.id, "audit id"),
     zone: readString(row.zone_name, "audit zone"),

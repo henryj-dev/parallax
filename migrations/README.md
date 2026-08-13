@@ -22,6 +22,33 @@ So a file that is not re-appliable does not fail during review. It fails the
 next time something reschedules a pod, which may be weeks later and will not
 look like it was caused by the migration.
 
+## Changing something 001 already created
+
+`CREATE TABLE IF NOT EXISTS` does not revisit a table that exists, so editing a
+column, a default, or a constraint in `001` reaches only databases that have not
+been created yet. Every installation already running keeps what it was created
+with, while the file reads as though it were fixed -- which is worse than not
+fixing it, because the next person believes the file.
+
+Changing something that already exists takes a new file with a statement that
+says so. Guard it on the catalog rather than re-running the change, so that
+re-applying it on every pod start costs a lookup:
+
+```sql
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'the_new_name') THEN
+    ALTER TABLE ... DROP CONSTRAINT IF EXISTS the_old_name;
+    ALTER TABLE ... ADD CONSTRAINT the_new_name CHECK (...) NOT VALID;
+  END IF;
+END $$;
+```
+
+`IF NOT EXISTS` does not apply to constraints, which is why the guard names the
+new constraint instead. `NOT VALID` skips the scan of existing rows; it is only
+sound when the new rule accepts everything the old one did. See
+`003_audit_actions.sql`.
+
 ## Adding one
 
 Name it `NNN_short_description.sql`, continuing the sequence.

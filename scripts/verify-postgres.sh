@@ -48,8 +48,12 @@ echo "== applying every migration to a fresh database =="
 apply_migrations() {
   DATABASE_URL="$DATABASE_URL" node "$ROOT/cmd/parallax/main.ts" migrate --json
 }
+# Counted from the directory rather than written here: a number that has to be
+# edited with every migration gets edited without being thought about, and this
+# assertion is meant to catch a file that is not being picked up at all.
+EXPECTED=$(ls "$ROOT/migrations"/*.sql | wc -l | tr -d ' ')
 APPLIED=$(apply_migrations | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).applied.length))')
-[ "$APPLIED" = "2" ] || fail "expected 2 migrations to be applied, reported $APPLIED"
+[ "$APPLIED" = "$EXPECTED" ] || fail "expected $EXPECTED migrations to be applied, reported $APPLIED"
 TABLES=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'parallax_%'")
 [ "$TABLES" = "7" ] || fail "expected 7 tables, found $TABLES"
@@ -71,7 +75,10 @@ TABLES=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c
 ok "three simultaneous runs all succeeded, schema unchanged"
 
 start_app() {
+  # Keep provider state inside the work directory: the default is under the
+  # repository, so the run would otherwise write to the developer's own data.
   DATABASE_URL="$DATABASE_URL" HOST=127.0.0.1 PORT="$APPPORT" \
+    PARALLAX_PROVIDER_STATE_FILE="$WORK/provider-state.json" \
     node "$ROOT/src/index.ts" > "$WORK/app.log" 2>&1 &
   APP_PID=$!
   for _ in $(seq 1 60); do
@@ -137,6 +144,44 @@ ROWS=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
 [ "$ROWS" = "1/3/3" ] || fail "expected 1/3/3 zone/revision/audit rows, found $ROWS"
 ok "zone/revision/audit rows = $ROWS"
 
+echo "== adopting records the provider already holds =="
+# Every audit action has to be one PostgreSQL will accept. The in-memory store
+# used by the unit tests takes any string, so an action missing from the CHECK
+# constraint is invisible until a real database refuses the write -- which is
+# how `records.adopted` reached a release. Adoption needs a record Parallax did
+# not create, so one is placed in the provider's state directly.
+stop_app
+# Added to the state, not written over it: replacing the document would drop the
+# records applied above and the restart check below would read that as drift.
+node -e '
+  const fs = require("node:fs");
+  const path = process.argv[1];
+  const state = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, "utf8")) : { version: 1, nextId: 1, targets: {} };
+  state.targets["adopted.example/external"] = [
+    { id: "human-1", providerId: "human-1", managed: false, name: "www", type: "A", content: "198.51.100.7", ttl: 300 },
+  ];
+  fs.writeFileSync(path, JSON.stringify(state));
+' "$WORK/provider-state.json"
+start_app
+curl -sf -X POST -H 'content-type: application/json' -d '{"name":"adopted.example"}' "$API/zones" >/dev/null
+# Deliberately not `curl -f`: the failure this step exists to catch returns 500,
+# and -f would abort with an exit code and discard the body that says why.
+ADOPTED=$(curl -s -w '\n%{http_code}' -X POST "$API/zones/adopted.example/adopt?view=external")
+ADOPT_STATUS=$(printf '%s' "$ADOPTED" | tail -n1)
+[ "$ADOPT_STATUS" = "200" ] || fail "adopt returned $ADOPT_STATUS: $(printf '%s' "$ADOPTED" | head -n1)"
+case "$ADOPTED" in
+  *'"seen":1'*) : ;;
+  *) fail "expected the provider's record to be seen, got $ADOPTED" ;;
+esac
+ACTION=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
+  "SELECT action FROM parallax_audit WHERE zone_name = 'adopted.example' ORDER BY id DESC LIMIT 1")
+[ "$ACTION" = "records.adopted" ] || fail "expected a records.adopted audit row, found '$ACTION'"
+# Writing the row is only half of it: the reader rejects actions it does not
+# know, so a value the constraint permits can still break the history endpoint.
+HISTORY=$(curl -s -o /dev/null -w '%{http_code}' "$API/zones/adopted.example/history")
+[ "$HISTORY" = "200" ] || fail "history returned $HISTORY after adopting"
+ok "adoption recorded records.adopted and history still reads"
+
 echo "== restart persistence =="
 stop_app
 start_app
@@ -170,8 +215,12 @@ ok "revision table bounded at $KEPT rows"
 
 echo "== zone deletion cascades and withdraws provider records =="
 curl -sf -X DELETE "$API/zones/example.com" >/dev/null
+# Scoped to the deleted zone: the adoption check above leaves its own zone
+# behind, and a global count would turn that into a cascade failure.
 LEFT=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
-  "SELECT (SELECT count(*) FROM parallax_zones) || '/' || (SELECT count(*) FROM parallax_zone_revisions) || '/' || (SELECT count(*) FROM parallax_apply_statuses)")
+  "SELECT (SELECT count(*) FROM parallax_zones WHERE name = 'example.com')
+       || '/' || (SELECT count(*) FROM parallax_zone_revisions WHERE zone_name = 'example.com')
+       || '/' || (SELECT count(*) FROM parallax_apply_statuses WHERE zone_name = 'example.com')")
 [ "$LEFT" = "0/0/0" ] || fail "expected cascade to empty child tables, found $LEFT"
 AUDIT=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT count(*) FROM parallax_audit WHERE action='zone.deleted' AND zone_name='example.com'")

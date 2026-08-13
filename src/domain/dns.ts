@@ -49,6 +49,26 @@ export interface Zone {
 /** A point-in-time, immutable copy of a zone's desired state. */
 export type ZoneRevision = Zone;
 
+/**
+ * Every kind of change the audit trail records.
+ *
+ * Copies of this list live where they cannot import it: a CHECK constraint in
+ * the migrations and a label map in the portal. Adding an action here without
+ * adding it there produced a control plane that wrote a value its own database
+ * refused. A test compares them against this list, so the copies stay copies.
+ */
+export const AUDIT_ACTIONS = [
+  "zone.created",
+  "zone.deleted",
+  "record.upserted",
+  "record.deleted",
+  "desired.replaced",
+  "desired.restored",
+  "records.adopted",
+] as const;
+
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
+
 export interface AuditEntry {
   /**
    * How many records this revision added, removed and changed. Derived from the
@@ -62,7 +82,7 @@ export interface AuditEntry {
   id: number;
   zone: string;
   revision: number;
-  action: "zone.created" | "zone.deleted" | "record.upserted" | "record.deleted" | "desired.replaced" | "desired.restored" | "records.adopted";
+  action: AuditAction;
   actor: string;
   at: string;
   detail: Record<string, unknown>;
