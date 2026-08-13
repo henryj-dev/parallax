@@ -214,6 +214,22 @@ const COMMANDS: readonly Command[] = [
     run: ({ runtime, actor }, input) => requireControlPlane(runtime).createZone(String(input.zone), actor),
   },
   {
+    name: "zone adopt",
+    summary: "Describe records that already exist at the provider, without taking them over",
+    role: "editor",
+    options: [
+      ZONE,
+      { name: "view", summary: "internal or external", required: true },
+      { name: "expectedRevision", summary: "Refuse if the zone moved on", type: "number" },
+    ],
+    run: async (context, input) => {
+      const result = await requireControlPlane(context.runtime).adoptProviderRecords(
+        String(input.zone), String(input.view), context.actor, expectedRevisionOf(input),
+      );
+      return { zone: result.zone.name, revision: result.zone.revision, adopted: result.adopted };
+    },
+  },
+  {
     name: "zone delete",
     summary: "Delete a zone and withdraw the records Parallax published for it",
     role: "admin",

@@ -329,6 +329,7 @@ pnpm cli zone list
 pnpm cli zone create --zone example.com
 pnpm cli record set --zone example.com --view external --id www \
   --record '{"name":"www","type":"A","content":"93.184.216.34","ttl":300}'
+pnpm cli zone adopt --zone example.com --view external
 pnpm cli preview --zone example.com
 pnpm cli apply --zone example.com
 pnpm cli settings set --values '{"allowLocalProvider":true}'
@@ -344,12 +345,54 @@ trail. Add `--json` for machine-readable output. Exit codes follow `sysexits`:
 Because the command line reaches the store directly it acts with full rights;
 HTTP callers are limited to what their token's role allows.
 
+## Adopting records that already exist
+
+A zone usually has a history before Parallax arrives. Records made by hand at the
+provider are not in the desired state, so Parallax treats them as somebody else's:
+it will not touch them, and it cannot derive anything from them.
+
+That is a problem for the internal view, which is materialized from the external
+desired state. Whatever the desired state does not describe, the internal view
+does not answer for -- and an authoritative server does not say "I don't know",
+it says NXDOMAIN. A resolver takes that as an answer and stops. So an internal
+view of a zone that has other records has to be complete before it is wired up.
+
+`zone adopt` reads what the provider currently holds and writes it into the
+desired state:
+
+```sh
+pnpm cli zone adopt --zone example.com --view external
+pnpm cli preview --zone example.com --view external   # expect no operations
+```
+
+**Adopting does not take the records over.** A desired record identical to an
+unmanaged one produces no operation, so the provider's copies stay exactly as
+they are, unmanaged, and whoever maintained them still does. What changes is
+that Parallax now knows they exist. If one of them later changes at the
+provider, the difference appears as a conflict in `preview` -- naming both
+values -- rather than being silently overwritten in either direction.
+
+Re-running it is safe: records already described are skipped, so a second run
+adopts nothing and does not create a revision. Run it again whenever records
+are added at the provider by hand.
+
+Two limits worth knowing before you rely on it:
+
+- Only `A`, `AAAA`, `CNAME` and `TXT` are supported. Providers list other types
+  and Parallax skips them, so `MX`, `NS`, `CAA` and `SRV` records are neither
+  adopted nor visible. A name that exists *only* with such a type will still be
+  NXDOMAIN in the internal view.
+- A record that differs from the desired state by TTL alone is left as the
+  conflict it already was. Adoption describes what is there; it does not settle
+  disagreements.
+
 ## HTTP API
 
 All control-plane routes are under `/api/v1`.
 
 - `GET|POST /zones` (`{ "name": "example.com" }`)
 - `GET|PUT|DELETE /zones/:zone` (`DELETE ?abandonProviderRecords=true`)
+- `POST /zones/:zone/adopt?view=external`
 - `PUT|DELETE /zones/:zone/views/:view/records/:id`
 - `GET|POST /zones/:zone/preview`
 - `POST /zones/:zone/apply`

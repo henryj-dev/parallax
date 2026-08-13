@@ -46,6 +46,24 @@ describe("HTTP API", () => {
     assert.equal(headers["content-length"], String(JSON.stringify({ zones: [] }).length));
   });
 
+  it("adopts provider records over HTTP and refuses the call without a view", async () => {
+    const adapters = createInMemoryAdapters();
+    const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
+    assert.equal((await api(request("/api/v1/zones", "POST", { name: "example.com" }))).status, 201);
+    adapters.provider.seed("example.com/external", [
+      { id: "a", name: "www", type: "A", content: "203.0.113.1", ttl: 300, providerId: "cf-1", managed: false },
+    ]);
+
+    // A missing view must be refused, not coerced into the string "undefined".
+    const viewless = await api(request("/api/v1/zones/example.com/adopt", "POST", {}));
+    assert.equal(viewless.status, 400);
+
+    const response = await api(request("/api/v1/zones/example.com/adopt?view=external", "POST", {}));
+    assert.equal(response.status, 200);
+    const body = await response.json() as { adopted: { id: string }[] };
+    assert.deepEqual(body.adopted.map((record) => record.id), ["www-a"]);
+  });
+
   it("reports malformed percent-encoding in a path as a client error", async () => {
     const api = setup();
     const response = await api(request("/api/v1/zones/%zz"));

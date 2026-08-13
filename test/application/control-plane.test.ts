@@ -257,6 +257,63 @@ describe("ControlPlane", () => {
     await first;
   });
 
+  it("adopts records that exist at the provider without taking them over", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    // Two records a human created at the provider, which Parallax knows nothing about.
+    provider.seed("example.com/external", [
+      { id: "a", name: "www", type: "A", content: "203.0.113.1", ttl: 300, providerId: "cf-1", managed: false },
+      { id: "b", name: "docs", type: "CNAME", content: "pages.example.net", ttl: 300, providerId: "cf-2", managed: false },
+    ]);
+
+    const { zone, adopted } = await service.adoptProviderRecords("example.com", "external", "operator");
+    assert.equal(adopted.length, 2);
+    assert.deepEqual(zone.views.find((view) => view.name === "external")?.records.map((record) => record.id),
+      ["www-a", "docs-cname"]);
+
+    // The point of adoption: it describes what is there, so applying changes nothing.
+    provider.calls.length = 0;
+    const applied = await service.apply("example.com", "external");
+    assert.equal(applied.statuses[0]?.state, "applied");
+    assert.equal(provider.calls.length, 0, "adopted records must not be rewritten at the provider");
+    assert.deepEqual((await provider.list("example.com/external")).map((record) => record.managed), [false, false],
+      "the provider's records stay unmanaged -- whoever maintained them still does");
+  });
+
+  it("adopts idempotently, so re-running it does not accumulate duplicates", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    provider.seed("example.com/external", [
+      { id: "a", name: "www", type: "A", content: "203.0.113.1", ttl: 300, providerId: "cf-1", managed: false },
+    ]);
+    await service.adoptProviderRecords("example.com", "external");
+    const second = await service.adoptProviderRecords("example.com", "external");
+    assert.equal(second.adopted.length, 0);
+    assert.equal(second.zone.views.find((view) => view.name === "external")?.records.length, 1);
+    assert.equal(second.zone.revision, 2, "a no-op adoption must not burn a revision");
+  });
+
+  it("lets the internal view inherit adopted records, so unknown names are not left out", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    provider.seed("example.com/external", [
+      { id: "a", name: "www", type: "A", content: "203.0.113.1", ttl: 300, providerId: "cf-1", managed: false },
+    ]);
+    await service.adoptProviderRecords("example.com", "external");
+    // An internal override for one name must not hide the rest of the zone.
+    await service.upsertRecord("example.com", "internal", "www", {
+      name: "www", type: "A", content: "10.10.10.10", ttl: 60,
+    });
+    await service.upsertRecord("example.com", "external", "api", {
+      name: "api", type: "A", content: "8.8.8.9", ttl: 300,
+    });
+    await service.apply("example.com", "internal");
+    const internal = await provider.list("example.com/internal");
+    assert.deepEqual(internal.map((record) => `${record.name} ${record.content}`).sort(),
+      ["api 8.8.8.9", "www 10.10.10.10"],
+      "the internal view answers for adopted names too, so nothing falls to NXDOMAIN");
+  });
+
   it("prevents apply when desired state collides with an unmanaged record", async () => {
     const { service, provider } = setup();
     await service.createZone("example.com");

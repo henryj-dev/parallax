@@ -221,6 +221,9 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
     if (action === "apply" && segments.length === 5 && method === "POST") {
       return { command: "apply", input: { zone, view: readViewQuery(url), expectedRevision }, revisioned: true };
     }
+    if (action === "adopt" && segments.length === 5 && method === "POST") {
+      return { command: "zone adopt", input: { zone, view: readViewQuery(url), expectedRevision }, revisioned: true };
+    }
     if (action === "status" && segments.length === 5 && method === "GET") {
       return { command: "status", input: { zone } };
     }

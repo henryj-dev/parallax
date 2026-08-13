@@ -42,7 +42,7 @@ export interface AuditEntry {
   id: number;
   zone: string;
   revision: number;
-  action: "zone.created" | "zone.deleted" | "record.upserted" | "record.deleted" | "desired.replaced" | "desired.restored";
+  action: "zone.created" | "zone.deleted" | "record.upserted" | "record.deleted" | "desired.replaced" | "desired.restored" | "records.adopted";
   actor: string;
   at: string;
   detail: Record<string, unknown>;

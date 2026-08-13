@@ -13,7 +13,7 @@ import {
   type Zone,
   type ZoneRevision,
 } from "../domain/dns.ts";
-import { buildReconcilePlan, type ReconcilePlan } from "../domain/reconciliation.ts";
+import { buildReconcilePlan, type ProviderRecord, type ReconcilePlan } from "../domain/reconciliation.ts";
 import { ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneRepository } from "./ports.ts";
 
 export class NotFoundError extends Error {}
@@ -300,6 +300,71 @@ export class ControlPlane {
     const affected = new Set([...zone.views.map((view) => view.name), ...views.map((view) => view.name)]);
     await this.#commitDesiredChange(zone, updated, "desired.replaced", actor, {}, affected, expectedRevision);
     return updated;
+  }
+
+  /**
+   * Brings records that already exist at a provider into the desired state.
+   *
+   * An authoritative server cannot say "I do not know this name" -- it answers
+   * NXDOMAIN, which a forwarder treats as an answer and does not fall back on.
+   * So an internal view that inherits from a public zone has to be complete, and
+   * it can only inherit what the desired state describes. Records created
+   * directly at the provider are invisible to it.
+   *
+   * Adopting does not take them over. A desired record identical to an unmanaged
+   * one produces no operation, so the provider's copy stays exactly as it is and
+   * whoever maintains it keeps doing so; if it later changes there, the
+   * difference surfaces as a conflict rather than being overwritten. What
+   * changes is that Parallax now knows the record exists, which is what the
+   * internal view needs in order to derive from it.
+   */
+  adoptProviderRecords(zoneName: string, viewName: string, actor = "system", expectedRevision?: number): Promise<{ zone: Zone; adopted: DesiredRecord[] }> {
+    return this.#exclusive(zoneName, () => this.#adoptProviderRecords(zoneName, viewName, actor, expectedRevision));
+  }
+
+  async #adoptProviderRecords(zoneName: string, viewName: string, actor: string, expectedRevision?: number): Promise<{ zone: Zone; adopted: DesiredRecord[] }> {
+    const zone = await this.getZone(zoneName);
+    this.#assertExpectedRevision(zone, expectedRevision);
+    const view = validateViewName(viewName);
+    const actual = await this.#provider.list(targetKey(zone.name, view));
+
+    const views = zone.views.map(cloneView);
+    let target = views.find((candidate) => candidate.name === view);
+    if (!target) {
+      target = { name: view, records: [] };
+      views.push(target);
+    }
+    const taken = new Set(views.flatMap((candidate) => candidate.records.map((record) => record.id)));
+    const adopted: DesiredRecord[] = [];
+    for (const record of actual) {
+      // Already Parallax's, or already described by a record that matches it.
+      if (record.managed) continue;
+      if (target.records.some((desired) => describesSameValue(desired, record))) continue;
+      const id = adoptedId(record, taken);
+      taken.add(id);
+      const desired = createDesiredRecord(id, {
+        name: record.name,
+        type: record.type,
+        content: record.content,
+        ttl: record.ttl,
+        ...(record.proxied === undefined ? {} : { proxied: record.proxied }),
+        // A zone holds whatever it already holds, including addresses this would
+        // otherwise refuse to publish. That guard is for deciding to expose an
+        // address; here the address is already exposed, and refusing to describe
+        // it would leave the internal view incomplete for exactly those names.
+        ...(record.type === "A" || record.type === "AAAA" ? { acknowledgeNonGlobalIp: true } : {}),
+      });
+      adopted.push(desired);
+      target.records.push(desired);
+    }
+    if (adopted.length === 0) return { zone, adopted };
+
+    if (view === "external") target.records = normalizeExternalRecords(target.records);
+    ensureUniqueRecordKeys(target.records);
+    const updated = this.#nextRevision(zone, views);
+    await this.#commitDesiredChange(zone, updated, "records.adopted", actor, { view, adopted: adopted.length },
+      new Set(views.map((candidate) => candidate.name)), expectedRevision);
+    return { zone: updated, adopted };
   }
 
   async listRevisions(zoneName: string, page?: PageRequest): Promise<Paged<"revisions", ZoneRevision>> {
@@ -609,6 +674,31 @@ function ensureUniqueRecordKeys(records: DesiredRecord[]): void {
 }
 
 /** Builds the complete internal view from the external baseline and sparse internal overrides. */
+/** Whether a desired record already says what a provider record says. */
+function describesSameValue(desired: DesiredRecord, actual: ProviderRecord): boolean {
+  return desired.name.toLowerCase() === actual.name.toLowerCase()
+    && desired.type === actual.type
+    && desired.content === actual.content;
+}
+
+/**
+ * A stable, readable id for a record that arrived without one. Derived from what
+ * the record is, so adopting twice reuses the same id rather than accumulating
+ * duplicates under new names.
+ */
+function adoptedId(record: ProviderRecord, taken: ReadonlySet<string>): string {
+  const base = `${record.name === "@" ? "root" : record.name}-${record.type}`
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/gu, "-")
+    .replace(/^[^a-z0-9]+/u, "")
+    .slice(0, 30) || "adopted";
+  if (!taken.has(base)) return base;
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${base}-${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
+
 export function materializeProviderViews(views: Zone["views"]): Zone["views"] {
   const external = views.find((view) => view.name === "external");
   const overrides = views.find((view) => view.name === "internal");
