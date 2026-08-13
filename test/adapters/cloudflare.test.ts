@@ -27,6 +27,26 @@ describe("CloudflareProviderAdapter", () => {
     ]);
   });
 
+  it("drops proxied from types Cloudflare cannot proxy, which it reports anyway", async () => {
+    // Cloudflare answers with `proxied` on every record, including TXT and MX.
+    // Carrying that through would describe a record this control plane refuses.
+    const fetch = async (): Promise<Response> => Response.json({
+      success: true,
+      result: [
+        { id: "txt", name: "example.com", type: "TXT", content: "v=spf1 -all", ttl: 300, proxied: false },
+        { id: "web", name: "www.example.com", type: "A", content: "192.0.2.1", ttl: 300, proxied: false },
+      ],
+      result_info: { page: 1, total_pages: 1 },
+    });
+    const adapter = new CloudflareProviderAdapter({ token: "secret", zoneId: "zone-1", fetch, ownershipSecret: OWNERSHIP_SECRET });
+
+    assert.deepEqual(await adapter.list("example.com/external"), [
+      { id: "txt", providerId: "txt", managed: false, name: "@", type: "TXT", content: "v=spf1 -all", ttl: 300 },
+      // Kept here: on an address record, not proxying is a decision, not noise.
+      { id: "web", providerId: "web", managed: false, name: "www", type: "A", content: "192.0.2.1", ttl: 300, proxied: false },
+    ]);
+  });
+
   it("creates fully-qualified records with authorization, ownership metadata and Cloudflare Auto TTL", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {

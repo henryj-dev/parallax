@@ -280,6 +280,41 @@ describe("ControlPlane", () => {
       "the provider's records stay unmanaged -- whoever maintained them still does");
   });
 
+  it("adopts a record whose provider reports proxied on a type that cannot be proxied", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    // Cloudflare sends proxied:false on TXT. Describing it verbatim would make
+    // adoption fail against its own validation, taking every record with it.
+    provider.seed("example.com/external", [
+      { id: "t", name: "@", type: "TXT", content: "v=spf1 -all", ttl: 300, providerId: "cf-1", managed: false, proxied: false },
+      { id: "a", name: "www", type: "A", content: "8.8.8.10", ttl: 300, providerId: "cf-2", managed: false, proxied: false },
+    ]);
+
+    const { adopted, seen } = await service.adoptProviderRecords("example.com", "external");
+    assert.equal(seen, 2);
+    assert.deepEqual(adopted.map((record) => record.id), ["root-txt", "www-a"]);
+    assert.equal(adopted[0]?.proxied, undefined, "proxied means nothing on a TXT record");
+    assert.equal(adopted[1]?.proxied, false, "on an address record it is a decision worth keeping");
+  });
+
+  it("names the record when one of them cannot be described", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    provider.seed("example.com/external", [
+      { id: "ok", name: "www", type: "A", content: "8.8.8.10", ttl: 300, providerId: "cf-1", managed: false },
+      { id: "bad", name: "alias", type: "CNAME", content: "not a hostname", ttl: 300, providerId: "cf-2", managed: false },
+    ]);
+
+    // Adoption commits the view at once, so one bad record stops all of them --
+    // which is only workable if the message says which record.
+    await assert.rejects(service.adoptProviderRecords("example.com", "external"), (error: Error) => {
+      assert.match(error.message, /alias CNAME not a hostname/);
+      return true;
+    });
+    const zone = await service.getZone("example.com");
+    assert.equal(zone.views.find((view) => view.name === "external")?.records.length ?? 0, 0);
+  });
+
   it("adopts idempotently, so re-running it does not accumulate duplicates", async () => {
     const { service, provider } = setup();
     await service.createZone("example.com");

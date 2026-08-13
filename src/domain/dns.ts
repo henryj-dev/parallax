@@ -9,6 +9,17 @@ export const CLOUDFLARE_DNS_ONLY_MIN_TTL = 60;
 export const CLOUDFLARE_MAX_TTL = 86_400;
 
 export type RecordType = (typeof RECORD_TYPES)[number];
+
+/**
+ * Whether a proxy can stand in front of this record type.
+ *
+ * Cloudflare answers with `proxied` on every record it returns, including the
+ * types it cannot proxy, so this is also the test for whether that field means
+ * anything on a record that came back from a provider.
+ */
+export function canBeProxied(type: string): boolean {
+  return type === "A" || type === "AAAA" || type === "CNAME";
+}
 export type ProviderView = (typeof PROVIDER_VIEWS)[number];
 
 export interface DesiredRecord {
@@ -139,13 +150,13 @@ export function createDesiredRecord(id: string, input: unknown): DesiredRecord {
   if (!hasValidTtl) issues.push("ttl must be an integer between 1 and 2147483647");
   // Cloudflare forces Auto on proxied address and CNAME records, but the request
   // still has to carry a TTL this control plane would accept on its own.
-  const usesCloudflareAutoTtl = value.proxied === true && ["A", "AAAA", "CNAME"].includes(typeValue);
+  const usesCloudflareAutoTtl = value.proxied === true && canBeProxied(typeValue);
   const ttl = usesCloudflareAutoTtl && hasValidTtl ? CLOUDFLARE_AUTO_TTL : requestedTtl;
 
   if (value.proxied !== undefined && typeof value.proxied !== "boolean") {
     issues.push("proxied must be a boolean");
   }
-  if (value.proxied !== undefined && !["A", "AAAA", "CNAME"].includes(typeValue)) {
+  if (value.proxied !== undefined && !canBeProxied(typeValue)) {
     issues.push("proxied is supported only for A, AAAA and CNAME records");
   }
   if (value.acknowledgeNonGlobalIp !== undefined && typeof value.acknowledgeNonGlobalIp !== "boolean") {

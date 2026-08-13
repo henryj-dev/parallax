@@ -1,5 +1,5 @@
 import type { ProviderAdapter } from "../application/ports.ts";
-import { effectiveExternalTtl, type DesiredRecord, type RecordType } from "../domain/dns.ts";
+import { canBeProxied, effectiveExternalTtl, type DesiredRecord, type RecordType } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 import { ownershipComment, readOwnershipComment } from "./ownership.ts";
 
@@ -72,7 +72,11 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
           content: normalizeContent(record.type, record.content),
           ttl: effectiveExternalTtl(record as Pick<DesiredRecord, "type" | "ttl" | "proxied">),
         };
-        if (record.proxied !== undefined) mapped.proxied = record.proxied;
+        // Cloudflare reports `proxied` on every type, including the ones it
+        // cannot proxy. Carrying `proxied: false` on a TXT record would be a
+        // value this control plane refuses to describe, so it is dropped where
+        // it has no meaning rather than at every reader.
+        if (record.proxied !== undefined && canBeProxied(record.type)) mapped.proxied = record.proxied;
         result.push(mapped);
       }
       const info = isObject(payload.result_info) ? payload.result_info : undefined;

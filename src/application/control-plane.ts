@@ -1,4 +1,5 @@
 import {
+  canBeProxied,
   createDesiredRecord,
   concreteDnsTtl,
   DomainValidationError,
@@ -318,11 +319,11 @@ export class ControlPlane {
    * changes is that Parallax now knows the record exists, which is what the
    * internal view needs in order to derive from it.
    */
-  adoptProviderRecords(zoneName: string, viewName: string, actor = "system", expectedRevision?: number): Promise<{ zone: Zone; adopted: DesiredRecord[] }> {
+  adoptProviderRecords(zoneName: string, viewName: string, actor = "system", expectedRevision?: number): Promise<AdoptionResult> {
     return this.#exclusive(zoneName, () => this.#adoptProviderRecords(zoneName, viewName, actor, expectedRevision));
   }
 
-  async #adoptProviderRecords(zoneName: string, viewName: string, actor: string, expectedRevision?: number): Promise<{ zone: Zone; adopted: DesiredRecord[] }> {
+  async #adoptProviderRecords(zoneName: string, viewName: string, actor: string, expectedRevision?: number): Promise<AdoptionResult> {
     const zone = await this.getZone(zoneName);
     this.#assertExpectedRevision(zone, expectedRevision);
     const view = validateViewName(viewName);
@@ -342,29 +343,18 @@ export class ControlPlane {
       if (target.records.some((desired) => describesSameValue(desired, record))) continue;
       const id = adoptedId(record, taken);
       taken.add(id);
-      const desired = createDesiredRecord(id, {
-        name: record.name,
-        type: record.type,
-        content: record.content,
-        ttl: record.ttl,
-        ...(record.proxied === undefined ? {} : { proxied: record.proxied }),
-        // A zone holds whatever it already holds, including addresses this would
-        // otherwise refuse to publish. That guard is for deciding to expose an
-        // address; here the address is already exposed, and refusing to describe
-        // it would leave the internal view incomplete for exactly those names.
-        ...(record.type === "A" || record.type === "AAAA" ? { acknowledgeNonGlobalIp: true } : {}),
-      });
+      const desired = describeAdopted(id, record);
       adopted.push(desired);
       target.records.push(desired);
     }
-    if (adopted.length === 0) return { zone, adopted };
+    if (adopted.length === 0) return { zone, adopted, seen: actual.length };
 
     if (view === "external") target.records = normalizeExternalRecords(target.records);
     ensureUniqueRecordKeys(target.records);
     const updated = this.#nextRevision(zone, views);
     await this.#commitDesiredChange(zone, updated, "records.adopted", actor, { view, adopted: adopted.length },
       new Set(views.map((candidate) => candidate.name)), expectedRevision);
-    return { zone: updated, adopted };
+    return { zone: updated, adopted, seen: actual.length };
   }
 
   async listRevisions(zoneName: string, page?: PageRequest): Promise<Paged<"revisions", ZoneRevision>> {
@@ -674,6 +664,48 @@ function ensureUniqueRecordKeys(records: DesiredRecord[]): void {
 }
 
 /** Builds the complete internal view from the external baseline and sparse internal overrides. */
+/** What one adoption run found and what it changed. */
+export interface AdoptionResult {
+  readonly zone: Zone;
+  /** Records now described that were not before. */
+  readonly adopted: DesiredRecord[];
+  /**
+   * How many records the provider listed for this view. Counting only the types
+   * this control plane supports, so comparing it against the provider's own
+   * total is how the type gap becomes visible. `seen` above zero with nothing
+   * adopted means the view was already complete -- not that adoption did
+   * nothing because it could not see anything.
+   */
+  readonly seen: number;
+}
+
+/**
+ * Turns one provider record into a desired record, naming the record when it
+ * cannot. Adoption commits the whole view at once, so a single record this
+ * control plane will not describe stops all of them -- and an error that only
+ * says which rule was broken leaves the operator to find the record by hand.
+ */
+function describeAdopted(id: string, record: ProviderRecord): DesiredRecord {
+  try {
+    return createDesiredRecord(id, {
+      name: record.name,
+      type: record.type,
+      content: record.content,
+      ttl: record.ttl,
+      ...(record.proxied !== undefined && canBeProxied(record.type) ? { proxied: record.proxied } : {}),
+      // A zone holds whatever it already holds, including addresses this would
+      // otherwise refuse to publish. That guard is for deciding to expose an
+      // address; here the address is already exposed, and refusing to describe
+      // it would leave the internal view incomplete for exactly those names.
+      ...(record.type === "A" || record.type === "AAAA" ? { acknowledgeNonGlobalIp: true } : {}),
+    });
+  } catch (error) {
+    if (!(error instanceof DomainValidationError)) throw error;
+    throw new DomainValidationError(error.issues.map((issue) =>
+      `${record.name} ${record.type} ${record.content}: ${issue}`));
+  }
+}
+
 /** Whether a desired record already says what a provider record says. */
 function describesSameValue(desired: DesiredRecord, actual: ProviderRecord): boolean {
   return desired.name.toLowerCase() === actual.name.toLowerCase()

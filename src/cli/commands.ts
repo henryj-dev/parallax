@@ -226,7 +226,7 @@ const COMMANDS: readonly Command[] = [
       const result = await requireControlPlane(context.runtime).adoptProviderRecords(
         String(input.zone), String(input.view), context.actor, expectedRevisionOf(input),
       );
-      return { zone: result.zone.name, revision: result.zone.revision, adopted: result.adopted };
+      return { zone: result.zone.name, revision: result.zone.revision, seen: result.seen, adopted: result.adopted };
     },
   },
   {

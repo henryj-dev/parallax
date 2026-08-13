@@ -375,8 +375,16 @@ desired state:
 
 ```sh
 pnpm cli zone adopt --zone example.com --view external
+# seen: what the provider listed. adopted: what is newly described.
 pnpm cli preview --zone example.com --view external   # expect no operations
 ```
+
+Read `seen` before reading the preview. A preview with no operations means the
+desired state and the provider agree -- which is also true when the desired
+state is empty, so on its own it does not tell you that adoption put anything
+there. `seen` above zero with nothing adopted means the view was already
+complete. `seen` of zero means the provider offered nothing this control plane
+could read, which is the type limit below rather than an empty zone.
 
 **Adopting does not take the records over.** A desired record identical to an
 unmanaged one produces no operation, so the provider's copies stay exactly as
@@ -394,7 +402,11 @@ Two limits worth knowing before you rely on it:
 - Only `A`, `AAAA`, `CNAME` and `TXT` are supported. Providers list other types
   and Parallax skips them, so `MX`, `NS`, `CAA` and `SRV` records are neither
   adopted nor visible. A name that exists *only* with such a type will still be
-  NXDOMAIN in the internal view.
+  NXDOMAIN in the internal view; a name that also has a supported type answers
+  for that type and returns no data for the rest. Compare `seen` against the
+  provider's own record count to size the gap.
+- Adoption commits the view in one step, so a record that cannot be described
+  stops all of them and nothing is written. The error names the record.
 - A record that differs from the desired state by TTL alone is left as the
   conflict it already was. Adoption describes what is there; it does not settle
   disagreements.
