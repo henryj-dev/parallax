@@ -328,6 +328,22 @@ describe("ControlPlane", () => {
     assert.equal(second.zone.revision, 2, "a no-op adoption must not burn a revision");
   });
 
+  it("needs nothing after adoption for the internal view to answer for what it adopted", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    provider.seed("example.com/external", [
+      { id: "a", name: "www", type: "A", content: "8.8.8.10", ttl: 300, providerId: "cf-1", managed: false },
+    ]);
+    await service.adoptProviderRecords("example.com", "external");
+
+    // The internal view is derived when it is reconciled, not stored, so the
+    // zone still shows only the external records. Adoption is the whole step.
+    const zone = await service.getZone("example.com");
+    assert.deepEqual(zone.views.map((view) => `${view.name}=${view.records.length}`), ["external=1"]);
+    await service.apply("example.com", "internal");
+    assert.deepEqual((await provider.list("example.com/internal")).map((record) => record.content), ["8.8.8.10"]);
+  });
+
   it("lets the internal view inherit adopted records, so unknown names are not left out", async () => {
     const { service, provider } = setup();
     await service.createZone("example.com");

@@ -379,6 +379,10 @@ pnpm cli zone adopt --zone example.com --view external
 pnpm cli preview --zone example.com --view external   # expect no operations
 ```
 
+The internal view is derived when it is reconciled, not stored, so `zone get`
+shows only the records adoption wrote to the external view. An internal view
+that reports no records is the normal state, not a failed adoption.
+
 Read `seen` before reading the preview. A preview with no operations means the
 desired state and the provider agree -- which is also true when the desired
 state is empty, so on its own it does not tell you that adoption put anything
