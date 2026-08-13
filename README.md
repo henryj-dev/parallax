@@ -87,6 +87,19 @@ that state, and refuses API requests that arrive with proxy forwarding headers.
 locked itself out; those tokens are listed as managed and cannot be revoked
 through the API. The last administrator token cannot be revoked.
 
+Issue one token per person or per automation, not one for the deployment. The
+audit trail records the token's subject as the actor, so a shared token makes
+every change -- portal, `curl`, another session -- look like the same actor, and
+there is no way to tell them apart afterwards.
+
+A server reads the tokens at startup and re-reads them every few seconds, so a
+token issued or revoked from the command line, another replica, or a second
+server takes effect within that window rather than at the next restart. The
+delay matters in both directions: a freshly issued token is refused for a
+moment, and a revoked one keeps working for the same moment. If the store cannot
+be read the process keeps the tokens it already has and logs the failure, since
+locking out every valid token is worse than serving a stale list briefly.
+
 It is also the only way to start a deployment that is not on loopback, since
 there is no loopback session to issue the first token from. Any container image
 binds `0.0.0.0`, so a container always needs it:

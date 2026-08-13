@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { scheduler } from "node:timers/promises";
 import { describe, it } from "node:test";
 import { AccessTokenService } from "../../src/application/access-tokens.ts";
 import type { AccessTokenRepository, StoredAccessToken } from "../../src/application/ports.ts";
 import { FileConfigurationStore } from "../../src/infrastructure/file-settings.ts";
-import { createAuthorizedHandler } from "../../src/security/http-authorization.ts";
+import { authenticate, createAuthorizedHandler } from "../../src/security/http-authorization.ts";
 
 class MemoryAccessTokenRepository implements AccessTokenRepository {
   tokens: StoredAccessToken[] = [];
@@ -21,6 +22,66 @@ class MemoryAccessTokenRepository implements AccessTokenRepository {
 }
 
 describe("AccessTokenService", () => {
+  // A deployment runs the command line in a separate process (`kubectl exec`),
+  // so these two instances stand for the server and that command.
+  function pair(repository: AccessTokenRepository): { server: AccessTokenService; cli: AccessTokenService } {
+    const bootstrap = [{ token: "bootstrap-token-long-enough-for-the-check", subject: "boot", role: "admin" as const }];
+    return { server: new AccessTokenService(repository, bootstrap), cli: new AccessTokenService(repository, bootstrap) };
+  }
+
+  function accepts(service: AccessTokenService, token: string): boolean {
+    return authenticate(new Request("http://localhost/api/v1/zones", {
+      headers: { authorization: `Bearer ${token}` },
+    }), service.security()) !== undefined;
+  }
+
+  it("accepts a token another process issued, without being restarted", async () => {
+    const repository = new MemoryAccessTokenRepository();
+    const { server, cli } = pair(repository);
+    await server.load();
+    await cli.load();
+    const stop = server.startRefreshing(5);
+
+    const issued = await cli.issue("ops-henry", "admin");
+    assert.equal(accepts(server, issued.token), false, "not yet -- the server has not read the store since");
+    await scheduler.wait(30);
+    assert.equal(accepts(server, issued.token), true);
+    stop();
+  });
+
+  it("stops accepting a token another process revoked, without being restarted", async () => {
+    const repository = new MemoryAccessTokenRepository();
+    const { server, cli } = pair(repository);
+    await cli.load();
+    const issued = await cli.issue("ops-henry", "admin");
+    await server.load();
+    assert.equal(accepts(server, issued.token), true);
+
+    const stop = server.startRefreshing(5);
+    await cli.revoke(issued.metadata.id);
+    await scheduler.wait(30);
+    assert.equal(accepts(server, issued.token), false, "a revocation that leaves the token working is not a revocation");
+    stop();
+  });
+
+  it("keeps the tokens it has when the store cannot be read", async () => {
+    const repository = new MemoryAccessTokenRepository();
+    const { server, cli } = pair(repository);
+    await cli.load();
+    const issued = await cli.issue("ops-henry", "admin");
+    await server.load();
+
+    const errors: unknown[] = [];
+    repository.list = async () => { throw new Error("store is unreachable"); };
+    const stop = server.startRefreshing(5, (error) => errors.push(error));
+    await scheduler.wait(30);
+    stop();
+
+    assert.ok(errors.length > 0, "the failure must be reported, not swallowed");
+    assert.equal(accepts(server, issued.token), true,
+      "an unreachable store must not lock out everyone holding a valid token");
+  });
+
   it("returns a new token once and stores only its digest", async () => {
     const repository = new MemoryAccessTokenRepository();
     const service = new AccessTokenService(repository);

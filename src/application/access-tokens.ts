@@ -18,6 +18,13 @@ export interface IssuedAccessToken {
   readonly metadata: AccessTokenMetadata;
 }
 
+/**
+ * How long a token issued or revoked in another process may take to take
+ * effect here. Short enough that an operator does not conclude the command
+ * failed, long enough that the query is nothing next to serving traffic.
+ */
+export const TOKEN_REFRESH_INTERVAL_MS = 5_000;
+
 const SUBJECT_PATTERN = /^[^\u0000-\u001f\u007f]{1,128}$/u;
 
 /**
@@ -44,6 +51,30 @@ export class AccessTokenService {
   async load(): Promise<void> {
     this.#stored = await this.#repository.list();
     this.#security = this.#buildSecurity();
+  }
+
+  /**
+   * Keeps this process's view of the tokens close to the store's.
+   *
+   * Issuing and revoking through this instance updates it immediately, but a
+   * token issued anywhere else -- the command line in a `kubectl exec`, another
+   * replica, a second server -- is written to the store and nowhere else. A
+   * process that only ever loaded at startup would refuse a valid token, and,
+   * worse, would keep accepting one that had been revoked. Both look like the
+   * store lying, and the second is a revocation that does not revoke.
+   *
+   * A store read on a fixed interval bounds that window regardless of how much
+   * traffic the process is taking. A read that fails leaves the previous view
+   * in place: the store being briefly unreachable should not lock out everyone
+   * holding a valid token.
+   */
+  startRefreshing(intervalMs = TOKEN_REFRESH_INTERVAL_MS, onError: (error: unknown) => void = () => {}): () => void {
+    const timer = setInterval(() => {
+      this.load().catch(onError);
+    }, intervalMs);
+    // Refreshing is not a reason for the process to stay alive.
+    timer.unref?.();
+    return () => clearInterval(timer);
   }
 
   /** A stable object while nothing changes, so prepared digests stay cached. */

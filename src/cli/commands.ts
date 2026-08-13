@@ -1,4 +1,4 @@
-import type { AccessTokenService } from "../application/access-tokens.ts";
+import { TOKEN_REFRESH_INTERVAL_MS, type AccessTokenService } from "../application/access-tokens.ts";
 import type { CloudflareCredentialManager } from "../application/cloudflare-credentials.ts";
 import { NotFoundError, type ControlPlane } from "../application/control-plane.ts";
 import type { SettingsService } from "../application/settings.ts";
@@ -384,11 +384,18 @@ const COMMANDS: readonly Command[] = [
       { name: "subject", summary: "Who the token is for", required: true },
       { name: "role", summary: "admin, editor or viewer", required: true },
     ],
-    run: (context, input) => requireAccessTokens(context).issue(input.subject, input.role),
+    run: async (context, input) => {
+      const issued = await requireAccessTokens(context).issue(input.subject, input.role);
+      // A server that is already running loaded its tokens at startup and
+      // refreshes on an interval, so this one does not work the instant the
+      // command returns. Saying so here is cheaper than reading a 401 as a
+      // wrong token, which is what it looks like.
+      return { ...issued, note: `A running server accepts this within ${TOKEN_REFRESH_INTERVAL_MS / 1000} seconds.` };
+    },
   },
   {
     name: "token revoke",
-    summary: "Revoke an issued token",
+    summary: "Revoke an issued token; a running server stops accepting it within seconds",
     role: "admin",
     options: [{ name: "id", summary: "Token identifier", required: true }],
     run: async (context, input) => {

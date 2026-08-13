@@ -28,6 +28,10 @@ if (!accessTokens.security().enabled && !isLoopbackHost(config.host)) {
   process.exit(1);
 }
 
+accessTokens.startRefreshing(undefined, (error) => {
+  console.error(`parallax: could not refresh access tokens: ${error instanceof Error ? error.message : "unknown error"}`);
+});
+
 const handleApi = createNodeHandler(runtime, () => accessTokens.security(), {
   get publicOrigin() { return settingsService.current().publicOrigin || undefined; },
   get trustForwardedHeaders() { return settingsService.current().trustForwardedHeaders; },
