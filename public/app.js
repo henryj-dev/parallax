@@ -294,6 +294,15 @@ function renderSync(state) {
   $("#revision-caption").textContent = desired ? t("sync.progress", { applied, desired }) : t("sync.noneApplied");
 }
 
+/**
+ * The counts, when the entry carries them. Without them a revision that emptied
+ * a zone reads like every other line: an action, a time and an actor.
+ */
+function changeCounts(entry, t) {
+  if (typeof entry.added !== "number") return "";
+  return ` · ${escapeHtml(t("history.counts", { added: entry.added, removed: entry.removed, changed: entry.changed }))}`;
+}
+
 function renderHistory(state) {
   const entries = state.history.slice(0, HISTORY_PAGE_SIZE);
   $("#history-empty").hidden = entries.length > 0;
