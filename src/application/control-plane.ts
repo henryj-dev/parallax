@@ -633,9 +633,10 @@ function cloneView(view: Zone["views"][number]): Zone["views"][number] {
  * while saying something else.
  *
  * Read from the before and after snapshots the entry already carries, so an
- * entry written before this existed still reports it. An entry that carries no
- * snapshots -- a zone deletion -- reports nothing rather than zeroes, which
- * would read as "this changed nothing".
+ * entry written before this existed still reports it. A deleted zone has a
+ * before and no after, which counts every record it held as removed. An entry
+ * with no snapshots at all reports nothing rather than zeroes, which would
+ * read as "this changed nothing".
  */
 function summarizeDesiredChange(entry: AuditEntry): { added: number; removed: number; changed: number } | undefined {
   const detail = entry.detail as { before?: { views?: DnsView[] } | null; after?: { views?: DnsView[] } } | undefined;
