@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
-import { AUDIT_ACTIONS, RECORD_TYPES } from "../../src/domain/dns.ts";
+import { AUDIT_ACTIONS, canBeProxied, RECORD_TYPES } from "../../src/domain/dns.ts";
 
 const root = new URL("../../", import.meta.url);
 
@@ -54,5 +54,15 @@ describe("record types", () => {
     const offered = [...select.slice(0, select.indexOf("</select>")).matchAll(/<option>([A-Z]+)<\/option>/gu)]
       .map((match) => match[1]);
     assert.deepEqual([...offered].sort(), [...RECORD_TYPES].sort());
+  });
+
+  it("lets the portal offer the proxy on exactly the types that can carry it", async () => {
+    // The portal disables the checkbox for types a proxy cannot stand in front
+    // of. Its list is a copy of the domain's rule, and a copy that drifts here
+    // offers an option the server then refuses.
+    const app = await readFile(fileURLToPath(new URL("public/app.js", root)), "utf8");
+    const line = app.slice(app.indexOf("function syncProxyAvailability"));
+    const listed = [...line.slice(0, line.indexOf("}")).matchAll(/"([A-Z]+)"/gu)].map((match) => match[1] as string);
+    assert.deepEqual(listed.sort(), RECORD_TYPES.filter(canBeProxied).sort());
   });
 });
