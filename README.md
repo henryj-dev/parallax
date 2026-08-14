@@ -279,6 +279,28 @@ zone resolves at once.
 needs a writable `/var/run/pdns`. An ephemeral volume is right -- a control
 socket has no reason to survive a restart.
 
+### Pointing a resolver at the internal view
+
+Whatever answers the internal view is authoritative for the zone, so it replies
+NXDOMAIN for a name it does not hold -- an answer, not a failure, which a
+forwarder accepts and does not fall back from. That is why the internal view has
+to be complete before anything is pointed at it, and why [adoption](#adopting-records-that-already-exist)
+exists.
+
+Two things sit in front of it and answer first, and both look like Parallax
+serving the wrong value:
+
+**A forwarder may answer from `/etc/hosts` before it asks anything.** dnsmasq
+reads it by default, so a host whose own name is inside the zone answers itself
+as `127.0.0.1` no matter what the internal view says. `no-hosts` turns that off.
+Reported from a deployment where the gateway running dnsmasq was itself named
+inside the zone it was forwarding.
+
+**The resolver has to be reachable before clients are told to use it.** Handing
+out a resolver address by DHCP while a firewall still drops port 53 takes DNS
+away from every client that renews, and they have no way back. Open the port
+first, confirm a query from a client, and change the DHCP option after.
+
 ### Reading the history
 
 Every audit entry carries `added`, `removed` and `changed`: how many records
