@@ -135,16 +135,26 @@ Setting some but not all of the required five is refused at startup. A partly
 configured deployment meant to offer this, and starting anyway would leave a
 sign-in button that fails only when somebody presses it.
 
-**The role comes from the provider, not from here.** Parallax reads the `roles`
-claim the provider returns for this client and takes the highest of `admin`,
-`editor` and `viewer`. An account the provider grants no role for is refused --
-authenticating proves who someone is, not that they are anyone here, and a
-default would turn every account in the directory into an account in this
-control plane.
+**The role comes from the provider, not from here.** Parallax reads the
+`entitlements` claim the provider returns for this client and takes the highest
+of `admin`, `editor` and `viewer`. Keys it does not know are ignored. An account
+the provider grants nothing to is refused -- authenticating proves who someone
+is, not that they are anyone here, and a default would turn every account in the
+directory into an account in this control plane.
 
-So a person is given a role wherever the other services' roles are given. With
-KeyStone that is a per-client role assignment, whose keys must be `admin`,
+⚠️ **`entitlements`, not `roles` or `groups`.** A provider that distinguishes
+them means the distinction: `roles` says what a person *is* and is meant to be
+displayed, `groups` says where they sit in the organization, and neither is a
+grant. Reading either as permission turns a label into authority, and the label
+is usually maintained by someone who does not know it is doing that.
+
+So a person is granted access wherever the other services' access is granted.
+With KeyStone that is a per-client entitlement, whose keys must be `admin`,
 `editor` or `viewer` for Parallax to recognise them.
+
+The client authenticates with `client_secret_post` -- the secret travels in the
+token request body, not in an `Authorization` header -- so a provider that asks
+how to authenticate this client must be told that.
 
 The flow is Authorization Code with PKCE. `/auth/login` sends the browser to the
 provider, `/auth/callback` finishes, `/auth/logout` ends both sessions. Nothing

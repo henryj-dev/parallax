@@ -88,11 +88,11 @@ export async function exchangeCode(
 /**
  * Reads who this is, and what they may do here.
  *
- * The role comes from the provider's answer for *this client*, so a person's
+ * The grant comes from the provider's answer for *this client*, so a person's
  * standing in Parallax is administered where every other service's is. A
- * provider that says nothing about roles has not granted this person anything,
- * and that is refused rather than defaulted -- a default would make an account
- * anywhere in the directory into an account here.
+ * provider that grants this person nothing has said so, and that is refused
+ * rather than defaulted -- a default would make an account anywhere in the
+ * directory into an account here.
  */
 export async function readIdentity(
   config: OidcConfig,
@@ -109,10 +109,14 @@ export async function readIdentity(
   const subject = typeof record.sub === "string" ? record.sub : "";
   if (subject.length === 0) throw new OidcError("the identity provider returned an account with no subject");
 
-  const role = readRole(record.roles);
+  // `entitlements`, not `roles`. The provider draws that line itself: `roles`
+  // says what a person is and is meant for display, `groups` is where they sit
+  // in the organization, and neither is a grant. Reading either one here would
+  // turn a label into permission.
+  const role = readRole(record.entitlements);
   if (!role) {
     throw new OidcError(
-      "this account has no role for Parallax at the identity provider. An administrator assigns one there, using the key admin, editor or viewer.",
+      "this account has no entitlement for Parallax at the identity provider. An administrator grants one there, using the key admin, editor or viewer.",
     );
   }
   const label = typeof record.preferred_username === "string" ? record.preferred_username
@@ -122,10 +126,12 @@ export async function readIdentity(
 }
 
 /**
- * The provider sends roles as a list because a person can hold several. Here
- * they are ranked rather than rejected as ambiguous: refusing the login of
+ * The provider sends entitlements as a list because a person can hold several.
+ * They are ranked rather than rejected as ambiguous: refusing the login of
  * someone granted both `admin` and `viewer` would be a puzzle with no way to
  * act on it, and the highest is what every other reading of "may they" means.
+ * Keys Parallax does not know are ignored -- a service may grant more than this
+ * one understands.
  */
 function readRole(value: unknown): Role | undefined {
   const keys = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];

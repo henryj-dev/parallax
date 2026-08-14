@@ -60,7 +60,7 @@ describe("identity sign-in", () => {
   it("carries the provider's role into the session and into authentication", async () => {
     const handler = createIdentityHandler({
       settings: SETTINGS,
-      fetchImpl: provider({ sub: "keystone-user-1", roles: ["editor"], preferred_username: "ops" }),
+      fetchImpl: provider({ sub: "keystone-user-1", entitlements: ["editor"], preferred_username: "ops" }),
     });
     const started = await handler(new Request("https://parallax.example/auth/login?next=/zones"));
     assert.equal(started?.status, 302);
@@ -104,7 +104,7 @@ describe("identity sign-in", () => {
   });
 
   it("refuses a callback whose state is not the one this browser was given", async () => {
-    const handler = createIdentityHandler({ settings: SETTINGS, fetchImpl: provider({ sub: "x", roles: ["admin"] }) });
+    const handler = createIdentityHandler({ settings: SETTINGS, fetchImpl: provider({ sub: "x", entitlements: ["admin"] }) });
     const answered = await handler(new Request("https://parallax.example/auth/callback?code=abc&state=attacker", {
       headers: { cookie: "parallax_oidc_state=browser; parallax_oidc_verifier=v" },
     }));
@@ -121,14 +121,28 @@ describe("identity sign-in", () => {
       (error: Error) => {
         // Anyone in the directory can authenticate; that is not the same as
         // being someone here, and defaulting would make it the same.
-        assert.match(error.message, /no role for Parallax/);
+        assert.match(error.message, /no entitlement for Parallax/);
+        return true;
+      },
+    );
+  });
+
+  it("does not take a role or a group as permission", async () => {
+    // The provider labels people with `roles` and places them with `groups`,
+    // and says in its own console that neither is for authorization. A holder
+    // of both and no entitlement is somebody with a job title, not a grant.
+    await assert.rejects(
+      readIdentity(CONFIG, { accessToken: "t", expiresIn: 300 },
+        provider({ sub: "labelled", roles: ["admin"], groups: ["platform"], roles_label: "Administrator" })),
+      (error: Error) => {
+        assert.match(error.message, /no entitlement for Parallax/);
         return true;
       },
     );
   });
 
   it("sends the browser only to a path on this origin", async () => {
-    const handler = createIdentityHandler({ settings: SETTINGS, fetchImpl: provider({ sub: "u", roles: ["viewer"] }) });
+    const handler = createIdentityHandler({ settings: SETTINGS, fetchImpl: provider({ sub: "u", entitlements: ["viewer"] }) });
     for (const hostile of ["//evil.example", "/\\evil.example", "https://evil.example"]) {
       const started = await handler(new Request(`https://parallax.example/auth/login?next=${encodeURIComponent(hostile)}`));
       assert.equal(cookiesOf(started as Response).get("parallax_oidc_return"), "/", hostile);
