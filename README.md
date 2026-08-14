@@ -339,7 +339,20 @@ forwarder accepts and does not fall back from. That is why the internal view has
 to be complete before anything is pointed at it, and why [adoption](#adopting-records-that-already-exist)
 exists.
 
-Two things sit in front of it and answer first, and both look like Parallax
+**It is not the resolver clients should be given.** Whatever serves the internal
+view answers for that zone and refuses everything else -- `REFUSED` to
+`google.com` is it saying the question is not its to answer, which is correct
+and is not a fault. Clients point at a forwarder, and the forwarder sends the
+one zone here and the rest upstream:
+
+```
+client → forwarder ──(example.com)──→ the internal view
+                   └─(everything else)──→ a recursive resolver
+```
+
+Handing clients this address directly leaves them with one zone and no internet.
+
+Two more things sit in front of it and answer first, and both look like Parallax
 serving the wrong value:
 
 **A forwarder may answer from `/etc/hosts` before it asks anything.** dnsmasq
