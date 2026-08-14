@@ -10,7 +10,7 @@ resulting changes, and applies only records explicitly managed by Parallax.
 
 - Browser portal for zones, internal/external records, preview, apply, status,
   audit history, immutable revisions, restore, and zone deletion
-- A, AAAA, CNAME, and TXT validation with Cloudflare proxy constraints,
+- Every common record type, validated by its RDATA grammar, with Cloudflare proxy constraints,
   including RFC 8552 underscored names such as `_dmarc` and `_acme-challenge`
 - Deterministic `managed-only` reconciliation that leaves foreign records alone
 - Durable single-node JSON state and provider state with atomic writes
@@ -384,6 +384,38 @@ trail. Add `--json` for machine-readable output. Exit codes follow `sysexits`:
 Because the command line reaches the store directly it acts with full rights;
 HTTP callers are limited to what their token's role allows.
 
+## Record types
+
+`content` holds the record's RDATA in presentation format -- the same text a
+zone file puts after the type:
+
+```
+MX     10 mail.example.com
+SRV    10 5 5060 sip.example.com
+CAA    0 issue "letsencrypt.org"
+HTTPS  1 . alpn=h2,h3
+TXT    v=spf1 -all
+```
+
+Each type's grammar is checked when the record is saved, not when it is applied:
+a record that a provider would reject is one an operator saved, walked away
+from, and finds broken later, possibly against a zone that is already half
+published.
+
+Two things are handled by the adapters rather than written into the content.
+Cloudflare keeps the leading number of `MX`, `SRV` and `URI` in a field of its
+own, and a zone file needs hostnames made absolute -- an `MX` target written as
+`mail.example.com` in `example.com`'s file otherwise resolves to
+`mail.example.com.example.com`. Both are put back the way they were written when
+the record is read again, so neither shows up as drift.
+
+`SOA` and the DNSSEC records are not managed. They describe the zone's authority
+rather than its contents, every provider generates and signs them itself, and
+publishing our own would overwrite the provider's answer to a question we did
+not ask. An apex `NS` record is also not inherited by the internal view: it
+names the servers that answer for the zone, which is a fact about each provider,
+and copying it inward would delegate the internal view away from itself.
+
 ## Adopting records that already exist
 
 A zone usually has a history before Parallax arrives. Records made by hand at the
@@ -429,12 +461,10 @@ are added at the provider by hand.
 
 Two limits worth knowing before you rely on it:
 
-- Only `A`, `AAAA`, `CNAME` and `TXT` are supported. Providers list other types
-  and Parallax skips them, so `MX`, `NS`, `CAA` and `SRV` records are neither
-  adopted nor visible. A name that exists *only* with such a type will still be
-  NXDOMAIN in the internal view; a name that also has a supported type answers
-  for that type and returns no data for the rest. Compare `seen` against the
-  provider's own record count to size the gap.
+- A provider may hold types Parallax does not manage -- `SOA` and the DNSSEC
+  records, which every provider generates for itself. Those are skipped rather
+  than adopted. Compare `seen` against the provider's own record count to see
+  how many that is.
 - Adoption commits the view in one step, so a record that cannot be described
   stops all of them and nothing is written. The error names the record.
 - A record that differs from the desired state by TTL alone is left as the

@@ -71,6 +71,43 @@ describe("CloudflareProviderAdapter", () => {
     ]);
   });
 
+  it("moves the MX preference between Cloudflare's priority field and the record's content", async () => {
+    // Cloudflare keeps the leading number of MX, SRV and URI RDATA in its own
+    // field. The desired state keeps the whole presentation form, so the two
+    // have to be taken apart on the way out and put back on the way in.
+    const sent: unknown[] = [];
+    const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      if (init?.method === "POST") {
+        sent.push(JSON.parse(String(init.body)));
+        return Response.json({ success: true, result: {} });
+      }
+      return Response.json({
+        success: true,
+        result: [
+          { id: "mx", name: "example.com", type: "MX", content: "mail.example.net", priority: 10, ttl: 300 },
+          // Already in presentation form: the priority must not be added twice.
+          { id: "srv", name: "_sip.example.com", type: "SRV", content: "10 5 5060 sip.example.net", priority: 10, ttl: 300 },
+        ],
+        result_info: { page: 1, total_pages: 1 },
+      });
+    };
+    const adapter = new CloudflareProviderAdapter({ token: "secret", zoneId: "zone-1", fetch, ownershipSecret: OWNERSHIP_SECRET });
+
+    assert.deepEqual((await adapter.list("example.com/external")).map((record) => record.content), [
+      "10 mail.example.net",
+      "10 5 5060 sip.example.net",
+    ]);
+
+    await adapter.apply("example.com/external", {
+      kind: "create",
+      desired: { id: "mail", name: "@", type: "MX", content: "20 backup.example.net", ttl: 300 },
+    });
+    assert.deepEqual(sent, [{
+      name: "example.com", type: "MX", content: "backup.example.net", priority: 20, ttl: 300,
+      comment: (sent[0] as { comment: string }).comment,
+    }]);
+  });
+
   it("refuses a record whose ownership marker will not fit a Cloudflare comment", async () => {
     const calls: string[] = [];
     const fetch = async (input: string | URL | Request): Promise<Response> => {

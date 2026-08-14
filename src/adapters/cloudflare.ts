@@ -1,6 +1,6 @@
 import { ProviderConstraintError } from "../application/ports.ts";
 import type { ProviderAdapter } from "../application/ports.ts";
-import { canBeProxied, effectiveExternalTtl, type DesiredRecord, type RecordType } from "../domain/dns.ts";
+import { RECORD_TYPES, canBeProxied, effectiveExternalTtl, type DesiredRecord, type RecordType } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 import { MAX_RECORD_ID_LENGTH, MAX_MARKER_LENGTH, ownershipComment, readOwnershipComment } from "./ownership.ts";
 
@@ -22,6 +22,8 @@ interface CloudflareRecord {
   type: string;
   content: string;
   ttl: number;
+  /** Cloudflare keeps the leading number of MX, SRV and URI RDATA here. */
+  priority?: number;
   proxied?: boolean;
   comment?: string;
 }
@@ -70,7 +72,7 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
           managed,
           name,
           type: record.type,
-          content: normalizeContent(record.type, record.content),
+          content: joinPriority(record.type, normalizeContent(record.type, record.content), record.priority),
           ttl: effectiveExternalTtl(record as Pick<DesiredRecord, "type" | "ttl" | "proxied">),
         };
         // Cloudflare reports `proxied` on every type, including the ones it
@@ -217,10 +219,12 @@ function positiveInteger(value: number, field: string): number {
 }
 
 function recordBody(target: string, zone: string, record: DesiredRecord, ownershipSecret: string): Record<string, unknown> {
+  const { content, priority } = splitPriority(record.type, record.content);
   return {
     name: record.name === "@" ? zone : `${record.name}.${zone}`,
     type: record.type,
-    content: record.content,
+    content,
+    ...(priority === undefined ? {} : { priority }),
     ttl: effectiveExternalTtl(record),
     ...(record.proxied === undefined ? {} : { proxied: record.proxied }),
     comment: cloudflareComment(target, record, ownershipSecret),
@@ -302,13 +306,38 @@ function asCloudflareRecord(value: unknown): CloudflareRecord | undefined {
   if (!isObject(value)) return undefined;
   if (typeof value.id !== "string" || typeof value.name !== "string" || typeof value.type !== "string" || typeof value.content !== "string" || typeof value.ttl !== "number") return undefined;
   const record: CloudflareRecord = { id: value.id, name: value.name, type: value.type, content: value.content, ttl: value.ttl };
+  if (typeof value.priority === "number") record.priority = value.priority;
   if (typeof value.proxied === "boolean") record.proxied = value.proxied;
   if (typeof value.comment === "string") record.comment = value.comment;
   return record;
 }
 
 function isSupportedType(value: string): value is RecordType {
-  return value === "A" || value === "AAAA" || value === "CNAME" || value === "TXT";
+  return RECORD_TYPES.some((candidate) => candidate === value);
+}
+
+/**
+ * Types whose presentation format opens with a number that Cloudflare keeps in
+ * its own `priority` field instead of in `content`.
+ *
+ * Cloudflare has been moving these toward presentation format, so the reader
+ * accepts either: it prepends the priority only when the content does not
+ * already start with one. The writer always splits, which both forms accept.
+ */
+function hasSeparatePriority(type: string): boolean {
+  return type === "MX" || type === "SRV" || type === "URI";
+}
+
+function joinPriority(type: string, content: string, priority: number | undefined): string {
+  if (!hasSeparatePriority(type) || priority === undefined) return content;
+  return /^\d+\s/u.test(content) ? content : `${priority} ${content}`;
+}
+
+/** Splits the leading priority back out, for the field Cloudflare expects it in. */
+function splitPriority(type: string, content: string): { content: string; priority?: number } {
+  if (!hasSeparatePriority(type)) return { content };
+  const match = /^(\d+)\s+(.*)$/su.exec(content);
+  return match ? { content: match[2] as string, priority: Number(match[1]) } : { content };
 }
 
 async function readJson(response: Response): Promise<Record<string, unknown>> {

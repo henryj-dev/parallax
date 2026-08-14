@@ -1,5 +1,5 @@
 import type { ProviderAdapter } from "../application/ports.ts";
-import type { DesiredRecord, RecordType } from "../domain/dns.ts";
+import { RECORD_TYPES, type DesiredRecord, type RecordType } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 import { ownershipComment, readOwnershipComment } from "./ownership.ts";
 
@@ -253,13 +253,38 @@ function parseTtl(value: string): number | undefined {
 }
 
 function isManagedType(value: string): value is RecordType {
-  return value === "A" || value === "AAAA" || value === "CNAME" || value === "TXT";
+  return RECORD_TYPES.some((candidate) => candidate === value);
+}
+
+/**
+ * Where each type's RDATA carries a hostname, counted in whitespace-separated
+ * fields.
+ *
+ * A zone file reads a name without a trailing dot as relative to the origin, so
+ * writing `10 mail.example.com` into example.com's file publishes an MX for
+ * `mail.example.com.example.com`. The name has to be made absolute on the way
+ * out and relative again on the way back, and only in the field that holds one.
+ */
+const HOSTNAME_FIELD: Readonly<Record<string, number>> = {
+  CNAME: 0, DNAME: 0, NS: 0, PTR: 0, MX: 1, SRV: 3, SVCB: 1, HTTPS: 1, NAPTR: 5,
+};
+
+function withAbsoluteHostname(type: string, content: string, absolute: boolean): string {
+  const index = HOSTNAME_FIELD[type];
+  if (index === undefined) return content;
+  const fields = content.split(/(\s+)/u);
+  // Every second entry is a separator, so the nth field sits at 2n.
+  const position = index * 2;
+  const field = fields[position];
+  if (field === undefined || field === ".") return content;
+  fields[position] = absolute ? `${field.replace(/\.$/u, "")}.` : field.replace(/\.$/u, "");
+  return fields.join("");
 }
 
 function formatRecord(target: string, record: DesiredRecord, ownershipSecret: string): string {
   const content = record.type === "TXT"
     ? quoteDnsText(record.content)
-    : record.type === "CNAME" ? `${record.content.replace(/\.$/, "")}.` : record.content;
+    : withAbsoluteHostname(record.type, record.content, true);
   return `${record.name} ${record.ttl} IN ${record.type} ${content} ; ${ownershipComment(target, record.id, ownershipSecret)}`;
 }
 
@@ -267,7 +292,7 @@ function parseContent(type: RecordType, raw: string): string | undefined {
   if (type === "TXT") {
     return parseDnsText(raw);
   }
-  return type === "CNAME" ? raw.toLowerCase().replace(/\.$/, "") : raw;
+  return withAbsoluteHostname(type, type === "CNAME" ? raw.toLowerCase() : raw, false);
 }
 
 function splitRecordAndComment(line: string): { record: string; comment?: string } {

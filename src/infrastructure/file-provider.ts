@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { ProviderAdapter } from "../application/ports.ts";
-import type { DesiredRecord } from "../domain/dns.ts";
+import { RECORD_TYPES, type DesiredRecord } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 
 interface FileProviderState {
@@ -111,7 +111,7 @@ function parseProviderRecord(value: unknown): ProviderRecord {
   // Unmanaged records are representable so drift, conflicts, and adoption behave
   // here exactly as they do against a real provider.
   if (!isObject(value) || typeof value.id !== "string" || typeof value.providerId !== "string" || typeof value.managed !== "boolean" ||
-      typeof value.name !== "string" || !["A", "AAAA", "CNAME", "TXT"].includes(String(value.type)) ||
+      typeof value.name !== "string" || !RECORD_TYPES.some((candidate) => candidate === String(value.type)) ||
       typeof value.content !== "string" || !Number.isInteger(value.ttl) ||
       (value.proxied !== undefined && typeof value.proxied !== "boolean")) {
     throw new Error("invalid provider record");

@@ -156,6 +156,40 @@ rows "DELETE FROM records WHERE name='orphan.${ZONE}'" >/dev/null
 ok "cascade removed the marker, so ownership can never claim a row that is gone"
 
 
+echo "== every record type Parallax supports answers from PowerDNS =="
+# The presentation format Parallax keeps in `content` is what PowerDNS stores,
+# so this is where "supported" is decided: not that the row was written, but
+# that the server answers with it. PowerDNS also has a `prio` column, which the
+# writer leaves alone -- if 4.x needed it, MX and SRV would fail here.
+set_and_apply() {
+  parallax record set --zone "$ZONE" --view internal --id "$1" \
+    --record "{\"name\":\"$2\",\"type\":\"$3\",\"content\":\"$4\",\"ttl\":300}" >/dev/null
+}
+set_and_apply mxrec  mail  MX    "10 mailhost.${ZONE}"
+set_and_apply srvrec _sip  SRV   "10 5 5060 sip.${ZONE}"
+set_and_apply caarec caa   CAA   '0 issue \"letsencrypt.org\"'
+set_and_apply nsrec  sub   NS    "ns1.${ZONE}"
+set_and_apply ptrrec ptr   PTR   "host.${ZONE}"
+parallax apply --zone "$ZONE" --view internal | grep -q "state=applied" \
+  || fail "publishing the additional record types did not apply"
+sleep 1
+[ "$(query "mail.${ZONE}" MX)"  = "10 mailhost.${ZONE}." ]        || fail "MX answered '$(query "mail.${ZONE}" MX)'"
+[ "$(query "_sip.${ZONE}" SRV)" = "10 5 5060 sip.${ZONE}." ]      || fail "SRV answered '$(query "_sip.${ZONE}" SRV)'"
+[ "$(query "caa.${ZONE}" CAA)"  = '0 issue "letsencrypt.org"' ]   || fail "CAA answered '$(query "caa.${ZONE}" CAA)'"
+# An NS below the apex is a delegation, so the server answers it as a referral in
+# the authority section rather than as data. Reading only `dig +short` would
+# report the record as missing when it is published and behaving correctly.
+dig +tcp +time=3 +noall +authority -p "$DNSPORT" @127.0.0.1 "sub.${ZONE}" NS 2>/dev/null \
+  | grep -q "sub.${ZONE}.*NS.*ns1.${ZONE}." || fail "NS was not served as a delegation"
+# And PowerDNS is told it is a delegation, which is what it signs a zone by.
+[ "$(rows "SELECT auth FROM records WHERE name='sub.${ZONE}' AND type='NS'")" = "f" ] \
+  || fail "a delegation NS was stored as authoritative data"
+[ "$(query "ptr.${ZONE}" PTR)"  = "host.${ZONE}." ]               || fail "PTR answered '$(query "ptr.${ZONE}" PTR)'"
+# And what was published still matches what is wanted, so nothing drifts.
+DRIFT=$(parallax preview --zone "$ZONE" --view internal --json | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).views.internal.operations.length))')
+[ "$DRIFT" = "0" ] || fail "the new types propose $DRIFT operations against what was just written"
+ok "MX, SRV, CAA, NS and PTR answer over the wire and propose no drift"
+
 echo "== a name whose marker exceeds a Cloudflare comment still publishes here =="
 # Internal ids are derived from the name, so a name with several labels produces
 # an id long enough that its ownership marker passes 100 characters -- the limit

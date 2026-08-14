@@ -1,5 +1,5 @@
 import type { ProviderAdapter } from "../application/ports.ts";
-import { type DesiredRecord, type RecordType } from "../domain/dns.ts";
+import { RECORD_TYPES, type DesiredRecord, type RecordType } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 import type { CloseablePgPool, PgClient } from "../infrastructure/postgres.ts";
 import { ownershipComment, readOwnershipComment } from "./ownership.ts";
@@ -18,7 +18,7 @@ import { ownershipComment, readOwnershipComment } from "./ownership.ts";
  * the same marker string the other providers carry and is verified the same way.
  */
 
-const SUPPORTED: readonly RecordType[] = ["A", "AAAA", "CNAME", "TXT"];
+const SUPPORTED: readonly RecordType[] = RECORD_TYPES;
 
 export interface PowerDnsProviderAdapterOptions {
   readonly pool: CloseablePgPool;
@@ -92,9 +92,9 @@ export class PowerDnsProviderAdapter implements ProviderAdapter {
       } else {
         const { rows } = await client.query(
           `INSERT INTO records (domain_id, name, type, content, ttl, disabled, auth)
-           VALUES ($1, $2, $3, $4, $5, false, true) RETURNING id`,
+           VALUES ($1, $2, $3, $4, $5, false, $6) RETURNING id`,
           [domainId, absoluteName(operation.desired.name, zone), operation.desired.type,
-            toStoredContent(operation.desired), operation.desired.ttl],
+            toStoredContent(operation.desired), operation.desired.ttl, isAuthoritative(operation.desired)],
         );
         const id = asId(rows[0]);
         if (id === undefined) throw new Error("PowerDNS did not return an id for the inserted record");
@@ -166,6 +166,19 @@ function relativeName(name: string, zone: string): string | undefined {
   const lower = name.trim().toLowerCase().replace(/\.$/u, "");
   if (lower === zone) return "@";
   return lower.endsWith(`.${zone}`) ? lower.slice(0, -(zone.length + 1)) : undefined;
+}
+
+/**
+ * Whether PowerDNS should treat the row as its own data.
+ *
+ * An NS record below the apex marks a delegation: the zone stops being the
+ * answer there and points at another server. PowerDNS wants `auth` false for
+ * those, and uses the flag to decide what it signs. An unsigned zone answers
+ * correctly either way, so getting this wrong stays invisible until the day the
+ * zone is signed.
+ */
+function isAuthoritative(record: DesiredRecord): boolean {
+  return !(record.type === "NS" && record.name !== "@");
 }
 
 /** PowerDNS stores TXT as it is served, in quotes; the domain keeps them off. */

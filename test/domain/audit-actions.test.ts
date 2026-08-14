@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
-import { AUDIT_ACTIONS } from "../../src/domain/dns.ts";
+import { AUDIT_ACTIONS, RECORD_TYPES } from "../../src/domain/dns.ts";
 
 const root = new URL("../../", import.meta.url);
 
@@ -38,5 +38,21 @@ describe("audit actions", () => {
         assert.ok(block.includes(`"${key}":`), `${key} has no ${locale} translation`);
       }
     }
+  });
+});
+
+/**
+ * The portal's type list is a third copy of RECORD_TYPES, in HTML that nothing
+ * compiles. A type added to the domain and not here is one an operator can
+ * reach through the API and the command line but not the portal, which reads as
+ * the type not being supported.
+ */
+describe("record types", () => {
+  it("are all offered by the portal", async () => {
+    const html = await readFile(fileURLToPath(new URL("public/index.html", root)), "utf8");
+    const select = html.slice(html.indexOf('<select name="type">'));
+    const offered = [...select.slice(0, select.indexOf("</select>")).matchAll(/<option>([A-Z]+)<\/option>/gu)]
+      .map((match) => match[1]);
+    assert.deepEqual([...offered].sort(), [...RECORD_TYPES].sort());
   });
 });

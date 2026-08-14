@@ -134,6 +134,20 @@ DRIFT=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views.e
 [ "$DRIFT" = "0" ] || fail "expected convergence after apply, found $DRIFT operations"
 ok "second preview shows no drift: the adapter round-trips its own writes"
 
+echo "== an MX record round-trips Cloudflare's separate priority field =="
+# Cloudflare keeps the MX preference in its own field rather than in the content
+# it returns. Nothing local can settle whether the adapter puts it back the same
+# way: a stand-in provider hands back exactly what it was given, so the join and
+# the split cancel out and the test passes either way.
+curl -sf -X PUT -H 'content-type: application/json' \
+  -d "{\"name\":\"${LABEL}\",\"type\":\"MX\",\"content\":\"10 mail.${CF_ZONE}\",\"ttl\":300}" \
+  "$API/zones/${CF_ZONE}/views/external/records/verifymx" >/dev/null
+curl -sf -X POST "$API/zones/${CF_ZONE}/apply?view=external" | json 'v.statuses[0].state' | grep -qx applied \
+  || fail "the MX record did not apply"
+MX_DRIFT=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views.external.operations.length')
+[ "$MX_DRIFT" = "0" ] || fail "an MX record Parallax wrote proposes $MX_DRIFT operations against itself"
+ok "MX round-trips: the preference comes back where it was written"
+
 echo "== a TXT record survives Cloudflare's quoting =="
 # Cloudflare returns TXT in presentation form -- each character-string in double
 # quotes, split at 255 characters whether or not it was written that way. The

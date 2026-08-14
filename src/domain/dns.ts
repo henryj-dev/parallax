@@ -1,6 +1,23 @@
 import { BlockList, isIP } from "node:net";
 
-export const RECORD_TYPES = ["A", "AAAA", "CNAME", "TXT"] as const;
+/**
+ * Every record type Parallax will hold in a desired state.
+ *
+ * `content` carries the record's RDATA in presentation format -- the same text
+ * a zone file would put after the type. That is what CoreDNS writes verbatim
+ * and what PowerDNS stores, so a type is supported here as soon as its RDATA
+ * can be validated; providers that model part of it as a separate field, as
+ * Cloudflare does with MX priority, split and rejoin it in their adapter.
+ *
+ * Left out on purpose: SOA, and the DNSSEC records. Those describe the zone's
+ * authority rather than its contents, every provider generates and signs them
+ * itself, and a control plane that published its own would be overwriting the
+ * provider's answer to a question it did not ask.
+ */
+export const RECORD_TYPES = [
+  "A", "AAAA", "CAA", "CERT", "CNAME", "DNAME", "HINFO", "HTTPS", "MX", "NAPTR",
+  "NS", "OPENPGPKEY", "PTR", "SMIMEA", "SRV", "SSHFP", "SVCB", "TLSA", "TXT", "URI",
+] as const;
 /** The only views Parallax can reconcile; every provider target is `<zone>/<view>`. */
 export const PROVIDER_VIEWS = ["external", "internal"] as const;
 export const CLOUDFLARE_AUTO_TTL = 1;
@@ -151,25 +168,101 @@ export function validateRecordId(value: string): string {
   return id;
 }
 
+/**
+ * The shape of each type's RDATA, as presentation format writes it.
+ *
+ * Checked here rather than left to the provider: a record that only fails at
+ * apply is one an operator saved, walked away from, and finds broken later,
+ * possibly against a zone that is already half published.
+ *
+ * `undefined` means the content is acceptable; a string is what is wrong with
+ * it. Anything not listed is rejected by the type check before reaching here.
+ */
+function validateRecordContent(type: string, content: string): string | undefined {
+  const fields = content.split(/\s+/u).filter((field) => field.length > 0);
+  const quoted = [...content.matchAll(/"(?:[^"\\]|\\.)*"/gu)];
+  switch (type) {
+    case "A":
+      return isIP(content) === 4 ? undefined : "A content must be a valid IPv4 address";
+    case "AAAA":
+      return isIP(content) === 6 ? undefined : "AAAA content must be a valid IPv6 address";
+    case "CNAME": case "DNAME": case "NS": case "PTR":
+      return isValidHostname(content) ? undefined : `${type} content must be a valid hostname`;
+    case "TXT":
+      return content.length >= 1 && content.length <= 4096
+        ? undefined : "TXT content must contain between 1 and 4096 characters";
+    case "MX":
+      // `10 mail.example.com` -- preference first, exactly as a zone file has it.
+      return fields.length === 2 && isUnsigned(fields[0], 16) && isValidHostname(fields[1] as string)
+        ? undefined : "MX content must be a preference and a hostname, as in `10 mail.example.com`";
+    case "SRV":
+      return fields.length === 4 && isUnsigned(fields[0], 16) && isUnsigned(fields[1], 16)
+        && isUnsigned(fields[2], 16) && (fields[3] === "." || isValidHostname(fields[3] as string))
+        ? undefined : "SRV content must be priority, weight, port and target, as in `10 5 443 host.example.com`";
+    case "CAA":
+      // `0 issue "letsencrypt.org"` -- the value is a quoted character-string.
+      return fields.length >= 3 && isUnsigned(fields[0], 8) && /^[a-z][a-z0-9]*$/u.test(fields[1] ?? "")
+        && quoted.length === 1 && content.endsWith('"')
+        ? undefined : 'CAA content must be a flag, a tag and a quoted value, as in `0 issue "letsencrypt.org"`';
+    case "TLSA": case "SMIMEA":
+      return fields.length === 4 && fields.slice(0, 3).every((field) => isUnsigned(field, 8))
+        && isHex(fields[3] as string)
+        ? undefined : `${type} content must be three numbers and hexadecimal data, as in \`3 1 1 ab12…\``;
+    case "SSHFP":
+      return fields.length === 3 && isUnsigned(fields[0], 8) && isUnsigned(fields[1], 8) && isHex(fields[2] as string)
+        ? undefined : "SSHFP content must be an algorithm, a type and hexadecimal data, as in `4 2 ab12…`";
+    case "NAPTR":
+      return fields.length >= 6 && isUnsigned(fields[0], 16) && isUnsigned(fields[1], 16) && quoted.length === 3
+        ? undefined : 'NAPTR content must be two numbers, three quoted strings and a replacement, as in `100 10 "s" "SIP+D2U" "" _sip._udp.example.com`';
+    case "URI":
+      return fields.length >= 3 && isUnsigned(fields[0], 16) && isUnsigned(fields[1], 16) && quoted.length === 1
+        ? undefined : 'URI content must be a priority, a weight and a quoted target, as in `10 1 "https://example.com/"`';
+    case "SVCB": case "HTTPS":
+      // Priority 0 is the alias form, which takes a target and no parameters.
+      return fields.length >= 2 && isUnsigned(fields[0], 16)
+        && (fields[1] === "." || isValidHostname(fields[1] as string))
+        ? undefined : `${type} content must be a priority and a target, as in \`1 . alpn=h2,h3\``;
+    case "CERT":
+      return fields.length === 4 && isUnsigned(fields[0], 16) && isUnsigned(fields[1], 16)
+        && isUnsigned(fields[2], 8) && isBase64(fields[3] as string)
+        ? undefined : "CERT content must be a type, a key tag, an algorithm and base64 data";
+    case "OPENPGPKEY":
+      return isBase64(content) ? undefined : "OPENPGPKEY content must be base64 data";
+    case "HINFO":
+      return quoted.length === 2 ? undefined : 'HINFO content must be two quoted strings, as in `"Intel" "Linux"`';
+    default:
+      return undefined;
+  }
+}
+
+function isUnsigned(value: string | undefined, bits: number): boolean {
+  if (value === undefined || !/^\d{1,5}$/u.test(value)) return false;
+  return Number(value) <= 2 ** bits - 1;
+}
+
+function isHex(value: string): boolean {
+  return value.length > 0 && value.length % 2 === 0 && /^[0-9a-f]+$/iu.test(value);
+}
+
+function isBase64(value: string): boolean {
+  return value.length > 0 && /^[A-Za-z0-9+/]+={0,2}$/u.test(value);
+}
+
 export function createDesiredRecord(id: string, input: unknown): DesiredRecord {
   const issues: string[] = [];
   const value = asObject(input);
   const recordId = validateRecordId(id);
   const typeValue = typeof value.type === "string" ? value.type.toUpperCase() : "";
   if (!RECORD_TYPES.some((candidate) => candidate === typeValue)) {
-    issues.push("type must be one of A, AAAA, CNAME or TXT");
+    issues.push(`type must be one of ${RECORD_TYPES.join(", ")}`);
   }
 
   const name = typeof value.name === "string" ? value.name.trim().toLowerCase() : "";
   if (!isValidRecordName(name)) issues.push("name must be @ or a valid relative DNS name");
 
   let content = typeof value.content === "string" ? value.content.trim() : "";
-  if (typeValue === "A" && isIP(content) !== 4) issues.push("A content must be a valid IPv4 address");
-  if (typeValue === "AAAA" && isIP(content) !== 6) issues.push("AAAA content must be a valid IPv6 address");
-  if (typeValue === "CNAME" && !isValidHostname(content)) issues.push("CNAME content must be a valid hostname");
-  if (typeValue === "TXT" && (content.length === 0 || content.length > 4096)) {
-    issues.push("TXT content must contain between 1 and 4096 characters");
-  }
+  const contentIssue = validateRecordContent(typeValue, content);
+  if (contentIssue) issues.push(contentIssue);
 
   const requestedTtl = value.ttl;
   const hasValidTtl = typeof requestedTtl === "number"

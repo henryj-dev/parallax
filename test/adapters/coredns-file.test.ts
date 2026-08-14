@@ -97,7 +97,8 @@ describe("CoreDnsFileAdapter", () => {
       kind: "create",
       desired: { id: "txt", name: "@", type: "TXT", content: "hello \\\"dns\\\"", ttl: 300 },
     });
-    assert.equal((await adapter.list("example.com/internal"))[0]?.content, "hello \\\"dns\\\"");
+    const written = await adapter.list("example.com/internal");
+    assert.equal(written.find((record) => record.type === "TXT")?.content, "hello \\\"dns\\\"");
   });
 
   it("splits TXT character-strings at 255 UTF-8 bytes without splitting code points", async () => {
@@ -143,6 +144,9 @@ describe("CoreDnsFileAdapter", () => {
     const adapter = new CoreDnsFileAdapter({ files: store.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
 
     assert.deepEqual((await adapter.list("example.com/internal")).map((record) => `${record.name}/${record.type}/${record.content}/${record.ttl}`), [
+      // The zone's own NS record is read now that NS is a type Parallax knows.
+      // It stays unmanaged, so nothing proposes to change it.
+      "@/NS/ns1.example.com/3600",
       "legacy/A/10.9.9.9/3600",
       "mail/A/10.9.9.10/3600",
       "mail/A/10.9.9.12/3600",

@@ -837,7 +837,7 @@ export function materializeProviderViews(views: Zone["views"]): Zone["views"] {
   if (normalizedExternal) normalizedExternal.records = normalizeExternalRecords(normalizedExternal.records);
   if (!external && !overrides) return result;
   const effective = new Map<string, DesiredRecord[]>();
-  for (const record of normalizedExternal?.records ?? []) {
+  for (const record of (normalizedExternal?.records ?? []).filter(isInheritable)) {
     const key = recordOwnerType(record);
     const group = effective.get(key) ?? [];
     group.push(asInternalRecord(record));
@@ -860,6 +860,19 @@ export function materializeProviderViews(views: Zone["views"]): Zone["views"] {
 
 function recordOwnerType(record: DesiredRecord): string {
   return `${record.name}\u0000${record.type}`;
+}
+
+/**
+ * Whether a record in the external view describes something the internal view
+ * should say too.
+ *
+ * Apex NS records name the servers that answer for the zone, which is a fact
+ * about each provider and not about the zone's contents. Inheriting them would
+ * publish the public nameservers into an internal zone that a different server
+ * is authoritative for -- delegating the internal view away from itself.
+ */
+function isInheritable(record: DesiredRecord): boolean {
+  return !(record.type === "NS" && record.name === "@");
 }
 
 function asInternalRecord(record: DesiredRecord): DesiredRecord {

@@ -123,6 +123,33 @@ for _ in $(seq 1 40); do [ -n "$(query portal.example.com A)" ] && break; sleep 
   || fail "underscored TXT did not resolve, got: $(query _dmarc.example.com TXT)"
 ok "applied records resolve: portal=10.0.0.7, _dmarc TXT present"
 
+echo "== every record type resolves from the generated zone file =="
+# A zone file reads a bare name as relative to the origin, so an MX target
+# written without a trailing dot resolves to mail.example.com.example.com. That
+# mistake is invisible in the file and only shows up in the answer, which is
+# why this asks the server rather than reading what was written.
+put() {
+  curl -sf -X PUT -H 'content-type: application/json' \
+    -d "{\"name\":\"$2\",\"type\":\"$3\",\"content\":\"$4\",\"ttl\":300}" \
+    "$API/zones/example.com/views/internal/records/$1" >/dev/null
+}
+put mxrec  mail  MX    "10 mailhost.example.net"
+put srvrec _sip  SRV   "10 5 5060 sip.example.net"
+put caarec caa   CAA   '0 issue \"letsencrypt.org\"'
+put ptrrec ptr   PTR   "host.example.net"
+curl -sf -X POST "$API/zones/example.com/apply?view=internal" >/dev/null
+for _ in $(seq 1 40); do [ -n "$(query mail.example.com MX)" ] && break; sleep 0.5; done
+[ "$(query mail.example.com MX)"  = "10 mailhost.example.net." ]      || fail "MX resolved to '$(query mail.example.com MX)'"
+[ "$(query _sip.example.com SRV)" = "10 5 5060 sip.example.net." ]    || fail "SRV resolved to '$(query _sip.example.com SRV)'"
+[ "$(query caa.example.com CAA)"  = '0 issue "letsencrypt.org"' ]     || fail "CAA resolved to '$(query caa.example.com CAA)'"
+[ "$(query ptr.example.com PTR)"  = "host.example.net." ]             || fail "PTR resolved to '$(query ptr.example.com PTR)'"
+# Read back through the adapter too: the trailing dot belongs to the file, not
+# to the desired state, so a round trip that keeps it would propose changes.
+DRIFT=$(curl -sf "$API/zones/example.com/preview?view=internal" \
+  | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).views.internal.operations.length))')
+[ "$DRIFT" = "0" ] || fail "the new types propose $DRIFT operations against what was just written"
+ok "MX, SRV, CAA and PTR resolve with absolute targets and propose no drift"
+
 echo "== the SOA serial advanced and CoreDNS reloaded it =="
 AFTER=$(serial)
 [ -n "$BEFORE" ] && [ -n "$AFTER" ] || fail "could not read the SOA serial"
