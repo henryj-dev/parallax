@@ -18,6 +18,10 @@ export class ApiError extends Error {
 const DEFAULT_ROOT = "/api/v1";
 
 export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fetch.bind(globalThis) } = {}) {
+  /**
+   * @param {string} path
+   * @param {{ method?: string, body?: unknown, headers?: Record<string, string> }} [options]
+   */
   async function request(path, { method = "GET", body, headers } = {}) {
     // The session cookie is HttpOnly, so the browser attaches it and this script
     // never reads it. `same-origin` keeps it off any cross-site request.

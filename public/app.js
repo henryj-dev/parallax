@@ -272,9 +272,8 @@ function renderSync(state) {
       error: found?.error ?? "",
     };
   };
-  const internal = forView("internal");
-  const external = forView("external");
-  for (const [prefix, target] of [["internal", internal], ["external", external]]) {
+  const targets = { internal: forView("internal"), external: forView("external") };
+  for (const [prefix, target] of Object.entries(targets)) {
     const label = $(`#${prefix}-sync`);
     label.className = `target-status ${target.state}`;
     label.textContent = t(`status.${target.state}`);
@@ -282,13 +281,13 @@ function renderSync(state) {
       ? localizeProviderError(target.error, t)
       : t("sync.appliedRevision", { revision: target.appliedRevision });
   }
-  const overall = [internal.state, external.state].includes("failed")
+  const overall = [targets.internal.state, targets.external.state].includes("failed")
     ? "failed"
-    : [internal.state, external.state].every((value) => value === "applied") ? "applied" : "pending";
+    : [targets.internal.state, targets.external.state].every((value) => value === "applied") ? "applied" : "pending";
   const chip = $("#sync-overall");
   chip.className = `status-chip ${overall}`;
   chip.textContent = t(`status.${overall}`);
-  const applied = Math.min(internal.appliedRevision, external.appliedRevision);
+  const applied = Math.min(targets.internal.appliedRevision, targets.external.appliedRevision);
   const percent = desired > 0 ? Math.min(100, Math.round((applied / desired) * 100)) : overall === "applied" ? 100 : 0;
   $("#revision-progress").style.width = `${percent}%`;
   $("#revision-caption").textContent = desired ? t("sync.progress", { applied, desired }) : t("sync.noneApplied");
@@ -802,10 +801,13 @@ $("#token-list").addEventListener("click", (event) => {
 });
 
 document.addEventListener("click", (event) => {
-  const closeButton = event.target.closest("[data-close-dialog]");
+  // A click can land on a text node's parent or on the document itself, so the
+  // target is only an element some of the time.
+  const clicked = event.target instanceof Element ? event.target : null;
+  const closeButton = clicked?.closest("[data-close-dialog]");
   if (closeButton) closeButton.closest("dialog")?.close();
-  if (event.target.closest('[data-action="open-create"]')) $("#add-zone-button").click();
-  if (event.target.closest('[data-action="add-record"]')) openRecordDialog();
+  if (clicked?.closest('[data-action="open-create"]')) $("#add-zone-button").click();
+  if (clicked?.closest('[data-action="add-record"]')) openRecordDialog();
 });
 
 window.addEventListener("beforeunload", (event) => {

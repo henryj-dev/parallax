@@ -315,6 +315,7 @@ export function normalizeLocale(value) {
   return SUPPORTED_LOCALES.includes(base) ? base : null;
 }
 
+/** @param {{ persistedLocale?: string | null, browserLocales?: readonly string[] }} [sources] */
 export function resolveLocale({ persistedLocale, browserLocales = [] } = {}) {
   const persisted = normalizeLocale(persistedLocale);
   if (persisted) return persisted;

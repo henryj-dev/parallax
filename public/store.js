@@ -89,6 +89,9 @@ export function createStore(client) {
   const activeName = () => state.activeZone?.name ?? "";
   const activeRevision = () => state.activeZone?.revision ?? undefined;
 
+  // Checked against the declaration the view compiles against, so the two cannot
+  // drift: a command renamed here without being renamed there stops building.
+  /** @type {import("./store.d.ts").Store} */
   const store = {
     getState: () => state,
     subscribe(listener) { changeListeners.add(listener); return () => changeListeners.delete(listener); },
@@ -449,6 +452,7 @@ export function createStore(client) {
       });
     },
 
+    /** @param {string} zone @param {{ profile?: string }} [binding] */
     async testBinding(zone, { profile } = {}) {
       setError("credential", null);
       if (!zone) {
@@ -527,7 +531,15 @@ export function createStore(client) {
 
   };
 
-  /** Shared shape for the administration flows: run, report, refresh. */
+  /**
+   * Shared shape for the administration flows: run, report, refresh.
+   *
+   * @param {string} scope
+   * @param {string} successKey
+   * @param {Record<string, string>} values
+   * @param {() => Promise<unknown>} work
+   * @param {{ refresh?: boolean, failureKey?: string, errorKeyFor?: (error: import("./api-client.js").ApiError) => string | undefined }} [options]
+   */
   async function administer(scope, successKey, values, work, { refresh = true, failureKey, errorKeyFor } = {}) {
     setError(scope, null);
     try {
