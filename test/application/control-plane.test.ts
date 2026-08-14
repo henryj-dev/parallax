@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE } from "../../src/application/control-plane.ts";
 import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type DesiredChange, type ProviderAdapter, type ZoneDeletion } from "../../src/application/ports.ts";
+import type { DesiredRecord } from "../../src/domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../../src/domain/reconciliation.ts";
 import { createInMemoryAdapters, InMemoryApplyLock, InMemoryProvider, InMemoryStatusRepository, InMemoryZoneRepository } from "../../src/infrastructure/in-memory.ts";
 
@@ -261,16 +262,21 @@ describe("ControlPlane", () => {
     // Enumerated from the record itself rather than listed here: a field added
     // to DesiredRecord joins this test without anyone remembering to add it,
     // which is the only way the count keeps up with the shape it describes.
-    const base = { name: "www", type: "A" as const, content: "8.8.8.10", ttl: 300, proxied: false };
+    // Typed so the compiler, not a memory, keeps this current: a field added to
+    // DesiredRecord makes this object incomplete and the test stops building.
+    const base: Required<Omit<DesiredRecord, "id">> = {
+      name: "www", type: "A", content: "8.8.8.10", ttl: 300,
+      proxied: false, acknowledgeNonGlobalIp: false,
+    };
     const moved: Record<string, unknown> = {
       name: "web", type: "AAAA", content: "8.8.8.11", ttl: 600, proxied: true,
       acknowledgeNonGlobalIp: true,
     };
-    for (const field of [...Object.keys(base), "acknowledgeNonGlobalIp"]) {
+    for (const field of Object.keys(base)) {
       const { service } = setup();
       await service.createZone("example.com");
       await service.upsertRecord("example.com", "external", "web", base);
-      const after = { ...base, [field]: moved[field] };
+      const after: Record<string, unknown> = { ...base, [field]: moved[field] };
       // AAAA needs an address of its own family; the point is the field moved.
       if (field === "type") { after.content = "2001:4860:4860::8888"; }
       await service.upsertRecord("example.com", "external", "web", after);
