@@ -1,7 +1,8 @@
+import { ProviderConstraintError } from "../application/ports.ts";
 import type { ProviderAdapter } from "../application/ports.ts";
 import { canBeProxied, effectiveExternalTtl, type DesiredRecord, type RecordType } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
-import { ownershipComment, readOwnershipComment } from "./ownership.ts";
+import { MAX_RECORD_ID_LENGTH, MAX_MARKER_LENGTH, ownershipComment, readOwnershipComment } from "./ownership.ts";
 
 type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -141,10 +142,14 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
 }
 
 /** Raised when the account holds no zone by that name, or the token cannot see it. */
-export class ZoneNotFoundError extends Error {}
+export class ZoneNotFoundError extends Error {
+  override readonly name = "ZoneNotFoundError";
+}
 
 /** Raised when the token can edit DNS but is not allowed to look zones up. */
-export class ZoneLookupForbiddenError extends Error {}
+export class ZoneLookupForbiddenError extends Error {
+  override readonly name = "ZoneLookupForbiddenError";
+}
 
 export interface ResolveZoneIdOptions {
   readonly name: string;
@@ -218,8 +223,24 @@ function recordBody(target: string, zone: string, record: DesiredRecord, ownersh
     content: record.content,
     ttl: effectiveExternalTtl(record),
     ...(record.proxied === undefined ? {} : { proxied: record.proxied }),
-    comment: ownershipComment(target, record.id, ownershipSecret),
+    comment: cloudflareComment(target, record, ownershipSecret),
   };
+}
+
+/**
+ * Cloudflare caps a record comment at 100 characters, and refuses the write
+ * rather than truncating. Checked here, where the limit is, so a record too
+ * long only for Cloudflare still publishes to providers that store the marker
+ * in a column with no length.
+ */
+function cloudflareComment(target: string, record: DesiredRecord, ownershipSecret: string): string {
+  const comment = ownershipComment(target, record.id, ownershipSecret);
+  if (comment.length > MAX_MARKER_LENGTH) {
+    throw new ProviderConstraintError(
+      `Cloudflare allows ${MAX_MARKER_LENGTH} characters in a record comment, and the ownership marker for record ${record.id} needs ${comment.length}. Shorten the record id to at most ${MAX_RECORD_ID_LENGTH} characters.`,
+    );
+  }
+  return comment;
 }
 
 function zoneFromTarget(target: string): string {
@@ -237,7 +258,44 @@ function relativeName(name: string, zone: string): string | undefined {
 }
 
 function normalizeContent(type: RecordType, content: string): string {
-  return type === "CNAME" ? content.toLowerCase().replace(/\.$/, "") : content;
+  if (type === "CNAME") return content.toLowerCase().replace(/\.$/, "");
+  return type === "TXT" ? readTxtPresentation(content) : content;
+}
+
+/**
+ * Reads the value out of a TXT record as Cloudflare returns it.
+ *
+ * A TXT record is one or more quoted character-strings, split at 255 characters
+ * by every provider whether or not the operator wrote it that way, and
+ * Cloudflare hands back that presentation form. The desired state holds the
+ * value itself, unquoted, because that is what each provider needs to be given
+ * and what a reader of the record means by its content.
+ *
+ * Two things went wrong without this. The internal view stored the quotes as
+ * part of the value and PowerDNS quoted that again, so an internal resolver
+ * answered a string beginning with `"` where the public one answered SPF. And a
+ * TXT record Parallax created would have come back quoted, differed from the
+ * desired state on every comparison, and proposed the same update forever.
+ */
+function readTxtPresentation(content: string): string {
+  if (!content.startsWith('"')) return content;
+  let value = "";
+  let index = 0;
+  while (index < content.length) {
+    if (content[index] !== '"') { index += 1; continue; }
+    index += 1;
+    while (index < content.length && content[index] !== '"') {
+      if (content[index] === "\\" && index + 1 < content.length) {
+        value += content[index + 1];
+        index += 2;
+      } else {
+        value += content[index];
+        index += 1;
+      }
+    }
+    index += 1;
+  }
+  return value;
 }
 
 function asCloudflareRecord(value: unknown): CloudflareRecord | undefined {

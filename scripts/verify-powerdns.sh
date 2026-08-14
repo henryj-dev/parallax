@@ -155,5 +155,23 @@ rows "DELETE FROM records WHERE name='orphan.${ZONE}'" >/dev/null
   || fail "the marker survived the record it belonged to"
 ok "cascade removed the marker, so ownership can never claim a row that is gone"
 
+
+echo "== a name whose marker exceeds a Cloudflare comment still publishes here =="
+# Internal ids are derived from the name, so a name with several labels produces
+# an id long enough that its ownership marker passes 100 characters -- the limit
+# Cloudflare puts on a record comment. PowerDNS keeps markers in a `text` column
+# and has no such limit, and these are exactly the names an internal view exists
+# for, so the limit must not reach this path.
+LONG_NAME="gw-01.dev-icn-vtr.internal"
+parallax record set --zone "$ZONE" --view external --id long-marker \
+  --record "{\"name\":\"${LONG_NAME}\",\"type\":\"A\",\"content\":\"93.184.216.34\",\"ttl\":300}" >/dev/null
+parallax apply --zone "$ZONE" --view internal | grep -q "state=applied" \
+  || fail "a long derived id stopped the internal view from applying"
+sleep 1
+[ "$(query "${LONG_NAME}.${ZONE}" A)" = "93.184.216.34" ] || fail "the long name did not resolve"
+LONGEST=$(rows "SELECT max(length(marker)) FROM parallax_powerdns_ownership")
+[ "$LONGEST" -gt 100 ] || fail "expected a marker over 100 characters, longest is $LONGEST -- the check proves nothing"
+ok "a ${LONGEST}-character marker published, which Cloudflare would refuse"
+
 echo
 echo "PowerDNS integration verification passed."

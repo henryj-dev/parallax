@@ -23,14 +23,22 @@ const PREFIX = "parallax-managed";
 const V3 = `${PREFIX}:v3`;
 const V2 = `${PREFIX}:v2`;
 
-/** Cloudflare's limit on a DNS record comment, and so the marker's budget. */
+/**
+ * Cloudflare's limit on a DNS record comment.
+ *
+ * It lives here so the id bound can be derived from it, and it is enforced in
+ * the Cloudflare adapter -- not here. A marker is also written to a PowerDNS
+ * `text` column and a zone-file comment, neither of which has a length, and a
+ * limit applied to every provider would stop records that the provider actually
+ * asked for from being published to a provider that never had the limit.
+ */
 export const MAX_MARKER_LENGTH = 100;
 
 /**
- * The longest record id that still fits, given the prefix, two separators and a
- * 43-character signature. `validateRecordId` holds ids to this, so the throw
- * below is a backstop against the format changing out from under it rather than
- * something a caller can trigger.
+ * The longest record id whose marker still fits a Cloudflare comment, given the
+ * prefix, two separators and a 43-character signature. `validateRecordId` holds
+ * ids a caller supplies to this; ids Parallax derives for the internal view are
+ * built to a different bound and never reach Cloudflare.
  */
 export const MAX_RECORD_ID_LENGTH = MAX_MARKER_LENGTH - V3.length - 2 - 43;
 
@@ -38,11 +46,7 @@ export function ownershipComment(target: string, recordId: string, secret: strin
   assertSecret(secret);
   // Record ids are `[a-z0-9_-]`, which needs no encoding to survive the reader's
   // pattern -- and encoding it would spend a third of the budget on nothing.
-  const comment = `${V3}:${recordId}:${sign(target, recordId, secret)}`;
-  if (comment.length > MAX_MARKER_LENGTH) {
-    throw new Error(`ownership marker for record ${recordId} is ${comment.length} characters, over the ${MAX_MARKER_LENGTH} a provider comment allows`);
-  }
-  return comment;
+  return `${V3}:${recordId}:${sign(target, recordId, secret)}`;
 }
 
 /**

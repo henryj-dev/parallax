@@ -46,7 +46,9 @@ export interface MigrationRuntime extends CommandRuntime {
   close(): Promise<void>;
 }
 
-export class RuntimeStartupError extends Error {}
+export class RuntimeStartupError extends Error {
+  override readonly name = "RuntimeStartupError";
+}
 
 export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRuntime> {
   // One decision picks every backend: a database when DATABASE_URL is set,

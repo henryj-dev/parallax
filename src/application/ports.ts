@@ -1,10 +1,27 @@
 import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 
-export class RevisionConflictError extends Error {}
+export class RevisionConflictError extends Error {
+  override readonly name = "RevisionConflictError";
+}
 
 /** No provider implementation is wired for a `<zone>/<view>` target. */
-export class ProviderNotConfiguredError extends Error {}
+export class ProviderNotConfiguredError extends Error {
+  override readonly name = "ProviderNotConfiguredError";
+}
+
+/**
+ * A limit of the provider that Parallax checked itself, before or while
+ * writing: the record is valid, and this particular provider cannot hold it.
+ *
+ * Separate from an error the provider returned, which is withheld from callers
+ * because it can quote a request that carried a token or a path. This message
+ * is Parallax's own sentence about Parallax's own data, so hiding it only costs
+ * the reader the one thing that would have explained the failure.
+ */
+export class ProviderConstraintError extends Error {
+  override readonly name = "ProviderConstraintError";
+}
 
 /**
  * Bounds what a zone's history keeps. Applied inside the same atomic commit as
@@ -106,6 +123,15 @@ export interface ApplyStatus {
   state: "pending" | "applied" | "failed";
   lastAttemptAt?: string;
   error?: string;
+  /**
+   * On a failure, how many of the plan's operations the provider had already
+   * accepted. A provider is reached one record at a time over a network, so a
+   * view that fails part way through is left part applied and its resolver
+   * answers for part of it. `failed` alone does not say that, and the operator
+   * has to know it before deciding whether to retry or to look at what is live.
+   */
+  completedOperations?: number;
+  plannedOperations?: number;
 }
 
 export interface StatusRepository {

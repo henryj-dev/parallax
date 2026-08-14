@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE } from "../../src/application/control-plane.ts";
-import { ProviderNotConfiguredError, RevisionConflictError, type DesiredChange, type ZoneDeletion } from "../../src/application/ports.ts";
+import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type DesiredChange, type ProviderAdapter, type ZoneDeletion } from "../../src/application/ports.ts";
 import type { ProviderRecord, ReconcileOperation } from "../../src/domain/reconciliation.ts";
 import { createInMemoryAdapters, InMemoryApplyLock, InMemoryProvider, InMemoryStatusRepository, InMemoryZoneRepository } from "../../src/infrastructure/in-memory.ts";
 
@@ -430,6 +430,49 @@ describe("ControlPlane", () => {
     assert.deepEqual(internal.map((record) => `${record.name} ${record.content}`).sort(),
       ["api 8.8.8.9", "www 10.10.10.10"],
       "the internal view answers for adopted names too, so nothing falls to NXDOMAIN");
+  });
+
+  it("says how far a view got when the provider refuses part way through", async () => {
+    const zones = new InMemoryZoneRepository();
+    let accepted = 0;
+    const provider: ProviderAdapter = {
+      list: async () => [],
+      apply: async () => {
+        accepted += 1;
+        if (accepted > 2) throw new ProviderConstraintError("that record does not fit here");
+      },
+    };
+    const service = new ControlPlane(zones, new InMemoryStatusRepository(), provider);
+    await service.createZone("example.com");
+    for (const id of ["one", "two", "three", "four"]) {
+      await service.upsertRecord("example.com", "external", id, {
+        name: id, type: "A", content: `8.8.8.1${id.length}`, ttl: 300,
+      });
+    }
+
+    const status = (await service.apply("example.com", "external")).statuses[0];
+    assert.equal(status?.state, "failed");
+    // A provider is written one record at a time, so a failed view is a view
+    // that is part live -- and a resolver is answering for that part.
+    assert.equal(status?.completedOperations, 2);
+    assert.equal(status?.plannedOperations, 4);
+    // Parallax's own sentence about its own data survives to the operator.
+    assert.equal(status?.error, "that record does not fit here");
+  });
+
+  it("still withholds what the provider itself said", async () => {
+    const zones = new InMemoryZoneRepository();
+    const provider: ProviderAdapter = {
+      list: async () => [],
+      apply: async () => { throw new Error("PUT https://api.example/zones?token=super-secret failed"); },
+    };
+    const service = new ControlPlane(zones, new InMemoryStatusRepository(), provider);
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "one", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+
+    const status = (await service.apply("example.com", "external")).statuses[0];
+    assert.equal(status?.error, "provider operation failed");
+    assert.equal(status?.completedOperations, 0, "how far it got is safe to report even when the reason is not");
   });
 
   it("prevents apply when desired state collides with an unmanaged record", async () => {

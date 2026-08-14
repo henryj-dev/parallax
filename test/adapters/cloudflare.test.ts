@@ -47,6 +47,54 @@ describe("CloudflareProviderAdapter", () => {
     ]);
   });
 
+  it("reads a TXT value out of the quoted form Cloudflare returns it in", async () => {
+    // Cloudflare hands back presentation format, and splits anything over 255
+    // characters into several strings whether or not the operator did.
+    const fetch = async (): Promise<Response> => Response.json({
+      success: true,
+      result: [
+        { id: "spf", name: "example.com", type: "TXT", content: '"v=spf1 include:_spf.example.net ~all"', ttl: 300 },
+        { id: "split", name: "long.example.com", type: "TXT", content: '"first half" "second half"', ttl: 300 },
+        { id: "quote", name: "odd.example.com", type: "TXT", content: '"says \\"hello\\""', ttl: 300 },
+        { id: "bare", name: "bare.example.com", type: "TXT", content: "unquoted=value", ttl: 300 },
+      ],
+      result_info: { page: 1, total_pages: 1 },
+    });
+    const adapter = new CloudflareProviderAdapter({ token: "secret", zoneId: "zone-1", fetch, ownershipSecret: OWNERSHIP_SECRET });
+
+    assert.deepEqual((await adapter.list("example.com/external")).map((record) => record.content), [
+      "v=spf1 include:_spf.example.net ~all",
+      // Rejoined: the strings are one value, split only to satisfy the wire.
+      "first halfsecond half",
+      'says "hello"',
+      "unquoted=value",
+    ]);
+  });
+
+  it("refuses a record whose ownership marker will not fit a Cloudflare comment", async () => {
+    const calls: string[] = [];
+    const fetch = async (input: string | URL | Request): Promise<Response> => {
+      calls.push(String(input));
+      return Response.json({ success: true, result: {} });
+    };
+    const adapter = new CloudflareProviderAdapter({ token: "secret", zoneId: "zone-1", fetch, ownershipSecret: OWNERSHIP_SECRET });
+
+    await assert.rejects(
+      adapter.apply("example.com/external", {
+        kind: "create",
+        desired: { id: "a".repeat(64), name: "www", type: "A", content: "192.0.2.1", ttl: 300 },
+      }),
+      (error: Error) => {
+        assert.equal(error.name, "ProviderConstraintError");
+        // Naming Cloudflare matters: the same record publishes fine elsewhere.
+        assert.match(error.message, /Cloudflare allows 100 characters/);
+        assert.match(error.message, new RegExp(`record ${"a".repeat(64)}`));
+        return true;
+      },
+    );
+    assert.deepEqual(calls, [], "the record must not be sent before the marker is known to fit");
+  });
+
   it("creates fully-qualified records with authorization, ownership metadata and Cloudflare Auto TTL", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {

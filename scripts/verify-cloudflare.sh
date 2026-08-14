@@ -134,6 +134,28 @@ DRIFT=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views.e
 [ "$DRIFT" = "0" ] || fail "expected convergence after apply, found $DRIFT operations"
 ok "second preview shows no drift: the adapter round-trips its own writes"
 
+echo "== a TXT record survives Cloudflare's quoting =="
+# Cloudflare returns TXT in presentation form -- each character-string in double
+# quotes, split at 255 characters whether or not it was written that way. The
+# desired state holds the value itself, so an adapter that passed the quotes
+# through would differ from what it just wrote and propose the same update
+# forever. Nothing local can catch that: a stand-in provider hands back exactly
+# what it was given.
+TXT_VALUE="parallax-verify=1 and a space"
+curl -sf -X PUT -H 'content-type: application/json' \
+  -d "{\"name\":\"${LABEL}\",\"type\":\"TXT\",\"content\":\"${TXT_VALUE}\",\"ttl\":300}" \
+  "$API/zones/${CF_ZONE}/views/external/records/verifytxt" >/dev/null
+curl -sf -X POST "$API/zones/${CF_ZONE}/apply?view=external" | json 'v.statuses[0].state' | grep -qx applied \
+  || fail "the TXT record did not apply"
+TXT_DRIFT=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views.external.operations.length')
+[ "$TXT_DRIFT" = "0" ] || fail "a TXT record Parallax wrote proposes $TXT_DRIFT operations against itself"
+# And the value read back is the value, not the value wrapped in quotes.
+READ_BACK=$(curl -sf -H "Authorization: Bearer ${CF_API_TOKEN}" \
+  "${CF_API_BASE:-https://api.cloudflare.com/client/v4}/zones/${CF_ZONE_ID}/dns_records?type=TXT&name=${LABEL}.${CF_ZONE}" \
+  | json 'v.result[0].content')
+echo "  note: Cloudflare returns this TXT content as ${READ_BACK}" >&2
+ok "TXT round-trips: no drift proposed against a record Parallax wrote"
+
 curl -sf -X PUT -H 'content-type: application/json' \
   -d "{\"name\":\"${LABEL}\",\"type\":\"A\",\"content\":\"192.0.2.11\",\"ttl\":120,\"proxied\":true,\"acknowledgeNonGlobalIp\":true}" \
   "$API/zones/${CF_ZONE}/views/external/records/verify" >/dev/null

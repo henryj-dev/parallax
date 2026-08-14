@@ -6,7 +6,9 @@ export interface ParsedInvocation {
   readonly input: CommandInput;
 }
 
-export class UsageError extends Error {}
+export class UsageError extends Error {
+  override readonly name = "UsageError";
+}
 
 /**
  * Turns `["record", "set", "--zone", "example.com", ...]` into a command name

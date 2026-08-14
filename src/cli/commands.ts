@@ -53,10 +53,16 @@ export interface Command {
 
 export type CommandInput = Record<string, unknown>;
 
-export class UnknownCommandError extends Error {}
-export class CommandPermissionError extends Error {}
+export class UnknownCommandError extends Error {
+  override readonly name = "UnknownCommandError";
+}
+export class CommandPermissionError extends Error {
+  override readonly name = "CommandPermissionError";
+}
 /** The runtime lacks the service this command needs, e.g. no credential key. */
-export class CommandUnavailableError extends Error {}
+export class CommandUnavailableError extends Error {
+  override readonly name = "CommandUnavailableError";
+}
 
 const ROLE_RANK: Record<Role, number> = { viewer: 0, editor: 1, admin: 2 };
 

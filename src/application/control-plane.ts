@@ -16,10 +16,14 @@ import {
   type ZoneRevision,
 } from "../domain/dns.ts";
 import { buildReconcilePlan, type ProviderRecord, type ReconcilePlan } from "../domain/reconciliation.ts";
-import { ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneRepository } from "./ports.ts";
+import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneRepository } from "./ports.ts";
 
-export class NotFoundError extends Error {}
-export class ConflictError extends Error {}
+export class NotFoundError extends Error {
+  override readonly name = "NotFoundError";
+}
+export class ConflictError extends Error {
+  override readonly name = "ConflictError";
+}
 
 /**
  * A view's plan, or the reason there is none. An empty plan with no error means
@@ -465,8 +469,13 @@ export class ControlPlane {
       try {
         const plan = buildReconcilePlan(view.records, await this.#provider.list(key));
         if (plan.summary.conflict > 0) throw new ConflictError("unmanaged provider records conflict with desired state");
-        for (const operation of plan.operations) {
-          if (operation.kind !== "conflict") await this.#provider.apply(key, operation);
+        const planned = plan.operations.filter((operation) => operation.kind !== "conflict");
+        for (const [index, operation] of planned.entries()) {
+          try {
+            await this.#provider.apply(key, operation);
+          } catch (error) {
+            throw new PartialApplyError(error, index, planned.length);
+          }
         }
         const status: ApplyStatus = {
           zone: zone.name,
@@ -479,18 +488,24 @@ export class ControlPlane {
         await this.#statuses.save(status);
         results.push(status);
       } catch (error) {
-        const expected = error instanceof ConflictError || error instanceof ProviderNotConfiguredError;
-        const publicError = expected ? (error as Error).message : "provider operation failed";
+        const progress = error instanceof PartialApplyError ? error : undefined;
+        const cause = progress ? progress.cause : error;
+        // Parallax's own sentences are safe to repeat: they describe Parallax's
+        // data against a limit Parallax knows. What a provider returned is not,
+        // because it can quote the request that carried a token or a path.
+        const expected = cause instanceof ConflictError || cause instanceof ProviderNotConfiguredError
+          || cause instanceof ProviderConstraintError;
+        const publicError = expected ? (cause as Error).message : "provider operation failed";
         if (!expected) {
           // The message stays hidden -- a provider error can carry a token or a
           // path. A system error's `code` carries neither: it names the syscall
           // failure class, which is the difference between "read-only volume"
           // and "provider rejected it" for whoever reads this line.
-          const code = (error as NodeJS.ErrnoException | undefined)?.code;
+          const code = (cause as NodeJS.ErrnoException | undefined)?.code;
           console.error("provider operation failed", {
             zone: zone.name,
             view: view.name,
-            errorName: error instanceof Error ? error.name : "unknown",
+            errorName: cause instanceof Error ? cause.name : "unknown",
             ...(typeof code === "string" ? { errorCode: code } : {}),
           });
         }
@@ -502,6 +517,7 @@ export class ControlPlane {
           state: "failed",
           lastAttemptAt: attemptedAt,
           error: publicError,
+          ...(progress ? { completedOperations: progress.completed, plannedOperations: progress.planned } : {}),
         };
         await this.#statuses.save(status);
         results.push(status);
@@ -729,6 +745,23 @@ function ensureUniqueRecordKeys(records: DesiredRecord[]): void {
 }
 
 /** Builds the complete internal view from the external baseline and sparse internal overrides. */
+/**
+ * Carries how far a view got before the provider refused, so the status can say
+ * so. Nothing outside this module sees it: the cause is unwrapped where the
+ * status is built.
+ */
+class PartialApplyError extends Error {
+  readonly cause: unknown;
+  readonly completed: number;
+  readonly planned: number;
+  constructor(cause: unknown, completed: number, planned: number) {
+    super("provider operation failed");
+    this.cause = cause;
+    this.completed = completed;
+    this.planned = planned;
+  }
+}
+
 /** What one adoption run found and what it changed. */
 export interface AdoptionResult {
   readonly zone: Zone;
