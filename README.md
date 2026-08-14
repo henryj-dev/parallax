@@ -17,7 +17,7 @@ resulting changes, and applies only records explicitly managed by Parallax.
 - Optional PostgreSQL source of truth with transactional immutable revisions
 - Optional Cloudflare API and CoreDNS RFC 1035 zone-file adapters
 - Encrypted, write-only Cloudflare credential management from the admin portal
-- Optional admin/editor/viewer token authentication and audit actors
+- Optional admin/editor/viewer token authentication, OpenID Connect sign-in, and audit actors
 - Health endpoints and security headers
 - Dependency-light Node.js HTTP server and TypeScript test suite
 
@@ -114,6 +114,48 @@ Anything else is refused before the server binds:
 parallax: refusing to serve a non-loopback address with no access token.
 Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.
 ```
+
+### Signing in through an identity provider
+
+Access tokens stay: the command line uses them, automation uses them, and
+`PARALLAX_AUTH_TOKENS` is how a deployment that has locked itself out gets back
+in. What this adds is a way for a person to sign in as themselves.
+
+```sh
+PARALLAX_OIDC_ISSUER=https://idp.example
+PARALLAX_OIDC_CLIENT_ID=parallax
+PARALLAX_OIDC_CLIENT_SECRET=…
+PARALLAX_OIDC_REDIRECT_URI=https://parallax.example/auth/callback
+PARALLAX_OIDC_SESSION_SECRET=…            # 32 bytes or more
+PARALLAX_OIDC_SCOPES="openid profile email"   # optional
+PARALLAX_OIDC_SESSION_SECONDS=43200           # optional, 60..604800
+```
+
+Setting some but not all of the required five is refused at startup. A partly
+configured deployment meant to offer this, and starting anyway would leave a
+sign-in button that fails only when somebody presses it.
+
+**The role comes from the provider, not from here.** Parallax reads the `roles`
+claim the provider returns for this client and takes the highest of `admin`,
+`editor` and `viewer`. An account the provider grants no role for is refused --
+authenticating proves who someone is, not that they are anyone here, and a
+default would turn every account in the directory into an account in this
+control plane.
+
+So a person is given a role wherever the other services' roles are given. With
+KeyStone that is a per-client role assignment, whose keys must be `admin`,
+`editor` or `viewer` for Parallax to recognise them.
+
+The flow is Authorization Code with PKCE. `/auth/login` sends the browser to the
+provider, `/auth/callback` finishes, `/auth/logout` ends both sessions. Nothing
+it sets is readable by script, and the state and PKCE values live only for the
+ten minutes a sign-in takes.
+
+`PARALLAX_OIDC_SESSION_SECRET` signs the browser session. Unlike the other two
+secrets, **rotating it is safe** -- it ends every session and nothing else. The
+session is self-contained, which is also why it cannot be revoked before it
+expires: shorten `PARALLAX_OIDC_SESSION_SECONDS` if that matters more than how
+often people sign in.
 
 ### Ending TLS in the process
 

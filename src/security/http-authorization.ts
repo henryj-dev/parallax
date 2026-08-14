@@ -1,3 +1,4 @@
+import { readSession, assertSessionSecret } from "./session-token.ts";
 import { createHash, timingSafeEqual } from "node:crypto";
 
 export type Role = "admin" | "editor" | "viewer";
@@ -29,6 +30,11 @@ export interface SecurityConfig {
   readonly lockoutMs?: number;
   /** Lifetime of an issued session cookie in seconds. Defaults to 12 hours. */
   readonly sessionMaxAgeSeconds?: number;
+  /**
+   * Signs the cookie an identity provider login leaves behind. Absent means no
+   * such login is offered, and only tokens authenticate.
+   */
+  readonly identitySessionSecret?: string;
 }
 
 /** Tokens open the whole control plane, so they get the same floor as the other secrets. */
@@ -37,6 +43,13 @@ const DEFAULT_MAX_FAILED_ATTEMPTS = 10;
 const DEFAULT_LOCKOUT_MS = 60_000;
 const DEFAULT_SESSION_MAX_AGE_SECONDS = 43_200;
 export const SESSION_PATH = "/api/v1/session";
+/**
+ * Kept apart from the token cookie rather than reusing it. That one holds a
+ * credential the deployment issued and can revoke; this one holds a claim about
+ * a person that expires on its own. Reading both from one name would mean one
+ * of them being tried as the other on every request.
+ */
+export const IDENTITY_COOKIE = "parallax_identity";
 
 export interface Principal {
   readonly role: Role;
@@ -53,6 +66,7 @@ interface PreparedToken {
 interface PreparedConfig {
   readonly cookieName: string;
   readonly tokens: readonly PreparedToken[];
+  readonly identitySessionSecret?: string;
 }
 
 // RFC 6750 b64token syntax; excluding whitespace and header/cookie delimiters also
@@ -189,6 +203,15 @@ async function handleSession(
   throttle: FailureThrottle,
   maxAgeSeconds: number,
 ): Promise<Response> {
+  if (request.method === "GET") {
+    // Who the caller currently is. The portal draws itself from this: an
+    // administration control it cannot use is worse than one it cannot see,
+    // because pressing it is the only way to find out.
+    const principal = authenticateWithPreparedTokens(request, prepared);
+    return principal
+      ? Response.json({ role: principal.role, subject: principal.subject }, { headers: { "cache-control": "no-store" } })
+      : authenticationError(401);
+  }
   if (request.method !== "POST" && request.method !== "DELETE") {
     return Response.json({ error: "not_found", message: "route was not found" }, { status: 404, headers: { "cache-control": "no-store" } });
   }
@@ -324,6 +347,7 @@ function hasSameOrigin(request: Request): boolean {
 function prepareConfig(config: SecurityConfig): PreparedConfig {
   const cookieName = config.cookieName ?? "parallax_session";
   if (!COOKIE_NAME_PATTERN.test(cookieName)) throw invalidConfiguration();
+  if (config.identitySessionSecret !== undefined) assertSessionSecret(config.identitySessionSecret);
 
   const prepared: PreparedToken[] = [];
   const add = (recordDigest: Buffer, role: Role, subject: string): void => {
@@ -346,12 +370,26 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
     if (decoded.byteLength !== DIGEST_BYTES) throw invalidConfiguration();
     add(decoded, record.role, record.subject);
   }
-  return { cookieName, tokens: prepared };
+  return { cookieName, tokens: prepared, ...(config.identitySessionSecret === undefined ? {} : { identitySessionSecret: config.identitySessionSecret }) };
 }
 
 function authenticateWithPreparedTokens(request: Request, prepared: PreparedConfig): Principal | undefined {
   const candidate = readCandidate(request, prepared.cookieName);
-  return candidate === undefined ? undefined : matchToken(candidate, prepared.tokens);
+  const byToken = candidate === undefined ? undefined : matchToken(candidate, prepared.tokens);
+  if (byToken) return byToken;
+  // Second, not first: a request that presented a token meant to act as that
+  // token, and answering it as whoever the browser happens to be signed in as
+  // would attribute the change to the wrong actor.
+  return prepared.identitySessionSecret === undefined
+    ? undefined
+    : matchIdentitySession(request, prepared.identitySessionSecret);
+}
+
+function matchIdentitySession(request: Request, secret: string): Principal | undefined {
+  const value = readCookie(request.headers.get("cookie"), IDENTITY_COOKIE);
+  if (value === undefined) return undefined;
+  const claims = readSession(value, secret);
+  return claims === undefined ? undefined : { role: claims.role, subject: claims.subject };
 }
 
 function matchToken(candidate: string, tokens: readonly PreparedToken[]): Principal | undefined {

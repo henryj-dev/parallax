@@ -160,6 +160,7 @@ function render(state) {
   if ($("#credential-dialog").open) renderAdministration(state);
   if ($("#record-dialog").open) renderRecordDialogHeading();
   $("#sign-out-button").hidden = !state.authRequired || !state.authenticated;
+  syncRoleVisibility(state);
   // Every error the store records reaches the surface that caused it, or a
   // refused action would look like nothing happened at all.
   renderErrors();
@@ -546,10 +547,41 @@ function readRecordForm(form) {
 
 // ---- dialogs --------------------------------------------------------------
 
+/**
+ * Administration surfaces are admin-only in the API, so a caller who is not one
+ * is not offered them. Hidden rather than disabled: a disabled control still
+ * says "this exists for you", and it does not.
+ */
+function syncRoleVisibility(state) {
+  $("#credential-settings-button").hidden = state.authRequired && state.role !== "admin";
+}
+
 function openAuthDialog() {
   const dialog = $("#auth-dialog");
+  const identity = $("#auth-identity");
+  identity.hidden = !store.getState().identityProvider;
+  if (!identity.hidden) {
+    // Come back to the page that was being asked for, not to the root.
+    const next = `${location.pathname}${location.search}${location.hash}`;
+    $("#auth-identity-link").href = `/auth/login?next=${encodeURIComponent(next)}`;
+  }
   if (!dialog.open) dialog.showModal();
   queueMicrotask(() => $("#auth-form").elements.token.focus());
+}
+
+/**
+ * A sign-in that failed comes back as a redirect with the reason in the query,
+ * because there is no page to show it on until the browser has landed here.
+ */
+function reportSignInError() {
+  const reason = new URLSearchParams(location.search).get("signin_error");
+  if (!reason) return;
+  const target = $("#auth-form-error");
+  target.textContent = reason;
+  target.hidden = false;
+  const clean = new URL(location.href);
+  clean.searchParams.delete("signin_error");
+  history.replaceState(null, "", clean);
 }
 
 function selectProviderPanel(panel) {
@@ -815,5 +847,6 @@ window.addEventListener("beforeunload", (event) => {
 });
 
 setLocale(locale);
+reportSignInError();
 void store.readAuthenticationMode();
 void store.loadZones();

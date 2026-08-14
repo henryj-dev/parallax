@@ -7,9 +7,10 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "./config.ts";
-import { createNodeHandler } from "./http/api.ts";
+import { createNodeHandler, requestOrigin } from "./http/api.ts";
+import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.ts";
 import { createRuntime } from "./runtime.ts";
-import { authenticate } from "./security/http-authorization.ts";
+import { authenticate, type SecurityConfig } from "./security/http-authorization.ts";
 
 const config = readConfig();
 
@@ -32,11 +33,25 @@ accessTokens.startRefreshing(undefined, (error) => {
   console.error(`parallax: could not refresh access tokens: ${error instanceof Error ? error.message : "unknown error"}`);
 });
 
-const handleApi = createNodeHandler(runtime, () => accessTokens.security(), {
+// Signing in through an identity provider, when one is configured. It sits
+// ahead of the API because it is how a caller with no credential acquires one.
+const handleIdentity = config.oidc ? createIdentityHandler({ settings: config.oidc }) : undefined;
+
+const nodeHandlerOptions = {
   get publicOrigin() { return settingsService.current().publicOrigin || undefined; },
   get trustForwardedHeaders() { return settingsService.current().trustForwardedHeaders; },
   terminatesTls: config.tls !== undefined,
+};
+
+// The identity session is a second way to be a principal, so the security layer
+// is told the secret that signs it. With no provider configured the field stays
+// absent and nothing but a token authenticates.
+const securityConfig = (): SecurityConfig => ({
+  ...accessTokens.security(),
+  ...(config.oidc ? { identitySessionSecret: config.oidc.sessionSecret } : {}),
 });
+
+const handleApi = createNodeHandler(runtime, securityConfig, nodeHandlerOptions);
 
 /**
  * The portal lives beside the sources when run from TypeScript and two levels
@@ -143,6 +158,10 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       status: "ok",
       service: "parallax",
       authentication: accessTokens.security().enabled ? "required" : "disabled",
+      // Whether a sign-in button should be drawn. Its absence is what an
+      // unauthenticated caller sees anyway when it presses one that is not
+      // wired, so saying it here costs nothing and saves a dead button.
+      identityProvider: config.oidc ? "available" : "unavailable",
     }));
     return;
   }
@@ -171,6 +190,29 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       response.end(JSON.stringify({ status: "not_ready", service: "parallax" }));
     }
     return;
+  }
+  if (handleIdentity && pathname.startsWith(`${IDENTITY_PREFIX}/`)) {
+    // Built with the same origin resolution the API uses: behind a terminating
+    // proxy the request arrives as http, and a cookie marked Secure by that
+    // reading would never be sent back.
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(request.headers)) {
+      if (Array.isArray(value)) for (const item of value) headers.append(name, item);
+      else if (value !== undefined) headers.set(name, value);
+    }
+    const answered = await handleIdentity(new Request(
+      new URL(request.url ?? "/", requestOrigin(request, nodeHandlerOptions)),
+      { method: request.method, headers },
+    ));
+    if (answered) {
+      const out: Record<string, string | string[]> = {};
+      for (const [name, value] of answered.headers) {
+        out[name] = name === "set-cookie" ? answered.headers.getSetCookie() : value;
+      }
+      response.writeHead(answered.status, out);
+      response.end(answered.body === null ? undefined : await answered.text());
+      return;
+    }
   }
   if (pathname.startsWith("/api/")) {
     await handleApi(request, response);
@@ -211,7 +253,7 @@ function isProxiedRequest(request: IncomingMessage): boolean {
 }
 
 function isAuthenticated(request: IncomingMessage): boolean {
-  const security = accessTokens.security();
+  const security = securityConfig();
   if (!security.enabled) return false;
   const headers = new Headers();
   for (const name of ["authorization", "cookie"]) {

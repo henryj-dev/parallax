@@ -193,6 +193,11 @@
         <div class="form-error" id="auth-form-error" role="alert" hidden></div>
         <div class="dialog-actions"><button class="button primary" type="submit" data-i18n="auth.open">Open control plane</button></div>
       </form>
+      <div id="auth-identity" hidden>
+        <p class="auth-divider" data-i18n="auth.or">or</p>
+        <a class="button" id="auth-identity-link" href="/auth/login" data-i18n="auth.identity">Sign in with your organization account</a>
+        <p class="auth-hint" data-i18n="auth.identityHint">Your role comes from the identity provider. An administrator assigns it there.</p>
+      </div>
     </dialog>
 
     <dialog id="revisions-dialog" class="wide-dialog">

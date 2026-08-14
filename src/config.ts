@@ -29,6 +29,19 @@ export interface ParallaxConfig {
   tls?: { certFile: string; keyFile: string };
   /** Port answering plain HTTP with a redirect to the TLS origin; unset disables it. */
   httpRedirectPort?: number;
+  /** Signs in through an identity provider. Unset leaves only access tokens. */
+  oidc?: OidcSettings;
+}
+
+export interface OidcSettings {
+  readonly issuer: string;
+  readonly clientId: string;
+  readonly clientSecret: string;
+  readonly redirectUri: string;
+  readonly scopes: string;
+  /** Signs the browser session. Rotating it ends every session and nothing else. */
+  readonly sessionSecret: string;
+  readonly sessionMaxAgeSeconds: number;
 }
 
 export function readConfig(environment: NodeJS.ProcessEnv = process.env): ParallaxConfig {
@@ -43,6 +56,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
   if (httpRedirectPort !== undefined && !tls) {
     throw new Error("PARALLAX_HTTP_REDIRECT_PORT only makes sense with TLS configured on the main port");
   }
+  const oidc = readOidc(environment);
   return {
     host: environment.HOST?.trim() || "127.0.0.1",
     port: readPort(environment.PORT),
@@ -58,7 +72,57 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     bootstrapTokens: readBootstrapTokens(environment.PARALLAX_AUTH_TOKENS),
     ...(tls ? { tls } : {}),
     ...(httpRedirectPort !== undefined ? { httpRedirectPort } : {}),
+    ...(oidc ? { oidc } : {}),
   };
+}
+
+/**
+ * All of it or none of it. A deployment that set four of the five values meant
+ * to offer this login, and starting without it would leave a sign-in button
+ * that fails only when somebody presses it.
+ */
+function readOidc(environment: NodeJS.ProcessEnv): OidcSettings | undefined {
+  const fields = {
+    issuer: environment.PARALLAX_OIDC_ISSUER?.trim(),
+    clientId: environment.PARALLAX_OIDC_CLIENT_ID?.trim(),
+    clientSecret: environment.PARALLAX_OIDC_CLIENT_SECRET?.trim(),
+    redirectUri: environment.PARALLAX_OIDC_REDIRECT_URI?.trim(),
+    sessionSecret: environment.PARALLAX_OIDC_SESSION_SECRET?.trim(),
+  };
+  const missing = Object.entries(fields).filter(([, value]) => !value).map(([name]) => name);
+  if (missing.length === Object.keys(fields).length) return undefined;
+  if (missing.length > 0) {
+    throw new Error(`OIDC is partly configured; also set ${missing.map(environmentNameFor).join(", ")}`);
+  }
+  const issuer = (fields.issuer as string).replace(/\/+$/, "");
+  if (!/^https:\/\//u.test(issuer) && !/^http:\/\/(localhost|127\.0\.0\.1)([:/]|$)/u.test(issuer)) {
+    throw new Error("PARALLAX_OIDC_ISSUER must be an https URL; the authorization code and the account are read over it");
+  }
+  if (Buffer.byteLength(fields.sessionSecret as string, "utf8") < 32) {
+    throw new Error("PARALLAX_OIDC_SESSION_SECRET must contain at least 32 bytes");
+  }
+  return {
+    issuer,
+    clientId: fields.clientId as string,
+    clientSecret: fields.clientSecret as string,
+    redirectUri: fields.redirectUri as string,
+    sessionSecret: fields.sessionSecret as string,
+    scopes: environment.PARALLAX_OIDC_SCOPES?.trim() || "openid profile email",
+    sessionMaxAgeSeconds: readSessionMaxAge(environment.PARALLAX_OIDC_SESSION_SECONDS),
+  };
+}
+
+function environmentNameFor(field: string): string {
+  return `PARALLAX_OIDC_${field.replace(/[A-Z]/gu, (letter) => `_${letter}`).toUpperCase()}`;
+}
+
+function readSessionMaxAge(value: string | undefined): number {
+  if (!value) return 43_200;
+  const seconds = Number(value);
+  if (!Number.isInteger(seconds) || seconds < 60 || seconds > 604_800) {
+    throw new Error("PARALLAX_OIDC_SESSION_SECONDS must be an integer between 60 and 604800");
+  }
+  return seconds;
 }
 
 /**

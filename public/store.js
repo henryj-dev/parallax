@@ -102,9 +102,18 @@ export function createStore(client) {
 
     async readAuthenticationMode() {
       try {
-        state.authRequired = (await client.authenticationMode()) !== "disabled";
+        const answer = await client.authenticationMode();
+        state.authRequired = answer.mode !== "disabled";
+        state.identityProvider = answer.identityProvider;
+        // A session may already exist -- an identity provider leaves one behind
+        // without this page ever having asked for it.
+        state.role = await client.readSession().then((session) => session.role, () => null);
+        state.authenticated = state.role !== null;
       } catch {
+        // Unreachable is treated as protected: drawing an open control plane
+        // that turns out to be closed is the worse of the two mistakes.
         state.authRequired = true;
+        state.identityProvider = false;
       }
       emitChange();
     },
@@ -112,8 +121,9 @@ export function createStore(client) {
     async signIn(token) {
       setError("auth", null);
       try {
-        await client.createSession(token);
+        const session = await client.createSession(token);
         state.authenticated = true;
+        state.role = session.role;
         emitChange();
         await this.loadZones();
         return true;

@@ -95,7 +95,7 @@ export function createNodeHandler(
  * would reject every same-origin proof sent by a client behind TLS termination,
  * so an explicit public origin or trusted forwarding headers take precedence.
  */
-function requestOrigin(request: IncomingMessage, options: NodeHandlerOptions): string {
+export function requestOrigin(request: IncomingMessage, options: NodeHandlerOptions): string {
   if (options.publicOrigin) return options.publicOrigin;
   const forwarded = options.trustForwardedHeaders ? forwardedOrigin(request) : undefined;
   // A server that ended TLS itself knows the scheme without being told. Falling

@@ -60,9 +60,13 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     async authenticationMode() {
       const response = await fetchImpl("/health/live", { credentials: "same-origin" });
       const body = await response.json();
-      return body?.authentication === "disabled" ? "disabled" : "required";
+      return {
+        mode: body?.authentication === "disabled" ? "disabled" : "required",
+        identityProvider: body?.identityProvider === "available",
+      };
     },
 
+    readSession: () => request("/session"),
     createSession: (token) => request("/session", { method: "POST", body: { token } }),
     deleteSession: () => request("/session", { method: "DELETE" }),
 
