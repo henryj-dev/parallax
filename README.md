@@ -725,9 +725,18 @@ pnpm verify:postgres    # Docker PostgreSQL: migration, restart, locks, retentio
 pnpm verify:coredns     # Docker CoreDNS + dig: zone load, SOA reload, conflicts
 pnpm verify:powerdns    # Docker PowerDNS + PostgreSQL + dig: publish, conflict, withdraw
 pnpm verify:proxy       # Docker nginx over TLS: origin, cookies, HSTS, readiness
+pnpm verify:dns         # dig against the built-in listener: every type, TC, relay
 pnpm verify:cloudflare  # opt-in; needs a real scoped token, skips without one
 pnpm audit              # dependency advisories
 ```
+
+`verify:dns` needs neither Docker nor a network: the listener is in-process and
+the upstream it relays to is a stub, which is also what lets it prove the relay
+returned exactly what the upstream said. Its centre is that all twenty record
+types are asked for and rendered by `dig` -- an independent reader of the same
+bytes, which reports a malformed record instead of printing one. Types are asked
+for by number, because a `dig` that does not know a type's name quietly asks for
+`A` instead and answers nothing, which reads as the listener having no record.
 
 `verify:proxy` covers the one shape unit tests cannot stand in for: the server
 sees plain HTTP on loopback while the browser sees HTTPS. It first reproduces
@@ -735,8 +744,8 @@ the misconfigured case, where the `https` Origin is refused, so the checks that
 follow cannot pass vacuously; then it proves `trustForwardedHeaders` and
 `publicOrigin` each repair it, and that a cross-site Origin is still refused.
 
-`verify:postgres`, `verify:coredns`, and `verify:proxy` need Docker and remove
-their containers on exit.
+`verify:postgres`, `verify:coredns`, `verify:powerdns`, and `verify:proxy` need
+Docker and remove their containers on exit.
 
 A passing run is evidence about the commit it ran on and nothing else. The
 Cloudflare one first passed at `ef61201`, against a live zone, and the three

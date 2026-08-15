@@ -461,9 +461,17 @@ pnpm verify:postgres    # Docker PostgreSQL: 마이그레이션, 재시작, 잠�
 pnpm verify:coredns     # Docker CoreDNS + dig: 존 로드, SOA reload, 충돌 탐지
 pnpm verify:powerdns    # Docker PowerDNS + PostgreSQL + dig: 발행, 충돌, 회수
 pnpm verify:proxy       # Docker nginx TLS 종단: Origin, 쿠키, HSTS, readiness
+pnpm verify:dns         # 내장 리스너에 dig 로 질의: 전 타입, TC, 릴레이
 pnpm verify:cloudflare  # 옵트인. 실제 토큰이 필요하며 없으면 건너뜀
 pnpm audit              # 의존성 취약점 점검
 ```
+
+`verify:dns`는 Docker도 네트워크도 필요 없습니다. 리스너가 프로세스 안에 있고, 릴레이할
+상위 리졸버는 스텁이라서 — 그 덕분에 릴레이가 상위가 말한 것을 그대로 돌려줬는지까지
+확인할 수 있습니다. 핵심은 **20개 레코드 타입 전부**를 넣고 `dig`로 되읽는 것입니다.
+같은 바이트를 독립적으로 파싱하는 쪽이고, 망가진 레코드는 출력하는 대신 오류로 보고합니다.
+타입은 이름이 아니라 **번호로** 묻습니다. 타입 이름을 모르는 `dig`는 조용히 `A`를 대신
+묻고 아무 답도 얻지 못해서, 리스너에 레코드가 없는 것처럼 읽히기 때문입니다.
 
 `verify:proxy`는 단위 테스트가 대신할 수 없는 형태를 다룹니다. 서버는 루프백에서
 평문 HTTP를 보는데 브라우저는 HTTPS를 봅니다. 먼저 설정이 없을 때 `https` Origin이
@@ -471,8 +479,8 @@ pnpm audit              # 의존성 취약점 점검
 `trustForwardedHeaders`와 `publicOrigin`이 각각 이를 복구하는지, 그리고 교차 사이트
 Origin은 여전히 거부되는지 확인합니다.
 
-`verify:postgres`, `verify:coredns`, `verify:proxy`는 Docker가 필요하며 종료 시
-컨테이너를 제거합니다.
+`verify:postgres`, `verify:coredns`, `verify:powerdns`, `verify:proxy`는 Docker가
+필요하며 종료 시 컨테이너를 제거합니다.
 
 통과한 실행은 그 실행이 돈 커밋에 대한 증거일 뿐입니다. Cloudflare 검증은 `ef61201`에서
 실제 존을 대상으로 처음 통과했고, 그 앞의 세 번은 각각 결함을 하나씩 찾았습니다 — 앞의 것이
