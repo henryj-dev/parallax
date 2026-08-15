@@ -201,7 +201,7 @@ function renderWorkspace(state) {
   const active = Boolean(state.activeZone);
   $("#welcome-state").hidden = active;
   $("#zone-workspace").hidden = !active;
-  for (const id of ["#refresh-button", "#preview-button"]) $(id).disabled = state.loadingZone;
+  for (const id of ["#refresh-button", "#preview-button", "#adopt-button"]) $(id).disabled = state.loadingZone;
   $("#apply-button").disabled = state.loadingZone || state.applying;
   $("#apply-button").textContent = t(state.applying ? "zone.applying" : "zone.apply");
   if (!active) return;
@@ -706,6 +706,13 @@ $("#apply-from-plan").addEventListener("click", async () => {
   if (await store.apply()) $("#plan-dialog").close();
 });
 for (const id of ["#close-plan", "#cancel-plan"]) $(id).addEventListener("click", () => $("#plan-dialog").close());
+
+$("#adopt-button").addEventListener("click", async () => {
+  // Adoption writes a revision, so it asks first -- and says what it will not
+  // do, because "adopt" reads like taking ownership and it is the opposite.
+  if (!globalThis.confirm(t("zone.adoptConfirm"))) return;
+  await store.adopt();
+});
 
 $("#revisions-button").addEventListener("click", async () => {
   $("#revisions-dialog").showModal();

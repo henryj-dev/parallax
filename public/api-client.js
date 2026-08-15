@@ -96,6 +96,8 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     history: (zone, limit) => request(`${zonePath(zone)}/history?limit=${encodeURIComponent(limit)}`),
     preview: (zone, desired) => request(`${zonePath(zone)}/preview`, { method: "POST", body: desired }),
     apply: (zone, revision) => request(`${zonePath(zone)}/apply`, { method: "POST", headers: ifMatch(revision) }),
+    adopt: (zone, revision) =>
+      request(`${zonePath(zone)}/adopt?view=external`, { method: "POST", headers: ifMatch(revision) }),
 
     listRevisions: (zone, limit) => request(`${zonePath(zone)}/revisions?limit=${encodeURIComponent(limit)}`),
     restoreRevision: (zone, revision, expected) =>

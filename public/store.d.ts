@@ -78,6 +78,8 @@ export interface Store {
   removeRecord(index: number): void;
   proposeRecordId(name: string, type: string): string;
 
+  /** Describes records the provider already holds; does not take them over. */
+  adopt(): Outcome;
   preview(): Outcome;
   apply(): Outcome;
 

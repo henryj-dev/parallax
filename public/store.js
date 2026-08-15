@@ -294,6 +294,27 @@ export function createStore(client) {
 
     // ---- preview and apply ------------------------------------------------
 
+    /**
+     * Brings what the provider already holds into the desired state.
+     *
+     * Reports `seen` as well as what it took, because those two numbers are the
+     * difference between "the view was already complete" and "nothing could be
+     * read at all" -- and a run that adopted nothing looks identical otherwise.
+     */
+    async adopt() {
+      setError("zone", null);
+      try {
+        const result = await client.adopt(activeName(), state.status?.revision);
+        notice("zone.adopted", { seen: String(result.seen), adopted: String(result.adopted.length) });
+        await this.selectZone(activeName());
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        setError("zone", "zone.adoptFailed", { error: error.message });
+        return false;
+      }
+    },
+
     async preview() {
       state.plan = null;
       state.planError = "";
