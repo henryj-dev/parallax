@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { ConflictError, NotFoundError, ProviderManagedRecordError } from "../application/control-plane.ts";
 import { CredentialNotFoundError, CredentialTestError } from "../application/cloudflare-credentials.ts";
 import { ZoneLookupForbiddenError, ZoneNotFoundError } from "../adapters/cloudflare.ts";
+import { FallbackDomainForbiddenError } from "../adapters/cloudflare-fallback.ts";
 import { ProviderNotConfiguredError } from "../application/ports.ts";
 import { parseInvocation, UsageError } from "../cli/argv.ts";
 import {
@@ -361,6 +362,9 @@ function errorResponse(error: unknown): Response {
   // Not a validation failure: the record is well formed and the caller may
   // read it. It is refused because something else owns it.
   if (error instanceof ProviderManagedRecordError) return json({ error: "provider_managed", message: error.message }, 409);
+  // The credential is valid and the request is well formed; the token simply
+  // is not allowed here, which is a different thing to tell an operator.
+  if (error instanceof FallbackDomainForbiddenError) return json({ error: "provider_forbidden", message: error.message }, 403);
   if (error instanceof ProviderNotConfiguredError) return json({ error: "provider_not_configured", message: error.message }, 409);
   if (error instanceof UnknownCommandError || error instanceof UsageError) {
     return json({ error: "unknown_command", message: error.message }, 400);

@@ -3,6 +3,7 @@ import { access, lstat, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { AccessTokenService } from "./application/access-tokens.ts";
 import { CloudflareCredentialManager } from "./application/cloudflare-credentials.ts";
+import { FallbackDomainService } from "./application/fallback-domains.ts";
 import { ControlPlane } from "./application/control-plane.ts";
 import { SettingsService, type ParallaxSettings } from "./application/settings.ts";
 import { DomainValidationError } from "./domain/dns.ts";
@@ -38,6 +39,7 @@ export interface ParallaxRuntime extends CommandRuntime {
   readonly settings: SettingsService;
   readonly accessTokens: AccessTokenService;
   readonly credentials?: CloudflareCredentialManager;
+  readonly fallbackDomains?: FallbackDomainService;
   readonly provider: RoutingProviderAdapter;
   /**
    * Called after this process commits a zone change. Only this process's own
@@ -88,13 +90,19 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
   }
 
   const provider = new RoutingProviderAdapter();
-  const credentials = config.credentialMasterKey
+  // One store, two services. The device-settings service speaks with the same
+  // stored token as the DNS side rather than holding a second secret of its own.
+  const credentialStore = config.credentialMasterKey
+    ? new EncryptedCredentialStore({ repository: credentialRepository, masterKey: config.credentialMasterKey })
+    : undefined;
+  const credentials = credentialStore
     ? new CloudflareCredentialManager({
-      store: new EncryptedCredentialStore({ repository: credentialRepository, masterKey: config.credentialMasterKey }),
+      store: credentialStore,
       router: provider,
       ownershipSecret: config.ownershipSecret ?? "",
     })
     : undefined;
+  const fallbackDomains = credentialStore ? new FallbackDomainService({ secrets: credentialStore }) : undefined;
 
   const applyProviderSettings = (current: ParallaxSettings): void => {
     provider.setFallback(
@@ -147,6 +155,7 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     // capability out of this object also keeps POST /api/v1/cli from turning an
     // HTTP administrator into the database's DDL role.
     ...(credentials ? { credentials } : {}),
+    ...(fallbackDomains ? { fallbackDomains } : {}),
     provider,
     onZoneChange: (listener) => { zoneChangeListeners.push(listener); },
     close: async () => {

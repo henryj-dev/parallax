@@ -263,12 +263,14 @@ export class CloudflareCredentialManager {
 const PROBE_ZONE = "profile-probe.invalid";
 
 export class CredentialNotFoundError extends Error {
+  override readonly name = "CredentialNotFoundError";
   constructor() {
     super("Cloudflare credential was not found");
   }
 }
 
 export class CredentialTestError extends Error {
+  override readonly name = "CredentialTestError";
   constructor() {
     super("Cloudflare credential test failed");
   }

@@ -1,5 +1,6 @@
 import { TOKEN_REFRESH_INTERVAL_MS, type AccessTokenService } from "../application/access-tokens.ts";
 import type { CloudflareCredentialManager } from "../application/cloudflare-credentials.ts";
+import type { FallbackDomainService } from "../application/fallback-domains.ts";
 import { NotFoundError, type ControlPlane } from "../application/control-plane.ts";
 import type { SettingsService } from "../application/settings.ts";
 import { DomainValidationError } from "../domain/dns.ts";
@@ -16,6 +17,7 @@ export interface CommandRuntime {
   readonly settings?: SettingsService;
   readonly accessTokens?: AccessTokenService;
   readonly credentials?: CloudflareCredentialManager;
+  readonly fallbackDomains?: FallbackDomainService;
   /** Present only when a database backs this process. */
   readonly migrate?: () => Promise<MigrationRun>;
 }
@@ -138,6 +140,27 @@ function coerceValue(raw: unknown, type: CommandValueType, name: string): unknow
   } catch {
     throw new Error(`--${name} must be valid JSON`);
   }
+}
+
+/** An option the caller may omit entirely, distinguished from one left empty. */
+function optionalText(value: unknown): string | undefined {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text === "" ? undefined : text;
+}
+
+/** A comma-separated option, with the empty case meaning "none given". */
+function splitList(value: unknown): string[] {
+  return typeof value === "string"
+    ? value.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "")
+    : [];
+}
+
+function requireFallbackDomains(context: CommandContext): FallbackDomainService {
+  const service = context.runtime.fallbackDomains;
+  if (!service) {
+    throw new CommandUnavailableError("provider credentials are unavailable; set PARALLAX_CREDENTIAL_MASTER_KEY");
+  }
+  return service;
 }
 
 function requireCredentials(context: CommandContext): CloudflareCredentialManager {
@@ -532,6 +555,47 @@ const COMMANDS: readonly Command[] = [
       }
       return { unbound: input.zone };
     },
+  },
+  {
+    name: "fallback list",
+    summary: "Show the provider's client-side resolver overrides",
+    role: "admin",
+    options: [
+      { name: "profile", summary: "Stored credential profile to authenticate with", required: true },
+      { name: "policy", summary: "Device settings profile id; the account default when absent" },
+    ],
+    run: async (context, input) => ({
+      domains: await requireFallbackDomains(context).list(String(input.profile), optionalText(input.policy)),
+    }),
+  },
+  {
+    name: "fallback set",
+    summary: "Point one suffix at a resolver, leaving the rest of the list alone",
+    role: "admin",
+    options: [
+      { name: "profile", summary: "Stored credential profile to authenticate with", required: true },
+      { name: "suffix", summary: "Apex domain; every name beneath it is covered", required: true },
+      { name: "dns-server", summary: "Comma-separated resolver addresses" },
+      { name: "description", summary: "Shown in the provider's client UI" },
+      { name: "policy", summary: "Device settings profile id; the account default when absent" },
+    ],
+    run: async (context, input) => await requireFallbackDomains(context).set(String(input.profile), {
+      suffix: String(input.suffix),
+      dnsServer: splitList(input["dns-server"]),
+      ...(optionalText(input.description) ? { description: String(input.description) } : {}),
+    }, optionalText(input.policy)),
+  },
+  {
+    name: "fallback delete",
+    summary: "Remove one suffix from the override list",
+    role: "admin",
+    options: [
+      { name: "profile", summary: "Stored credential profile to authenticate with", required: true },
+      { name: "suffix", summary: "Apex domain to stop overriding", required: true },
+      { name: "policy", summary: "Device settings profile id; the account default when absent" },
+    ],
+    run: async (context, input) => await requireFallbackDomains(context)
+      .remove(String(input.profile), String(input.suffix), optionalText(input.policy)),
   },
   {
     name: "credential zone test",
