@@ -11,13 +11,20 @@ import { createDnsServer, type ServedZone } from "./dns/server.ts";
 import { servedZones } from "./dns/snapshot.ts";
 import { createNodeHandler, requestOrigin } from "./http/api.ts";
 import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.ts";
+import { unservedTargets } from "./http/readiness.ts";
 import { createRuntime } from "./runtime.ts";
 import { authenticate, type SecurityConfig } from "./security/http-authorization.ts";
 
 const config = readConfig();
 
-/** How long a published override may take to reach the DNS listener. */
+/**
+ * How long a zone change made somewhere else may take to reach the DNS
+ * listener. A change made through this process is served as soon as it commits.
+ */
 const DNS_REFRESH_MS = 5_000;
+
+/** What the listener is answering from, and what readiness reports about it. */
+let dnsSnapshot: ServedZone[] = [];
 
 let runtime;
 try {
@@ -173,11 +180,11 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   if (pathname === "/health/ready") {
     try {
       const zones = await controlPlane.listZones();
-      const missingTargets = zones.flatMap((zone) => {
-        const views = new Set(zone.views.map((view) => view.name));
-        if (views.has("external")) views.add("internal");
-        return [...views].map((view) => `${zone.name}/${view}`).filter((target) => !provider.isConfigured(target));
-      });
+      const missingTargets = unservedTargets(
+        zones,
+        (target) => provider.isConfigured(target),
+        config.dns !== undefined,
+      );
       if (missingTargets.length > 0) throw new Error("provider configuration is incomplete");
       response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       // Backend and provider details describe the deployment, so only an
@@ -188,6 +195,13 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
           service: "parallax",
           storage: config.databaseUrl ? "postgresql" : "file",
           providerMode: settingsService.current().allowLocalProvider ? "local-fallback" : "configured",
+          // How many zones the listener will answer for, which is not the same
+          // as how many zones exist: one whose internal view is empty is left
+          // to the forwarder. Somebody checking why a name does not resolve
+          // internally needs to see that difference from outside the process.
+          dns: config.dns
+            ? { port: config.dns.port, zones: dnsSnapshot.length, forwarding: config.dns.forwardTo.length > 0 }
+            : "disabled",
         }
         : { status: "ready", service: "parallax" }));
     } catch {
@@ -324,10 +338,9 @@ if (config.httpRedirectPort !== undefined) {
  */
 if (config.dns) {
   const dnsConfig = config.dns;
-  let snapshot: ServedZone[] = [];
   const refresh = async (): Promise<void> => {
     const zones = await controlPlane.listZones();
-    snapshot = servedZones(zones, (zone, reason) => {
+    dnsSnapshot = servedZones(zones, (zone, reason) => {
       console.error(`parallax: not answering for ${zone}, its internal view could not be composed: ${reason}`);
     });
   };
@@ -339,17 +352,22 @@ if (config.dns) {
     console.error(`parallax: the DNS listener could not read the desired state: ${error instanceof Error ? error.message : "unknown error"}`);
     process.exit(1);
   }
-  const timer = setInterval(() => {
+  const reread = (): void => {
     void refresh().catch((error: unknown) => {
       // The last good snapshot keeps answering. A store that is briefly
       // unreachable must not turn into NXDOMAIN for every internal name.
       console.error(`parallax: keeping the last DNS snapshot, the desired state could not be re-read: ${error instanceof Error ? error.message : "unknown error"}`);
     });
-  }, DNS_REFRESH_MS);
+  };
+  // A change committed here is served at once. The timer stays because it is
+  // what covers every writer this process cannot see: a second instance sharing
+  // a database, or the command line writing to the same file.
+  runtime.onZoneChange(reread);
+  const timer = setInterval(reread, DNS_REFRESH_MS);
   timer.unref();
 
   const dns = createDnsServer({
-    zones: () => snapshot,
+    zones: () => dnsSnapshot,
     forwardTo: dnsConfig.forwardTo,
     onUnservable: (record) => {
       // Stored content the domain accepted and the wire cannot carry. The
@@ -359,7 +377,7 @@ if (config.dns) {
   });
   try {
     await dns.listen(dnsConfig.port, dnsConfig.host);
-    console.log(`parallax: dns://${dnsConfig.host}:${dnsConfig.port} answering for ${snapshot.length} zone(s)`);
+    console.log(`parallax: dns://${dnsConfig.host}:${dnsConfig.port} answering for ${dnsSnapshot.length} zone(s)`);
     if (dnsConfig.forwardTo.length === 0) {
       console.warn("parallax: no DNS upstream is configured, so names outside every managed zone are answered REFUSED. Set PARALLAX_DNS_FORWARD_TO if clients use this as their resolver.");
     }

@@ -1,5 +1,5 @@
 import { createSocket, type Socket } from "node:dgram";
-import { createServer, type Server } from "node:net";
+import { connect, createServer, type Server } from "node:net";
 import type { RecordType } from "../domain/dns.ts";
 import { encodeRdata, encodeSoa, rrType } from "./rdata.ts";
 import {
@@ -76,7 +76,7 @@ export function createDnsServer(options: DnsServerOptions): {
       if (forwardTo.length === 0) {
         return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
       }
-      const forwarded = await forward(message, forwardTo, forwardTimeoutMs);
+      const forwarded = await forward(message, forwardTo, forwardTimeoutMs, overTcp);
       return forwarded ?? writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: false }, Number.MAX_SAFE_INTEGER);
     }
     const parts = answerFromZone(query, zone, negativeTtl, options.onUnservable);
@@ -152,12 +152,18 @@ function answerFromZone(
   onUnservable: DnsServerOptions["onUnservable"],
 ) {
   const name = query.question.name;
-  const atName = zone.records.filter((record) => absolute(record.name, zone.name) === name);
   const soa = soaRecord(zone, negativeTtl);
+  let atName: ServedZone["records"] = zone.records.filter((record) => absolute(record.name, zone.name) === name);
 
   if (atName.length === 0) {
-    const exists = zone.records.some((record) => absolute(record.name, zone.name).endsWith(`.${name}`));
-    return { query, rcode: exists ? RCODE.NOERROR : RCODE.NXDOMAIN, authoritative: true, authority: [soa] };
+    // The name exists without holding anything of its own when something sits
+    // below it, and the apex always exists. Either way the answer is empty
+    // rather than NXDOMAIN, and no wildcard may cover a name that exists.
+    const exists = name === zone.name
+      || zone.records.some((record) => absolute(record.name, zone.name).endsWith(`.${name}`));
+    if (exists) return { query, rcode: RCODE.NOERROR, authoritative: true, authority: [soa] };
+    atName = wildcardMatch(zone, name);
+    if (atName.length === 0) return { query, rcode: RCODE.NXDOMAIN, authoritative: true, authority: [soa] };
   }
   // A CNAME answers for every type, which is why it may not share a name.
   const alias = atName.find((record) => record.type === "CNAME");
@@ -189,6 +195,30 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
 }
 
+/**
+ * The records a wilddcard covering this name holds, or none.
+ *
+ * The desired state accepts `*` and `*.name`, and every other publisher of the
+ * internal view expands them -- a zone file, PowerDNS and Cloudflare all do.
+ * Taking them literally here would answer NXDOMAIN for names the same desired
+ * state resolves everywhere else.
+ *
+ * The walk goes upwards from the queried name's parent and stops at the first
+ * wildcard it finds, so `*.eu.example.com` answers for `shop.eu.example.com`
+ * and `*.example.com` does not get the chance. A name that exists never reaches
+ * here, which is the rule that keeps a wildcard from answering over a real one.
+ */
+function wildcardMatch(zone: ServedZone, name: string): ServedZone["records"] {
+  let parent = name.slice(name.indexOf(".") + 1);
+  for (;;) {
+    const covering = `*.${parent}`;
+    const records = zone.records.filter((record) => absolute(record.name, zone.name) === covering);
+    if (records.length > 0) return records;
+    if (parent === zone.name || !parent.includes(".")) return [];
+    parent = parent.slice(parent.indexOf(".") + 1);
+  }
+}
+
 function soaRecord(zone: ServedZone, negativeTtl: number): ResourceRecord {
   return {
     name: zone.name,
@@ -209,25 +239,69 @@ function absolute(name: string, zone: string): string {
  * the answer says, and re-encoding somebody else's reply is a way to change it
  * by accident.
  */
-async function forward(message: Buffer, upstreams: readonly string[], timeoutMs: number): Promise<Buffer | undefined> {
+async function forward(
+  message: Buffer,
+  upstreams: readonly string[],
+  timeoutMs: number,
+  overTcp: boolean,
+): Promise<Buffer | undefined> {
   for (const upstream of upstreams) {
     const [host, port] = splitUpstream(upstream);
-    const reply = await new Promise<Buffer | undefined>((resolve) => {
-      const socket = createSocket("udp4");
-      const done = (value: Buffer | undefined): void => {
-        clearTimeout(timer);
-        socket.close();
-        resolve(value);
-      };
-      const timer = setTimeout(() => done(undefined), timeoutMs);
-      timer.unref();
-      socket.once("message", (answer) => done(answer));
-      socket.once("error", () => done(undefined));
-      socket.send(message, port, host, (error) => { if (error) done(undefined); });
-    });
+    // The transport the client used is the transport the upstream is asked on.
+    // A client only reaches TCP because it was told the UDP answer was
+    // truncated, so relaying that query over UDP hands back another truncated
+    // answer -- and the client has no move left, having already done the thing
+    // truncation asks for.
+    const reply = overTcp
+      ? await relayOverTcp(message, host, port, timeoutMs)
+      : await relayOverUdp(message, host, port, timeoutMs);
     if (reply) return reply;
   }
   return undefined;
+}
+
+function relayOverUdp(message: Buffer, host: string, port: number, timeoutMs: number): Promise<Buffer | undefined> {
+  return new Promise((resolve) => {
+    const socket = createSocket("udp4");
+    const done = (value: Buffer | undefined): void => {
+      clearTimeout(timer);
+      socket.close();
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(undefined), timeoutMs);
+    timer.unref();
+    socket.once("message", (answer) => done(answer));
+    socket.once("error", () => done(undefined));
+    socket.send(message, port, host, (error) => { if (error) done(undefined); });
+  });
+}
+
+function relayOverTcp(message: Buffer, host: string, port: number, timeoutMs: number): Promise<Buffer | undefined> {
+  return new Promise((resolve) => {
+    const framed = Buffer.alloc(2 + message.length);
+    framed.writeUInt16BE(message.length, 0);
+    message.copy(framed, 2);
+    const socket = connect(port, host, () => socket.write(framed));
+    let buffered = Buffer.alloc(0);
+    const done = (value: Buffer | undefined): void => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(undefined), timeoutMs);
+    timer.unref();
+    socket.on("data", (chunk) => {
+      buffered = Buffer.concat([buffered, chunk]);
+      if (buffered.length < 2) return;
+      const size = buffered.readUInt16BE(0);
+      if (buffered.length < size + 2) return;
+      // The frame is stripped here and put back by the caller's own framing, so
+      // an upstream that batches replies cannot smuggle a second one through.
+      done(Buffer.from(buffered.subarray(2, size + 2)));
+    });
+    socket.on("error", () => done(undefined));
+    socket.on("close", () => done(undefined));
+  });
 }
 
 function splitUpstream(value: string): [string, number] {

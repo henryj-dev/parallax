@@ -18,9 +18,10 @@ UPSTREAMPORT="${UPSTREAMPORT:-15354}"
 APPPORT="${APPPORT:-39170}"
 WORK="$(mktemp -d)"
 API="http://127.0.0.1:${APPPORT}/api/v1"
-# The listener re-reads the desired state on a timer, so every assertion about a
-# change has to be allowed to arrive rather than sampled once.
+# A change committed by this process is served at once; anything else waits for
+# the periodic re-read, so assertions about arrival are given room.
 REFRESH_WAIT=20
+DNS_REFRESH_SECONDS=5
 
 cleanup() {
   for pid in "${APP_PID:-}" "${REFUSE_PID:-}" "${UPSTREAM_PID:-}"; do
@@ -42,8 +43,13 @@ short() { dig +short +time=3 +tries=1 -p "$DNSPORT" @127.0.0.1 "$@" 2>/dev/null 
 answer() { dig +noall +answer +time=3 +tries=1 -p "$DNSPORT" @127.0.0.1 "$@" 2>/dev/null || true; }
 status() { dig +noall +comments +time=3 +tries=1 -p "$DNSPORT" @127.0.0.1 "$@" 2>/dev/null | sed -n 's/.*status: \([A-Z]*\).*/\1/p'; }
 
+# Deployment details are reported only to an authenticated caller, so the run
+# uses a token throughout rather than only where it is read back.
+TOKEN="verify-dns-token-that-is-at-least-32-bytes-long"
+AUTH=(-H "authorization: Bearer ${TOKEN}")
+
 put() {
-  curl -sf -X PUT -H 'content-type: application/json' \
+  curl -sf "${AUTH[@]}" -X PUT -H 'content-type: application/json' \
     -d "$(node -e 'process.stdout.write(JSON.stringify({name:process.argv[1],type:process.argv[2],content:process.argv[3],ttl:300}))' "$2" "$3" "$4")" \
     "$API/zones/example.com/views/internal/records/$1" >/dev/null \
     || fail "the control plane refused $3 $4"
@@ -99,16 +105,43 @@ echo "== starting a stub upstream =="
 # place, and never NOTIMP.
 cat > "$WORK/upstream.mjs" <<'EOF'
 import { createSocket } from "node:dgram";
+import { createServer } from "node:net";
 import { appendFileSync } from "node:fs";
 const [port, log] = [Number(process.argv[2]), process.argv[3]];
+
+// NOTIMP over UDP, NXDOMAIN over TCP. Two different markers because the query
+// has to reach the upstream on the same transport the client used, and a single
+// marker could not tell the two apart.
 const socket = createSocket("udp4");
 socket.on("message", (message, remote) => {
-  appendFileSync(log, "query\n");
+  appendFileSync(log, "udp\n");
   const reply = Buffer.from(message);
   reply.writeUInt16BE(0x8184, 2);
   socket.send(reply, remote.port, remote.address);
 });
-socket.bind(port, "127.0.0.1", () => console.log("ready"));
+
+const tcp = createServer((connection) => {
+  let buffered = Buffer.alloc(0);
+  connection.on("data", (chunk) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    if (buffered.length < 2) return;
+    const size = buffered.readUInt16BE(0);
+    if (buffered.length < size + 2) return;
+    appendFileSync(log, "tcp\n");
+    const reply = Buffer.from(buffered.subarray(2, size + 2));
+    reply.writeUInt16BE(0x8183, 2);
+    const framed = Buffer.alloc(2 + reply.length);
+    framed.writeUInt16BE(reply.length, 0);
+    reply.copy(framed, 2);
+    connection.end(framed);
+  });
+  connection.on("error", () => connection.destroy());
+});
+
+let ready = 0;
+const announce = () => { ready += 1; if (ready === 2) console.log("ready"); };
+socket.bind(port, "127.0.0.1", announce);
+tcp.listen(port, "127.0.0.1", announce);
 EOF
 : > "$WORK/upstream.log"
 node "$WORK/upstream.mjs" "$UPSTREAMPORT" "$WORK/upstream.log" > "$WORK/upstream.out" 2>&1 &
@@ -124,6 +157,7 @@ PARALLAX_CONFIG_FILE="$WORK/configuration.json" \
 PARALLAX_PROVIDER_STATE_FILE="$WORK/provider.json" \
 PARALLAX_DNS_PORT="$DNSPORT" \
 PARALLAX_DNS_FORWARD_TO="127.0.0.1#${UPSTREAMPORT}" \
+PARALLAX_AUTH_TOKENS="[{\"token\":\"${TOKEN}\",\"role\":\"admin\",\"subject\":\"verify\"}]" \
   node "$ROOT/src/index.ts" > "$WORK/app.log" 2>&1 &
 APP_PID=$!
 for _ in $(seq 1 60); do
@@ -137,7 +171,7 @@ ok "control plane on ${APPPORT}, listener on ${DNSPORT}"
 echo "== a zone with no internal records is left to the upstream, not answered for =="
 # The normal state right after adopting a zone. Claiming authority for it would
 # answer NXDOMAIN for every name the zone holds.
-curl -sf -X POST -H 'content-type: application/json' -d '{"name":"example.com"}' "$API/zones" >/dev/null
+curl -sf "${AUTH[@]}" -X POST -H 'content-type: application/json' -d '{"name":"example.com"}' "$API/zones" >/dev/null
 sleep 6
 [ "$(status anything.example.com A)" = "NOTIMP" ] \
   || fail "an empty zone was answered for locally, status was '$(status anything.example.com A)'"
@@ -224,24 +258,72 @@ echo "$TRUNCATED" | grep -q ' tc' || fail "a 600-byte record was not truncated o
   || fail "the record did not come back whole when dig retried over TCP"
 ok "TC set over UDP, and the full 600 bytes over TCP"
 
-echo "== a name outside every zone is relayed, unchanged =="
-BEFORE=$(wc -l < "$WORK/upstream.log" | tr -d ' ')
-[ "$(status elsewhere.example.net A)" = "NOTIMP" ] \
-  || fail "the reply did not come from the upstream, status was '$(status elsewhere.example.net A)'"
-AFTER=$(wc -l < "$WORK/upstream.log" | tr -d ' ')
-[ "$AFTER" -gt "$BEFORE" ] || fail "the upstream was never asked ($BEFORE -> $AFTER)"
-ok "relayed to the upstream and its answer returned as it was"
+echo "== a wildcard covers the names below it, and never over a real one =="
+# The desired state accepts `*` and every other publisher expands it. A listener
+# that took it literally would answer NXDOMAIN for names the same desired state
+# resolves through CoreDNS, PowerDNS or Cloudflare.
+put star '*' A 192.0.2.60
+put stareu '*.eu' A 192.0.2.61
+for _ in $(seq 1 "$REFRESH_WAIT"); do [ -n "$(short whatever.example.com A)" ] && break; sleep 1; done
+[ "$(short whatever.example.com A)" = "192.0.2.60" ] \
+  || fail "the apex wildcard did not answer, got '$(short whatever.example.com A)'"
+[ "$(short shop.eu.example.com A)" = "192.0.2.61" ] \
+  || fail "the closest wildcard did not win, got '$(short shop.eu.example.com A)'"
+[ "$(short cname.example.com CNAME)" = "origin.example.net." ] \
+  || fail "the wildcard answered over an exact record"
+ok "wildcard synthesis, closest match first, exact records untouched"
 
-echo "== a change made through the API is served without a restart =="
+echo "== a name outside every zone is relayed, on the transport it arrived on =="
+BEFORE=$(grep -c udp "$WORK/upstream.log" || true)
+[ "$(status elsewhere.example.net A)" = "NOTIMP" ] \
+  || fail "the UDP reply did not come from the upstream, status was '$(status elsewhere.example.net A)'"
+AFTER=$(grep -c udp "$WORK/upstream.log" || true)
+[ "$AFTER" -gt "$BEFORE" ] || fail "the upstream was never asked over UDP ($BEFORE -> $AFTER)"
+
+# A client only reaches TCP because it was told the UDP answer was truncated.
+# Relaying that over UDP hands back another truncated answer and the client has
+# no move left, so the transport has to carry through.
+TCP_STATUS=$(dig +tcp +noall +comments +time=3 +tries=1 -p "$DNSPORT" @127.0.0.1 elsewhere.example.net A 2>/dev/null | sed -n 's/.*status: \([A-Z]*\).*/\1/p')
+[ "$TCP_STATUS" = "NXDOMAIN" ] \
+  || fail "a TCP query was not relayed over TCP: expected the TCP upstream's NXDOMAIN, got '$TCP_STATUS'"
+grep -q tcp "$WORK/upstream.log" || fail "the upstream was never asked over TCP"
+ok "UDP relayed to UDP and TCP to TCP, each answer returned as it was"
+
+echo "== a change made through the API is served at once, not at the next refresh =="
+# The listener is told when this process commits, so this must not need the
+# timer. The bound is under the refresh interval on purpose: at or above it,
+# the check would pass even if the notification did nothing.
 put a a A 192.0.2.9
-for _ in $(seq 1 "$REFRESH_WAIT"); do
-  [ "$(short a.example.com A | sort | tr '\n' ' ')" = "192.0.2.2 192.0.2.9 " ] && break
-  sleep 1
+SERVED=""
+for _ in $(seq 1 8); do
+  [ "$(short a.example.com A | sort | tr '\n' ' ')" = "192.0.2.2 192.0.2.9 " ] && { SERVED=yes; break; }
+  sleep 0.25
 done
-[ "$(short a.example.com A | sort | tr '\n' ' ')" = "192.0.2.2 192.0.2.9 " ] \
-  || fail "the changed record was not served, got: $(short a.example.com A | tr '\n' ' ')"
+[ -n "$SERVED" ] \
+  || fail "the change was not served within 2s, so only the ${DNS_REFRESH_SECONDS}s timer could have delivered it: $(short a.example.com A | tr '\n' ' ')"
 [ -n "${APP_PID:-}" ] && kill -0 "$APP_PID" 2>/dev/null || fail "the process restarted, which is not what was being tested"
-ok "the new value is answered by the same process"
+ok "answered by the same process, before the refresh timer could have run"
+
+echo "== readiness reports what the listener is answering for =="
+# The zone count is not the number of zones: one with an empty internal view is
+# left to the forwarder. Somebody asking why a name does not resolve internally
+# needs to see that difference from outside the process.
+# Unauthenticated first: readiness has to be 200 for a listener-only deployment
+# that configures no provider at all, or a probe would never send it traffic.
+curl -sf "http://127.0.0.1:${APPPORT}/health/ready" >/dev/null \
+  || fail "a deployment served only by the listener reports itself not ready"
+READY=$(curl -sf "${AUTH[@]}" "http://127.0.0.1:${APPPORT}/health/ready")
+echo "$READY" | node -e '
+  let body = "";
+  process.stdin.on("data", (chunk) => { body += chunk; }).on("end", () => {
+    const dns = JSON.parse(body).dns;
+    if (!dns || dns === "disabled") { console.error("readiness does not report the listener"); process.exit(1); }
+    if (dns.port !== Number(process.argv[1])) { console.error(`port reads as ${dns.port}`); process.exit(1); }
+    if (!(dns.zones >= 1)) { console.error(`zones reads as ${dns.zones}`); process.exit(1); }
+    if (dns.forwarding !== true) { console.error("forwarding is not reported"); process.exit(1); }
+  });
+' "$DNSPORT" || fail "readiness did not describe the DNS listener"
+ok "readiness names the port, the zone count and that it forwards"
 
 echo "== an unparseable message gets no reply at all =="
 # A reply to a message that cannot be parsed is a reply to whatever source

@@ -6,6 +6,7 @@ import { CloudflareCredentialManager } from "./application/cloudflare-credential
 import { ControlPlane } from "./application/control-plane.ts";
 import { SettingsService, type ParallaxSettings } from "./application/settings.ts";
 import { DomainValidationError } from "./domain/dns.ts";
+import { watchingZones } from "./dns/zone-changes.ts";
 import { CoreDnsFileAdapter } from "./adapters/coredns-file.ts";
 import { PowerDnsProviderAdapter } from "./adapters/powerdns.ts";
 import { NodeCoreDnsFileOperations } from "./adapters/node-coredns-files.ts";
@@ -38,6 +39,12 @@ export interface ParallaxRuntime extends CommandRuntime {
   readonly accessTokens: AccessTokenService;
   readonly credentials?: CloudflareCredentialManager;
   readonly provider: RoutingProviderAdapter;
+  /**
+   * Called after this process commits a zone change. Only this process's own
+   * writes are seen; anything that needs to observe another instance has to
+   * read the store on its own schedule.
+   */
+  onZoneChange(listener: () => void): void;
   close(): Promise<void>;
 }
 
@@ -130,7 +137,15 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     throw new RuntimeStartupError(`${message(error)}. Check PARALLAX_CREDENTIAL_MASTER_KEY matches the key that sealed the stored credentials.`);
   }
 
-  const controlPlane = new ControlPlane(persisted.zones, persisted.statuses, provider, undefined, persisted.applyLock, {
+  // Wrapped rather than announced by the control plane itself: a change cannot
+  // reach the store without passing through here, and nothing else has to learn
+  // about an event it does not use.
+  const zoneChangeListeners: (() => void)[] = [];
+  const zones = watchingZones(persisted.zones, () => {
+    for (const listener of zoneChangeListeners) listener();
+  });
+
+  const controlPlane = new ControlPlane(zones, persisted.statuses, provider, undefined, persisted.applyLock, {
     get maxRevisionsPerZone() { return settings.current().revisionRetention; },
     get auditRetentionDays() { return settings.current().auditRetentionDays; },
   });
@@ -144,6 +159,7 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     ...(pool ? { migrate: () => applyMigrations(pool, findMigrationsDirectory(import.meta.dirname)) } : {}),
     ...(credentials ? { credentials } : {}),
     provider,
+    onZoneChange: (listener) => { zoneChangeListeners.push(listener); },
     close: async () => {
       await pool?.end().catch(() => undefined);
       await powerDnsPool?.end().catch(() => undefined);

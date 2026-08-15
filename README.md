@@ -298,7 +298,7 @@ server that then answers for it; the third answers from this process directly.
 | Served as | RFC 1035 zone files | rows in PowerDNS's database | answers from this process |
 | Needs | a filesystem both processes reach | nothing beyond the database | nothing |
 | In a cluster | a volume that must survive restarts | no volume | no volume |
-| Change is served after | `reload` interval, about a second | the resolver's cache TTL | one refresh, 5 seconds |
+| Change is served after | `reload` interval, about a second | the resolver's cache TTL | at once, or one refresh (5s) for a change made elsewhere |
 | Reconciles | yes | yes | no |
 
 **The two publishers are exclusive; the listener is not.** Configuring
@@ -335,6 +335,21 @@ writes.** The file-backed store is read once and cached per process, so a
 holding the port. Changes made through the portal or the API are the ones the
 listener follows. With `DATABASE_URL` every instance reads the same rows and the
 question does not arise.
+
+A change committed by this process is served as soon as it commits, because the
+repository the control plane writes through says so. The 5-second refresh stays
+for everything that cannot announce itself: a second instance sharing a
+database, or the command line writing to the same file.
+
+**Wildcards are expanded, not taken literally.** A record named `*` or `*.eu`
+answers for the names below it, the closest one wins, and neither answers over a
+name that exists. That is what a zone file, PowerDNS and Cloudflare all do with
+the same desired state, and a listener that disagreed would resolve a name
+differently depending on which publisher a deployment happened to use.
+
+**Readiness counts the listener as serving the internal view.** A deployment
+that answers DNS itself and configures no provider at all is ready. Without
+that, its probe would never pass while it answered every query correctly.
 
 The zone-file shape needs persistent storage and not an ephemeral volume,
 because a zone file also holds records nobody else has a copy of -- the ones an
@@ -737,6 +752,10 @@ types are asked for and rendered by `dig` -- an independent reader of the same
 bytes, which reports a malformed record instead of printing one. Types are asked
 for by number, because a `dig` that does not know a type's name quietly asks for
 `A` instead and answers nothing, which reads as the listener having no record.
+It also covers what only a running listener can show: truncation over UDP
+completing over TCP, a TCP query relayed to the upstream over TCP rather than
+downgraded, wildcard synthesis, a change served before the refresh timer could
+have run, and readiness passing with no provider configured at all.
 
 `verify:proxy` covers the one shape unit tests cannot stand in for: the server
 sees plain HTTP on loopback while the browser sees HTTPS. It first reproduces
