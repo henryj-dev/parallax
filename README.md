@@ -92,6 +92,38 @@ directory mode, not every file recursively. This permission migration is
 separate from stale-lock recovery: do not remove a lock for a mode error; follow
 the named-lock procedure below only after confirming that no writer is active.
 
+### Upgrading an existing deployment
+
+**The version you are replacing reads the new configuration first.** A rolling
+replacement changes the secret or the environment before the new image arrives,
+so the running one restarts against it. Every configuration change made for an
+upgrade therefore has to be accepted by *both* versions, and a value that only
+the new one understands takes the service down until the new one lands.
+
+The dangerous direction is the one where **the older version is laxer**. A value
+it accepts without complaint may be one the incoming version refuses, and that
+failure arrives after the replacement rather than during it. The canonical-form
+requirement on `PARALLAX_AUTH_TOKENS` is exactly this: the version before it
+accepted any sufficiently long string.
+
+A record missing `subject` or `role` is not that case -- both versions reject it,
+with the same message -- so generating a token string is only half of the change.
+A deployment that replaced the value with a conforming token and no `role` was
+down for five minutes on a record neither version would have accepted.
+
+Four things this version refuses to run without, and none of them announces
+itself before the restart:
+
+| | Refuses | Fix |
+|---|---|---|
+| `PARALLAX_AUTH_TOKENS` | to start | canonical base64url of 32 random bytes; `subject` and `role` are required by **both** versions, so keep them |
+| Data directory mode | to start | `chmod 0700` each parent, as above; file backends only |
+| `DATABASE_URL` without TLS | to start | `sslmode=verify-full`, or `PARALLAX_ALLOW_PLAINTEXT_POSTGRES=true` for a separately protected network |
+| Schema older than the code | to write | `parallax migrate`; apply reports a constraint error until it runs |
+
+The first three stop the process, which a readiness probe reports. The fourth
+starts cleanly and fails at the first write, which it does not.
+
 Everything else -- provider wiring, retention, proxy origin, access tokens and
 provider credentials -- is stored alongside the zones and managed from the
 portal's **Provider settings** screen. A local change takes effect immediately;
