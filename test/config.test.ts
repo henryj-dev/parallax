@@ -17,11 +17,11 @@ describe("configuration", () => {
   it("reads the database connection and the keys that protect stored data", () => {
     const key = Buffer.alloc(32, 7);
     const config = readConfig({
-      DATABASE_URL: "postgres://parallax:test@db/parallax",
+      DATABASE_URL: "postgres://parallax:test@db/parallax?sslmode=verify-full",
       PARALLAX_OWNERSHIP_SECRET: "test-ownership-secret-that-is-at-least-32-bytes",
       PARALLAX_CREDENTIAL_MASTER_KEY: key.toString("base64"),
     });
-    assert.equal(config.databaseUrl, "postgres://parallax:test@db/parallax");
+    assert.equal(config.databaseUrl, "postgres://parallax:test@db/parallax?sslmode=verify-full");
     assert.equal(config.ownershipSecret, "test-ownership-secret-that-is-at-least-32-bytes");
     assert.deepEqual(config.credentialMasterKey, key);
     assert.deepEqual(readConfig({ PARALLAX_CREDENTIAL_MASTER_KEY: key.toString("hex") }).credentialMasterKey, key);
@@ -54,7 +54,7 @@ describe("configuration", () => {
   });
 
   it("parses break-glass tokens without returning them in errors", () => {
-    const token = "admin-secret-00000000000000000000";
+    const token = Buffer.alloc(32, 9).toString("base64url");
     assert.deepEqual(readConfig({
       PARALLAX_AUTH_TOKENS: JSON.stringify([{ token, role: "admin", subject: "owner" }]),
     }).bootstrapTokens, [{ token, subject: "owner", role: "admin" }]);
@@ -65,7 +65,7 @@ describe("configuration", () => {
     );
     assert.throws(
       () => readConfig({ PARALLAX_AUTH_TOKENS: '[{"token":"a","role":"admin","subject":"owner"}]' }),
-      /at least 32 bytes/,
+      /32 random bytes/,
     );
     assert.deepEqual(readConfig({ PARALLAX_AUTH_TOKENS: "[]" }).bootstrapTokens, []);
   });
@@ -80,10 +80,29 @@ describe("configuration", () => {
     assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?sslmode=prefer"), true);
     assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?sslmode=verify-full"), false);
     assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?ssl=true"), false);
+    assert.equal(usesPlaintextPostgres("host=db dbname=parallax"), true);
 
     assert.equal(isLoopbackHost("127.0.0.1"), true);
     assert.equal(isLoopbackHost("localhost"), true);
     assert.equal(isLoopbackHost("0.0.0.0"), false);
+  });
+
+  it("fails closed on malformed and cleartext remote PostgreSQL configuration", () => {
+    assert.throws(() => readConfig({ DATABASE_URL: "host=db dbname=parallax" }), /must be a PostgreSQL URL/);
+    assert.throws(() => readConfig({ DATABASE_URL: "postgres://u:p@db/parallax" }), /must verify PostgreSQL TLS/);
+    assert.throws(
+      () => readConfig({ PARALLAX_POWERDNS_DATABASE_URL: "postgres://u:p@powerdns/pdns?sslmode=prefer" }),
+      /PARALLAX_POWERDNS_DATABASE_URL must verify PostgreSQL TLS/,
+    );
+    assert.equal(readConfig({ DATABASE_URL: "postgres://u:p@localhost/parallax" }).databaseUrl, "postgres://u:p@localhost/parallax");
+    assert.equal(readConfig({
+      DATABASE_URL: "postgres://u:p@db/parallax",
+      PARALLAX_ALLOW_PLAINTEXT_POSTGRES: "true",
+    }).databaseUrl, "postgres://u:p@db/parallax");
+    assert.throws(
+      () => readConfig({ PARALLAX_ALLOW_PLAINTEXT_POSTGRES: "yes" }),
+      /must be true or false/,
+    );
   });
 
   it("takes a certificate and key together or not at all", () => {
@@ -135,6 +154,7 @@ describe("configuration", () => {
       host: "127.0.0.1",
       port: 5353,
       forwardTo: [],
+      forwardAllow: ["127.0.0.0/8", "::1/128"],
     });
   });
 
@@ -158,6 +178,39 @@ describe("configuration", () => {
       () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_TO: "#53" }),
       /contains an upstream with no host/,
     );
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_TO: "10.0.0.1#" }),
+      /contains an upstream with no port/,
+    );
     assert.throws(() => readConfig({ PARALLAX_DNS_PORT: "70000" }), /PARALLAX_DNS_PORT must be an integer/);
+  });
+
+  it("requires an explicit forwarding allowlist on a non-loopback DNS listener", () => {
+    assert.throws(
+      () => readConfig({
+        PARALLAX_DNS_PORT: "53",
+        PARALLAX_DNS_HOST: "0.0.0.0",
+        PARALLAX_DNS_FORWARD_TO: "1.1.1.1",
+      }),
+      /PARALLAX_DNS_FORWARD_ALLOW must explicitly name/,
+    );
+    assert.deepEqual(readConfig({
+      PARALLAX_DNS_PORT: "53",
+      PARALLAX_DNS_HOST: "0.0.0.0",
+      PARALLAX_DNS_FORWARD_TO: "1.1.1.1",
+      PARALLAX_DNS_FORWARD_ALLOW: "10.0.0.0/8, 2001:db8::/32",
+    }).dns?.forwardAllow, ["10.0.0.0/8", "2001:db8::/32"]);
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_ALLOW: "10.0.0.0/99" }),
+      /invalid prefix/,
+    );
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_ALLOW: "10.0.0.0/" }),
+      /invalid prefix/,
+    );
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_ALLOW: "not-an-address" }),
+      /invalid address/,
+    );
   });
 });

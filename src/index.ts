@@ -11,7 +11,8 @@ import { createDnsServer, type ServedZone } from "./dns/server.ts";
 import { servedZones } from "./dns/snapshot.ts";
 import { createNodeHandler, requestOrigin } from "./http/api.ts";
 import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.ts";
-import { unservedTargets } from "./http/readiness.ts";
+import { createReadinessMonitor } from "./http/readiness.ts";
+import { redirectLocation } from "./http/redirect.ts";
 import { createRuntime } from "./runtime.ts";
 import { authenticate, type SecurityConfig } from "./security/http-authorization.ts";
 
@@ -34,7 +35,23 @@ try {
   process.exit(1);
 }
 
-const { controlPlane, settings: settingsService, accessTokens, provider } = runtime;
+const { controlPlane, settings: settingsService, accessTokens, credentials, provider } = runtime;
+const readiness = createReadinessMonitor(
+  () => controlPlane.listZones(),
+  (target) => provider.isConfigured(target),
+  config.dns !== undefined,
+  {
+    configurationRevision: () => provider.configurationRevision(),
+    forwardsEmptyInternalViews: (config.dns?.forwardTo.length ?? 0) > 0,
+    onZones: (zones) => {
+      if (!config.dns) return;
+      const next = servedZones(zones, (zone, reason) => {
+        console.error(`parallax: not answering for ${zone}, its internal view could not be composed: ${reason}`);
+      });
+      dnsSnapshot = next;
+    },
+  },
+);
 
 if (!accessTokens.security().enabled && !isLoopbackHost(config.host)) {
   console.error("parallax: refusing to serve a non-loopback address with no access token. Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.");
@@ -44,6 +61,33 @@ if (!accessTokens.security().enabled && !isLoopbackHost(config.host)) {
 accessTokens.startRefreshing(undefined, (error) => {
   console.error(`parallax: could not refresh access tokens: ${error instanceof Error ? error.message : "unknown error"}`);
 });
+settingsService.startRefreshing(undefined, (error) => {
+  console.error(`parallax: could not refresh settings: ${error instanceof Error ? error.message : "unknown error"}`);
+});
+credentials?.startRefreshing(undefined, (error) => {
+  console.error(`parallax: could not refresh provider credentials: ${error instanceof Error ? error.message : "unknown error"}`);
+});
+
+const refreshDesiredState = (): void => {
+  void readiness.refresh().catch((error: unknown) => {
+    // DNS keeps its last known-good snapshot, while readiness fails closed.
+    console.error(`parallax: desired state could not be refreshed: ${error instanceof Error ? error.message : "unknown error"}`);
+  });
+};
+try {
+  // One startup scan feeds both readiness and DNS so neither can initially
+  // claim success from an empty or unchecked snapshot.
+  await readiness.refresh();
+} catch (error) {
+  console.error(`parallax: the desired state could not be read: ${error instanceof Error ? error.message : "unknown error"}`);
+  if (config.dns) process.exit(1);
+}
+runtime.onZoneChange(() => {
+  readiness.invalidate();
+  refreshDesiredState();
+});
+const desiredStateTimer = setInterval(refreshDesiredState, DNS_REFRESH_MS);
+desiredStateTimer.unref();
 
 // Signing in through an identity provider, when one is configured. It sits
 // ahead of the API because it is how a caller with no credential acquires one.
@@ -179,13 +223,9 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
   if (pathname === "/health/ready") {
     try {
-      const zones = await controlPlane.listZones();
-      const missingTargets = unservedTargets(
-        zones,
-        (target) => provider.isConfigured(target),
-        config.dns !== undefined,
-      );
-      if (missingTargets.length > 0) throw new Error("provider configuration is incomplete");
+      const tokenReadiness = accessTokens.readiness();
+      if (!tokenReadiness.ready) throw new Error("access-token cache is stale");
+      if (!readiness.ready()) throw new Error("provider configuration is incomplete");
       response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       // Backend and provider details describe the deployment, so only an
       // authenticated caller receives them.
@@ -202,6 +242,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
           dns: config.dns
             ? { port: config.dns.port, zones: dnsSnapshot.length, forwarding: config.dns.forwardTo.length > 0 }
             : "disabled",
+          accessTokens: tokenReadiness,
         }
         : { status: "ready", service: "parallax" }));
     } catch {
@@ -294,29 +335,25 @@ server.keepAliveTimeout = 10_000;
  * arrives over TLS, and anything else it could do would be reachable without
  * one.
  *
- * `publicOrigin` is the answer when an administrator set one. Without it the
- * host the client asked for is used and the port is left implied, because the
- * port this process bound is not the port the client reached it on: a Kubernetes
- * Service or a published container port maps one to the other, and that mapping
- * is invisible from in here. Naming the bound port would send clients to a port
- * nothing answers on -- in exactly the deployments this listener exists for.
+ * `publicOrigin` is mandatory for this listener. A request's Host header is
+ * untrusted input and must never choose the redirect destination.
  */
 if (config.httpRedirectPort !== undefined) {
   const redirector = createServer((request, response) => {
     setSecurityHeaders(response);
-    const configured = settingsService.current().publicOrigin;
-    const host = (request.headers.host ?? "").split(":")[0] || config.host;
-    const origin = configured || `https://${host}`;
-    response.writeHead(308, { location: `${origin}${request.url ?? "/"}`, "cache-control": "no-store" });
+    const origin = settingsService.current().publicOrigin;
+    if (!origin) {
+      response.writeHead(503, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+      response.end("redirect origin unavailable\n");
+      return;
+    }
+    response.writeHead(308, { location: redirectLocation(origin, request.url), "cache-control": "no-store" });
     response.end();
   });
   redirector.headersTimeout = 15_000;
   redirector.requestTimeout = 15_000;
   redirector.listen(config.httpRedirectPort, config.host, () => {
     console.log(`parallax: redirecting http://${config.host}:${config.httpRedirectPort} to TLS`);
-    if (!settingsService.current().publicOrigin) {
-      console.warn("parallax: no publicOrigin is set, so redirects assume TLS on 443 at the requested host. Set it if clients reach this deployment at any other address.");
-    }
   });
 }
 
@@ -324,10 +361,9 @@ if (config.httpRedirectPort !== undefined) {
  * Answers DNS for the internal view out of the desired state, when a port is
  * configured.
  *
- * The snapshot is re-read on a timer rather than on a change, because the
- * control plane commits through a repository and has no event to subscribe to.
- * The cost is stated rather than hidden: a published override takes effect
- * here within one refresh, and a record's own TTL is the longer wait anyway.
+ * A local durable commit invalidates and refreshes the snapshot immediately;
+ * the timer covers another replica or CLI process. Both triggers share one
+ * background scan, which also feeds the constant-time readiness cache.
  *
  * Nothing here reconciles. This listener answers from the desired state
  * directly, which is why it does not conflict with the CoreDNS or PowerDNS
@@ -338,37 +374,10 @@ if (config.httpRedirectPort !== undefined) {
  */
 if (config.dns) {
   const dnsConfig = config.dns;
-  const refresh = async (): Promise<void> => {
-    const zones = await controlPlane.listZones();
-    dnsSnapshot = servedZones(zones, (zone, reason) => {
-      console.error(`parallax: not answering for ${zone}, its internal view could not be composed: ${reason}`);
-    });
-  };
-  try {
-    // Loaded before the port is bound, so the first query is not answered out
-    // of an empty snapshot -- which would be NXDOMAIN for every managed name.
-    await refresh();
-  } catch (error) {
-    console.error(`parallax: the DNS listener could not read the desired state: ${error instanceof Error ? error.message : "unknown error"}`);
-    process.exit(1);
-  }
-  const reread = (): void => {
-    void refresh().catch((error: unknown) => {
-      // The last good snapshot keeps answering. A store that is briefly
-      // unreachable must not turn into NXDOMAIN for every internal name.
-      console.error(`parallax: keeping the last DNS snapshot, the desired state could not be re-read: ${error instanceof Error ? error.message : "unknown error"}`);
-    });
-  };
-  // A change committed here is served at once. The timer stays because it is
-  // what covers every writer this process cannot see: a second instance sharing
-  // a database, or the command line writing to the same file.
-  runtime.onZoneChange(reread);
-  const timer = setInterval(reread, DNS_REFRESH_MS);
-  timer.unref();
-
   const dns = createDnsServer({
     zones: () => dnsSnapshot,
     forwardTo: dnsConfig.forwardTo,
+    forwardAllow: dnsConfig.forwardAllow,
     onUnservable: (record) => {
       // Stored content the domain accepted and the wire cannot carry. The
       // query was answered SERVFAIL, so this line is the only place it is said.
@@ -400,5 +409,8 @@ server.listen(config.port, config.host, () => {
   }
   if (config.databaseUrl && usesPlaintextPostgres(config.databaseUrl)) {
     console.warn("parallax: DATABASE_URL does not request TLS; zone data and audit history cross the network in cleartext. Append ?sslmode=verify-full unless PostgreSQL is reached over a trusted local socket.");
+  }
+  if (config.powerDnsDatabaseUrl && usesPlaintextPostgres(config.powerDnsDatabaseUrl)) {
+    console.warn("parallax: PARALLAX_POWERDNS_DATABASE_URL does not request TLS; DNS state crosses the network in cleartext. Append ?sslmode=verify-full unless PostgreSQL is reached over a trusted local socket.");
   }
 });

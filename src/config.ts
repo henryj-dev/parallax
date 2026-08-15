@@ -1,4 +1,6 @@
-import { MIN_TOKEN_BYTES, type Role, type TokenRecord } from "./security/http-authorization.ts";
+import { isIP } from "node:net";
+import { isStrongBootstrapToken } from "./application/access-tokens.ts";
+import type { Role, TokenRecord } from "./security/http-authorization.ts";
 
 /**
  * The environment carries only what cannot be read out of the store: where to
@@ -14,6 +16,8 @@ export interface ParallaxConfig {
   stateFile: string;
   /** Local provider state file, used only when the local provider is enabled. */
   providerStateFile: string;
+  /** Immutable deployment-owned root beneath which CoreDNS files may be written. */
+  coreDnsRoot?: string;
   /** Settings, credentials and tokens file used when no database is configured. */
   configurationFile: string;
   databaseUrl?: string;
@@ -51,6 +55,8 @@ export interface DnsListenerSettings {
   readonly port: number;
   /** Upstreams, `host` or `host#port`. Empty answers REFUSED instead of relaying. */
   readonly forwardTo: readonly string[];
+  /** Client networks allowed to use those upstreams. */
+  readonly forwardAllow: readonly string[];
 }
 
 export interface OidcSettings {
@@ -78,16 +84,30 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
   }
   const oidc = readOidc(environment);
   const dns = readDnsListener(environment);
+  const allowPlaintextPostgres = readOptIn(
+    environment.PARALLAX_ALLOW_PLAINTEXT_POSTGRES,
+    "PARALLAX_ALLOW_PLAINTEXT_POSTGRES",
+  );
+  const databaseUrl = readPostgresConnection(
+    environment.DATABASE_URL,
+    "DATABASE_URL",
+    allowPlaintextPostgres,
+  );
+  const powerDnsDatabaseUrl = readPostgresConnection(
+    environment.PARALLAX_POWERDNS_DATABASE_URL,
+    "PARALLAX_POWERDNS_DATABASE_URL",
+    allowPlaintextPostgres,
+  );
+  const coreDnsRoot = environment.PARALLAX_COREDNS_ROOT?.trim() || undefined;
   return {
     host: environment.HOST?.trim() || "127.0.0.1",
     port: readPort(environment.PORT),
     stateFile: environment.PARALLAX_STATE_FILE?.trim() || "data/parallax-state.json",
     providerStateFile: environment.PARALLAX_PROVIDER_STATE_FILE?.trim() || "data/provider-state.json",
     configurationFile: environment.PARALLAX_CONFIG_FILE?.trim() || "data/parallax-config.json",
-    ...(environment.DATABASE_URL?.trim() ? { databaseUrl: environment.DATABASE_URL.trim() } : {}),
-    ...(environment.PARALLAX_POWERDNS_DATABASE_URL?.trim()
-      ? { powerDnsDatabaseUrl: environment.PARALLAX_POWERDNS_DATABASE_URL.trim() }
-      : {}),
+    ...(databaseUrl ? { databaseUrl } : {}),
+    ...(powerDnsDatabaseUrl ? { powerDnsDatabaseUrl } : {}),
+    ...(coreDnsRoot ? { coreDnsRoot } : {}),
     ...(ownershipSecret ? { ownershipSecret } : {}),
     ...(credentialMasterKey ? { credentialMasterKey } : {}),
     bootstrapTokens: readBootstrapTokens(environment.PARALLAX_AUTH_TOKENS),
@@ -107,6 +127,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
 function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | undefined {
   const port = environment.PARALLAX_DNS_PORT?.trim();
   if (!port) return undefined;
+  const host = environment.PARALLAX_DNS_HOST?.trim() || environment.HOST?.trim() || "127.0.0.1";
   const forwardTo = (environment.PARALLAX_DNS_FORWARD_TO ?? "")
     .split(",")
     .map((upstream) => upstream.trim())
@@ -114,13 +135,43 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
   for (const upstream of forwardTo) {
     const [host, upstreamPort] = upstream.split("#") as [string, string | undefined];
     if (!host) throw new Error(`PARALLAX_DNS_FORWARD_TO contains an upstream with no host: ${upstream}`);
-    if (upstreamPort !== undefined) readPort(upstreamPort, `PARALLAX_DNS_FORWARD_TO (${upstream})`);
+    if (upstreamPort !== undefined) {
+      if (!upstreamPort) throw new Error(`PARALLAX_DNS_FORWARD_TO contains an upstream with no port: ${upstream}`);
+      readPort(upstreamPort, `PARALLAX_DNS_FORWARD_TO (${upstream})`);
+    }
   }
+  const explicitForwardAllow = environment.PARALLAX_DNS_FORWARD_ALLOW?.trim();
+  if (forwardTo.length > 0 && !isLoopbackHost(host) && !explicitForwardAllow) {
+    throw new Error("PARALLAX_DNS_FORWARD_ALLOW must explicitly name the client CIDRs allowed to recurse when the DNS listener is not loopback");
+  }
+  const forwardAllow = readDnsClientCidrs(explicitForwardAllow || "127.0.0.0/8,::1/128");
   return {
-    host: environment.PARALLAX_DNS_HOST?.trim() || environment.HOST?.trim() || "127.0.0.1",
+    host,
     port: readPort(port, "PARALLAX_DNS_PORT"),
     forwardTo,
+    forwardAllow,
   };
+}
+
+function readDnsClientCidrs(source: string): string[] {
+  return source.split(",").map((entry) => entry.trim()).filter(Boolean).map((entry) => {
+    const slash = entry.lastIndexOf("/");
+    const address = slash < 0 ? entry : entry.slice(0, slash);
+    const family = isIP(address);
+    if (family === 0) throw new Error(`PARALLAX_DNS_FORWARD_ALLOW contains an invalid address: ${entry}`);
+    if (slash >= 0) {
+      const prefixText = entry.slice(slash + 1);
+      if (!/^\d{1,3}$/u.test(prefixText)) {
+        throw new Error(`PARALLAX_DNS_FORWARD_ALLOW contains an invalid prefix: ${entry}`);
+      }
+      const prefix = Number(prefixText);
+      const bits = family === 4 ? 32 : 128;
+      if (!Number.isInteger(prefix) || prefix < 0 || prefix > bits) {
+        throw new Error(`PARALLAX_DNS_FORWARD_ALLOW contains an invalid prefix: ${entry}`);
+      }
+    }
+    return entry;
+  });
 }
 
 /**
@@ -215,8 +266,8 @@ function readBootstrapTokens(source: string | undefined): TokenRecord[] {
     if (!isObject(item) || typeof item.token !== "string" || typeof item.subject !== "string" || !isRole(item.role)) {
       throw new Error("PARALLAX_AUTH_TOKENS contains an invalid token record");
     }
-    if (Buffer.byteLength(item.token, "utf8") < MIN_TOKEN_BYTES) {
-      throw new Error(`PARALLAX_AUTH_TOKENS entries must contain at least ${MIN_TOKEN_BYTES} bytes; generate one with: openssl rand -base64 32`);
+    if (!isStrongBootstrapToken(item.token)) {
+      throw new Error("PARALLAX_AUTH_TOKENS entries must be 32 random bytes in canonical base64url form; generate one with: openssl rand -base64 32 | tr '+/' '-_' | tr -d '='");
     }
     return { token: item.token, subject: item.subject, role: item.role };
   });
@@ -238,13 +289,43 @@ function readPort(value: string | undefined, name = "PORT"): number {
 export function usesPlaintextPostgres(connectionString: string): boolean {
   try {
     const url = new URL(connectionString);
+    if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") return true;
     const mode = url.searchParams.get("sslmode");
     const ssl = url.searchParams.get("ssl");
     if (ssl === "true" || ssl === "1") return false;
-    return mode === null || mode === "disable" || mode === "allow" || mode === "prefer";
+    return mode !== "verify-ca" && mode !== "verify-full";
   } catch {
-    return false;
+    return true;
   }
+}
+
+function readPostgresConnection(
+  source: string | undefined,
+  name: string,
+  allowPlaintext: boolean,
+): string | undefined {
+  const connectionString = source?.trim();
+  if (!connectionString) return undefined;
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    throw new Error(`${name} must be a PostgreSQL URL, not a libpq keyword connection string`);
+  }
+  if ((url.protocol !== "postgres:" && url.protocol !== "postgresql:") || !url.hostname) {
+    throw new Error(`${name} must be a PostgreSQL URL with a host`);
+  }
+  if (usesPlaintextPostgres(connectionString) && !isLoopbackHost(url.hostname) && !allowPlaintext) {
+    throw new Error(`${name} must verify PostgreSQL TLS with sslmode=verify-full (or verify-ca); set PARALLAX_ALLOW_PLAINTEXT_POSTGRES=true only for a separately protected network`);
+  }
+  return connectionString;
+}
+
+function readOptIn(source: string | undefined, name: string): boolean {
+  if (source === undefined || source.trim() === "") return false;
+  if (source.trim() === "true") return true;
+  if (source.trim() === "false") return false;
+  throw new Error(`${name} must be true or false`);
 }
 
 export function isLoopbackHost(value: string): boolean {

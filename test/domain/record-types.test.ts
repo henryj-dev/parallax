@@ -56,4 +56,39 @@ describe("record types", () => {
       },
     );
   });
+
+  it("rejects zone-file control characters, structural tokens and directives in raw RDATA", () => {
+    const vulnerable = {
+      CAA: '0 issue "letsencrypt.org"',
+      HINFO: '"Intel" "Linux"',
+      HTTPS: "1 . alpn=h2,h3",
+      NAPTR: '100 10 "s" "SIP+D2U" "" _sip._udp.example.com',
+      SVCB: "1 svc.example.net alpn=h2",
+      URI: '10 1 "https://example.com/"',
+    } as const;
+    for (const [type, content] of Object.entries(vulnerable)) {
+      for (const suffix of [
+        "\n@ 60 IN A 6.6.6.6",
+        "\r\n$INCLUDE /etc/passwd",
+        "; injected comment",
+        " ($ORIGIN attacker.example)",
+        "\u0000",
+      ]) {
+        assert.throws(
+          () => createDesiredRecord("probe", { name: "probe", type, content: `${content}${suffix}`, ttl: 300 }),
+          DomainValidationError,
+          `${type} accepted ${JSON.stringify(suffix)}`,
+        );
+      }
+    }
+
+    // TXT is quoted by the CoreDNS adapter, so an ordinary semicolon remains
+    // data; raw control characters are still rejected at the common boundary.
+    assert.equal(createDesiredRecord("txt", {
+      name: "@", type: "TXT", content: "v=DMARC1; p=none", ttl: 300,
+    }).content, "v=DMARC1; p=none");
+    assert.throws(() => createDesiredRecord("txt", {
+      name: "@", type: "TXT", content: "first\nsecond", ttl: 300,
+    }), DomainValidationError);
+  });
 });

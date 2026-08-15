@@ -55,6 +55,21 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
   /** Optimistic concurrency: refuse the write if the zone moved on. */
   const ifMatch = (revision) => (revision ? { "If-Match": `"${revision}"` } : {});
 
+  async function listAllZones() {
+    const zones = [];
+    let offset = 0;
+    for (;;) {
+      const page = await request(`/zones?limit=500&offset=${offset}`);
+      if (!page || !Array.isArray(page.zones)) throw new ApiError("invalid zone page", 502);
+      zones.push(...page.zones);
+      if (!page.hasMore) return { zones };
+      // A page that claims there is more but advances nothing would otherwise
+      // spin the portal forever on a malformed or mismatched server response.
+      if (page.zones.length === 0) throw new ApiError("zone pagination did not advance", 502);
+      offset += page.zones.length;
+    }
+  }
+
   return {
     /** Outside the API root: reports whether this deployment requires a token. */
     async authenticationMode() {
@@ -70,7 +85,7 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     createSession: (token) => request("/session", { method: "POST", body: { token } }),
     deleteSession: () => request("/session", { method: "DELETE" }),
 
-    listZones: () => request("/zones"),
+    listZones: listAllZones,
     getZone: (zone) => request(zonePath(zone)),
     createZone: (name) => request("/zones", { method: "POST", body: { name } }),
     replaceDesired: (zone, desired, revision) =>
@@ -108,7 +123,7 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     issueToken: (body) => request("/tokens", { method: "POST", body }),
     revokeToken: (id) => request(`/tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
-    /** Runs any command the CLI exposes, for anything without a dedicated route. */
+    /** Runs any serving command without a dedicated route; schema migration is local-CLI only. */
     runCommand: (argv) => request("/cli", { method: "POST", body: { argv } }),
   };
 }

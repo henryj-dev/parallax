@@ -8,7 +8,12 @@ import {
 import { ConflictError, NotFoundError } from "../../src/application/control-plane.ts";
 import { readConfig } from "../../src/config.ts";
 import { DomainValidationError } from "../../src/domain/dns.ts";
-import { createMigrationRuntime, createRuntime, RuntimeStartupError } from "../../src/runtime.ts";
+import {
+  createMigrationRuntime,
+  createRuntime,
+  createSettingsRecoveryRuntime,
+  RuntimeStartupError,
+} from "../../src/runtime.ts";
 import { MIGRATION_TARGETS, type MigrationTarget } from "../../src/infrastructure/migrations.ts";
 
 const argv = process.argv.slice(2);
@@ -29,9 +34,14 @@ try {
   const invocation = parseInvocation(invocationArgv);
   // Migrating is the one command that runs against a store it cannot read yet,
   // so it gets a connection and nothing that would read through it.
+  const config = readConfig();
   runtime = invocation.name === "migrate"
-    ? createMigrationRuntime(readConfig(), migrationTarget(invocation.input))
-    : await createRuntime(readConfig());
+    ? createMigrationRuntime(config, migrationTarget(invocation.input))
+    // A machine-specific stored setting can make the serving runtime fail
+    // closed. Keep a deliberately narrow local-CLI path available to repair it.
+    : invocation.name === "settings set"
+      ? createSettingsRecoveryRuntime(config)
+      : await createRuntime(config);
   // The command line reaches the store directly, so it acts with full rights;
   // HTTP callers are restricted by the role their token carries.
   const result = await runCommand({ runtime, actor: actorName(), role: "admin" }, invocation.name, invocation.input);
