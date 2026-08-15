@@ -65,9 +65,16 @@ export function readOwnershipComment(
 }
 
 function readVersion3(comment: string, secret: string, target: string): { recordId: string } | undefined {
-  const match = new RegExp(`(?:^|\\s)${V3}:([a-z0-9_-]+):([A-Za-z0-9_-]+)(?:$|\\s)`).exec(comment);
-  if (!match?.[1] || !match[2]) return undefined;
-  return matches(sign(target, match[1], secret), match[2]) ? { recordId: match[1] } : undefined;
+  const candidates = comment.matchAll(new RegExp(
+    `(?:^|\\s)${V3}:([a-z0-9_-]+):([A-Za-z0-9_-]+)(?=$|\\s)`,
+    "g",
+  ));
+  for (const match of candidates) {
+    const recordId = match[1];
+    const signature = match[2];
+    if (recordId && signature && matches(sign(target, recordId, secret), signature)) return { recordId };
+  }
+  return undefined;
 }
 
 /**
@@ -77,16 +84,22 @@ function readVersion3(comment: string, secret: string, target: string): { record
  * rewritten as version 3 the next time it changes.
  */
 function readVersion2(comment: string, secret: string, target: string): { recordId: string } | undefined {
-  const match = new RegExp(`(?:^|\\s)${V2}:([A-Za-z0-9_-]+):([A-Za-z0-9_-]+):([A-Za-z0-9_-]+)(?:$|\\s)`).exec(comment);
-  if (!match?.[1] || !match[2] || !match[3]) return undefined;
-  try {
-    const written = decode(match[1]);
-    if (written !== target) return undefined;
-    const recordId = decode(match[2]);
-    return matches(sign(written, recordId, secret), match[3]) ? { recordId } : undefined;
-  } catch {
-    return undefined;
+  const candidates = comment.matchAll(new RegExp(
+    `(?:^|\\s)${V2}:([A-Za-z0-9_-]+):([A-Za-z0-9_-]+):([A-Za-z0-9_-]+)(?=$|\\s)`,
+    "g",
+  ));
+  for (const match of candidates) {
+    if (!match[1] || !match[2] || !match[3]) continue;
+    try {
+      const written = decode(match[1]);
+      if (written !== target) continue;
+      const recordId = decode(match[2]);
+      if (matches(sign(written, recordId, secret), match[3])) return { recordId };
+    } catch {
+      // A malformed candidate must not hide a later valid marker.
+    }
   }
+  return undefined;
 }
 
 function matches(expected: string, actual: string): boolean {

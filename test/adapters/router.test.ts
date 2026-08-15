@@ -39,11 +39,50 @@ describe("RoutingProviderAdapter", () => {
     assert.equal(router.isConfigured("unconfigured.example/external"), true);
   });
 
+  it("does not let a fallback absorb a zone whose explicit binding was removed", async () => {
+    const external = new SpyAdapter();
+    const fallback = new SpyAdapter();
+    const router = new RoutingProviderAdapter({ external: { "example.com": external }, fallback });
+    assert.equal(router.unregisterExternal("example.com"), true);
+
+    assert.equal(router.isConfigured("example.com/external"), false);
+    await assert.rejects(() => router.list("example.com/external"), /no provider is configured/i);
+    assert.deepEqual(fallback.targets, []);
+  });
+
+  it("can scope a local fallback to the internal view", async () => {
+    const fallback = new SpyAdapter();
+    const router = new RoutingProviderAdapter();
+    router.setFallback(fallback, ["internal"]);
+
+    await router.list("example.com/internal");
+    await assert.rejects(() => router.list("example.com/external"), /no provider is configured/i);
+    assert.deepEqual(fallback.targets, ["example.com/internal"]);
+  });
+
   it("reports missing production routes without probing a provider", () => {
     const router = new RoutingProviderAdapter({ external: { "example.com": new SpyAdapter() } });
     assert.equal(router.isConfigured("example.com/external"), true);
     assert.equal(router.isConfigured("example.com/internal"), false);
     assert.equal(router.isConfigured("other.example/external"), false);
+  });
+
+  it("revisions only configuration changes that can alter readiness", () => {
+    const router = new RoutingProviderAdapter();
+    const internalRevision = router.configurationRevision();
+    router.setInternal(new SpyAdapter());
+    assert.equal(router.configurationRevision(), internalRevision + 1);
+
+    const replacementRevision = router.configurationRevision();
+    router.setInternal(new SpyAdapter());
+    assert.equal(router.configurationRevision(), replacementRevision, "adapter replacement stays configured");
+
+    router.registerExternal("example.com", new SpyAdapter());
+    const externalRevision = router.configurationRevision();
+    router.registerExternal("example.com", new SpyAdapter());
+    assert.equal(router.configurationRevision(), externalRevision, "credential rotation stays configured");
+    router.unregisterExternal("example.com");
+    assert.equal(router.configurationRevision(), externalRevision + 1);
   });
 
   it("rejects malformed or unsupported targets", async () => {

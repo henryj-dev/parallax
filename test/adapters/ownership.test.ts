@@ -64,6 +64,17 @@ describe("ownership marker", () => {
     assert.deepEqual(readOwnershipComment(` ${legacy} `, SECRET, target), { recordId: "www" });
   });
 
+  it("finds a valid marker after malformed or forged decoys", () => {
+    const target = "example.com/internal";
+    const current = ownershipComment(target, "current", SECRET);
+    const legacy = version2(target, "legacy");
+    const forgedV3 = `parallax-managed:v3:decoy:${"A".repeat(43)}`;
+    const forgedV2 = `parallax-managed:v2:${"A".repeat(8)}:${"B".repeat(8)}:${"C".repeat(43)}`;
+
+    assert.deepEqual(readOwnershipComment(`${forgedV3} operator-note ${current}`, SECRET, target), { recordId: "current" });
+    assert.deepEqual(readOwnershipComment(`${forgedV2} ${legacy}`, SECRET, target), { recordId: "legacy" });
+  });
+
   it("writes the current format", () => {
     assert.match(ownershipComment("example.com/external", "www", SECRET), /^parallax-managed:v3:www:/);
   });

@@ -10,32 +10,57 @@ export interface RoutingProviderAdapterOptions {
 /** Dispatches split-horizon targets to their configured provider implementations. */
 export class RoutingProviderAdapter implements ProviderAdapter {
   readonly #external = new Map<string, ProviderAdapter>();
+  readonly #quarantinedExternal = new Set<string>();
   #internal?: ProviderAdapter;
   #fallback?: ProviderAdapter;
+  #fallbackViews = new Set<"internal" | "external">();
+  #configurationRevision = 0;
 
   constructor(options: RoutingProviderAdapterOptions = {}) {
     this.#internal = options.internal;
     this.#fallback = options.fallback;
+    if (options.fallback) this.#fallbackViews = new Set(["internal", "external"]);
     const entries = options.external instanceof Map ? options.external.entries() : Object.entries(options.external ?? {});
     for (const [zone, adapter] of entries) this.registerExternal(zone, adapter);
   }
 
   /** Swaps the internal-view adapter, so a settings change needs no restart. */
   setInternal(adapter: ProviderAdapter | undefined): void {
+    const before = this.isConfigured("readiness.invalid/internal");
     this.#internal = adapter;
+    if (before !== this.isConfigured("readiness.invalid/internal")) this.#configurationRevision += 1;
   }
 
   /** Swaps the adapter used when no specific one is configured for a target. */
-  setFallback(adapter: ProviderAdapter | undefined): void {
+  setFallback(adapter: ProviderAdapter | undefined, views: readonly ("internal" | "external")[] = ["internal", "external"]): void {
+    const before = this.#representativeConfiguration();
     this.#fallback = adapter;
+    this.#fallbackViews = adapter ? new Set(views) : new Set();
+    if (before !== this.#representativeConfiguration()) this.#configurationRevision += 1;
   }
 
   registerExternal(zone: string, adapter: ProviderAdapter): void {
-    this.#external.set(normalizeZone(zone), adapter);
+    const normalized = normalizeZone(zone);
+    const target = `${normalized}/external`;
+    const before = this.isConfigured(target);
+    this.#external.set(normalized, adapter);
+    this.#quarantinedExternal.delete(normalized);
+    if (before !== this.isConfigured(target)) this.#configurationRevision += 1;
   }
 
   unregisterExternal(zone: string): boolean {
-    return this.#external.delete(normalizeZone(zone));
+    const normalized = normalizeZone(zone);
+    const target = `${normalized}/external`;
+    const before = this.isConfigured(target);
+    const removed = this.#external.delete(normalized);
+    if (removed) this.#quarantinedExternal.add(normalized);
+    if (before !== this.isConfigured(target)) this.#configurationRevision += 1;
+    return removed;
+  }
+
+  /** Changes only when some target's configured/unconfigured answer may change. */
+  configurationRevision(): number {
+    return this.#configurationRevision;
   }
 
   isConfigured(target: string): boolean {
@@ -45,8 +70,10 @@ export class RoutingProviderAdapter implements ProviderAdapter {
     } catch {
       return false;
     }
-    return (parsed.view === "external" ? this.#external.has(parsed.zone) : this.#internal !== undefined)
-      || this.#fallback !== undefined;
+    const explicit = parsed.view === "external" ? this.#external.has(parsed.zone) : this.#internal !== undefined;
+    return explicit || (this.#fallback !== undefined
+      && this.#fallbackViews.has(parsed.view)
+      && !(parsed.view === "external" && this.#quarantinedExternal.has(parsed.zone)));
   }
 
   async list(target: string) {
@@ -59,10 +86,16 @@ export class RoutingProviderAdapter implements ProviderAdapter {
     await route.adapter.apply(route.target, operation);
   }
 
+  #representativeConfiguration(): string {
+    return `${this.isConfigured("readiness.invalid/internal")}:${this.isConfigured("readiness.invalid/external")}`;
+  }
+
   #route(target: string): { adapter: ProviderAdapter; target: string } {
     const parsed = parseTarget(target);
     const adapter = parsed.view === "external" ? this.#external.get(parsed.zone) : this.#internal;
-    const selected = adapter ?? this.#fallback;
+    const fallbackAllowed = this.#fallbackViews.has(parsed.view)
+      && !(parsed.view === "external" && this.#quarantinedExternal.has(parsed.zone));
+    const selected = adapter ?? (fallbackAllowed ? this.#fallback : undefined);
     if (!selected) throw new ProviderNotConfiguredError(`no provider is configured for ${parsed.target}`);
     return { adapter: selected, target: parsed.target };
   }

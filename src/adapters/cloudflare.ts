@@ -192,9 +192,10 @@ export async function resolveZoneId(options: ResolveZoneIdOptions): Promise<stri
 
   const payload = await readJson(response);
   if (response.status === 403) {
-    // Distinct from "not found" because the operator's next step differs: grant
-    // the permission, rather than check which account holds the domain.
-    throw new ZoneLookupForbiddenError(`this token cannot look up zones. Grant it Zone -> Zone -> Read, or the zone id for ${name} cannot be found automatically`);
+    // Cloudflare uses the same status for a token it rejects and one that is
+    // valid but lacks Zone Read. Do not claim to distinguish those cases when
+    // the response does not provide trustworthy evidence for doing so.
+    throw new ZoneLookupForbiddenError(`this token is invalid or cannot look up zones. Verify it, then grant Zone -> Zone -> Read so the zone id for ${name} can be found automatically`);
   }
   if (!response.ok || payload.success !== true) {
     throw new Error(`Cloudflare API request failed while looking up ${name} (HTTP ${response.status})`);

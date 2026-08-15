@@ -1,4 +1,4 @@
-import type { ProviderAdapter } from "../application/ports.ts";
+import { ProviderConstraintError, type ProviderAdapter } from "../application/ports.ts";
 import { RECORD_TYPES, type DesiredRecord, type RecordType } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 import type { CloseablePgPool, PgClient } from "../infrastructure/postgres.ts";
@@ -75,20 +75,27 @@ export class PowerDnsProviderAdapter implements ProviderAdapter {
     try {
       await client.query("BEGIN");
       const domainId = await this.#domainId(client, zone);
+      await this.#assertUnsigned(client, domainId, zone);
       if (operation.kind === "delete") {
         // The cascade removes the marker with the row, so nothing has to be
         // deleted twice or can be left behind if this fails halfway.
-        await this.#assertOwned(client, target, operation.providerId);
-        await client.query("DELETE FROM records WHERE id = $1", [Number(operation.providerId)]);
+        const providerId = readProviderId(operation.providerId);
+        await this.#assertOwned(client, target, domainId, providerId);
+        const deleted = await client.query("DELETE FROM records WHERE id = $1 AND domain_id = $2", [providerId, domainId]);
+        if (deleted.rowCount !== 1) throw new Error(`PowerDNS record ${providerId} disappeared before deletion`);
       } else if (operation.kind === "update") {
-        await this.#assertOwned(client, target, operation.providerId);
-        await client.query(
-          "UPDATE records SET name = $2, type = $3, content = $4, ttl = $5 WHERE id = $1",
-          [Number(operation.providerId), absoluteName(operation.desired.name, zone), operation.desired.type,
-            toStoredContent(operation.desired), operation.desired.ttl],
+        const providerId = readProviderId(operation.providerId);
+        await this.#assertOwned(client, target, domainId, providerId);
+        const updated = await client.query(
+          `UPDATE records
+              SET name = $3, type = $4, content = $5, ttl = $6, auth = $7, ordername = NULL
+            WHERE id = $1 AND domain_id = $2`,
+          [providerId, domainId, absoluteName(operation.desired.name, zone), operation.desired.type,
+            toStoredContent(operation.desired), operation.desired.ttl, isAuthoritative(operation.desired)],
         );
+        if (updated.rowCount !== 1) throw new Error(`PowerDNS record ${providerId} disappeared before update`);
         await client.query("UPDATE parallax_powerdns_ownership SET marker = $2 WHERE record_id = $1",
-          [Number(operation.providerId), ownershipComment(target, operation.desired.id, this.#ownershipSecret)]);
+          [providerId, ownershipComment(target, operation.desired.id, this.#ownershipSecret)]);
       } else {
         const { rows } = await client.query(
           `INSERT INTO records (domain_id, name, type, content, ttl, disabled, auth)
@@ -96,7 +103,7 @@ export class PowerDnsProviderAdapter implements ProviderAdapter {
           [domainId, absoluteName(operation.desired.name, zone), operation.desired.type,
             toStoredContent(operation.desired), operation.desired.ttl, isAuthoritative(operation.desired)],
         );
-        const id = asId(rows[0]);
+        const id = asProviderId(rows[0]);
         if (id === undefined) throw new Error("PowerDNS did not return an id for the inserted record");
         await client.query("INSERT INTO parallax_powerdns_ownership (record_id, marker) VALUES ($1, $2)",
           [id, ownershipComment(target, operation.desired.id, this.#ownershipSecret)]);
@@ -113,7 +120,7 @@ export class PowerDnsProviderAdapter implements ProviderAdapter {
 
   async #domainId(client: PgClient, zone: string): Promise<number> {
     const { rows } = await client.query("SELECT id FROM domains WHERE lower(name) = $1", [zone]);
-    const id = asId(rows[0]);
+    const id = asSafeId(rows[0]);
     if (id === undefined) throw new Error(`PowerDNS has no zone named ${zone}`);
     return id;
   }
@@ -123,15 +130,43 @@ export class PowerDnsProviderAdapter implements ProviderAdapter {
    * different target -- a record published for another view is not this view's
    * to edit.
    */
-  async #assertOwned(client: PgClient, target: string, providerId: string): Promise<void> {
+  async #assertOwned(client: PgClient, target: string, domainId: number, providerId: string): Promise<void> {
     const { rows } = await client.query(
-      "SELECT marker FROM parallax_powerdns_ownership WHERE record_id = $1", [Number(providerId)]);
+      `SELECT o.marker
+         FROM parallax_powerdns_ownership o
+         JOIN records r ON r.id = o.record_id
+        WHERE o.record_id = $1 AND r.domain_id = $2
+        FOR UPDATE`,
+      [providerId, domainId]);
     const marker = rows[0] && typeof (rows[0] as { marker?: unknown }).marker === "string"
       ? (rows[0] as { marker: string }).marker
       : undefined;
     if (!readOwnershipComment(marker, this.#ownershipSecret, target)) {
       throw new Error(`PowerDNS record ${providerId} is not owned by target ${target}`);
     }
+  }
+
+  /**
+   * `ordername` depends on the zone's NSEC/NSEC3 mode and empty non-terminals.
+   * Guessing it in this direct-SQL adapter would silently corrupt denial proofs.
+   * Unsigned zones ignore the field; signed zones must use PowerDNS's API (with
+   * API-RECTIFY) or be changed through pdnsutil, both of which know the mode.
+   */
+  async #assertUnsigned(client: PgClient, domainId: number, zone: string): Promise<void> {
+    const { rows } = await client.query<{ signed?: unknown }>(
+      `SELECT
+         EXISTS (SELECT 1 FROM cryptokeys WHERE domain_id = $1 AND active = true)
+         OR EXISTS (
+           SELECT 1
+             FROM domainmetadata
+            WHERE domain_id = $1 AND kind = 'PRESIGNED' AND content = '1'
+         ) AS signed`,
+      [domainId],
+    );
+    if (rows[0]?.signed === true) {
+      throw new ProviderConstraintError(`PowerDNS zone ${zone} is DNSSEC-signed; direct SQL changes are refused because ordername requires zone rectification`);
+    }
+    if (rows[0]?.signed !== false) throw new Error("PowerDNS did not report whether the zone is DNSSEC-signed");
   }
 
   /**
@@ -148,7 +183,7 @@ export class PowerDnsProviderAdapter implements ProviderAdapter {
     const serial = Number(fields[2]);
     if (!Number.isSafeInteger(serial)) return;
     fields[2] = String(serial + 1);
-    await client.query("UPDATE records SET content = $2 WHERE id = $1", [row.id, fields.join(" ")]);
+    await client.query("UPDATE records SET content = $2 WHERE id = $1 AND domain_id = $3", [row.id, fields.join(" "), domainId]);
   }
 }
 
@@ -194,7 +229,7 @@ function fromStoredContent(type: RecordType, content: string): string {
 }
 
 interface Row {
-  id: number;
+  id: string;
   name: string;
   type: string;
   content: string;
@@ -205,18 +240,37 @@ interface Row {
 function asRow(value: unknown): Row | undefined {
   if (value === null || typeof value !== "object") return undefined;
   const row = value as Record<string, unknown>;
-  const id = asId(row);
+  const id = asProviderId(row);
   if (id === undefined || typeof row.name !== "string" || typeof row.type !== "string") return undefined;
   if (typeof row.content !== "string" || typeof row.ttl !== "number") return undefined;
   if (!SUPPORTED.includes(row.type as RecordType)) return undefined;
   return { id, name: row.name, type: row.type, content: row.content, ttl: row.ttl, marker: typeof row.marker === "string" ? row.marker : null };
 }
 
-function asId(value: unknown): number | undefined {
+function asSafeId(value: unknown): number | undefined {
   if (value === null || typeof value !== "object") return undefined;
   const id = (value as { id?: unknown }).id;
-  if (typeof id === "number" && Number.isSafeInteger(id)) return id;
-  // `pg` returns BIGINT as a string, which is what `records.id` is.
-  if (typeof id === "string" && /^\d+$/u.test(id)) return Number(id);
+  const parsed = typeof id === "string" && /^\d+$/u.test(id) ? Number(id) : id;
+  if (typeof parsed === "number" && Number.isSafeInteger(parsed) && parsed > 0) return parsed;
   return undefined;
+}
+
+/** Keeps BIGINT identifiers as decimal strings so values above 2^53 stay exact. */
+function asProviderId(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const id = (value as { id?: unknown }).id;
+  if (typeof id === "number") return Number.isSafeInteger(id) && id > 0 ? String(id) : undefined;
+  if (typeof id !== "string" || !/^\d+$/u.test(id)) return undefined;
+  try {
+    const canonical = BigInt(id).toString();
+    return canonical === "0" ? undefined : canonical;
+  } catch {
+    return undefined;
+  }
+}
+
+function readProviderId(value: string): string {
+  const parsed = asProviderId({ id: value });
+  if (!parsed) throw new Error("invalid PowerDNS provider id");
+  return parsed;
 }
