@@ -349,6 +349,29 @@ function renderPlan(state) {
   $("#apply-from-plan").disabled = operations.length === 0 && !state.dirty;
 }
 
+/**
+ * What a revision actually holds, so it can be read before it is restored.
+ *
+ * Restoring makes this snapshot the current intent and the next apply carries it
+ * out, so the question is not how old it is but whether what is written here
+ * should happen now. A count alone cannot answer that.
+ */
+function renderRevisionSnapshot(state) {
+  if (state.inspectedRevisionError) {
+    return `<div class="form-error">${escapeHtml(t("revisions.inspectFailed", { error: state.inspectedRevisionError }))}</div>`;
+  }
+  const views = state.inspectedRevision?.views ?? [];
+  const rows = views.flatMap((view) => (view.records ?? []).map((record) =>
+    `<tr><td>${escapeHtml(localizeViewName(view.name, t))}</td><td>${escapeHtml(displayName(record.name))}</td>`
+    + `<td>${escapeHtml(record.type)}</td><td class="revision-content">${escapeHtml(record.content)}</td>`
+    + `<td>${escapeHtml(String(record.ttl))}</td></tr>`));
+  if (rows.length === 0) return `<div class="mini-empty">${escapeHtml(t("revisions.snapshotEmpty"))}</div>`;
+  return `<div class="revision-snapshot"><table><thead><tr>`
+    + `<th>${escapeHtml(t("revisions.colView"))}</th><th>${escapeHtml(t("revisions.colName"))}</th>`
+    + `<th>${escapeHtml(t("revisions.colType"))}</th><th>${escapeHtml(t("revisions.colContent"))}</th>`
+    + `<th>${escapeHtml(t("revisions.colTtl"))}</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
+}
+
 function renderRevisions(state) {
   const content = $("#revisions-content");
   if (state.revisionsError) {
@@ -362,7 +385,8 @@ function renderRevisions(state) {
   content.innerHTML = [...state.revisions].reverse().map((revision) => {
     const records = (revision.views ?? []).reduce((count, view) => count + (view.records?.length ?? 0), 0);
     const current = revision.revision === state.activeZone?.revision;
-    return `<article class="revision-item"><span><b>${escapeHtml(t("revisions.item", { revision: revision.revision, currentText: current ? t("revisions.current") : "" }))}</b><small>${escapeHtml(formatDate(revision.updatedAt))} · ${escapeHtml(t(pluralKey("revisions.records", records), { count: records }))}</small></span>${current ? "" : `<button class="button compact" type="button" data-restore-revision="${escapeHtml(revision.revision)}">${escapeHtml(t("revisions.restore"))}</button>`}</article>`;
+    const open = state.inspectedRevision?.revision === revision.revision;
+    return `<article class="revision-item"><span><b>${escapeHtml(t("revisions.item", { revision: revision.revision, currentText: current ? t("revisions.current") : "" }))}</b><small>${escapeHtml(formatDate(revision.updatedAt))} · ${escapeHtml(t(pluralKey("revisions.records", records), { count: records }))}</small></span><span class="revision-actions"><button class="button compact quiet" type="button" data-inspect-revision="${escapeHtml(revision.revision)}" aria-expanded="${open}">${escapeHtml(t(open ? "revisions.hide" : "revisions.inspect"))}</button>${current ? "" : `<button class="button compact" type="button" data-restore-revision="${escapeHtml(revision.revision)}">${escapeHtml(t("revisions.restore"))}</button>`}</span></article>${open ? renderRevisionSnapshot(state) : ""}`;
   }).join("");
 }
 
@@ -721,6 +745,12 @@ $("#revisions-button").addEventListener("click", async () => {
 });
 $("#close-revisions").addEventListener("click", () => $("#revisions-dialog").close());
 $("#revisions-content").addEventListener("click", async (event) => {
+  const clicked = event.target instanceof Element ? event.target : null;
+  const inspect = clicked?.closest("[data-inspect-revision]");
+  if (inspect) {
+    await store.inspectRevision(Number(inspect.dataset.inspectRevision));
+    return;
+  }
   const button = event.target.closest("[data-restore-revision]");
   if (!button) return;
   const revision = button.dataset.restoreRevision;

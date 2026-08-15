@@ -100,6 +100,7 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
       request(`${zonePath(zone)}/adopt?view=external`, { method: "POST", headers: ifMatch(revision) }),
 
     listRevisions: (zone, limit) => request(`${zonePath(zone)}/revisions?limit=${encodeURIComponent(limit)}`),
+    getRevision: (zone, revision) => request(`${zonePath(zone)}/revisions/${encodeURIComponent(revision)}`),
     restoreRevision: (zone, revision, expected) =>
       request(`${zonePath(zone)}/revisions/${encodeURIComponent(revision)}/restore`, {
         method: "POST",

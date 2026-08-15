@@ -84,6 +84,8 @@ export interface Store {
   apply(): Outcome;
 
   loadRevisions(): Promise<void>;
+  /** Loads one snapshot for reading, or closes the one already open. */
+  inspectRevision(revision: number): Outcome;
   restoreRevision(revision: number): Outcome;
 
   loadAdministration(): Outcome;

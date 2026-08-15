@@ -41,6 +41,8 @@ export function createStore(client) {
 
     revisions: [],
     revisionsError: "",
+    inspectedRevision: null,
+    inspectedRevisionError: "",
 
     profiles: [],
     bindings: [],
@@ -377,6 +379,35 @@ export function createStore(client) {
         state.revisionsError = error.message;
       }
       emitChange();
+    },
+
+    /**
+     * Reads one snapshot so it can be seen before it is restored.
+     *
+     * Fetched rather than taken from the loaded page: the list is bounded, and
+     * the revision somebody wants to look at is often an old one. Restoring is
+     * not undoing -- it makes that snapshot the current intent, and the next
+     * apply carries it out -- so what is in it has to be readable first.
+     */
+    async inspectRevision(revision) {
+      if (state.inspectedRevision?.revision === revision) {
+        state.inspectedRevision = null;
+        emitChange();
+        return true;
+      }
+      state.inspectedRevision = null;
+      state.inspectedRevisionError = "";
+      emitChange();
+      try {
+        state.inspectedRevision = await client.getRevision(activeName(), revision);
+        emitChange();
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        state.inspectedRevisionError = error.message;
+        emitChange();
+        return false;
+      }
     },
 
     async restoreRevision(revision) {

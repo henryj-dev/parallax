@@ -319,3 +319,11 @@ dialog input:not([type="checkbox"]), dialog select { width: 100%; min-height: 40
 }
 
 #non-global-warning[hidden] { display: none; }
+
+/* A revision's contents, shown inline under the row it belongs to. */
+.revision-actions { display: flex; gap: 8px; }
+.revision-snapshot { margin: -4px 0 10px; overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+.revision-snapshot table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.revision-snapshot th { padding: 7px 10px; color: var(--muted); font-size: 10px; font-weight: 600; text-align: left; }
+.revision-snapshot td { padding: 6px 10px; border-top: 1px solid var(--line); }
+.revision-snapshot .revision-content { font-family: var(--mono); word-break: break-all; }
