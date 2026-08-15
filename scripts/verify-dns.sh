@@ -70,8 +70,11 @@ caa|CAA|257|0 issue "letsencrypt.org"
 cert|CERT|37|1 12345 8 aGVsbG8=
 cname|CNAME|5|origin.example.net
 dname|DNAME|39|target.example.net
+dnskey|DNSKEY|48|257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==
+ds|DS|43|12345 8 2 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 hinfo|HINFO|13|"Intel" "Linux"
 https|HTTPS|65|1 . alpn=h2,h3
+loc|LOC|29|51 30 12.748 N 0 7 39.611 W 0.00m
 mx|MX|15|10 mail.example.net
 naptr|NAPTR|35|100 10 "s" "SIP+D2U" "" _sip._udp.example.net
 ns|NS|2|ns1.example.net
