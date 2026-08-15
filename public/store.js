@@ -102,6 +102,16 @@ export function createStore(client) {
 
     // ---- session ---------------------------------------------------------
 
+    /**
+     * Carries a failed provider sign-in into the same error channel the token
+     * form uses. Writing it into the DOM directly does not work: the next
+     * render reads the store, finds no error, and hides the line again -- so
+     * the one thing that explains the failure disappears as it is drawn.
+     */
+    reportSignInFailure(reason) {
+      setError("auth", "auth.identityFailed", { reason });
+    },
+
     async readAuthenticationMode() {
       try {
         const answer = await client.authenticationMode();

@@ -185,6 +185,7 @@ export const messages = Object.freeze({
     "auth.open": "Open control plane", "auth.or": "or", "auth.identity": "Sign in with your organization account", "auth.identityHint": "Your role comes from the identity provider. An administrator assigns it there.",
     "auth.forbidden": "This token cannot open the control plane.",
     "auth.rejected": "The token was not accepted.",
+    "auth.identityFailed": "{reason}",
     "revisions.eyebrow": "Immutable desired state",
     "revisions.title": "Revision history",
     "revisions.body": "Restoring a snapshot creates a new revision. Existing history is never rewritten.",

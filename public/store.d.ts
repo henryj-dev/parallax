@@ -64,6 +64,8 @@ export interface Store {
   onNotice(listener: (notice: StoreNotice) => void): () => void;
   onIntent(listener: (event: { type: string }) => void): () => void;
 
+  /** Shows why a provider sign-in was refused, in the dialog that asked for it. */
+  reportSignInFailure(reason: string): void;
   readAuthenticationMode(): Promise<void>;
   signIn(token: string): Outcome;
   signOut(): Promise<void>;

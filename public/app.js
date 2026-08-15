@@ -600,9 +600,7 @@ function openAuthDialog() {
 function reportSignInError() {
   const reason = new URLSearchParams(location.search).get("signin_error");
   if (!reason) return;
-  const target = $("#auth-form-error");
-  target.textContent = reason;
-  target.hidden = false;
+  store.reportSignInFailure(reason);
   const clean = new URL(location.href);
   clean.searchParams.delete("signin_error");
   history.replaceState(null, "", clean);

@@ -69,7 +69,13 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
     const cleared = [STATE_COOKIE, VERIFIER_COOKIE, RETURN_COOKIE].map((name) => clearedCookie(name, url));
 
     const provided = url.searchParams.get("error");
-    if (provided) return failure("the identity provider refused the sign-in", cleared, url);
+    if (provided) {
+      // The code is defined by the protocol and names the decision -- consent
+      // refused, scope rejected, account not permitted. Withholding it leaves
+      // "refused" and no way to tell which of those happened.
+      const detail = url.searchParams.get("error_description");
+      return failure(`the identity provider refused the sign-in (${provided}${detail ? `: ${detail}` : ""})`, cleared, url);
+    }
     const code = url.searchParams.get("code");
     const state = url.searchParams.get("state");
     // A callback whose state does not match the one this browser was given is
