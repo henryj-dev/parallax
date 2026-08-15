@@ -7,12 +7,17 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "./config.ts";
+import { createDnsServer, type ServedZone } from "./dns/server.ts";
+import { servedZones } from "./dns/snapshot.ts";
 import { createNodeHandler, requestOrigin } from "./http/api.ts";
 import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.ts";
 import { createRuntime } from "./runtime.ts";
 import { authenticate, type SecurityConfig } from "./security/http-authorization.ts";
 
 const config = readConfig();
+
+/** How long a published override may take to reach the DNS listener. */
+const DNS_REFRESH_MS = 5_000;
 
 let runtime;
 try {
@@ -299,6 +304,69 @@ if (config.httpRedirectPort !== undefined) {
       console.warn("parallax: no publicOrigin is set, so redirects assume TLS on 443 at the requested host. Set it if clients reach this deployment at any other address.");
     }
   });
+}
+
+/**
+ * Answers DNS for the internal view out of the desired state, when a port is
+ * configured.
+ *
+ * The snapshot is re-read on a timer rather than on a change, because the
+ * control plane commits through a repository and has no event to subscribe to.
+ * The cost is stated rather than hidden: a published override takes effect
+ * here within one refresh, and a record's own TTL is the longer wait anyway.
+ *
+ * Nothing here reconciles. This listener answers from the desired state
+ * directly, which is why it does not conflict with the CoreDNS or PowerDNS
+ * adapters -- those publish the same view into a server that answers for it,
+ * and only one of those may be configured at a time. Running this alongside one
+ * of them is two servers answering, which is a deployment's decision about
+ * which address clients ask.
+ */
+if (config.dns) {
+  const dnsConfig = config.dns;
+  let snapshot: ServedZone[] = [];
+  const refresh = async (): Promise<void> => {
+    const zones = await controlPlane.listZones();
+    snapshot = servedZones(zones, (zone, reason) => {
+      console.error(`parallax: not answering for ${zone}, its internal view could not be composed: ${reason}`);
+    });
+  };
+  try {
+    // Loaded before the port is bound, so the first query is not answered out
+    // of an empty snapshot -- which would be NXDOMAIN for every managed name.
+    await refresh();
+  } catch (error) {
+    console.error(`parallax: the DNS listener could not read the desired state: ${error instanceof Error ? error.message : "unknown error"}`);
+    process.exit(1);
+  }
+  const timer = setInterval(() => {
+    void refresh().catch((error: unknown) => {
+      // The last good snapshot keeps answering. A store that is briefly
+      // unreachable must not turn into NXDOMAIN for every internal name.
+      console.error(`parallax: keeping the last DNS snapshot, the desired state could not be re-read: ${error instanceof Error ? error.message : "unknown error"}`);
+    });
+  }, DNS_REFRESH_MS);
+  timer.unref();
+
+  const dns = createDnsServer({
+    zones: () => snapshot,
+    forwardTo: dnsConfig.forwardTo,
+    onUnservable: (record) => {
+      // Stored content the domain accepted and the wire cannot carry. The
+      // query was answered SERVFAIL, so this line is the only place it is said.
+      console.error(`parallax: ${record.zone} ${record.name} ${record.type} could not be answered: ${record.reason}`);
+    },
+  });
+  try {
+    await dns.listen(dnsConfig.port, dnsConfig.host);
+    console.log(`parallax: dns://${dnsConfig.host}:${dnsConfig.port} answering for ${snapshot.length} zone(s)`);
+    if (dnsConfig.forwardTo.length === 0) {
+      console.warn("parallax: no DNS upstream is configured, so names outside every managed zone are answered REFUSED. Set PARALLAX_DNS_FORWARD_TO if clients use this as their resolver.");
+    }
+  } catch (error) {
+    console.error(`parallax: could not bind the DNS port: ${error instanceof Error ? error.message : "unknown error"}`);
+    process.exit(1);
+  }
 }
 
 server.listen(config.port, config.host, () => {

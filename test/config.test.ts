@@ -127,4 +127,37 @@ describe("configuration", () => {
       /PARALLAX_HTTP_REDIRECT_PORT must be an integer/,
     );
   });
+
+  it("binds the DNS listener only when a port names one", () => {
+    assert.equal(readConfig({}).dns, undefined);
+    assert.equal(readConfig({ PARALLAX_DNS_FORWARD_TO: "10.0.0.1" }).dns, undefined, "upstreams alone bind nothing");
+    assert.deepEqual(readConfig({ PARALLAX_DNS_PORT: "5353" }).dns, {
+      host: "127.0.0.1",
+      port: 5353,
+      forwardTo: [],
+    });
+  });
+
+  it("takes the DNS listener's own host, and otherwise the portal's, rather than every address", () => {
+    // A resolver that starts answering the whole network because a port was set
+    // is not a default anybody should have to discover.
+    assert.equal(readConfig({ PARALLAX_DNS_PORT: "53", HOST: "10.0.0.5" }).dns?.host, "10.0.0.5");
+    assert.equal(readConfig({ PARALLAX_DNS_PORT: "53", HOST: "10.0.0.5", PARALLAX_DNS_HOST: "0.0.0.0" }).dns?.host, "0.0.0.0");
+  });
+
+  it("reads the upstreams it relays to, and refuses one it could not reach", () => {
+    assert.deepEqual(
+      readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_TO: " 10.0.0.1 , 10.0.0.2#5353 ," }).dns?.forwardTo,
+      ["10.0.0.1", "10.0.0.2#5353"],
+    );
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_TO: "10.0.0.1#notaport" }),
+      /PARALLAX_DNS_FORWARD_TO \(10\.0\.0\.1#notaport\) must be an integer/,
+    );
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_TO: "#53" }),
+      /contains an upstream with no host/,
+    );
+    assert.throws(() => readConfig({ PARALLAX_DNS_PORT: "70000" }), /PARALLAX_DNS_PORT must be an integer/);
+  });
 });

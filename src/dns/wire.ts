@@ -1,0 +1,256 @@
+/**
+ * Just enough of the DNS wire format to answer for the zones this control plane
+ * holds, and to hand everything else to somebody who can.
+ *
+ * Written here rather than taken from a library because the read side has to be
+ * hostile-input safe -- these bytes arrive from anyone who can reach the port --
+ * and a parser that is one dependency away is one whose failure modes are not
+ * ours to know. The write side is small: the answers are already computed.
+ */
+import type { RecordType } from "../domain/dns.ts";
+
+export const CLASS_IN = 1;
+
+/**
+ * The `satisfies` is the point: every type the domain accepts must have a wire
+ * code here, and the compiler is what requires it. Adding a type to
+ * `RECORD_TYPES` and forgetting this file would otherwise produce a record that
+ * validates, publishes, and cannot be answered for.
+ *
+ * SOA, OPT and ANY are not stored types -- they are synthesized, negotiated and
+ * asked for -- so they are named separately rather than added to the domain.
+ */
+export const TYPE = Object.freeze({
+  A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, HINFO: 13, MX: 15, TXT: 16, AAAA: 28,
+  SRV: 33, NAPTR: 35, CERT: 37, DNAME: 39, OPT: 41, SSHFP: 44, TLSA: 52,
+  SMIMEA: 53, OPENPGPKEY: 61, SVCB: 64, HTTPS: 65, URI: 256, CAA: 257, ANY: 255,
+} as const satisfies Record<RecordType | "SOA" | "OPT" | "ANY", number>);
+
+const TYPE_NAMES = new Map<number, string>(Object.entries(TYPE).map(([name, value]) => [value as number, name]));
+
+export const RCODE = Object.freeze({ NOERROR: 0, FORMERR: 1, SERVFAIL: 2, NXDOMAIN: 3, NOTIMP: 4, REFUSED: 5 });
+
+export interface Question {
+  /** Lowercased, no trailing dot. The root is the empty string. */
+  readonly name: string;
+  readonly type: number;
+  readonly class: number;
+}
+
+export interface ParsedQuery {
+  readonly id: number;
+  /** Byte 2 of the header, kept so the reply can echo RD and the opcode. */
+  readonly flags: number;
+  readonly question: Question;
+  /** Largest reply the client will accept over UDP, from its OPT record. */
+  readonly udpPayloadSize: number;
+  readonly hasOpt: boolean;
+}
+
+export class WireFormatError extends Error {
+  override readonly name = "WireFormatError";
+}
+
+const HEADER_BYTES = 12;
+const MAX_NAME_BYTES = 255;
+const MAX_LABEL_BYTES = 63;
+/** Without an OPT record a client is promised no more than this. */
+export const MIN_UDP_PAYLOAD = 512;
+
+/**
+ * Reads the one question a query carries.
+ *
+ * Only the question is parsed. Everything else in the message is either absent
+ * from a query or not something an authoritative answer depends on, and parsing
+ * what is not needed is parsing that can be wrong.
+ */
+export function readQuery(message: Buffer): ParsedQuery {
+  if (message.length < HEADER_BYTES) throw new WireFormatError("message is shorter than a header");
+  const id = message.readUInt16BE(0);
+  const flags = message.readUInt16BE(2);
+  if ((flags & 0x8000) !== 0) throw new WireFormatError("message is a response, not a query");
+  const questionCount = message.readUInt16BE(4);
+  if (questionCount !== 1) throw new WireFormatError(`expected exactly one question, found ${questionCount}`);
+
+  const { name, offset } = readName(message, HEADER_BYTES);
+  if (offset + 4 > message.length) throw new WireFormatError("question is truncated");
+  const type = message.readUInt16BE(offset);
+  const klass = message.readUInt16BE(offset + 2);
+
+  const opt = findOpt(message, offset + 4, message.readUInt16BE(6), message.readUInt16BE(8), message.readUInt16BE(10));
+  return {
+    id,
+    flags,
+    question: { name, type, class: klass },
+    // The client's advertised size is a ceiling, not a floor: sending more than
+    // it asked for is how a reply gets fragmented and dropped. Only the absent
+    // case falls back to 512, and an absurdly large claim is capped.
+    udpPayloadSize: opt === undefined ? MIN_UDP_PAYLOAD : Math.min(Math.max(opt, 512), 4096),
+    hasOpt: opt !== undefined,
+  };
+}
+
+/**
+ * Walks the records after the question looking for the client's OPT record,
+ * which is where it says how large a reply it can take.
+ *
+ * Returns `undefined` rather than throwing when the rest of the message cannot
+ * be walked: a query whose additional section is malformed is still a question
+ * that can be answered, and the only thing lost is the larger size.
+ */
+function findOpt(message: Buffer, start: number, answers: number, authority: number, additional: number): number | undefined {
+  let offset = start;
+  try {
+    for (let index = 0; index < answers + authority + additional; index += 1) {
+      const read = readName(message, offset);
+      offset = read.offset;
+      if (offset + 10 > message.length) return undefined;
+      const type = message.readUInt16BE(offset);
+      const size = message.readUInt16BE(offset + 8);
+      if (type === TYPE.OPT) return message.readUInt16BE(offset + 2);
+      offset += 10 + size;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Reads a name, following compression pointers.
+ *
+ * Every pointer must move strictly backwards. That single rule is what stops a
+ * name from pointing at itself or at a later pointer that points back -- a
+ * message a stranger can send, which would otherwise loop forever inside this
+ * process.
+ */
+export function readName(message: Buffer, start: number): { name: string; offset: number } {
+  const labels: string[] = [];
+  let offset = start;
+  let afterPointer: number | undefined;
+  let limit = start;
+  let bytes = 0;
+
+  for (;;) {
+    if (offset >= message.length) throw new WireFormatError("name runs past the end of the message");
+    const length = message[offset] as number;
+    if ((length & 0xc0) === 0xc0) {
+      if (offset + 1 >= message.length) throw new WireFormatError("compression pointer is truncated");
+      const target = ((length & 0x3f) << 8) | (message[offset + 1] as number);
+      if (target >= limit) throw new WireFormatError("compression pointer does not move backwards");
+      if (afterPointer === undefined) afterPointer = offset + 2;
+      limit = target;
+      offset = target;
+      continue;
+    }
+    // This is also the 63-byte label limit. The two top bits are the only thing
+    // that distinguishes a length from a pointer, so any byte above 63 that is
+    // not a pointer is rejected right here, and a separate length check below
+    // would be one no message could ever reach.
+    if ((length & 0xc0) !== 0) throw new WireFormatError("label length has reserved bits set");
+    offset += 1;
+    if (length === 0) break;
+    if (offset + length > message.length) throw new WireFormatError("label runs past the end of the message");
+    bytes += length + 1;
+    if (bytes > MAX_NAME_BYTES) throw new WireFormatError("name is longer than 255 bytes");
+    labels.push(message.toString("latin1", offset, offset + length));
+    offset += length;
+  }
+  return { name: labels.join(".").toLowerCase(), offset: afterPointer ?? offset };
+}
+
+/** Encodes a name uncompressed. Compression is not used: the saving is small. */
+export function writeName(name: string): Buffer {
+  const trimmed = name.replace(/\.$/u, "");
+  if (trimmed === "") return Buffer.of(0);
+  const parts = trimmed.split(".");
+  const chunks: Buffer[] = [];
+  for (const part of parts) {
+    const label = Buffer.from(part, "latin1");
+    if (label.length === 0 || label.length > MAX_LABEL_BYTES) throw new WireFormatError(`invalid label in ${name}`);
+    chunks.push(Buffer.of(label.length), label);
+  }
+  chunks.push(Buffer.of(0));
+  const encoded = Buffer.concat(chunks);
+  if (encoded.length > MAX_NAME_BYTES) throw new WireFormatError(`name ${name} is longer than 255 bytes`);
+  return encoded;
+}
+
+export interface ResourceRecord {
+  readonly name: string;
+  readonly type: number;
+  readonly ttl: number;
+  readonly data: Buffer;
+}
+
+export interface ReplyParts {
+  readonly query: ParsedQuery;
+  readonly rcode: number;
+  readonly authoritative: boolean;
+  readonly answers?: readonly ResourceRecord[];
+  readonly authority?: readonly ResourceRecord[];
+}
+
+/**
+ * Builds a reply, and truncates it if the client cannot take it whole.
+ *
+ * `truncated` is not a failure: it tells the client to ask again over TCP, and
+ * a client that does not is one that would have received a mangled answer
+ * instead. A 420-byte DKIM record makes this ordinary rather than exotic.
+ */
+export function writeReply(parts: ReplyParts, maxBytes: number): Buffer {
+  const answers = parts.answers ?? [];
+  const authority = parts.authority ?? [];
+  const full = assemble(parts, answers, authority);
+  if (full.length <= maxBytes) return full;
+  const empty = assemble(parts, [], []);
+  const header = Buffer.from(empty.subarray(0, empty.length));
+  header.writeUInt16BE(header.readUInt16BE(2) | 0x0200, 2);
+  return header;
+}
+
+function assemble(parts: ReplyParts, answers: readonly ResourceRecord[], authority: readonly ResourceRecord[]): Buffer {
+  const { query } = parts;
+  // Echo the opcode and RD from the query; set QR, and AA when we are the
+  // authority. RA is set only when the answer came from somewhere that recurses.
+  let flags = 0x8000 | (query.flags & 0x7900) | (parts.rcode & 0x000f);
+  if (parts.authoritative) flags |= 0x0400;
+
+  const header = Buffer.alloc(HEADER_BYTES);
+  header.writeUInt16BE(query.id, 0);
+  header.writeUInt16BE(flags, 2);
+  header.writeUInt16BE(1, 4);
+  header.writeUInt16BE(answers.length, 6);
+  header.writeUInt16BE(authority.length, 8);
+  header.writeUInt16BE(query.hasOpt ? 1 : 0, 10);
+
+  const chunks = [header, writeName(query.question.name), Buffer.alloc(4)];
+  chunks[2]?.writeUInt16BE(query.question.type, 0);
+  chunks[2]?.writeUInt16BE(query.question.class, 2);
+  for (const record of [...answers, ...authority]) chunks.push(writeRecord(record));
+  if (query.hasOpt) chunks.push(writeOpt(query.udpPayloadSize));
+  return Buffer.concat(chunks);
+}
+
+function writeRecord(record: ResourceRecord): Buffer {
+  const name = writeName(record.name);
+  const fixed = Buffer.alloc(10);
+  fixed.writeUInt16BE(record.type, 0);
+  fixed.writeUInt16BE(CLASS_IN, 2);
+  fixed.writeUInt32BE(record.ttl, 4);
+  fixed.writeUInt16BE(record.data.length, 8);
+  return Buffer.concat([name, fixed, record.data]);
+}
+
+/** Answers the client's OPT with our own, so EDNS stays negotiated. */
+function writeOpt(payloadSize: number): Buffer {
+  const opt = Buffer.alloc(11);
+  opt.writeUInt8(0, 0);
+  opt.writeUInt16BE(TYPE.OPT, 1);
+  opt.writeUInt16BE(payloadSize, 3);
+  return opt;
+}
+
+export function typeName(type: number): string {
+  return TYPE_NAMES.get(type) ?? `TYPE${type}`;
+}

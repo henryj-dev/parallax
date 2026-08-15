@@ -31,6 +31,26 @@ export interface ParallaxConfig {
   httpRedirectPort?: number;
   /** Signs in through an identity provider. Unset leaves only access tokens. */
   oidc?: OidcSettings;
+  /** Answers DNS for the internal view directly. Unset leaves the port unbound. */
+  dns?: DnsListenerSettings;
+}
+
+/**
+ * Where the DNS listener binds and where it sends what it is not authoritative
+ * for.
+ *
+ * These stay in the environment rather than the store with the rest of the
+ * operational settings, and the upstreams are the reason. Everything this
+ * process is not authoritative for is relayed to them, so whoever can change
+ * them can silently answer for every name in the network that is not in a
+ * managed zone. That is not a tuning knob; it is the same kind of value as the
+ * keys, and it belongs where a deployment sets it and a portal session cannot.
+ */
+export interface DnsListenerSettings {
+  readonly host: string;
+  readonly port: number;
+  /** Upstreams, `host` or `host#port`. Empty answers REFUSED instead of relaying. */
+  readonly forwardTo: readonly string[];
 }
 
 export interface OidcSettings {
@@ -57,6 +77,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     throw new Error("PARALLAX_HTTP_REDIRECT_PORT only makes sense with TLS configured on the main port");
   }
   const oidc = readOidc(environment);
+  const dns = readDnsListener(environment);
   return {
     host: environment.HOST?.trim() || "127.0.0.1",
     port: readPort(environment.PORT),
@@ -73,6 +94,32 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     ...(tls ? { tls } : {}),
     ...(httpRedirectPort !== undefined ? { httpRedirectPort } : {}),
     ...(oidc ? { oidc } : {}),
+    ...(dns ? { dns } : {}),
+  };
+}
+
+/**
+ * The listener binds only when a port is named. Its own host defaults to the
+ * portal's, which is loopback unless a deployment said otherwise -- a resolver
+ * that starts answering the whole network because a port was set is not a
+ * default anybody should have to discover.
+ */
+function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | undefined {
+  const port = environment.PARALLAX_DNS_PORT?.trim();
+  if (!port) return undefined;
+  const forwardTo = (environment.PARALLAX_DNS_FORWARD_TO ?? "")
+    .split(",")
+    .map((upstream) => upstream.trim())
+    .filter((upstream) => upstream.length > 0);
+  for (const upstream of forwardTo) {
+    const [host, upstreamPort] = upstream.split("#") as [string, string | undefined];
+    if (!host) throw new Error(`PARALLAX_DNS_FORWARD_TO contains an upstream with no host: ${upstream}`);
+    if (upstreamPort !== undefined) readPort(upstreamPort, `PARALLAX_DNS_FORWARD_TO (${upstream})`);
+  }
+  return {
+    host: environment.PARALLAX_DNS_HOST?.trim() || environment.HOST?.trim() || "127.0.0.1",
+    port: readPort(port, "PARALLAX_DNS_PORT"),
+    forwardTo,
   };
 }
 

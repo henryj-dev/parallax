@@ -16,6 +16,8 @@ resulting changes, and applies only records explicitly managed by Parallax.
 - Durable single-node JSON state and provider state with atomic writes
 - Optional PostgreSQL source of truth with transactional immutable revisions
 - Optional Cloudflare API and CoreDNS RFC 1035 zone-file adapters
+- Optional built-in DNS listener that answers the internal view from the desired
+  state over UDP and TCP, and relays every other name to an upstream
 - Encrypted, write-only Cloudflare credential management from the admin portal
 - Optional admin/editor/viewer token authentication, OpenID Connect sign-in, and audit actors
 - Health endpoints and security headers
@@ -57,6 +59,9 @@ bind, how to reach the store, and the keys that protect what is stored.
 | `PARALLAX_OWNERSHIP_SECRET` | 32+ byte secret that signs managed-record ownership markers |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | Exactly 32 bytes as base64 or 64 hexadecimal characters; encrypts stored credentials |
 | `PARALLAX_POWERDNS_DATABASE_URL` | PowerDNS's own database, when the internal view is published into it instead of CoreDNS zone files |
+| `PARALLAX_DNS_PORT` | Answer DNS for the internal view from this process. Unset leaves the port unbound |
+| `PARALLAX_DNS_HOST` | Address the DNS listener binds; defaults to `HOST`, which is loopback unless set |
+| `PARALLAX_DNS_FORWARD_TO` | Comma-separated upstreams (`host` or `host#port`) for names outside every zone. Empty answers `REFUSED` instead of relaying |
 | `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | Certificate and key for this process to end TLS itself; set both or neither |
 | `PARALLAX_HTTP_REDIRECT_PORT` | Port answering plain HTTP with a redirect to the TLS origin; needs TLS configured |
 | `PARALLAX_AUTH_TOKENS` | JSON array of `{"token","subject","role"}`; `role` is `admin`, `editor` or `viewer`, and each token is at least 32 bytes. Optional on loopback, **required to bind any other address** |
@@ -285,16 +290,51 @@ reconciliation publish a second answer beside one it never saw.
 
 ### Publishing the internal view
 
-The internal view has two shapes, and a deployment picks one by configuring it.
-Configuring both is refused at startup rather than resolved by a precedence
-rule nobody would remember when the wrong one turned out to be serving.
+The internal view reaches clients three ways. Two of them publish it into a DNS
+server that then answers for it; the third answers from this process directly.
 
-| | `coreDnsDirectory` | `PARALLAX_POWERDNS_DATABASE_URL` |
-| --- | --- | --- |
-| Published as | RFC 1035 zone files | rows in PowerDNS's database |
-| Needs | a filesystem both processes reach | nothing beyond the database |
-| In a cluster | a volume that must survive restarts | no volume |
-| Change is served after | `reload` interval, about a second | the resolver's cache TTL |
+| | `coreDnsDirectory` | `PARALLAX_POWERDNS_DATABASE_URL` | `PARALLAX_DNS_PORT` |
+| --- | --- | --- | --- |
+| Served as | RFC 1035 zone files | rows in PowerDNS's database | answers from this process |
+| Needs | a filesystem both processes reach | nothing beyond the database | nothing |
+| In a cluster | a volume that must survive restarts | no volume | no volume |
+| Change is served after | `reload` interval, about a second | the resolver's cache TTL | one refresh, 5 seconds |
+| Reconciles | yes | yes | no |
+
+**The two publishers are exclusive; the listener is not.** Configuring
+`coreDnsDirectory` and `PARALLAX_POWERDNS_DATABASE_URL` together is refused at
+startup rather than resolved by a precedence rule nobody would remember when the
+wrong one turned out to be serving. `PARALLAX_DNS_PORT` is a different kind of
+thing and does not enter that rule: it publishes nothing, writes no ownership
+marker, and compares nothing against a provider. It reads the desired state and
+answers, which is why `apply` is not involved and why a change appears within
+one refresh rather than after a reconcile. Running it beside a publisher is two
+servers answering, and which one clients ask is the deployment's decision.
+
+The listener is off unless `PARALLAX_DNS_PORT` names a port, and then it binds
+`PARALLAX_DNS_HOST` -- or `HOST`, which is loopback unless a deployment said
+otherwise. A resolver that starts answering the whole network because a port was
+set is not a default anybody should have to discover.
+
+The upstreams stay in the environment rather than the stored settings, with the
+keys, and for the same reason: everything this process is not authoritative for
+is relayed to them, so whoever can change them can silently answer for every
+name in the network that is not in a managed zone. That is not a tuning knob.
+
+Two things are worth knowing before pointing anything at it:
+
+**A zone whose internal view is empty is left out, not answered for.** That is
+the normal state right after [adopting](#adopting-records-that-already-exist) a
+zone, and claiming authority for it would answer NXDOMAIN for every name the
+zone holds. Left out, those names go to the upstreams and keep resolving
+publicly until an override exists.
+
+**With the file backend a running listener does not see another process's
+writes.** The file-backed store is read once and cached per process, so a
+`parallax record set` run in a terminal reaches the file and not the server
+holding the port. Changes made through the portal or the API are the ones the
+listener follows. With `DATABASE_URL` every instance reads the same rows and the
+question does not arise.
 
 The zone-file shape needs persistent storage and not an ephemeral volume,
 because a zone file also holds records nobody else has a copy of -- the ones an
@@ -339,18 +379,34 @@ forwarder accepts and does not fall back from. That is why the internal view has
 to be complete before anything is pointed at it, and why [adoption](#adopting-records-that-already-exist)
 exists.
 
-**It is not the resolver clients should be given.** Whatever serves the internal
-view answers for that zone and refuses everything else -- `REFUSED` to
-`google.com` is it saying the question is not its to answer, which is correct
-and is not a fault. Clients point at a forwarder, and the forwarder sends the
-one zone here and the rest upstream:
+**A publisher is not the resolver clients should be given.** CoreDNS and
+PowerDNS serving the internal view answer for that zone and refuse everything
+else -- `REFUSED` to `google.com` is the server saying the question is not its to
+answer, which is correct and is not a fault. Clients point at a forwarder, and
+the forwarder sends the one zone here and the rest upstream:
 
 ```
 client → forwarder ──(example.com)──→ the internal view
                    └─(everything else)──→ a recursive resolver
 ```
 
-Handing clients this address directly leaves them with one zone and no internet.
+Handing clients that address directly leaves them with one zone and no internet.
+
+**The built-in listener is the exception, and only with upstreams set.** It is
+both halves at once: authoritative for the managed zones, and a relay for
+everything else, which is what `PARALLAX_DNS_FORWARD_TO` configures.
+
+```
+client → PARALLAX_DNS_PORT ──(example.com)──→ answered from the desired state
+                           └─(everything else)──→ PARALLAX_DNS_FORWARD_TO
+```
+
+Both halves in one listener is the point. Split across two, something in front
+has to know which names are whose, and that knowledge then lives in a list on
+every resolver, maintained by hand, going stale the moment a zone is added. Here
+the list is the desired state. Without upstreams the listener refuses everything
+it is not authoritative for, and then it is a publisher's equal and belongs
+behind a forwarder like one.
 
 Two more things sit in front of it and answer first, and both look like Parallax
 serving the wrong value:
@@ -488,6 +544,15 @@ Each type's grammar is checked when the record is saved, not when it is applied:
 a record that a provider would reject is one an operator saved, walked away
 from, and finds broken later, possibly against a zone that is already half
 published.
+
+Every type in that list can also be put on the wire by the [built-in
+listener](#publishing-the-internal-view), and the compiler is what requires it:
+the encoder is a table over the same list the domain validates against, so a
+type added to one and not the other does not build. A record that validates,
+publishes, and then cannot be answered for is the failure that guards against.
+If a stored record still cannot be encoded, the whole RRset is answered
+SERVFAIL and the reason is logged -- never a partial RRset, which looks complete,
+gets cached, and silently loses whatever went missing.
 
 Two things are handled by the adapters rather than written into the content.
 Cloudflare keeps the leading number of `MX`, `SRV` and `URI` in a field of its
