@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { createSocket } from "node:dgram";
-import { connect, createServer, type AddressInfo } from "node:net";
+import { connect, createServer, isIP, type AddressInfo } from "node:net";
 import { after, describe, it } from "node:test";
-import { createDnsServer, type ServedZone, type UnservableRecord } from "../../src/dns/server.ts";
+import {
+  createDnsServer,
+  createTimedDnsResolver,
+  type ResolvedDnsAddress,
+  type ServedZone,
+  type UnservableRecord,
+} from "../../src/dns/server.ts";
 import { RCODE, TYPE, readName } from "../../src/dns/wire.ts";
 
 function encodeName(name: string): Buffer {
@@ -22,6 +28,12 @@ function buildQuery(name: string, type: number = TYPE.A, id = 0x4242): Buffer {
   tail.writeUInt16BE(type, 0);
   tail.writeUInt16BE(1, 2);
   return Buffer.concat([header, encodeName(name), tail]);
+}
+
+function forwardedReply(message: Buffer, marker: number[]): Buffer {
+  const reply = Buffer.from(message);
+  reply.writeUInt16BE((reply.readUInt16BE(2) & 0x7900) | 0x8080, 2);
+  return Buffer.concat([reply, Buffer.from(marker)]);
 }
 
 /** The answer section, decoded far enough to say what was returned. */
@@ -54,31 +66,31 @@ function rcodeOf(reply: Buffer | undefined): number {
   return received(reply).readUInt16BE(2) & 0x000f;
 }
 
-async function freePort(): Promise<number> {
+async function freePort(host = "127.0.0.1"): Promise<number> {
   const probe = createServer();
-  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => probe.listen(0, host, resolve));
   const port = (probe.address() as AddressInfo).port;
   await new Promise<void>((resolve) => probe.close(() => resolve()));
   return port;
 }
 
-function ask(port: number, message: Buffer, timeoutMs = 2000): Promise<Buffer | undefined> {
+function ask(port: number, message: Buffer, timeoutMs = 2000, host = "127.0.0.1"): Promise<Buffer | undefined> {
   return new Promise((resolve) => {
-    const socket = createSocket("udp4");
+    const socket = createSocket(isIP(host) === 6 ? "udp6" : "udp4");
     const done = (value: Buffer | undefined): void => { clearTimeout(timer); socket.close(); resolve(value); };
     const timer = setTimeout(() => done(undefined), timeoutMs);
     socket.once("message", (reply) => done(reply));
     socket.once("error", () => done(undefined));
-    socket.send(message, port, "127.0.0.1");
+    socket.send(message, port, host);
   });
 }
 
 /** Sends over TCP, optionally in pieces, to exercise the length-prefix framing. */
-function askOverTcp(port: number, message: Buffer, split = false): Promise<Buffer> {
+function askOverTcp(port: number, message: Buffer, split = false, host = "127.0.0.1"): Promise<Buffer> {
   const framed = Buffer.concat([Buffer.alloc(2), message]);
   framed.writeUInt16BE(message.length, 0);
   return new Promise((resolve, reject) => {
-    const socket = connect(port, "127.0.0.1", () => {
+    const socket = connect(port, host, () => {
       if (!split) socket.write(framed);
       else {
         socket.write(framed.subarray(0, 3));
@@ -115,10 +127,13 @@ describe("DNS server", () => {
   const closers: (() => Promise<void>)[] = [];
   after(async () => { for (const close of closers) await close().catch(() => undefined); });
 
-  async function start(options: Partial<Parameters<typeof createDnsServer>[0]> & { zones: () => readonly ServedZone[] }) {
-    const port = await freePort();
+  async function start(
+    options: Partial<Parameters<typeof createDnsServer>[0]> & { zones: () => readonly ServedZone[] },
+    host = "127.0.0.1",
+  ) {
+    const port = await freePort(host);
     const server = createDnsServer(options);
-    await server.listen(port, "127.0.0.1");
+    await server.listen(port, host);
     closers.push(() => server.close());
     return { port, server };
   }
@@ -137,6 +152,58 @@ describe("DNS server", () => {
 
     const overTcp = await askOverTcp(port, buildQuery("www.example.com"));
     assert.deepEqual(readAnswers(overTcp).length, 2);
+  });
+
+  it("binds both UDP and TCP when configured with an IPv6 host", async () => {
+    const { port } = await start({ zones: () => [EXAMPLE] }, "::1");
+
+    const overUdp = received(await ask(port, buildQuery("www.example.com"), 2_000, "::1"));
+    assert.equal(readAnswers(overUdp).length, 2);
+
+    const overTcp = await askOverTcp(port, buildQuery("www.example.com"), false, "::1");
+    assert.equal(readAnswers(overTcp).length, 2);
+  });
+
+  it("binds UDP and TCP to the same resolved address for a hostname", async () => {
+    const port = await freePort("::1");
+    const resolutions: string[] = [];
+    const server = createDnsServer({
+      zones: () => [EXAMPLE],
+      resolveHost: async (host) => {
+        resolutions.push(host);
+        return { address: "::1", family: 6 };
+      },
+    });
+    await server.listen(port, "localhost");
+    closers.push(() => server.close());
+
+    assert.equal(readAnswers(received(await ask(port, buildQuery("www.example.com"), 2_000, "::1"))).length, 2);
+    assert.equal(readAnswers(await askOverTcp(port, buildQuery("www.example.com"), false, "::1")).length, 2);
+    assert.deepEqual(resolutions, ["localhost"], "the bind hostname is resolved once for both transports");
+  });
+
+  it("bounds and coalesces stalled upstream hostname resolutions", async () => {
+    let calls = 0;
+    let releaseLookup = (_value: ResolvedDnsAddress): void => {};
+    const rawLookup = new Promise<ResolvedDnsAddress>((resolve) => { releaseLookup = resolve; });
+    const resolve = createTimedDnsResolver(async () => {
+      calls += 1;
+      return rawLookup;
+    });
+
+    assert.deepEqual(await Promise.all([
+      resolve("upstream.example", 10),
+      resolve("UPSTREAM.EXAMPLE", 10),
+    ]), [undefined, undefined]);
+    assert.equal(calls, 1, "concurrent callers share the raw lookup");
+
+    assert.equal(await resolve("upstream.example", 5), undefined);
+    assert.equal(calls, 1, "a timed-out raw lookup is not fanned out by later queries");
+
+    releaseLookup({ address: "127.0.0.1", family: 4 });
+    await new Promise<void>((done) => setImmediate(done));
+    assert.deepEqual(await resolve("upstream.example", 10), { address: "127.0.0.1", family: 4 });
+    assert.equal(calls, 2, "a settled lookup is removed so a later query can refresh it");
   });
 
   it("reassembles a TCP message that arrives in pieces", async () => {
@@ -205,6 +272,132 @@ describe("DNS server", () => {
     const { port } = await start({ zones: () => [EXAMPLE], forwardTo: [`127.0.0.1#${upstreamPort}`] });
     const reply = received(await ask(port, buildQuery("elsewhere.example.org")));
     assert.equal(reply.subarray(-2).toString("hex"), "dead", "the upstream's bytes came back as they were");
+  });
+
+  it("ignores forged-source and mismatched upstream datagrams until a valid response arrives", async () => {
+    const upstreamPort = await freePort();
+    const upstream = createSocket("udp4");
+    const rogue = createSocket("udp4");
+    await Promise.all([
+      new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve)),
+      new Promise<void>((resolve) => rogue.bind(0, "127.0.0.1", resolve)),
+    ]);
+    closers.push(async () => { upstream.close(); rogue.close(); });
+    upstream.on("message", (message, remote) => {
+      const valid = forwardedReply(message, [0xbe, 0xef]);
+      const forged = forwardedReply(message, [0xba, 0xd1]);
+      rogue.send(forged, remote.port, remote.address);
+
+      const notAResponse = Buffer.from(message);
+      const wrongId = forwardedReply(message, [0xba, 0xd2]);
+      wrongId.writeUInt16BE(wrongId.readUInt16BE(0) ^ 1, 0);
+      const wrongOpcode = forwardedReply(message, [0xba, 0xd3]);
+      wrongOpcode.writeUInt16BE((wrongOpcode.readUInt16BE(2) & ~0x7800) | 0x0800, 2);
+      const wrongQuestion = forwardedReply(buildQuery("wrong.example.org", TYPE.A, message.readUInt16BE(0)), [0xba, 0xd4]);
+      upstream.send(notAResponse, remote.port, remote.address);
+      upstream.send(wrongId, remote.port, remote.address);
+      upstream.send(wrongOpcode, remote.port, remote.address);
+      upstream.send(wrongQuestion, remote.port, remote.address);
+      setTimeout(() => upstream.send(valid, remote.port, remote.address), 20);
+    });
+
+    const { port } = await start({
+      zones: () => [EXAMPLE],
+      forwardTo: [`127.0.0.1#${upstreamPort}`],
+      forwardTimeoutMs: 250,
+    });
+    const reply = received(await ask(port, buildQuery("elsewhere.example.org")));
+    assert.equal(reply.subarray(-2).toString("hex"), "beef");
+    assert.equal(reply.readUInt16BE(0), 0x4242);
+  });
+
+  it("allows forwarding only for explicitly permitted client networks", async () => {
+    const upstreamPort = await freePort();
+    const upstream = createSocket("udp4");
+    await new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve));
+    let receivedQueries = 0;
+    upstream.on("message", () => { receivedQueries += 1; });
+    closers.push(async () => { upstream.close(); });
+
+    const { port } = await start({
+      zones: () => [EXAMPLE],
+      forwardTo: [`127.0.0.1#${upstreamPort}`],
+      forwardAllow: ["10.0.0.0/8"],
+    });
+    assert.equal(rcodeOf(await ask(port, buildQuery("elsewhere.example.org"))), RCODE.REFUSED);
+    assert.equal(receivedQueries, 0);
+  });
+
+  it("rejects malformed forwarding CIDRs instead of treating an empty prefix as zero", () => {
+    assert.throws(
+      () => createDnsServer({ zones: () => [], forwardAllow: ["10.0.0.1/"] }),
+      /invalid DNS client CIDR prefix/,
+    );
+  });
+
+  it("rate-limits each client without permanently denying it", async () => {
+    let now = 0;
+    const { port } = await start({
+      zones: () => [EXAMPLE],
+      rateLimitPerSecond: 1,
+      rateLimitBurst: 1,
+      now: () => now,
+    });
+    assert.ok(await ask(port, buildQuery("www.example.com"), 200));
+    assert.equal(await ask(port, buildQuery("www.example.com"), 80), undefined);
+    now = 1000;
+    assert.ok(await ask(port, buildQuery("www.example.com"), 200));
+  });
+
+  it("bounds simultaneous upstream work and returns SERVFAIL at capacity", async () => {
+    const upstreamPort = await freePort();
+    const upstream = createSocket("udp4");
+    await new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve));
+    let firstMessage: { message: Buffer; port: number; address: string } | undefined;
+    let signalFirst = (): void => {};
+    const sawFirst = new Promise<void>((resolve) => { signalFirst = resolve; });
+    upstream.on("message", (message, remote) => {
+      firstMessage ??= { message, port: remote.port, address: remote.address };
+      signalFirst();
+    });
+    closers.push(async () => { upstream.close(); });
+
+    const { port } = await start({
+      zones: () => [EXAMPLE],
+      forwardTo: [`127.0.0.1#${upstreamPort}`],
+      maxConcurrentForwards: 1,
+      forwardTimeoutMs: 500,
+    });
+    const first = ask(port, buildQuery("first.example.org", TYPE.A, 0x1001));
+    await sawFirst;
+    const second = await ask(port, buildQuery("second.example.org", TYPE.A, 0x1002));
+    assert.equal(rcodeOf(second), RCODE.SERVFAIL);
+    assert.ok(firstMessage);
+    upstream.send(forwardedReply(firstMessage.message, [0xca, 0xfe]), firstMessage.port, firstMessage.address);
+    assert.equal(received(await first).subarray(-2).toString("hex"), "cafe");
+  });
+
+  it("closes idle TCP clients and refuses connections beyond its cap", async () => {
+    const idle = await start({ zones: () => [EXAMPLE], tcpIdleTimeoutMs: 40 });
+    const idleSocket = connect(idle.port, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => { idleSocket.once("connect", resolve); idleSocket.once("error", reject); });
+    await Promise.race([
+      new Promise<void>((resolve) => idleSocket.once("close", () => resolve())),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("idle DNS TCP socket stayed open")), 300)),
+    ]);
+
+    const capped = await start({ zones: () => [EXAMPLE], maxTcpConnections: 1, tcpIdleTimeoutMs: 1000 });
+    const first = connect(capped.port, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => { first.once("connect", resolve); first.once("error", reject); });
+    const second = connect(capped.port, "127.0.0.1");
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        second.once("close", () => resolve());
+        second.once("error", () => resolve());
+      }),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("excess DNS TCP connection stayed open")), 300)),
+    ]);
+    first.destroy();
   });
 
   it("answers SERVFAIL when the upstream says nothing", async () => {
@@ -325,7 +518,6 @@ describe("DNS server", () => {
     // Relaying that query over UDP hands back another truncated answer, and the
     // client has no move left -- it already did the thing TC asks for.
     const upstreamPort = await freePort();
-    const big = Buffer.alloc(1200, 0x41);
     const overUdp: number[] = [];
     const udpUpstream = createSocket("udp4");
     await new Promise<void>((resolve) => udpUpstream.bind(upstreamPort, "127.0.0.1", resolve));
@@ -336,11 +528,18 @@ describe("DNS server", () => {
       udpUpstream.send(truncated, remote.port, remote.address);
     });
     const tcpUpstream = createServer((socket) => {
-      socket.on("data", () => {
-        const framed = Buffer.alloc(2 + big.length);
-        framed.writeUInt16BE(big.length, 0);
-        big.copy(framed, 2);
-        socket.write(framed);
+      socket.on("data", (request) => {
+        const querySize = request.readUInt16BE(0);
+        const query = request.subarray(2, 2 + querySize);
+        const reply = Buffer.alloc(1200, 0x41);
+        query.copy(reply);
+        reply.writeUInt16BE((reply.readUInt16BE(2) & 0x7900) | 0x8080, 2);
+        const framed = Buffer.alloc(2 + reply.length);
+        framed.writeUInt16BE(reply.length, 0);
+        reply.copy(framed, 2);
+        const wrong = Buffer.from(framed);
+        wrong.writeUInt16BE(wrong.readUInt16BE(2) ^ 1, 2);
+        socket.write(Buffer.concat([wrong, framed]));
       });
     });
     await new Promise<void>((resolve) => tcpUpstream.listen(upstreamPort, "127.0.0.1", resolve));

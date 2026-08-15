@@ -65,6 +65,24 @@ describe("zone change notification", () => {
     assert.equal(changes, 0);
   });
 
+  it("preserves atomic audit-retention requests", async () => {
+    let received: unknown;
+    const spy: ZoneRepository = {
+      ...repository().spy,
+      appendAudit: async (entry, retention) => {
+        received = retention;
+        return { ...entry, id: 1 } as AuditEntry;
+      },
+    };
+    const watched = watchingZones(spy, () => undefined);
+
+    await watched.appendAudit({ zone: "example.com" } as never, {
+      deleteAuditBefore: "2026-02-01T00:00:00.000Z",
+    });
+
+    assert.deepEqual(received, { deleteAuditBefore: "2026-02-01T00:00:00.000Z" });
+  });
+
   it("says so only once the write is durable", async () => {
     // A snapshot taken in response must never be able to read state older than
     // the change that prompted it.
@@ -86,6 +104,13 @@ describe("zone change notification", () => {
     assert.equal(changes, 0, "nothing changed, so nothing is re-read");
   });
 
+  it("does not report a durable write as failed when notification throws", async () => {
+    const { spy, durable } = repository();
+    const watched = watchingZones(spy, () => { throw new Error("listener failed"); });
+    await watched.save(zone());
+    assert.deepEqual(durable, ["save"]);
+  });
+
   it("passes reads and writes through to the repository underneath", async () => {
     const { spy, calls } = repository();
     const watched = watchingZones(spy, () => undefined);
@@ -93,5 +118,16 @@ describe("zone change notification", () => {
     await watched.save(zone());
     await watched.audit();
     assert.deepEqual(calls, ["list", "save", "audit"]);
+  });
+
+  it("preserves bounded zone-page requests", async () => {
+    const pages: unknown[] = [];
+    const spy: ZoneRepository = {
+      ...repository().spy,
+      list: async (page) => { pages.push(page); return []; },
+    };
+    const watched = watchingZones(spy, () => undefined);
+    await watched.list({ limit: 50, offset: 100 });
+    assert.deepEqual(pages, [{ limit: 50, offset: 100 }]);
   });
 });

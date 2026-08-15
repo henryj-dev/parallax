@@ -1,10 +1,12 @@
 import { createSocket, type Socket } from "node:dgram";
-import { connect, createServer, type Server } from "node:net";
+import { lookup } from "node:dns/promises";
+import { connect, createServer, isIP, type Server, type Socket as TcpSocket } from "node:net";
+import { performance } from "node:perf_hooks";
 import type { RecordType } from "../domain/dns.ts";
 import { encodeRdata, encodeSoa, rrType } from "./rdata.ts";
 import {
   CLASS_IN, MIN_UDP_PAYLOAD, RCODE, TYPE, WireFormatError,
-  readQuery, writeReply, type ResourceRecord,
+  isResponseToQuery, readQuery, writeReply, type ParsedQuery, type ResourceRecord,
 } from "./wire.ts";
 
 /** One zone's answers, as the control plane computed them. */
@@ -29,8 +31,19 @@ export interface DnsServerOptions {
   readonly zones: () => readonly ServedZone[];
   /** Where names outside every zone go. Empty means answer REFUSED instead. */
   readonly forwardTo?: readonly string[];
+  /** Client CIDRs allowed to use recursion. Defaults to loopback only. */
+  readonly forwardAllow?: readonly string[];
   readonly negativeTtl?: number;
   readonly forwardTimeoutMs?: number;
+  readonly maxConcurrentForwards?: number;
+  readonly tcpIdleTimeoutMs?: number;
+  readonly maxTcpConnections?: number;
+  readonly rateLimitPerSecond?: number;
+  readonly rateLimitBurst?: number;
+  /** Injected only by deterministic tests. */
+  readonly now?: () => number;
+  /** Resolves a bind or upstream hostname to the address both transports use. */
+  readonly resolveHost?: (host: string) => Promise<ResolvedDnsAddress>;
   /**
    * Told about a record that could not be encoded. Everything reaching here has
    * already passed the domain's validation, so this fires on stored content the
@@ -40,8 +53,19 @@ export interface DnsServerOptions {
   readonly onUnservable?: (record: UnservableRecord) => void;
 }
 
+export interface ResolvedDnsAddress {
+  readonly address: string;
+  readonly family: 4 | 6;
+}
+
 const DEFAULT_NEGATIVE_TTL = 60;
 const DEFAULT_FORWARD_TIMEOUT_MS = 4000;
+const DEFAULT_FORWARD_ALLOW = ["127.0.0.0/8", "::1/128"];
+const DEFAULT_MAX_CONCURRENT_FORWARDS = 256;
+const DEFAULT_TCP_IDLE_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_TCP_CONNECTIONS = 1024;
+const DEFAULT_RATE_LIMIT_PER_SECOND = 100;
+const DEFAULT_RATE_LIMIT_BURST = 200;
 
 /**
  * Answers for the zones this control plane holds, and forwards everything else.
@@ -59,10 +83,23 @@ export function createDnsServer(options: DnsServerOptions): {
   const negativeTtl = options.negativeTtl ?? DEFAULT_NEGATIVE_TTL;
   const forwardTo = options.forwardTo ?? [];
   const forwardTimeoutMs = options.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS;
+  const forwardAllow = compileCidrs(options.forwardAllow ?? DEFAULT_FORWARD_ALLOW);
+  const maxConcurrentForwards = positiveInteger(options.maxConcurrentForwards ?? DEFAULT_MAX_CONCURRENT_FORWARDS, "maxConcurrentForwards");
+  const tcpIdleTimeoutMs = positiveInteger(options.tcpIdleTimeoutMs ?? DEFAULT_TCP_IDLE_TIMEOUT_MS, "tcpIdleTimeoutMs");
+  const maxTcpConnections = positiveInteger(options.maxTcpConnections ?? DEFAULT_MAX_TCP_CONNECTIONS, "maxTcpConnections");
+  const rateLimiter = createRateLimiter(
+    positiveInteger(options.rateLimitPerSecond ?? DEFAULT_RATE_LIMIT_PER_SECOND, "rateLimitPerSecond"),
+    positiveInteger(options.rateLimitBurst ?? DEFAULT_RATE_LIMIT_BURST, "rateLimitBurst"),
+    options.now ?? Date.now,
+  );
+  const resolveHost = options.resolveHost ?? resolveDnsAddress;
+  const resolveForwardHost = createTimedDnsResolver(resolveHost);
   let udp: Socket | undefined;
   let tcp: Server | undefined;
+  const tcpSockets = new Set<TcpSocket>();
+  let activeForwards = 0;
 
-  async function respond(message: Buffer, overTcp: boolean): Promise<Buffer | undefined> {
+  async function respond(message: Buffer, overTcp: boolean, clientAddress: string): Promise<Buffer | undefined> {
     let query;
     try {
       query = readQuery(message);
@@ -76,7 +113,19 @@ export function createDnsServer(options: DnsServerOptions): {
       if (forwardTo.length === 0) {
         return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
       }
-      const forwarded = await forward(message, forwardTo, forwardTimeoutMs, overTcp);
+      if (!cidrsContain(forwardAllow, clientAddress)) {
+        return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
+      }
+      if (activeForwards >= maxConcurrentForwards) {
+        return writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: false }, Number.MAX_SAFE_INTEGER);
+      }
+      activeForwards += 1;
+      let forwarded: Buffer | undefined;
+      try {
+        forwarded = await forward(message, query, forwardTo, forwardTimeoutMs, overTcp, resolveForwardHost);
+      } finally {
+        activeForwards -= 1;
+      }
       return forwarded ?? writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: false }, Number.MAX_SAFE_INTEGER);
     }
     const parts = answerFromZone(query, zone, negativeTtl, options.onUnservable);
@@ -85,13 +134,22 @@ export function createDnsServer(options: DnsServerOptions): {
 
   return {
     async listen(port, host) {
-      udp = createSocket({ type: "udp4", reuseAddr: true });
+      const binding = await resolveHost(host);
+      assertResolvedAddress(binding, host);
+      // UDP sockets are family-specific. The TCP listener accepts either
+      // family from a hostname, so bind both transports to this one numeric
+      // result instead of letting their separate resolvers choose differently.
+      udp = createSocket({ type: binding.family === 6 ? "udp6" : "udp4", reuseAddr: true });
       udp.on("message", (message, remote) => {
-        void respond(message, false).then((reply) => {
+        if (!rateLimiter.allow(remote.address)) return;
+        void respond(message, false, remote.address).then((reply) => {
           if (reply) udp?.send(reply, remote.port, remote.address);
         }).catch(() => undefined);
       });
       tcp = createServer((socket) => {
+        tcpSockets.add(socket);
+        socket.setTimeout(tcpIdleTimeoutMs, () => socket.destroy());
+        socket.on("close", () => tcpSockets.delete(socket));
         // A TCP message is length-prefixed, and may arrive in pieces.
         let buffered = Buffer.alloc(0);
         socket.on("data", (chunk) => {
@@ -102,7 +160,9 @@ export function createDnsServer(options: DnsServerOptions): {
             if (buffered.length < size + 2) return;
             const message = buffered.subarray(2, size + 2);
             buffered = buffered.subarray(size + 2);
-            void respond(message, true).then((reply) => {
+            const clientAddress = socket.remoteAddress;
+            if (!clientAddress || !rateLimiter.allow(clientAddress)) continue;
+            void respond(message, true, clientAddress).then((reply) => {
               if (!reply) return;
               const framed = Buffer.alloc(2 + reply.length);
               framed.writeUInt16BE(reply.length, 0);
@@ -113,12 +173,14 @@ export function createDnsServer(options: DnsServerOptions): {
         });
         socket.on("error", () => socket.destroy());
       });
+      tcp.maxConnections = maxTcpConnections;
       await Promise.all([
-        new Promise<void>((resolve, reject) => { udp?.once("error", reject); udp?.bind(port, host, resolve); }),
-        new Promise<void>((resolve, reject) => { tcp?.once("error", reject); tcp?.listen(port, host, resolve); }),
+        new Promise<void>((resolve, reject) => { udp?.once("error", reject); udp?.bind(port, binding.address, resolve); }),
+        new Promise<void>((resolve, reject) => { tcp?.once("error", reject); tcp?.listen(port, binding.address, resolve); }),
       ]);
     },
     async close() {
+      for (const socket of tcpSockets) socket.destroy();
       await Promise.all([
         new Promise<void>((resolve) => { if (udp) udp.close(resolve); else resolve(); }),
         new Promise<void>((resolve) => { if (tcp) tcp.close(() => resolve()); else resolve(); }),
@@ -235,55 +297,141 @@ function absolute(name: string, zone: string): string {
 /**
  * Hands the query on unchanged and relays what comes back.
  *
- * The bytes are not parsed in either direction. Nothing here needs to know what
- * the answer says, and re-encoding somebody else's reply is a way to change it
- * by accident.
+ * The answer remains byte-for-byte intact, but its correlation fields are
+ * parsed before relay. A connected UDP socket lets the kernel reject any other
+ * source; the DNS checks reject stale or forged datagrams from the right peer.
  */
 async function forward(
   message: Buffer,
+  query: ParsedQuery,
   upstreams: readonly string[],
   timeoutMs: number,
   overTcp: boolean,
+  resolveHost: (host: string, timeoutMs: number) => Promise<ResolvedDnsAddress | undefined>,
 ): Promise<Buffer | undefined> {
   for (const upstream of upstreams) {
     const [host, port] = splitUpstream(upstream);
-    // The transport the client used is the transport the upstream is asked on.
-    // A client only reaches TCP because it was told the UDP answer was
-    // truncated, so relaying that query over UDP hands back another truncated
-    // answer -- and the client has no move left, having already done the thing
-    // truncation asks for.
+    const deadline = performance.now() + timeoutMs;
+    let resolved: ResolvedDnsAddress;
+    try {
+      const candidate = await resolveHost(host, timeoutMs);
+      if (!candidate) continue;
+      resolved = candidate;
+      assertResolvedAddress(resolved, host);
+    } catch {
+      continue;
+    }
+    const remainingMs = Math.ceil(deadline - performance.now());
+    if (remainingMs <= 0) continue;
+    // Preserve the client's transport: a TCP retry relayed over UDP could only
+    // return another truncated reply. Both paths validate DNS correlation data.
     const reply = overTcp
-      ? await relayOverTcp(message, host, port, timeoutMs)
-      : await relayOverUdp(message, host, port, timeoutMs);
+      ? await relayOverTcp(message, query, resolved.address, port, remainingMs)
+      : await relayOverUdp(message, query, resolved.address, resolved.family, port, remainingMs);
     if (reply) return reply;
   }
   return undefined;
 }
 
-function relayOverUdp(message: Buffer, host: string, port: number, timeoutMs: number): Promise<Buffer | undefined> {
+/**
+ * Shares one raw lookup per host and gives every caller a bounded wait.
+ *
+ * `dns.lookup()` cannot be cancelled. Merely racing it with a timer would let
+ * every new query start another abandoned lookup after its application-level
+ * timeout. Keeping the unresolved promise here bounds that backlog to one raw
+ * lookup per configured upstream while still releasing the forwarding slot.
+ */
+export function createTimedDnsResolver(
+  resolveHost: (host: string) => Promise<ResolvedDnsAddress>,
+): (host: string, timeoutMs: number) => Promise<ResolvedDnsAddress | undefined> {
+  interface PendingResolution {
+    readonly waiters: Set<(value: ResolvedDnsAddress | undefined) => void>;
+  }
+  const pending = new Map<string, PendingResolution>();
+  return (host, timeoutMs) => {
+    const key = normalizeDnsHost(host).toLowerCase();
+    let resolution = pending.get(key);
+    if (!resolution) {
+      resolution = { waiters: new Set() };
+      pending.set(key, resolution);
+      const current = resolution;
+      const finish = (value: ResolvedDnsAddress | undefined): void => {
+        if (pending.get(key) === current) pending.delete(key);
+        for (const waiter of current.waiters) waiter(value);
+        current.waiters.clear();
+      };
+      // Exactly one reaction observes the uncancellable raw lookup. Application
+      // callers subscribe to the removable Set below, so timed-out closures do
+      // not accumulate forever on a stalled Promise.
+      void Promise.resolve().then(() => resolveHost(host)).then(finish, () => finish(undefined));
+    }
+    const current = resolution;
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const complete = (value: ResolvedDnsAddress | undefined): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        current.waiters.delete(complete);
+        resolve(value);
+      };
+      current.waiters.add(complete);
+      timer = setTimeout(() => complete(undefined), timeoutMs);
+      timer.unref();
+    });
+  };
+}
+
+function relayOverUdp(
+  message: Buffer,
+  query: ParsedQuery,
+  host: string,
+  family: 4 | 6,
+  port: number,
+  timeoutMs: number,
+): Promise<Buffer | undefined> {
   return new Promise((resolve) => {
-    const socket = createSocket("udp4");
+    const socket = createSocket(family === 6 ? "udp6" : "udp4");
+    let settled = false;
     const done = (value: Buffer | undefined): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      socket.close();
+      try { socket.close(); } catch { /* The connect may have failed before bind. */ }
       resolve(value);
     };
     const timer = setTimeout(() => done(undefined), timeoutMs);
     timer.unref();
-    socket.once("message", (answer) => done(answer));
+    socket.on("message", (answer) => {
+      if (isResponseToQuery(answer, query)) done(answer);
+    });
     socket.once("error", () => done(undefined));
-    socket.send(message, port, host, (error) => { if (error) done(undefined); });
+    // Connected UDP makes the kernel reject datagrams from every other source
+    // address or port before the DNS-level checks above run.
+    socket.connect(port, host, () => {
+      socket.send(message, (error) => { if (error) done(undefined); });
+    });
   });
 }
 
-function relayOverTcp(message: Buffer, host: string, port: number, timeoutMs: number): Promise<Buffer | undefined> {
+function relayOverTcp(
+  message: Buffer,
+  query: ParsedQuery,
+  host: string,
+  port: number,
+  timeoutMs: number,
+): Promise<Buffer | undefined> {
   return new Promise((resolve) => {
     const framed = Buffer.alloc(2 + message.length);
     framed.writeUInt16BE(message.length, 0);
     message.copy(framed, 2);
     const socket = connect(port, host, () => socket.write(framed));
     let buffered = Buffer.alloc(0);
+    let settled = false;
     const done = (value: Buffer | undefined): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       socket.destroy();
       resolve(value);
@@ -292,12 +440,18 @@ function relayOverTcp(message: Buffer, host: string, port: number, timeoutMs: nu
     timer.unref();
     socket.on("data", (chunk) => {
       buffered = Buffer.concat([buffered, chunk]);
-      if (buffered.length < 2) return;
-      const size = buffered.readUInt16BE(0);
-      if (buffered.length < size + 2) return;
-      // The frame is stripped here and put back by the caller's own framing, so
-      // an upstream that batches replies cannot smuggle a second one through.
-      done(Buffer.from(buffered.subarray(2, size + 2)));
+      while (buffered.length >= 2) {
+        const size = buffered.readUInt16BE(0);
+        if (buffered.length < size + 2) return;
+        // Consume every complete frame, including a forged or stale one, so a
+        // later valid reply on the same connection still has a chance to win.
+        const answer = Buffer.from(buffered.subarray(2, size + 2));
+        buffered = buffered.subarray(size + 2);
+        if (isResponseToQuery(answer, query)) {
+          done(answer);
+          return;
+        }
+      }
     });
     socket.on("error", () => done(undefined));
     socket.on("close", () => done(undefined));
@@ -307,6 +461,149 @@ function relayOverTcp(message: Buffer, host: string, port: number, timeoutMs: nu
 function splitUpstream(value: string): [string, number] {
   const [host, port] = value.split("#") as [string, string | undefined];
   return [host, port === undefined ? 53 : Number(port)];
+}
+
+async function resolveDnsAddress(source: string): Promise<ResolvedDnsAddress> {
+  const host = normalizeDnsHost(source);
+  const literalFamily = isIP(host);
+  if (literalFamily === 4 || literalFamily === 6) {
+    return { address: host, family: literalFamily };
+  }
+  const resolved = await lookup(host);
+  const family = isIP(resolved.address);
+  if ((family !== 4 && family !== 6) || family !== resolved.family) {
+    throw new Error(`DNS host did not resolve to an IPv4 or IPv6 address: ${source}`);
+  }
+  return { address: resolved.address, family };
+}
+
+function normalizeDnsHost(source: string): string {
+  const host = source.trim();
+  if (host.startsWith("[") && host.endsWith("]")) {
+    const inner = host.slice(1, -1);
+    if (isIP(inner) === 6) return inner;
+  }
+  return host;
+}
+
+function assertResolvedAddress(value: ResolvedDnsAddress, source: string): void {
+  const family = isIP(value.address);
+  if ((family !== 4 && family !== 6) || family !== value.family) {
+    throw new Error(`DNS host resolver returned an invalid address for ${source}`);
+  }
+}
+
+interface CompiledCidr {
+  readonly address: Uint8Array;
+  readonly prefix: number;
+}
+
+function compileCidrs(values: readonly string[]): CompiledCidr[] {
+  return values.map((source) => {
+    const value = source.trim();
+    const slash = value.lastIndexOf("/");
+    const addressText = slash < 0 ? value : value.slice(0, slash);
+    const address = parseIpBytes(addressText);
+    if (!address) throw new Error(`invalid DNS client CIDR: ${source}`);
+    const bits = address.length * 8;
+    const prefixText = slash < 0 ? String(bits) : value.slice(slash + 1);
+    if (!/^\d{1,3}$/u.test(prefixText)) throw new Error(`invalid DNS client CIDR prefix: ${source}`);
+    const prefix = Number(prefixText);
+    if (!Number.isInteger(prefix) || prefix < 0 || prefix > bits) {
+      throw new Error(`invalid DNS client CIDR prefix: ${source}`);
+    }
+    return { address, prefix };
+  });
+}
+
+function cidrsContain(cidrs: readonly CompiledCidr[], source: string): boolean {
+  const address = parseIpBytes(source);
+  if (!address) return false;
+  return cidrs.some((cidr) => cidr.address.length === address.length
+    && prefixMatches(cidr.address, address, cidr.prefix));
+}
+
+function prefixMatches(network: Uint8Array, address: Uint8Array, prefix: number): boolean {
+  const complete = Math.floor(prefix / 8);
+  for (let index = 0; index < complete; index += 1) {
+    if (network[index] !== address[index]) return false;
+  }
+  const remainder = prefix % 8;
+  if (remainder === 0) return true;
+  const mask = (0xff << (8 - remainder)) & 0xff;
+  return ((network[complete] ?? 0) & mask) === ((address[complete] ?? 0) & mask);
+}
+
+function parseIpBytes(source: string): Uint8Array | undefined {
+  const unbracketed = source.trim().replace(/^\[|\]$/gu, "").split("%")[0] ?? "";
+  if (isIP(unbracketed) === 4) return Uint8Array.from(unbracketed.split(".").map(Number));
+  if (isIP(unbracketed) !== 6) return undefined;
+
+  let value = unbracketed.toLowerCase();
+  const embedded = /(?:^|:)(\d+\.\d+\.\d+\.\d+)$/u.exec(value)?.[1];
+  if (embedded) {
+    const bytes = embedded.split(".").map(Number);
+    const replacement = `${((bytes[0] ?? 0) << 8 | (bytes[1] ?? 0)).toString(16)}:${((bytes[2] ?? 0) << 8 | (bytes[3] ?? 0)).toString(16)}`;
+    value = `${value.slice(0, -embedded.length)}${replacement}`;
+  }
+  const halves = value.split("::");
+  const left = (halves[0] ?? "").split(":").filter(Boolean);
+  const right = (halves[1] ?? "").split(":").filter(Boolean);
+  const missing = 8 - left.length - right.length;
+  const groups = halves.length === 1 ? left : [...left, ...Array.from({ length: missing }, () => "0"), ...right];
+  if (groups.length !== 8) return undefined;
+  const bytes = new Uint8Array(16);
+  for (const [index, group] of groups.entries()) {
+    const parsed = Number.parseInt(group, 16);
+    bytes[index * 2] = parsed >>> 8;
+    bytes[index * 2 + 1] = parsed & 0xff;
+  }
+  // Node commonly reports IPv4 TCP peers in this mapped form.
+  if (bytes.slice(0, 10).every((byte) => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff) {
+    return bytes.slice(12);
+  }
+  return bytes;
+}
+
+function positiveInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
+
+function createRateLimiter(ratePerSecond: number, burst: number, now: () => number): { allow(address: string): boolean } {
+  const clients = new Map<string, { tokens: number; at: number }>();
+  const maxClients = 10_000;
+  const idleExpiryMs = Math.max(1000, Math.ceil(burst * 1000 / ratePerSecond));
+  let lastSweep = Number.NEGATIVE_INFINITY;
+  return {
+    allow(address) {
+      const parsed = parseIpBytes(address);
+      const key = parsed ? `${parsed.length}:${[...parsed].join(".")}` : address;
+      const time = now();
+      let client = clients.get(key);
+      if (!client) {
+        // Do not evict a live bucket merely because a new spoofed source was
+        // observed: cycling enough source addresses would otherwise reset the
+        // victim's allowance. Expired buckets are swept at most once a second;
+        // if the table is still full, an unknown client fails closed.
+        if (clients.size >= maxClients && time - lastSweep >= 1000) {
+          for (const [candidate, state] of clients) {
+            if (time - state.at >= idleExpiryMs) clients.delete(candidate);
+          }
+          lastSweep = time;
+        }
+        if (clients.size >= maxClients) return false;
+        client = { tokens: burst, at: time };
+        clients.set(key, client);
+      }
+      const elapsed = Math.max(0, time - client.at);
+      client.tokens = Math.min(burst, client.tokens + elapsed * ratePerSecond / 1000);
+      client.at = time;
+      if (client.tokens < 1) return false;
+      client.tokens -= 1;
+      return true;
+    },
+  };
 }
 
 export { CLASS_IN, MIN_UDP_PAYLOAD };

@@ -45,7 +45,7 @@ status() { dig +noall +comments +time=3 +tries=1 -p "$DNSPORT" @127.0.0.1 "$@" 2
 
 # Deployment details are reported only to an authenticated caller, so the run
 # uses a token throughout rather than only where it is read back.
-TOKEN="verify-dns-token-that-is-at-least-32-bytes-long"
+TOKEN="$(node -e 'process.stdout.write(Buffer.alloc(32, 0x42).toString("base64url"))')"
 AUTH=(-H "authorization: Bearer ${TOKEN}")
 
 put() {

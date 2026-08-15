@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   MIN_UDP_PAYLOAD, RCODE, TYPE, WireFormatError,
-  readName, readQuery, typeName, writeName, writeReply,
+  isResponseToQuery, readName, readQuery, typeName, writeName, writeReply,
 } from "../../src/dns/wire.ts";
 
 /**
@@ -76,6 +76,25 @@ describe("DNS wire format", () => {
   it("refuses a question whose type and class were cut off", () => {
     const full = buildQuery("example.com");
     assert.throws(() => readQuery(full.subarray(0, full.length - 2)), /truncated/);
+  });
+
+  it("matches forwarded responses by QR, opcode, id and the complete question", () => {
+    const request = buildQuery("www.example.com", TYPE.AAAA, { id: 0x4242 });
+    const query = readQuery(request);
+    const valid = Buffer.from(request);
+    valid.writeUInt16BE(0x8180, 2);
+    assert.equal(isResponseToQuery(valid, query), true);
+
+    const wrongId = Buffer.from(valid);
+    wrongId.writeUInt16BE(0x4243, 0);
+    const wrongOpcode = Buffer.from(valid);
+    wrongOpcode.writeUInt16BE(0x8980, 2);
+    const notAResponse = Buffer.from(request);
+    const wrongQuestion = buildQuery("other.example.com", TYPE.AAAA, { id: 0x4242, flags: 0x8180 });
+    const wrongType = buildQuery("www.example.com", TYPE.A, { id: 0x4242, flags: 0x8180 });
+    for (const candidate of [wrongId, wrongOpcode, notAResponse, wrongQuestion, wrongType, Buffer.of(1, 2, 3)]) {
+      assert.equal(isResponseToQuery(candidate, query), false);
+    }
   });
 
   describe("names", () => {

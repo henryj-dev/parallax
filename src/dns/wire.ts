@@ -91,6 +91,29 @@ export function readQuery(message: Buffer): ParsedQuery {
 }
 
 /**
+ * Checks the correlation fields a forwarding resolver must verify before it
+ * relays an upstream datagram. Malformed or unrelated packets are ignored so a
+ * later valid response from the connected upstream can still win.
+ */
+export function isResponseToQuery(message: Buffer, query: ParsedQuery): boolean {
+  try {
+    if (message.length < HEADER_BYTES) return false;
+    if (message.readUInt16BE(0) !== query.id) return false;
+    const flags = message.readUInt16BE(2);
+    if ((flags & 0x8000) === 0) return false;
+    if ((flags & 0x7800) !== (query.flags & 0x7800)) return false;
+    if (message.readUInt16BE(4) !== 1) return false;
+    const question = readName(message, HEADER_BYTES);
+    if (question.offset + 4 > message.length) return false;
+    return question.name === query.question.name
+      && message.readUInt16BE(question.offset) === query.question.type
+      && message.readUInt16BE(question.offset + 2) === query.question.class;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Walks the records after the question looking for the client's OPT record,
  * which is where it says how large a reply it can take.
  *

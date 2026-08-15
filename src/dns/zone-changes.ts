@@ -18,17 +18,23 @@ import type { ZoneRepository } from "../application/ports.ts";
  * so a snapshot taken in response can never be ahead of the store.
  */
 export function watchingZones(repository: ZoneRepository, onChange: () => void): ZoneRepository {
+  // A notification is advisory and follows the durable write. Its listener
+  // must not turn a committed mutation into an apparent failure that a caller
+  // retries, because that can duplicate higher-level side effects.
+  const changed = (): void => {
+    try { onChange(); } catch { /* The periodic refresh remains the fallback. */ }
+  };
   return {
-    list: () => repository.list(),
+    list: (page) => repository.list(page),
     get: (name) => repository.get(name),
     listRevisions: (zone, page) => repository.listRevisions(zone, page),
     getRevision: (zone, revision) => repository.getRevision(zone, revision),
-    appendAudit: (entry) => repository.appendAudit(entry),
+    appendAudit: (entry, retention) => repository.appendAudit(entry, retention),
     audit: (zone, page) => repository.audit(zone, page),
-    save: async (zone) => { await repository.save(zone); onChange(); },
-    saveRevision: async (snapshot) => { await repository.saveRevision(snapshot); onChange(); },
-    commitDesiredChange: async (change) => { await repository.commitDesiredChange(change); onChange(); },
-    commitZoneDeletion: async (deletion) => { await repository.commitZoneDeletion(deletion); onChange(); },
-    delete: async (name) => { await repository.delete(name); onChange(); },
+    save: async (zone) => { await repository.save(zone); changed(); },
+    saveRevision: async (snapshot) => { await repository.saveRevision(snapshot); changed(); },
+    commitDesiredChange: async (change) => { await repository.commitDesiredChange(change); changed(); },
+    commitZoneDeletion: async (deletion) => { await repository.commitZoneDeletion(deletion); changed(); },
+    delete: async (name) => { await repository.delete(name); changed(); },
   };
 }
