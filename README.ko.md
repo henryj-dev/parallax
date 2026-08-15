@@ -54,19 +54,44 @@ pnpm start
 | 변수 | 용도 |
 | --- | --- |
 | `HOST`, `PORT` | 서버 바인드 주소. 기본값 `127.0.0.1:3000` |
-| `DATABASE_URL` | PostgreSQL 원본 저장소. 스키마는 `parallax migrate`로 적용. TLS는 `?sslmode=verify-full` |
+| `DATABASE_URL` | PostgreSQL 원본 저장소. 루프백이 아닌 URL은 `sslmode=verify-full` 또는 `verify-ca`로 TLS를 검증해야 함 |
+| `PARALLAX_ALLOW_PLAINTEXT_POSTGRES` | 별도로 보호된 네트워크에서만, 검증된 TLS가 없는 비루프백 PostgreSQL URL을 명시적으로 허용하는 `true` 값 |
 | `PARALLAX_STATE_FILE` | 데이터베이스가 없을 때 존·리비전·상태·감사 기록 파일 |
 | `PARALLAX_CONFIG_FILE` | 데이터베이스가 없을 때 설정·자격 증명·접근 토큰 파일 |
 | `PARALLAX_PROVIDER_STATE_FILE` | 로컬 프로바이더가 켜져 있을 때만 사용하는 상태 파일 |
+| `PARALLAX_COREDNS_ROOT` | 저장된 `coreDnsDirectory`를 가두는 배포 소유 루트. CoreDNS 발행을 켜기 전에 반드시 설정 |
 | `PARALLAX_OWNERSHIP_SECRET` | 관리 레코드 소유권 마커에 서명하는 32바이트 이상 시크릿 |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장 자격 증명을 암호화하는 정확히 32바이트 키(base64 또는 64자 16진수) |
-| `PARALLAX_POWERDNS_DATABASE_URL` | PowerDNS 자체 데이터베이스. CoreDNS 존 파일 대신 여기로 내부 뷰를 발행할 때 |
+| `PARALLAX_POWERDNS_DATABASE_URL` | PowerDNS 자체 데이터베이스. 같은 PostgreSQL TLS 정책이 적용되며, CoreDNS 대신 여기로 내부 뷰를 발행할 때 사용 |
 | `PARALLAX_DNS_PORT` | 이 프로세스가 내부 뷰에 대해 직접 DNS로 응답한다. 설정하지 않으면 포트를 열지 않는다 |
-| `PARALLAX_DNS_HOST` | DNS 리스너가 바인드할 주소. 기본값은 `HOST` 이고, 지정하지 않았다면 루프백이다 |
-| `PARALLAX_DNS_FORWARD_TO` | 관리 존 밖의 이름을 넘길 상위 리졸버 목록(`host` 또는 `host#port`, 쉼표 구분). 비어 있으면 넘기지 않고 `REFUSED` 로 답한다 |
-| `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | 이 프로세스가 직접 TLS를 끝낼 인증서와 키. 둘 다 설정하거나 둘 다 비웁니다 |
-| `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP에 TLS origin으로의 리다이렉트를 내는 포트. TLS 설정이 있어야 합니다 |
-| `PARALLAX_AUTH_TOKENS` | `{"token","subject","role"}` 객체의 JSON 배열. `role`은 `admin`·`editor`·`viewer` 중 하나이고 토큰은 32바이트 이상. 루프백에서는 선택, **그 외 주소에 바인드하려면 필수** |
+| `PARALLAX_DNS_HOST` | DNS 리스너가 바인드할 주소. 기본값은 `HOST`이고, 지정하지 않았다면 루프백이다 |
+| `PARALLAX_DNS_FORWARD_TO` | 관리 존 밖의 이름을 넘길 상위 리졸버 목록(`host` 또는 `host#port`, 쉼표 구분). 비어 있으면 넘기지 않고 `REFUSED`로 답한다 |
+| `PARALLAX_DNS_FORWARD_ALLOW` | 재귀 전달을 허용할 클라이언트 CIDR. 기본값은 루프백이며, 비루프백 리스너에서 전달하려면 명시해야 함 |
+| `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | 이 프로세스가 직접 TLS를 종단할 인증서와 키. 둘 다 설정하거나 둘 다 비워야 함 |
+| `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP에 저장된 `publicOrigin`으로의 리다이렉트를 내는 포트. TLS와 해당 설정이 모두 필요 |
+| `PARALLAX_AUTH_TOKENS` | `{"token","subject","role"}` 객체의 JSON 배열. `role`은 `admin`, `editor`, `viewer` 중 하나이고, 토큰은 임의의 32바이트를 패딩 없는 canonical base64url로 인코딩한 43자 값. 루프백에서는 선택, **그 외 주소에 바인드하려면 필수** |
+
+파일 백엔드를 사용하는 배포에서는 설정한 각 데이터 파일의 상위 디렉터리를 서비스
+계정이 소유해야 하며, 모드는 **정확히 `0700`**이어야 합니다. 없는 디렉터리는 이 모드로
+만들지만, 기존 디렉터리에는 Parallax가 자동으로 `chmod`하지 않습니다. 설정 경로가
+`/tmp` 같은 공유 디렉터리를 가리킬 수 있어 권한을 자동으로 좁히면 다른 서비스를 망가뜨릴
+수 있기 때문입니다. 데이터 디렉터리가 흔히 `0755`인 기존 설치를 업그레이드할 때는 모든
+작성 프로세스를 멈추고 다음처럼 명시적으로 준비하세요. 파일별 상위 디렉터리가 다르면
+각 디렉터리에서 이 절차를 반복합니다.
+
+```sh
+# 소스 설치에서 기본 상대 경로를 사용할 때:
+chmod 0700 data
+
+# 시스템 서비스 경로 예시:
+sudo chown parallax:parallax /var/lib/parallax
+sudo chmod 0700 /var/lib/parallax
+```
+
+실제 배포의 서비스 계정과 경로를 사용하고, 모든 파일에 재귀적으로 `chmod`하지 마세요.
+이 권한 마이그레이션과 오래된 잠금 복구는 별개입니다. 모드 오류 때문에 잠금 파일을
+삭제하지 말고, 실제 작성자가 없음을 확인한 뒤 아래의 오류에 표시된 잠금 파일만 제거하는
+절차를 따르세요.
 
 나머지는 전부 — 프로바이더 연결, 보관 정책, 프록시 origin, 접근 토큰, 프로바이더
 자격 증명 — 존과 같은 저장소에 보관되며 포털의 **프로바이더 설정** 화면에서
@@ -76,9 +101,9 @@ pnpm start
 | 설정 | 효과 |
 | --- | --- |
 | `allowLocalProvider` | 실제 프로바이더가 없을 때 로컬 파일에 게시. 기본값은 꺼짐이므로 라우팅되지 않는 대상은 성공으로 보고되지 않고 실패합니다 |
-| `coreDnsDirectory` | 내부 뷰용 RFC 1035 존 파일 디렉터리. 비우면 비활성 |
-| `publicOrigin` | 브라우저가 포털에 접속하는 절대 origin. 비우면 요청마다 유추 |
-| `trustForwardedHeaders` | 리버스 프록시의 `X-Forwarded-Proto`/`X-Forwarded-Host` 신뢰 |
+| `coreDnsDirectory` | `PARALLAX_COREDNS_ROOT` 아래의 내부 뷰용 RFC 1035 존 파일 디렉터리. 비우면 비활성 |
+| `publicOrigin` | 브라우저가 포털에 접속하는 HTTPS origin. 루프백에서만 HTTP 허용 |
+| `trustForwardedHeaders` | 리버스 프록시 헤더 신뢰. 전달된 호스트가 보안 origin을 정하지 못하도록 `publicOrigin`이 있어야 설정 가능 |
 | `revisionRetention` | 존별 보관 리비전 스냅샷 수. `0`은 전부 보관 |
 | `auditRetentionDays` | 존별 감사 기록 보관 일수. `0`은 전부 보관 |
 
@@ -92,12 +117,22 @@ API 요청도 거부합니다. `PARALLAX_AUTH_TOKENS`는 스스로 잠긴 배포
 경로로 남아 있으며, 해당 토큰은 관리형으로 표시되고 API로 폐기할 수 없습니다.
 마지막 관리자 토큰은 폐기되지 않습니다.
 
+서버는 시작할 때 토큰을 읽고 5초마다 다시 읽습니다. 따라서 CLI나 다른 replica에서
+발급하거나 폐기한 토큰도 재시작 없이 최대 5초 안에 반영됩니다.
+저장소를 잠깐 읽지 못하면 마지막으로 읽은 목록을 유지하지만, 실패가 60초 동안
+계속되면 저장된 토큰 인증을 fail-closed 방식으로 거부하고 `/health/ready`를 준비되지
+않은 상태로 전환합니다. 환경변수의 비상 토큰은 복구를 위해 계속 쓸 수 있습니다.
+프로세스가 토큰을 한 번이라도 관찰하면 저장소가 비거나 장애가 나도 인증 비활성화
+상태로 돌아가지 않는 sticky auth가 적용됩니다.
+
 루프백이 아닌 배포를 시작하는 유일한 방법이기도 합니다. 첫 토큰을 발급받을 루프백
 세션 자체가 없기 때문입니다. 컨테이너 이미지는 `0.0.0.0`에 바인드하므로 컨테이너
-배포에는 항상 필요합니다:
+배포에는 항상 필요합니다. 다음 명령으로 43자의 canonical base64url 토큰을 만들고
+JSON 배열에 넣습니다.
 
-```json
-[{"token": "<32바이트 이상>", "subject": "deploy", "role": "admin"}]
+```sh
+TOKEN="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+printf '[{"token":"%s","subject":"deploy","role":"admin"}]\n' "$TOKEN"
 ```
 
 그 외의 경우 서버가 바인드하기 전에 거부합니다:
@@ -109,24 +144,20 @@ Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.
 
 ### 프로세스에서 TLS 종단하기
 
-앞단에 프록시가 없는 배포는 직접 TLS를 낼 수 있습니다. 두 변수를 인증서와 키에 맞추면
-주 포트가 HTTPS를 말합니다:
+앞단에 프록시가 없는 배포는 직접 TLS를 제공할 수 있습니다. 두 변수를 인증서와 키에
+맞추면 주 포트가 HTTPS를 제공합니다.
 
 ```sh
 PARALLAX_TLS_CERT_FILE=/etc/tls/tls.crt \
 PARALLAX_TLS_KEY_FILE=/etc/tls/tls.key \
-PARALLAX_HTTP_REDIRECT_PORT=80 \
 HOST=0.0.0.0 PORT=443 parallax-server
 ```
 
 그 외에는 아무것도 달라지지 않습니다. 서버가 연결을 자기가 끝냈다는 것을 알기 때문에,
 프록시 뒤에서 `publicOrigin`이 공급하던 same-origin 증명이 설정 없이 유도되고 쿠키에
-`Secure`가 붙습니다. 주소가 고정돼 있다면 `publicOrigin`을 설정하십시오. 리다이렉트 리스너가 클라이언트를 보내는
-곳이고, 없으면 리다이렉트는 요청한 호스트의 443을 가정할 수밖에 없습니다 — 이 프로세스가
-바인드한 포트는 클라이언트가 닿은 포트가 아닙니다. Service나 게시된 컨테이너 포트가 그 사이를
-매핑하기 때문입니다. 리다이렉트 리스너가 `publicOrigin` 없이 도는 경우 기동 시 그렇게 알리고, 나중에 그 값을 지우는
-사람에게도 같은 말을 합니다. 정당하지만 대가가 있는 설정 변경은 새 설정과 함께 `warnings`를
-돌려주며, 포털은 그것을 띄우고 명령줄은 stderr로 씁니다.
+`Secure`가 붙습니다. 리다이렉트 포트를 켜기 전에는 공개 HTTPS 주소를 `publicOrigin`에
+저장하십시오. 리다이렉트 리스너는 요청의 `Host`를 반영하지 않고 이 신뢰된 값만 사용하며,
+목적지가 아직 없거나 나중에 비워지면 리다이렉트 포트가 `503`으로 답합니다.
 
 디스크에서 교체된 인증서는 재시작 없이 반영됩니다. 파일이 아니라 디렉터리를 감시합니다.
 쿠버네티스 시크릿 마운트는 심볼릭 링크를 바꿔치는 방식으로 갱신되기 때문입니다. 교체 도중의
@@ -139,16 +170,16 @@ HOST=0.0.0.0 PORT=443 parallax-server
 ### 리버스 프록시 뒤에서 서비스하기
 
 쿠키로 인증한 변경 요청은 same-origin을 증명해야 하며, 이때 브라우저가 실제로
-사용한 origin이 필요합니다. TLS 종료 프록시 뒤에서는 `publicOrigin` 설정에
-공개 origin을 지정하거나, 프록시를 통해서만 이 프로세스에 도달할 수 있다면
-`trustForwardedHeaders`를 켭니다. 둘 다 없으면 서버가 요청을
-`http`로 재구성해 비교하므로 `https` 요청이 거부됩니다.
+사용한 origin이 필요합니다. TLS 종단 프록시 뒤에서는 `publicOrigin`에 공개 HTTPS
+origin을 지정합니다. 신뢰하는 프록시가 이 프로세스에 도달하는 유일한 경로일 때만
+`trustForwardedHeaders`를 켜십시오. 이 설정은 `publicOrigin`이 없으면 거부되므로
+전달된 호스트나 프로토콜이 보안 origin을 결정할 수 없습니다.
 
-인증은 `PARALLAX_AUTH_TOKENS`가 없을 때만 비활성화되며, 이는 루프백 개발 전용
-동작입니다. 그렇지 않으면 해당 포트에 도달한 모든 호출자가 관리자가 됩니다.
+인증은 환경 토큰과 저장 토큰이 모두 없을 때만 비활성화되며, 이는 루프백 개발 전용
+동작입니다. 인증이 비활성화되면 해당 포트에 도달한 모든 호출자가 관리자가 됩니다.
 인증이 비활성화된 상태에서 프록시 전달 헤더가 붙은 API 요청은 거부되고, 기동 시
-경고를 출력합니다. 앞단에 무언가를 두기 전에 반드시 토큰을 설정하세요. 토큰은
-32바이트 이상이어야 하며 `openssl rand -base64 32`로 생성할 수 있습니다. 인증
+경고를 출력합니다. 앞단에 무언가를 두기 전에 반드시 토큰을 설정하세요. 환경 토큰은
+위에서 설명한 임의의 32바이트 canonical base64url 형식이어야 합니다. 인증
 실패가 반복되면 `429`와 `Retry-After` 헤더로 응답하고, 유효한 토큰은 다른
 클라이언트의 실패 때문에 지연되지 않습니다.
 
@@ -194,6 +225,21 @@ Cloudflare에는 최소 권한 API 토큰을 사용합니다. 인증이 설정�
 메타데이터 응답에는 존, 존 ID, 갱신 시각만 포함됩니다. 암호화 자격 증명은
 삭제하면 해당 존의 프로바이더 연결이 끊깁니다.
 
+각 서버는 자격 증명 작업마다 암호화 문서를 새로 읽고, 실행 중인 Cloudflare 라우팅도
+5초마다 갱신합니다. 따라서 다른 replica가 프로필을 회전하거나 바인딩을 제거해도 최대
+한 주기 안에 새 토큰 또는 연결 해제가 반영됩니다. 파일 백엔드는 변경할 때 프로세스 간
+잠금을 잡은 뒤 최신 문서를 다시 읽으므로, 두 프로세스가 오래된 복사본으로 서로의 변경을
+덮어쓰지 않습니다. 갱신을 읽지 못하면 오류를 기록하고 마지막으로 정상 동작한 라우팅을
+유지하며, 접근 토큰과 달리 60초 stale 상한은 없습니다. 따라서 저장소 장애 동안 다른
+replica에서 폐기하거나 회전한 자격 증명이 이 프로세스에 반영되는 시간도 장애가 복구될
+때까지 늘어납니다.
+
+봉인된 문서는 AES-256-GCM 인증과 단조 증가 revision을 사용합니다. 실행 중인 프로세스가
+더 높은 revision을 한 번 관찰한 뒤 오래된 유효 문서가 재생되면 이를 거부합니다. 다만 이
+롤백 방어에는 외부의 단조 증가 신뢰 기준이 없습니다. 재시작한 프로세스나 아직 새 revision을
+보지 못한 replica는 콜드 스타트 전에 복원된 과거의 정상 암호문을 최신 값과 구분할 수
+없습니다. 저장소 자체의 백업과 접근 통제는 여전히 필요합니다.
+
 Cloudflare [TTL](https://developers.cloudflare.com/dns/manage-dns-records/reference/ttl/)은
 [API 표현](https://developers.cloudflare.com/api/resources/dns/subresources/records/)에서
 `1`을 **Auto**로 사용합니다. 프록시가 적용된 A, AAAA, CNAME 레코드는 TTL을
@@ -207,14 +253,25 @@ CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일
 증가시킨 뒤 파일을 원자적으로 교체합니다. CoreDNS가 serial 변경을 감지하도록
 `auto` 플러그인 또는 0이 아닌 재로드 간격을 지정한 `file` 플러그인을 설정해야
 합니다. 파일은 다른 사용자로 실행되는 CoreDNS가 읽을 수 있도록 `0644` 모드로
-기록합니다. 기존 비 Parallax 레코드와 권한 데이터는 유지하며, 서명된 소유권
-마커가 있는 레코드만 변경합니다.
+기록하고 파일과 디렉터리를 모두 `fsync`합니다. 기존 비 Parallax 레코드와 권한
+데이터는 유지하며, 서명된 소유권 마커가 있는 레코드만 변경합니다.
+
+`coreDnsDirectory`는 배포가 환경변수로 고정한 `PARALLAX_COREDNS_ROOT` 아래에 있어야
+합니다. 루트 자체가 심볼릭 링크이거나, 설정 경로가 루트를 벗어나거나 심볼릭 링크를
+통해 밖으로 빠지거나, 쓸 수 없으면 설정을 저장하기 전에 거부합니다. 존 파일 읽기도
+마지막 경로 요소를 따라가지 않는 방식으로 열고, 연 직후 실제 경로와 inode를 다시
+확인합니다. 관리자 설정이 서비스 사용자의 임의 파일 쓰기 권한으로 확대되지 않도록
+루트는 설정 파일과 별개인 배포 소유의 불변 디렉터리로 두십시오.
 
 기존 존 파일을 읽을 때는 일반적인 RFC 1035 표기를 모두 처리합니다. `$TTL`을
-상속하는 레코드, 앞 레코드의 소유자 이름을 상속하는 레코드, 선택적 class 필드,
-괄호로 여러 줄에 걸친 레코드가 포함됩니다. 읽을 수 없는 레코드 줄은 "레코드
-없음"이 아니라 오류로 처리합니다. 없는 것으로 간주하면 보지 못한 응답 옆에
-두 번째 응답을 게시하게 되기 때문입니다.
+상속하는 레코드, 앞 레코드의 소유자 이름을 상속하는 레코드, 선택적 `class` 필드,
+괄호로 여러 줄에 걸친 레코드가 포함됩니다. 중간의 `$ORIGIN`을 추적하고 새 관리
+레코드의 소유자 이름은 항상 절대 이름으로 기록합니다. `$TTL`과 `$ORIGIN` 외의
+`directive`, 지원하지 않는 레코드 타입, 중복된 관리 ID, 닫히지 않은 다중행 레코드는
+모두 fail-closed 오류입니다. 다중행 레코드의 `update`와 `delete`는 물리적 줄 전체를
+처리합니다. 읽을 수 없는 줄을 "레코드 없음"으로 간주하면 보지 못한 응답 옆에 두
+번째 응답을 게시할 수 있기 때문입니다. 저장 경계와 어댑터 양쪽에서 제어 문자,
+`zone-file` 구조 문자, `directive` 주입도 거부합니다.
 
 ### 내부 뷰가 클라이언트에 닿는 세 가지 방법
 
@@ -229,16 +286,16 @@ CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일
 | 변경이 응답되기까지 | `reload` 주기, 약 1초 | 리졸버의 캐시 TTL | 즉시. 다른 곳에서 바꿨다면 한 번의 갱신(5초) |
 | 조정(reconcile) | 함 | 함 | 안 함 |
 
-**발행하는 둘은 배타적이고, 리스너는 아닙니다.** `coreDnsDirectory` 와
-`PARALLAX_POWERDNS_DATABASE_URL` 을 둘 다 설정하면 기동을 거부합니다 — 잘못된 쪽이
+**발행하는 둘은 배타적이고, 리스너는 아닙니다.** `coreDnsDirectory`와
+`PARALLAX_POWERDNS_DATABASE_URL`을 둘 다 설정하면 기동을 거부합니다 — 잘못된 쪽이
 서비스 중이라는 걸 알게 됐을 때 아무도 기억하지 못할 우선순위 규칙으로 푸는 대신에.
-`PARALLAX_DNS_PORT` 는 종류가 다르고 그 규칙에 들어가지 않습니다. 아무것도 발행하지
-않고, 소유권 마커를 쓰지 않으며, 프로바이더와 비교하지도 않습니다. desired state 를 읽어
-응답할 뿐입니다 — `apply` 가 관여하지 않는 이유이자, 변경이 조정 이후가 아니라 한 번의
+`PARALLAX_DNS_PORT`는 종류가 다르고 그 규칙에 들어가지 않습니다. 아무것도 발행하지
+않고, 소유권 마커를 쓰지 않으며, 프로바이더와 비교하지도 않습니다. 목표 상태를 읽어
+응답할 뿐입니다 — `apply`가 관여하지 않는 이유이자, 변경이 조정 이후가 아니라 한 번의
 갱신 안에 드러나는 이유입니다. 발행하는 쪽과 함께 켜는 것은 응답하는 서버가 둘이라는
 뜻이고, 클라이언트가 어느 쪽에 묻는지는 배포가 정합니다.
 
-리스너는 `PARALLAX_DNS_PORT` 가 포트를 지정할 때만 열리고, 그때 `PARALLAX_DNS_HOST`
+리스너는 `PARALLAX_DNS_PORT`가 포트를 지정할 때만 열리고, 그때 `PARALLAX_DNS_HOST`
 — 없으면 `HOST`, 그것도 지정하지 않았다면 루프백 — 에 바인드합니다. 포트를 하나
 설정했다는 이유로 네트워크 전체에 응답하기 시작하는 것은, 누구도 나중에 발견해야 할
 기본값이 아닙니다.
@@ -248,18 +305,30 @@ CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일
 수 있는 사람은 관리 존 밖의 모든 이름에 대해 조용히 대신 답할 수 있습니다. 그건 튜닝
 손잡이가 아닙니다.
 
+전달은 기본적으로 `127.0.0.0/8`과 `::1/128`에서 온 클라이언트에만 허용됩니다.
+비루프백 주소에 리스너를 바인드하면서 `PARALLAX_DNS_FORWARD_TO`를 설정하려면
+`PARALLAX_DNS_FORWARD_ALLOW`에 허용 CIDR을 명시해야 하며, 그 밖의 클라이언트에는
+`REFUSED`로 답합니다. 클라이언트별 응답률 제한(RRL)은 초당 100개, 순간 `burst`
+200개입니다.
+동시에 실행하는 상위 전달은 256개, TCP 연결은 1,024개로 제한하고, TCP 연결이 10초간
+유휴 상태이면 닫습니다. 이 값들은 현재 안전한 내장 기본값이며 환경 설정 항목은 아닙니다.
+
+상위 리졸버로 보내는 UDP 소켓은 목적지에 `connect`해 커널이 다른 출처의 데이터그램을
+버리게 합니다. 같은 출처에서 온 응답도 `QR`, `opcode`, transaction ID, question의 이름,
+타입, class가 원래 질의와 모두 일치할 때만 중계합니다. 일치하지 않는 응답은 타임아웃될 때까지
+무시하므로 먼저 도착한 위조 응답이 정상 응답을 밀어내지 못합니다.
+
 무엇을 이 리스너에 물리기 전에 알아둘 것이 둘 있습니다.
 
-**내부 뷰가 비어 있는 존은 응답 대상에서 빠집니다.** 존을 adopt 한 직후의 정상 상태가
-바로 그것이고, 그 상태로 권한을 주장하면 존이 가진 모든 이름에 NXDOMAIN 으로 답하게
+**내부 뷰가 비어 있는 존은 응답 대상에서 빠집니다.** 존을 `adopt`한 직후의 정상 상태가
+바로 그것이고, 그 상태로 권한을 주장하면 존이 가진 모든 이름에 `NXDOMAIN`으로 답하게
 됩니다. 빼두면 그 이름들은 상위 리졸버로 넘어가, 오버라이드가 생길 때까지 공개된 값으로
 계속 해석됩니다.
 
-**파일 백엔드에서는 실행 중인 리스너가 다른 프로세스의 쓰기를 보지 못합니다.** 파일
-저장소는 프로세스마다 한 번 읽고 캐시하므로, 터미널에서 실행한 `parallax record set` 은
-파일에는 닿지만 포트를 쥔 서버에는 닿지 않습니다. 리스너가 따라가는 것은 포털이나 API 를
-통한 변경입니다. `DATABASE_URL` 을 쓰면 모든 인스턴스가 같은 행을 읽으므로 이 문제는
-생기지 않습니다.
+**리스너 스냅샷은 5초마다 갱신됩니다.** PostgreSQL과 파일 백엔드 모두 매번 최신
+상태를 읽으며, 파일 백엔드는 쓰기 전에 프로세스 간 잠금을 잡고 다시 읽습니다. 따라서
+터미널에서 실행한 `parallax record set`, 다른 replica, 포털과 API의 변경은 어느
+백엔드에서든 다음 갱신 주기 안에 포트를 쥔 서버에 반영됩니다.
 
 이 프로세스가 커밋한 변경은 커밋되는 즉시 응답에 반영됩니다. 컨트롤 플레인이 거쳐 쓰는
 저장소가 알려주기 때문입니다. 5초 주기 재읽기는 스스로 알릴 수 없는 쪽 — 데이터베이스를
@@ -273,6 +342,9 @@ state 를 두고 존 파일·PowerDNS·Cloudflare 가 모두 그렇게 하므로
 **readiness 는 리스너를 내부 뷰의 서비스 수단으로 인정합니다.** DNS 를 직접 응답하고
 프로바이더를 하나도 설정하지 않은 배포도 ready 입니다. 그러지 않으면 모든 질의에 정확히
 답하면서도 probe 는 영원히 통과하지 못합니다.
+공개 readiness 경로는 프로세스의 고정 크기 캐시만 읽고, 전체 존 스캔은 백그라운드에서
+한 번에 하나만 실행합니다. 존 또는 프로바이더 라우팅이 바뀌면 즉시 무효화하며, 갱신이
+실패하거나 10초 넘게 오래되면 준비되지 않은 상태로 답합니다.
 
 존 파일 쪽은 **휘발성 볼륨이 아니라 영속 저장소**가 필요합니다. 존 파일에는 아무도 사본을
 갖고 있지 않은 레코드 — 운영자가 손으로 관리하는 것 — 도 함께 있기 때문입니다. 잃으면
@@ -289,6 +361,12 @@ Parallax 데이터베이스가 아니라 거기에 두는 이유는, **소유권
 있어야** 하기 때문입니다 — Cloudflare 코멘트나 존 파일 주석이 주는 것과 같은 성질입니다.
 PowerDNS에서 레코드를 직접 지우면 마커도 함께 사라지므로, 없는 행을 소유했다고 주장하는
 일이 생기지 않습니다.
+
+이 어댑터는 PowerDNS 데이터베이스에 직접 SQL을 쓰므로 DNSSEC 서명 존은 변경하지
+않습니다. 서명 존의 `ordername`은 NSEC/NSEC3 모드와 정정(rectification) 결과에 따라
+달라지며 이를 추측하면 DNSSEC 부재 증명(denial proof)을 손상할 수 있습니다. 활성
+`cryptokeys`가 있으면 `apply`를 fail-closed로 거부하므로, 서명 존은 `API-RECTIFY`가
+설정된 PowerDNS API나 `pdnsutil`처럼 해당 모드를 아는 경로로 관리해야 합니다.
 
 어느 쪽이든 존은 DNS 엔진에 이미 있어야 합니다. PowerDNS는 `domains` 테이블에 있는 것을
 서비스하고, Parallax는 존을 만드는 것이 아니라 존에 레코드를 발행합니다.
@@ -320,14 +398,19 @@ PostgreSQL을 사용할 때는 서비스를 시작하기 전에 스키마를 적
 parallax migrate
 ```
 
-`migrations/`의 모든 파일을 이름 순으로 다시 적용하며 재실행해도 안전합니다. 모든 객체가
-`IF NOT EXISTS`로 만들어지고 각 파일이 자기 트랜잭션을 갖고 있어, 무엇을 건너뛸지 정하는
-버전 테이블이 필요 없습니다. 동시 실행은 advisory lock으로 직렬화되므로 쿠버네티스 init
-컨테이너나 배포 전 잡으로 쓸 수 있습니다.
+실행할 파일은 코드의 target별 고정 manifest에 적혀 있습니다. 디렉터리에 예상하지 않은
+SQL 파일이 있거나 필요한 파일이 빠졌으면 데이터베이스 연결을 얻기 전에 거부합니다. 각
+파일의 SHA-256 checksum은 `parallax_schema_migrations` ledger에 target과 이름별로
+기록됩니다. 이미 기록된 같은 파일은 건너뛰고, 적용 후 내용이 바뀐 파일은 실패하므로 과거
+마이그레이션을 수정하는 대신 새 번호의 파일을 추가해야 합니다. 동시 실행은 advisory lock으로
+직렬화되므로 쿠버네티스 init 컨테이너나 배포 전 잡으로 쓸 수 있습니다.
 
 기동 시 자동으로 적용하지는 않습니다. 의존하는 저장소를 부팅하면서 재구성하는 서버는 방금
 롤백된 이미지에서도 스키마를 전진시켜 버립니다. 대신 기동을 거부하고 없는 릴레이션 이름을
-알려 줍니다. 마이그레이션은 판단이므로 사람이 실행하는 명령입니다.
+알려 줍니다. 마이그레이션 기능은 로컬 `parallax migrate` CLI용 runtime에만 있고 서빙
+runtime에는 없습니다. 따라서 `POST /api/v1/cli`로는 실행할 수 없으며, 상시 서버의
+HTTP 관리자 권한이 데이터베이스 DDL 권한으로 확대되지 않습니다. 컨테이너의 migration
+파일도 `root` 소유의 읽기 전용 파일이라 UID 10001인 서버가 바꿀 수 없습니다.
 
 ## 하나의 표면, 세 가지 진입로
 
@@ -338,10 +421,11 @@ parallax migrate
 터미널(CLI) ────────────────▶  명령 계층  ──▶  컨트롤 플레인
 ```
 
-포털은 API하고만 통신하며 다른 어디에도 닿지 않습니다. API의 각 라우트는 번역기일
+포털은 API와만 통신하며 다른 어디에도 닿지 않습니다. API의 각 라우트는 번역기일
 뿐입니다. 요청을 명령 호출 하나로 바꾸고, 그 결과를 응답으로 바꿉니다. `parallax`는
-argv를 같은 호출로 파싱합니다. API는 명령 계층이 제공하지 않는 일을 할 수 없고 CLI는
-바로 그 명령들을 실행하므로, 둘이 어긋날 수 없습니다.
+argv를 같은 호출로 파싱합니다. API는 서빙 runtime이 제공하는 명령만 실행하고 CLI는
+같은 명령 계층을 직접 사용하므로 동작 계약이 어긋나지 않습니다. 유일한 기능 차이는
+스키마 마이그레이션으로, 로컬 CLI runtime에만 있습니다.
 
 `POST /api/v1/cli`는 명령줄 자체를 받습니다.
 
@@ -352,14 +436,15 @@ curl -X POST http://127.0.0.1:3000/api/v1/cli \
 ```
 
 셸이나 하위 프로세스 없이 같은 디스패처를 프로세스 안에서 실행하며, 호출자의 역할을
-해당 명령에 적용합니다. 따라서 이 엔드포인트로 토큰 권한을 우회할 수 없습니다.
+해당 명령에 적용합니다. 따라서 이 엔드포인트로 토큰 권한을 우회할 수 없고, 서빙 runtime에
+없는 `migrate`도 실행할 수 없습니다.
 
 ## 명령줄
 
 ```sh
 pnpm cli help                 # 전체 명령
 pnpm cli help record set      # 특정 명령의 옵션
-pnpm cli migrate                # 스키마 적용. 재실행 안전
+pnpm cli migrate              # 고정 manifest의 미적용 스키마만 적용
 pnpm cli zone list
 pnpm cli zone create --zone example.com
 pnpm cli record set --zone example.com --view external --id www \
@@ -370,8 +455,24 @@ pnpm cli settings set --values '{"allowLocalProvider":true}'
 pnpm cli token issue --subject deploy-bot --role editor
 ```
 
-CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽에 즉시 보입니다. 감사
-기록에는 실행자가 `cli:<user>`로 남습니다. 기계가 읽을 출력은 `--json`을 붙이세요.
+머신별 검증 조건에 맞지 않는 저장값 때문에 서버가 시작되지 않을 때도 서빙은
+fail-closed 상태를 유지하지만, 로컬 `settings set` 명령은 복구 경로로 사용할 수
+있습니다. 이 명령은 설정 저장소만 초기화하고, 최신 저장값에 패치를 합친 전체 후보를
+검증한 뒤 기록합니다. 프로바이더, 토큰, 컨트롤 플레인은 시작하지 않습니다. 예를 들어
+다른 머신에만 유효한 CoreDNS 경로는
+`pnpm cli settings set --values '{"coreDnsDirectory":""}'`로 비울 수 있습니다. 패치를
+합친 뒤에도 저장 불변식이 하나라도 유효하지 않으면 아무것도 기록하지 않고 거부합니다.
+
+CLI와 서버는 같은 저장소의 최신 값을 읽습니다. 파일 백엔드도 읽기마다 다시 열고 변경은
+프로세스 간 잠금 아래 병합하므로 오래된 메모리 상태로 다른 쪽의 변경을 덮어쓰지
+않습니다. 토큰과 내장 DNS 스냅샷처럼 주기적으로 갱신하는 런타임 상태에는 최대 5초가
+걸립니다. 감사 기록에는 실행자가 `cli:<user>`로 남습니다. 기계가 읽을 출력은 `--json`을
+붙이세요.
+
+파일 변경 중 프로세스가 강제 종료되면 숨김 잠금 파일이 남을 수 있습니다. 교체된 새
+작성자의 잠금을 경쟁 없이 구분할 수 없으므로 Parallax는 기존 잠금을 자동 삭제하지
+않습니다. 15초 뒤 오류에 표시된 잠금 파일은 해당 데이터 파일을 쓰는 Parallax
+프로세스가 없음을 확인한 다음, 표시된 그 파일만 수동으로 삭제하세요.
 종료 코드는 `sysexits`를 따릅니다. `64` 사용법, `65` 잘못된 입력, `69` 없음,
 `70` 충돌, `77` 권한, `78` 사용 불가.
 
@@ -382,7 +483,7 @@ CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽
 
 모든 컨트롤 플레인 경로는 `/api/v1` 아래에 있습니다.
 
-- `GET|POST /zones` (`{ "name": "example.com" }`)
+- `GET|POST /zones` (`GET ?limit=&offset=`, `POST { "name": "example.com" }`)
 - `GET|PUT|DELETE /zones/:zone` (`DELETE ?abandonProviderRecords=true`)
 - `PUT|DELETE /zones/:zone/views/:view/records/:id`
 - `GET|POST /zones/:zone/preview`
@@ -398,16 +499,23 @@ CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽
 - `GET /credentials/cloudflare`
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
 - `POST /credentials/cloudflare/:zone/test` — 저장된 연결, 또는 아직 저장하지 않은 `{ profile }`·`{ token }` 테스트
-- `POST /cli` (모든 명령 실행. `{ "argv": ["zone", "list"] }`)
+- `POST /cli` (서빙 runtime의 명령 실행. `migrate`는 제외. `{ "argv": ["zone", "list"] }`)
 - `GET /health/live`, `GET /health/ready`
 
 인증을 활성화한 경우 `Authorization: Bearer <token>`을 전달합니다. 목표 상태는
 프로바이더 변경보다 먼저 저장됩니다. 미리보기는 프로바이더를 변경하지 않으며,
 적용 결과는 뷰별로 독립적으로 보고됩니다. 미리보기는 호출할 때마다 실제
 프로바이더를 조회하므로 아무것도 변경하지 않더라도 editor 이상 권한이
-필요합니다. 히스토리와 리비전 목록은 페이지 단위로 반환합니다. 둘 다 `limit`
+필요합니다. 존, 히스토리와 리비전 목록은 페이지 단위로 반환합니다. 모두 `limit`
 (최대 500, 기본 50)과 `offset`을 받고 항목과 함께 `limit`, `offset`, `hasMore`를
-돌려줍니다.
+돌려줍니다. 존 목록은 이름 오름차순입니다.
+
+프로바이더를 바꾸는 `apply`와 존 삭제 회수는 목표 상태 감사와 별도로
+`provider.apply.started`, `provider.apply.completed`, `provider.apply.failed`를 남깁니다.
+시작 이벤트는 첫 프로바이더 변경 전에 기록되며 `actor`, `view`, `target`, 계획한 작업 수를
+포함합니다. 완료와 실패 이벤트에는 끝낸 작업 수가 기록되고, 실패 원인은 자격 증명이나
+시크릿을 포함하지 않는 안전한 오류로 정리됩니다. 중간에 실패해 일부만 반영된 작업도 감사
+이력에서 진행 정도를 확인할 수 있습니다.
 
 동기화 가능한 뷰는 `internal`과 `external`뿐입니다. 다른 뷰 이름은 쓰기 시점에
 거부되므로, 어떤 프로바이더도 적용할 수 없는 목표 상태가 존에 저장되는 일은
@@ -418,9 +526,10 @@ CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽
 응답합니다. Parallax 소유권 마커가 없는 레코드는 건드리지 않습니다. 회수를 먼저
 수행하므로, 프로바이더가 거부하거나 응답하지 않으면 존을 그대로 두어 삭제를 다시
 시도할 수 있습니다. 추적되지 않는 게시 레코드를 남기지 않기 위한 순서입니다.
-`?abandonProviderRecords=true`를 전달하면 회수를 의도적으로 건너뜁니다. 이는
-프로바이더가 영구히 사라진 경우에만 사용하며, 해당 레코드는 살아 있는 상태로
-남습니다.
+`?abandonProviderRecords=true`는 전체 회수를 건너뛰는 옵션이 아닙니다. 먼저 모든
+`target`을 읽고, 접근 가능한 `target`의 관리 레코드는 정상적으로 회수합니다. 읽을 수 없는
+`target`만 의도적으로 남기고 `abandonedProviderTargets`로 명시해 반환합니다. 사라진
+프로바이더가 있는 삭제에서만 사용하십시오.
 
 ## 컨테이너 이미지
 
@@ -428,22 +537,36 @@ CLI는 서버와 같은 저장소를 읽으므로 한쪽의 변경이 다른 쪽
 이미지를 만듭니다.
 
 ```sh
+BOOTSTRAP_TOKEN="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+OWNERSHIP_SECRET="$(openssl rand -base64 32)"
+CREDENTIAL_KEY="$(openssl rand -base64 32)"
+
 docker build -t parallax .
-docker run -p 3000:3000 \
-  -e DATABASE_URL='postgres://...' \
-  -e PARALLAX_OWNERSHIP_SECRET='...' \
-  -e PARALLAX_CREDENTIAL_MASTER_KEY='...' \
-  -e PARALLAX_AUTH_TOKENS='[{"token":"...","subject":"deploy","role":"admin"}]' \
+docker run --read-only -p 443:3443 \
+  -v "$PWD/tls.crt:/run/secrets/parallax-tls.crt:ro" \
+  -v "$PWD/tls.key:/run/secrets/parallax-tls.key:ro" \
+  -e DATABASE_URL='postgresql://parallax:secret@db/parallax?sslmode=verify-full' \
+  -e HOST=0.0.0.0 -e PORT=3443 \
+  -e PARALLAX_TLS_CERT_FILE=/run/secrets/parallax-tls.crt \
+  -e PARALLAX_TLS_KEY_FILE=/run/secrets/parallax-tls.key \
+  -e PARALLAX_OWNERSHIP_SECRET="$OWNERSHIP_SECRET" \
+  -e PARALLAX_CREDENTIAL_MASTER_KEY="$CREDENTIAL_KEY" \
+  -e PARALLAX_AUTH_TOKENS="[{\"token\":\"$BOOTSTRAP_TOKEN\",\"subject\":\"deploy\",\"role\":\"admin\"}]" \
   parallax
 ```
 
-이미지는 `0.0.0.0`에 바인드하므로 `PARALLAX_AUTH_TOKENS`가 필요합니다. 형식과 이유는
-[접근 토큰](#접근-토큰)을 보십시오.
+컨테이너 내부에서는 비특권 포트 3443을 사용하고 호스트의 443에 게시합니다. 인증서와
+개인 키는 읽기 전용으로 마운트하며, 이미지가 `0.0.0.0`에 바인드하므로 canonical 토큰을
+담은 `PARALLAX_AUTH_TOKENS`가 필요합니다. 형식과 이유는 [접근 토큰](#접근-토큰)을
+보십시오. HTTP 리다이렉트도 필요하면 먼저 `publicOrigin`을 저장한 뒤 별도의 비특권
+컨테이너 포트를 `PARALLAX_HTTP_REDIRECT_PORT`로 지정해 호스트의 80에 게시합니다.
 
 서버가 뜨기 전에 같은 이미지로 스키마를 적용합니다:
 
 ```sh
-docker run --rm -e DATABASE_URL='postgres://...' parallax parallax migrate
+docker run --rm \
+  -e DATABASE_URL='postgresql://parallax:secret@db/parallax?sslmode=verify-full' \
+  parallax parallax migrate
 ```
 
 쿠버네티스에서는 `command: ["parallax", "migrate"]`인 init 컨테이너가 됩니다. 닿지 못하거나

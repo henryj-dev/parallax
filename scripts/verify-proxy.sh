@@ -18,7 +18,7 @@ PROXYPORT="${PROXYPORT:-39443}"
 WORK="$(mktemp -d)"
 HOSTNAME_UNDER_TEST="parallax.test"
 SITE="https://${HOSTNAME_UNDER_TEST}:${PROXYPORT}"
-TOKEN="$(openssl rand -hex 32)"
+TOKEN="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
 JAR="$WORK/cookies"
 
 cleanup() {
@@ -116,8 +116,8 @@ CODE=$(status POST /api/v1/session -H 'content-type: application/json' -d "{\"to
 [ "$CODE" = "403" ] || fail "expected the https Origin to be refused while the origin is rebuilt as http, got $CODE"
 ok "with neither publicOrigin nor forwarded trust, the https Origin is refused (403)"
 
-echo "== trusting the proxy's forwarding headers repairs it =="
-configure '{"trustForwardedHeaders":true}'
+echo "== a trusted proxy plus an immutable public origin repairs it =="
+configure "{\"trustForwardedHeaders\":true,\"publicOrigin\":\"${SITE}\"}"
 HEADERS=$(site POST /api/v1/session -H 'content-type: application/json' -d "{\"token\":\"${TOKEN}\"}" -D - -o /dev/null)
 echo "$HEADERS" | head -1 | grep -q ' 200' || fail "sign-in through the proxy did not succeed: $(echo "$HEADERS" | head -1)"
 ok "sign-in through the proxy succeeds"
@@ -223,15 +223,12 @@ redirect_of() {
     -H "Host: ${HOSTNAME_UNDER_TEST}" "http://127.0.0.1:$((NATIVE_PORT + 1))/api/v1/zones"
 }
 REDIRECT=$(redirect_of)
-[ "$REDIRECT" = "308 https://${HOSTNAME_UNDER_TEST}/api/v1/zones" ] \
-  || fail "expected a 308 to the requested host with no port, got: $REDIRECT"
-# The port this process bound is not the port the client reached it on -- a
-# Service or a published container port maps between them. Naming the bound port
-# here sent clients to a port nothing answered on.
-case "$REDIRECT" in
-  *":${NATIVE_PORT}"*) fail "the redirect named the bound port: $REDIRECT" ;;
-esac
-ok "plain HTTP is redirected to the requested host, path intact, no bound port ($REDIRECT)"
+[ "$REDIRECT" = "503 " ] \
+  || fail "an unset redirect target reflected the request Host instead of failing closed: $REDIRECT"
+EVIL_REDIRECT=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
+  -H 'Host: evil.example' "http://127.0.0.1:$((NATIVE_PORT + 1))/api/v1/zones")
+[ "$EVIL_REDIRECT" = "503 " ] || fail "an attacker Host selected a redirect: $EVIL_REDIRECT"
+ok "plain HTTP fails closed until publicOrigin is configured and never reflects Host"
 
 configure_native "{\"publicOrigin\":\"${NATIVE_SITE}\"}"
 REDIRECT=$(redirect_of)
@@ -239,6 +236,7 @@ REDIRECT=$(redirect_of)
   || fail "publicOrigin was ignored by the redirect: $REDIRECT"
 ok "a configured publicOrigin is what the redirect sends clients to"
 configure_native '{"publicOrigin":""}'
+[ "$(redirect_of)" = "503 " ] || fail "clearing publicOrigin left a stale redirect target"
 
 echo "== a renewed certificate is picked up without a restart =="
 # The failure this prevents arrives months later: a pod presenting a certificate

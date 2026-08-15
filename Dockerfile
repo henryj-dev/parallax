@@ -30,14 +30,16 @@ WORKDIR /app
 RUN addgroup -g 10001 -S parallax && adduser -u 10001 -S -G parallax parallax
 
 COPY --from=deps  --chown=parallax:parallax /app/node_modules ./node_modules
-COPY --from=build --chown=parallax:parallax /app/dist ./dist
-COPY --chown=parallax:parallax package.json ./
+COPY --from=build /app/dist ./dist
+COPY package.json ./
 # The portal's assets. `findPublicDirectory()` walks up from the entry point's
 # own directory, so `/app/dist/src` reaches `/app/public` on its second step.
-COPY --chown=parallax:parallax public ./public
-# Never read at runtime. They are here so an operator applying them with psql can
-# check the schema against the image that will run on it.
-COPY --chown=parallax:parallax migrations ./migrations
+COPY public ./public
+# The CLI reads these only for an explicit `parallax migrate`. They remain owned
+# by root and non-writable by the serving uid, so compromising the service cannot
+# plant SQL for a later privileged migration run.
+COPY migrations ./migrations
+RUN chmod -R a-w /app/dist /app/public /app/migrations /app/package.json
 
 # Every operation is available from the command line, so it gets a name on PATH
 # rather than making an operator remember the path into dist.
@@ -55,7 +57,9 @@ RUN printf '#!/bin/sh\nexec node /app/dist/cmd/parallax/main.js "$@"\n' > /usr/l
 # host that runs the image. Mount something writable here only if the file
 # backend is in use -- an emptyDir is enough, because nothing written here is
 # authoritative while PostgreSQL is the store.
-RUN mkdir -p /var/lib/parallax && chown parallax:parallax /var/lib/parallax
+RUN mkdir -p /var/lib/parallax \
+ && chown parallax:parallax /var/lib/parallax \
+ && chmod 0700 /var/lib/parallax
 ENV PARALLAX_STATE_FILE=/var/lib/parallax/parallax-state.json
 ENV PARALLAX_CONFIG_FILE=/var/lib/parallax/parallax-config.json
 ENV PARALLAX_PROVIDER_STATE_FILE=/var/lib/parallax/provider-state.json

@@ -56,7 +56,7 @@ APPLIED=$(apply_migrations | node -e 'let d="";process.stdin.on("data",c=>d+=c).
 [ "$APPLIED" = "$EXPECTED" ] || fail "expected $EXPECTED migrations to be applied, reported $APPLIED"
 TABLES=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'parallax_%'")
-[ "$TABLES" = "7" ] || fail "expected 7 tables, found $TABLES"
+[ "$TABLES" = "8" ] || fail "expected 8 tables, found $TABLES"
 ok "schema applied through \`parallax migrate\` ($TABLES tables)"
 
 echo "== re-applying the migrations is idempotent =="
@@ -71,8 +71,59 @@ for pid in $(jobs -p); do wait "$pid" || FAILED=1; done
 [ "$FAILED" = "0" ] || fail "a concurrent migration run failed"
 TABLES=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'parallax_%'")
-[ "$TABLES" = "7" ] || fail "concurrent runs left $TABLES tables"
+[ "$TABLES" = "8" ] || fail "concurrent runs left $TABLES tables"
 ok "three simultaneous runs all succeeded, schema unchanged"
+
+echo "== late apply status merges with a newer desired revision =="
+DATABASE_URL="$DATABASE_URL" PARALLAX_VERIFY_ROOT="$ROOT" node --input-type=module - <<'NODE'
+import { pathToFileURL } from "node:url";
+
+const moduleUrl = pathToFileURL(`${process.env.PARALLAX_VERIFY_ROOT}/src/infrastructure/postgres.ts`).href;
+const { createPostgresAdapters, createPostgresPool } = await import(moduleUrl);
+const pool = createPostgresPool(process.env.DATABASE_URL);
+const adapters = createPostgresAdapters(pool);
+const zone = "status-merge.example";
+const attemptedAt = "2026-08-15T00:00:00.000Z";
+const snapshot = {
+  name: zone,
+  revision: 1,
+  views: [],
+  createdAt: attemptedAt,
+  updatedAt: attemptedAt,
+};
+const expected = {
+  desiredRevision: 3,
+  appliedRevision: 2,
+  state: "pending",
+  lastAttemptAt: attemptedAt,
+};
+
+const assertMerged = (status, view) => {
+  if (!status || Object.entries(expected).some(([key, value]) => status[key] !== value)) {
+    throw new Error(`${view} status did not merge monotonically: ${JSON.stringify(status)}`);
+  }
+};
+
+try {
+  await adapters.zones.save(snapshot);
+  // New desired status lands first; the late apply still contributes its
+  // provider-attempt timestamp and applied progress without downgrading it.
+  await adapters.statuses.save({ zone, view: "external", desiredRevision: 3, appliedRevision: 1, state: "pending" });
+  await adapters.statuses.save({ zone, view: "external", desiredRevision: 2, appliedRevision: 2,
+    state: "applied", lastAttemptAt: attemptedAt });
+  assertMerged(await adapters.statuses.get(zone, "external"), "external");
+
+  // The reverse interleaving must preserve the same two monotonic facts.
+  await adapters.statuses.save({ zone, view: "internal", desiredRevision: 2, appliedRevision: 2,
+    state: "applied", lastAttemptAt: attemptedAt });
+  await adapters.statuses.save({ zone, view: "internal", desiredRevision: 3, appliedRevision: 1, state: "pending" });
+  assertMerged(await adapters.statuses.get(zone, "internal"), "internal");
+} finally {
+  await adapters.zones.delete(zone);
+  await pool.end();
+}
+NODE
+ok "both status interleavings preserved the newer desired state and provider attempt"
 
 start_app() {
   # Keep provider state inside the work directory: the default is under the
@@ -141,7 +192,7 @@ ROWS=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT (SELECT count(*) FROM parallax_zones WHERE name = 'example.com')
        || '/' || (SELECT count(*) FROM parallax_zone_revisions WHERE zone_name = 'example.com')
        || '/' || (SELECT count(*) FROM parallax_audit WHERE zone_name = 'example.com')")
-[ "$ROWS" = "1/3/3" ] || fail "expected 1/3/3 zone/revision/audit rows, found $ROWS"
+[ "$ROWS" = "1/3/7" ] || fail "expected 1/3/7 zone/revision/audit rows, found $ROWS"
 ok "zone/revision/audit rows = $ROWS"
 
 echo "== adopting records the provider already holds =="

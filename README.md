@@ -52,32 +52,60 @@ bind, how to reach the store, and the keys that protect what is stored.
 | Variable | Purpose |
 | --- | --- |
 | `HOST`, `PORT` | Server bind address; defaults to `127.0.0.1:3000` |
-| `DATABASE_URL` | PostgreSQL source of truth; apply `migrations/*.sql` in order. Append `?sslmode=verify-full` for TLS |
+| `DATABASE_URL` | PostgreSQL source of truth. A non-loopback URL must use `sslmode=verify-full` or `verify-ca` |
+| `PARALLAX_ALLOW_PLAINTEXT_POSTGRES` | Explicitly allow a non-loopback PostgreSQL URL without verified TLS; use only on a separately protected network |
 | `PARALLAX_STATE_FILE` | Zones, revisions, statuses and audit, when no database is configured |
 | `PARALLAX_CONFIG_FILE` | Settings, credentials and access tokens, when no database is configured |
 | `PARALLAX_PROVIDER_STATE_FILE` | Local provider state, used only while the local provider is enabled |
+| `PARALLAX_COREDNS_ROOT` | Deployment-owned root that confines the stored `coreDnsDirectory`; required before CoreDNS publishing can be enabled |
 | `PARALLAX_OWNERSHIP_SECRET` | 32+ byte secret that signs managed-record ownership markers |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | Exactly 32 bytes as base64 or 64 hexadecimal characters; encrypts stored credentials |
-| `PARALLAX_POWERDNS_DATABASE_URL` | PowerDNS's own database, when the internal view is published into it instead of CoreDNS zone files |
+| `PARALLAX_POWERDNS_DATABASE_URL` | PowerDNS's own database, subject to the same PostgreSQL TLS policy, when the internal view is published into it |
 | `PARALLAX_DNS_PORT` | Answer DNS for the internal view from this process. Unset leaves the port unbound |
 | `PARALLAX_DNS_HOST` | Address the DNS listener binds; defaults to `HOST`, which is loopback unless set |
 | `PARALLAX_DNS_FORWARD_TO` | Comma-separated upstreams (`host` or `host#port`) for names outside every zone. Empty answers `REFUSED` instead of relaying |
+| `PARALLAX_DNS_FORWARD_ALLOW` | Client CIDRs allowed to recurse. Defaults to loopback; required explicitly for forwarding on a non-loopback listener |
 | `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | Certificate and key for this process to end TLS itself; set both or neither |
-| `PARALLAX_HTTP_REDIRECT_PORT` | Port answering plain HTTP with a redirect to the TLS origin; needs TLS configured |
-| `PARALLAX_AUTH_TOKENS` | JSON array of `{"token","subject","role"}`; `role` is `admin`, `editor` or `viewer`, and each token is at least 32 bytes. Optional on loopback, **required to bind any other address** |
+| `PARALLAX_HTTP_REDIRECT_PORT` | Port answering plain HTTP with a redirect to the stored `publicOrigin`; needs both TLS and that setting |
+| `PARALLAX_AUTH_TOKENS` | JSON array of `{"token","subject","role"}`; tokens must be canonical base64url encodings of 32 random bytes. Optional on loopback, **required to bind any other address** |
+
+File-backed deployments require the parent directory of each configured data
+file to be owned by the service user and have mode **exactly `0700`**. A missing
+directory is created with that mode, but Parallax deliberately does not `chmod`
+an existing directory: a path may name a shared parent such as `/tmp`, and
+silently restricting it would break unrelated services. Before upgrading an
+older installation whose data directory is commonly `0755`, stop every writer
+and provision the existing directory explicitly (repeat for each distinct
+parent directory):
+
+```sh
+# Default relative file paths in a source installation:
+chmod 0700 data
+
+# Example system-service path:
+sudo chown parallax:parallax /var/lib/parallax
+sudo chmod 0700 /var/lib/parallax
+```
+
+Use the actual service account and path for the deployment. Change only the
+directory mode, not every file recursively. This permission migration is
+separate from stale-lock recovery: do not remove a lock for a mode error; follow
+the named-lock procedure below only after confirming that no writer is active.
 
 Everything else -- provider wiring, retention, proxy origin, access tokens and
 provider credentials -- is stored alongside the zones and managed from the
-portal's **Provider settings** screen. A change takes effect immediately across
-the process; nothing needs a redeploy, and with PostgreSQL every instance reads
-the same value.
+portal's **Provider settings** screen. A local change takes effect immediately;
+each other server or CLI process re-reads settings every five seconds and runs
+the same machine-specific verifier before re-wiring itself. Nothing needs a
+redeploy, and a replica that cannot safely apply a value keeps its last good
+wiring and reports the refresh failure.
 
 | Setting | Effect |
 | --- | --- |
 | `allowLocalProvider` | Publish to a local file when no real provider is configured. Off by default, so an unrouted target fails loudly instead of reporting success |
-| `coreDnsDirectory` | Directory of RFC 1035 zone files for the internal view; empty disables it |
-| `publicOrigin` | Absolute origin browsers reach the portal at; empty derives it per request |
-| `trustForwardedHeaders` | Trust `X-Forwarded-Proto`/`X-Forwarded-Host` from a reverse proxy |
+| `coreDnsDirectory` | Directory of RFC 1035 zone files beneath `PARALLAX_COREDNS_ROOT`; empty disables it |
+| `publicOrigin` | HTTPS origin browsers reach the portal at (HTTP is accepted only on loopback) |
+| `trustForwardedHeaders` | Trust proxy headers; requires `publicOrigin` so forwarded host/protocol never choose the security origin |
 | `revisionRetention` | Newest revision snapshots kept per zone; `0` keeps every one |
 | `auditRetentionDays` | Days of audit history kept per zone; `0` keeps every entry |
 
@@ -97,21 +125,24 @@ audit trail records the token's subject as the actor, so a shared token makes
 every change -- portal, `curl`, another session -- look like the same actor, and
 there is no way to tell them apart afterwards.
 
-A server reads the tokens at startup and re-reads them every few seconds, so a
+A server reads the tokens at startup and re-reads them every five seconds, so a
 token issued or revoked from the command line, another replica, or a second
 server takes effect within that window rather than at the next restart. The
 delay matters in both directions: a freshly issued token is refused for a
-moment, and a revoked one keeps working for the same moment. If the store cannot
-be read the process keeps the tokens it already has and logs the failure, since
-locking out every valid token is worse than serving a stale list briefly.
+moment, and a revoked one keeps working for the same moment. A brief store
+failure keeps the last list, but after 60 seconds stored-token authentication
+fails closed and `/health/ready` reports not ready. Environment break-glass
+tokens remain available for recovery. Once a process has observed any token it
+never falls back to authentication-disabled mode, even if the store becomes
+empty or unavailable.
 
 It is also the only way to start a deployment that is not on loopback, since
 there is no loopback session to issue the first token from. Any container image
 binds `0.0.0.0`, so a container always needs it:
 
-```json
-[{"token": "<32+ bytes>", "subject": "deploy", "role": "admin"}]
-```
+Generate the required canonical 43-character base64url value with
+`openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'`, then place it in the
+JSON array as `{"token":"…","subject":"deploy","role":"admin"}`.
 
 Anything else is refused before the server binds:
 
@@ -186,14 +217,10 @@ HOST=0.0.0.0 PORT=443 parallax-server
 
 Nothing else changes. The server knows it ended the connection, so the same
 proof of same-origin that `publicOrigin` supplies behind a proxy is derived
-without configuration, and cookies carry `Secure`. Set `publicOrigin` when the address is fixed. It is what the redirect listener
-sends clients to, and without it the redirect can only assume TLS on 443 at the
-host the client asked for -- the port this process bound is not the port a
-client reached it on once a Service or a published container port maps between
-them. The server says so at startup when a redirect listener is running without
-one, and says it again to whoever clears the value later: a settings change
-that is legal but costs something answers with `warnings` alongside the new
-settings, which the portal shows and the command line writes to stderr.
+without configuration, and cookies carry `Secure`. Before enabling the redirect
+port, set `publicOrigin` to the public HTTPS origin. The redirect listener uses
+only that trusted value and never reflects a request's `Host`; until a target is
+configured, or whenever it is cleared, the redirect port answers `503`.
 
 A certificate replaced on disk is picked up without a restart. The directory is
 watched rather than the file, because a Kubernetes secret mount is renewed by
@@ -207,19 +234,22 @@ development and a deployment behind a terminating proxy both want.
 ### Serving the portal behind a reverse proxy
 
 Cookie-authenticated mutations must prove same-origin, which needs the origin a
-browser actually used. Behind TLS termination, set the `publicOrigin` setting
-to the public origin, or turn on `trustForwardedHeaders` when the proxy is the
-only way to reach this process. Without either, a proxied `https` request is
-rejected because the server would compare it against `http`.
+browser actually used. Behind TLS termination, set `publicOrigin` to the public
+HTTPS origin. Turn on `trustForwardedHeaders` only when a trusted proxy is the
+sole route to the process; the setting is refused without `publicOrigin`, so a
+forwarded Host or protocol can never choose the security origin.
 
 Authentication is disabled only when `PARALLAX_AUTH_TOKENS` is absent, which is
 intended for loopback development: every caller that reaches the port would
 otherwise be an administrator. API requests that arrive with proxy forwarding
 headers are refused while authentication is disabled, and the service logs a
 warning at startup. Configure tokens before putting anything in front of it.
-Each token needs at least 32 bytes; generate one with `openssl rand -base64 32`.
+Each token is exactly 32 random bytes in canonical base64url form; use the
+generation command above.
 Repeated authentication failures are answered with `429` and a `Retry-After`
-header, and a valid token is never delayed by another client's failures.
+header. Budgets are isolated per trusted transport client, and a successful
+request does not erase that client's failed guesses; valid tokens themselves
+are never delayed.
 
 The portal exchanges a token for a session cookie rather than holding it in
 memory: `POST /api/v1/session` with `{ "token": "..." }` replies with
@@ -246,6 +276,20 @@ to the portal, so the field is blank until you type a replacement.
 Store files written before profiles existed are migrated on first read: each
 distinct token becomes one profile, named after the first zone that used it, and
 every zone keeps its own zone ID. Nothing has to be re-entered.
+
+Each server re-reads the encrypted credential document every five seconds.
+Profile rotation and zone unbinding therefore reach every replica without a
+restart; a removed binding is also removed from that replica's provider router
+instead of retaining a decrypted token in memory indefinitely.
+
+The encrypted envelope carries an authenticated, increasing revision. A process
+that has observed a newer revision rejects an older valid envelope, as well as
+ordinary ciphertext tampering. A cold process has no external monotonic trust
+anchor, however, so restoring the entire credential store to an older valid
+ciphertext before that process starts cannot be distinguished cryptographically.
+Deployments whose threat model includes privileged store rollback need that
+anchor in their storage platform (for example immutable backup/audit controls),
+not only the envelope key.
 
 The token needs two zone permissions, scoped to the domains it manages:
 
@@ -282,11 +326,20 @@ plugin or the `file` plugin's nonzero `reload` interval so it observes serial
 changes. Existing non-Parallax records and authority data are retained; Parallax
 only updates records carrying its signed ownership marker.
 
+Set `PARALLAX_COREDNS_ROOT` to a deployment-owned directory before enabling the
+stored `coreDnsDirectory` setting. The selected directory must stay beneath that
+root both lexically and after resolving symlinks; the setting is rejected before
+it is persisted when the boundary or writeability check fails.
+
 Reading an existing zone file covers the common RFC 1035 forms: records that
 inherit `$TTL`, records that inherit the previous owner name, an optional class
 field, and parenthesized multi-line records. A record line Parallax cannot read
 is an error rather than an absent record, because treating it as absent would let
 reconciliation publish a second answer beside one it never saw.
+`$ORIGIN` is tracked while parsing and new managed records are written with
+absolute owner names. `$INCLUDE`, `$GENERATE`, unknown directives or record
+types, duplicate ownership ids, and malformed multi-line spans all fail closed
+before the file is written or CoreDNS is reloaded.
 
 ### Publishing the internal view
 
@@ -329,12 +382,25 @@ zone, and claiming authority for it would answer NXDOMAIN for every name the
 zone holds. Left out, those names go to the upstreams and keep resolving
 publicly until an override exists.
 
-**With the file backend a running listener does not see another process's
-writes.** The file-backed store is read once and cached per process, so a
-`parallax record set` run in a terminal reaches the file and not the server
-holding the port. Changes made through the portal or the API are the ones the
-listener follows. With `DATABASE_URL` every instance reads the same rows and the
-question does not arise.
+**The listener follows changes made by another process.** File-backed reads do
+not retain a process-lifetime snapshot: mutations take a cross-process lock,
+re-read under that lock, and atomically replace the durable file. The listener's
+five-second refresh therefore observes CLI writes without a restart. PostgreSQL
+instances likewise read the shared rows.
+
+A process killed during a file mutation can leave its hidden lock file behind.
+Parallax deliberately never removes a pre-existing lock automatically: doing so
+cannot be made race-free with a replacement writer. After the 15-second timeout,
+the error names the lock. Verify that no Parallax process is writing that data
+file, then remove only the named stale lock manually.
+
+Forwarding is limited to client CIDRs in `PARALLAX_DNS_FORWARD_ALLOW` (loopback
+only by default); a non-loopback listener with upstreams refuses to start until
+the allow-list is explicit. UDP and TCP replies are rate-limited per source
+(100/s with a burst of 200), concurrent upstream queries are capped at 256, and
+TCP uses a 10-second idle timeout with at most 1,024 connections. Upstream UDP
+sockets are connected, and a reply is accepted only when its source, QR/opcode,
+transaction id, and complete question match the query.
 
 A change committed by this process is served as soon as it commits, because the
 repository the control plane writes through says so. The 5-second refresh stays
@@ -350,6 +416,10 @@ differently depending on which publisher a deployment happened to use.
 **Readiness counts the listener as serving the internal view.** A deployment
 that answers DNS itself and configures no provider at all is ready. Without
 that, its probe would never pass while it answered every query correctly.
+The public readiness route reads only a constant-size process cache; the full
+zone scan runs at most once at a time in the background. Zone or provider-route
+changes invalidate it immediately, and a failed or ten-second-stale refresh is
+not ready.
 
 The zone-file shape needs persistent storage and not an ephemeral volume,
 because a zone file also holds records nobody else has a copy of -- the ones an
@@ -370,6 +440,12 @@ marker with it, so the table can never claim a row that is no longer there.
 Either way the zone must already exist in the DNS engine: PowerDNS serves what
 its `domains` table lists, and Parallax publishes records into a zone rather
 than creating one.
+
+The direct-SQL adapter refuses mutations when PowerDNS reports an active DNSSEC
+key. `ordername` depends on the zone's NSEC/NSEC3 mode and must be calculated by
+PowerDNS rectification; guessing it in SQL would corrupt denial proofs. Keep the
+published zone unsigned, or use a future API/rectify-capable adapter for signed
+zones.
 
 Two things about running PowerDNS are worth knowing before the first zone,
 because both look like Parallax failing when they are not:
@@ -452,6 +528,13 @@ did until after it has happened.
 The actor is the token's subject, so what the history can tell you about *who*
 depends on how many tokens exist. See [Access tokens](#access-tokens).
 
+Provider writes have their own write-ahead audit entries:
+`provider.apply.started`, `provider.apply.completed`, and
+`provider.apply.failed`. They record the target view and planned/completed
+operation counts, including partial apply or zone-purge progress. Provider
+errors are reduced to a safe category before persistence, so tokens or other
+provider response details do not enter the audit trail.
+
 ### Restoring a revision
 
 Restoring does not undo the past. It makes that revision's intent the current
@@ -478,16 +561,21 @@ For a PostgreSQL deployment, apply the schema before starting the service:
 parallax migrate
 ```
 
-It replays every file in `migrations/` in name order and is safe to re-run:
-each object is created with `IF NOT EXISTS` and each file carries its own
-transaction, so there is no version table deciding what to skip. Concurrent
-runs serialize on an advisory lock, which is what makes it usable as a
-Kubernetes init container or a pre-deploy job.
+It accepts only the release's fixed migration manifest and records every
+applied file with its SHA-256 checksum in `parallax_schema_migrations`. Missing,
+unexpected, or subsequently changed SQL is rejected before execution; a re-run
+skips matching ledger entries. Each schema change and its ledger row commit in
+the same transaction. Concurrent runs serialize on a migration-specific advisory
+lock, which is what makes the command usable as a Kubernetes init container or a
+pre-deploy job. The image keeps the trusted migration directory root-owned and
+non-writable by the serving UID.
 
-It is never applied implicitly at startup. A server that reshaped the store it
-depends on while booting would carry the schema forward under an image that had
-just been rolled back; instead it refuses to start and names the missing
-relation. Migrating is a decision, so it is a command someone runs.
+It is never applied implicitly at startup, and the serving runtime does not
+expose it through `POST /api/v1/cli`. A server that reshaped the store it depends
+on while booting would carry the schema forward under an image that had just
+been rolled back; instead it refuses to start and names the missing relation.
+Migrating is a deployment decision, so it is available only to the local CLI's
+separate migration runtime.
 
 ## One surface, three ways in
 
@@ -512,9 +600,11 @@ curl -X POST http://127.0.0.1:3000/api/v1/cli \
   -d '{"argv":["zone","create","--zone","example.com"]}'
 ```
 
-It runs the same dispatcher in-process -- no shell, no subprocess -- and applies
-the caller's role to the command it names, so the endpoint is not a way around
-what a token cannot already do.
+It runs the serving dispatcher's commands in-process -- no shell, no subprocess
+-- and applies the caller's role to the command it names, so the endpoint is not
+a way around what a token cannot already do. `migrate` is deliberately absent:
+database DDL is a local CLI/deployment capability, not an HTTP administrator
+capability.
 
 ## Command line
 
@@ -532,6 +622,15 @@ pnpm cli apply --zone example.com
 pnpm cli settings set --values '{"allowLocalProvider":true}'
 pnpm cli token issue --subject deploy-bot --role editor
 ```
+
+If a machine-specific stored value prevents the server from starting, serving
+remains fail-closed, but the local `settings set` command is still available as
+a recovery path. It initializes only the settings repository, merges the patch
+with the latest stored values, and verifies the complete repaired snapshot
+before writing; it does not start providers, tokens, or the control plane. For
+example, clear a CoreDNS path that belongs to another machine with
+`pnpm cli settings set --values '{"coreDnsDirectory":""}'`. A patch that leaves
+any stored invariant invalid is rejected and writes nothing.
 
 The CLI reads the same store as the server, so a change made in one is visible
 in the other immediately. It records who ran it (`cli:<user>`) in the audit
@@ -642,7 +741,7 @@ Two limits worth knowing before you rely on it:
 
 All control-plane routes are under `/api/v1`.
 
-- `GET|POST /zones` (`{ "name": "example.com" }`)
+- `GET|POST /zones` (`GET ?limit=&offset=`, `POST { "name": "example.com" }`)
 - `GET|PUT|DELETE /zones/:zone` (`DELETE ?abandonProviderRecords=true`)
 - `POST /zones/:zone/adopt?view=external`
 - `PUT|DELETE /zones/:zone/views/:view/records/:id`
@@ -659,7 +758,7 @@ All control-plane routes are under `/api/v1`.
 - `GET /credentials/cloudflare`
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
 - `POST /credentials/cloudflare/:zone/test` (tests the stored binding, or an unsaved `{ profile }` or `{ token }`)
-- `POST /cli` (runs any command; `{ "argv": ["zone", "list"] }`)
+- `POST /cli` (runs serving commands, never `migrate`; `{ "argv": ["zone", "list"] }`)
 - `GET /health/live` and `GET /health/ready`
 
 Supply `Authorization: Bearer <token>` when authentication is enabled. Desired
@@ -668,8 +767,9 @@ apply reports each view independently. Preview queries the live provider on ever
 call, so it requires an editor or administrator token even though it changes
 nothing. A view whose provider cannot be read reports why instead of failing
 the whole preview, and carries that reason beside an empty plan so it is never
-read as nothing to do; when no view can be read at all, the request fails. History and revision listings are paged: both accept `limit` (up to 500,
-default 50) and `offset`, and return `limit`, `offset`, and `hasMore` alongside
+read as nothing to do; when no view can be read at all, the request fails. Zone,
+history, and revision listings are paged: each accepts `limit` (up to 500,
+default 50) and `offset`, and returns `limit`, `offset`, and `hasMore` alongside
 the items.
 
 The only reconcilable views are `internal` and `external`; any other view name is
@@ -681,9 +781,10 @@ the desired state, and responds with `removedProviderRecords` describing exactly
 what was taken out of the provider. Records without Parallax's ownership marker
 are never touched. Withdrawal happens first: if the provider rejects it or is
 unreachable the zone is kept so the deletion can be retried, rather than leaving
-published records nothing tracks. Pass `?abandonProviderRecords=true` to skip
-withdrawal deliberately — that is only for a provider that is gone for good, and
-it leaves those records live.
+published records nothing tracks. Pass `?abandonProviderRecords=true` only when
+one or more provider targets may be gone for good. Parallax still reads every
+target first and withdraws all reachable records; only targets that cannot be
+read are left live and returned explicitly as `abandonedProviderTargets`.
 
 ## Container image
 
@@ -693,10 +794,10 @@ three surfaces: the API, the portal, and the command line.
 ```sh
 docker build -t parallax .
 docker run -p 3000:3000 \
-  -e DATABASE_URL='postgres://...' \
+  -e DATABASE_URL='postgres://parallax:password@db:5432/parallax?sslmode=verify-full' \
   -e PARALLAX_OWNERSHIP_SECRET='...' \
   -e PARALLAX_CREDENTIAL_MASTER_KEY='...' \
-  -e PARALLAX_AUTH_TOKENS='[{"token":"...","subject":"deploy","role":"admin"}]' \
+  -e PARALLAX_AUTH_TOKENS='[{"token":"<43-character-base64url-token>","subject":"deploy","role":"admin"}]' \
   parallax
 ```
 
@@ -706,7 +807,9 @@ The image binds `0.0.0.0`, so `PARALLAX_AUTH_TOKENS` is required -- see
 Apply the schema before the server starts, with the same image:
 
 ```sh
-docker run --rm -e DATABASE_URL='postgres://...' parallax parallax migrate
+docker run --rm \
+  -e DATABASE_URL='postgres://parallax:password@db:5432/parallax?sslmode=verify-full' \
+  parallax parallax migrate
 ```
 
 As a Kubernetes init container that is `command: ["parallax", "migrate"]`. It
