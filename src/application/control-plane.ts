@@ -6,6 +6,7 @@ import {
   isProviderView,
   normalizeExternalRecords,
   normalizeZoneName,
+  providerManagement,
   readPersistedViewName,
   validateExternalRecords,
   validateViewName,
@@ -23,6 +24,38 @@ export class NotFoundError extends Error {
 }
 export class ConflictError extends Error {
   override readonly name = "ConflictError";
+}
+export class ProviderManagedRecordError extends Error {
+  override readonly name = "ProviderManagedRecordError";
+}
+
+/**
+ * Refuses a change that would alter or remove a record the provider owns.
+ *
+ * Checked against the whole external view rather than at each call site, so
+ * every way in is covered by the same rule: editing one record, deleting one,
+ * and replacing the desired state wholesale all arrive here. A guard that only
+ * watched the two obvious doors would be one `PUT /desired` away from useless.
+ *
+ * Only the external view is guarded. The internal view exists to answer these
+ * names differently -- overriding a provider-served name with an address that
+ * only makes sense inside is the reason it exists -- so the same record shape is
+ * refused in one view and expected in the other.
+ */
+function assertProviderManagedIntact(before: readonly DnsView[], after: readonly DnsView[]): void {
+  const externalBefore = before.find((view) => view.name === "external");
+  if (!externalBefore) return;
+  const externalAfter = after.find((view) => view.name === "external");
+  for (const record of externalBefore.records) {
+    const management = providerManagement(record);
+    if (!management) continue;
+    const survivor = externalAfter?.records.find((candidate) => candidate.id === record.id);
+    if (survivor && survivor.name === record.name && survivor.type === record.type && survivor.content === record.content) continue;
+    const what = survivor ? "changed" : "deleted";
+    throw new ProviderManagedRecordError(
+      `${record.type} ${record.name} cannot be ${what} here: ${management.reason}. Change it where it was created, and adopt the zone again`,
+    );
+  }
 }
 
 /**
@@ -314,6 +347,7 @@ export class ControlPlane {
     if (view === "external") validateExternalRecords(target.records);
     target.records.sort((left, right) => left.id.localeCompare(right.id));
     views.sort((left, right) => left.name.localeCompare(right.name));
+    assertProviderManagedIntact(zone.views, views);
     materializeProviderViews(views);
     const updated = this.#nextRevision(zone, views);
     await this.#commitDesiredChange(zone, updated, "record.upserted", actor, { view, record }, [view], expectedRevision);
@@ -333,6 +367,7 @@ export class ControlPlane {
     const record = target?.records.find((candidate) => candidate.id === id);
     if (!target || !record) throw new NotFoundError(`record ${id} was not found in view ${view}`);
     target.records = target.records.filter((candidate) => candidate.id !== id);
+    assertProviderManagedIntact(zone.views, views);
     materializeProviderViews(views);
     const updated = this.#nextRevision(zone, views);
     await this.#commitDesiredChange(zone, updated, "record.deleted", actor, { view, record }, [view], expectedRevision);
@@ -347,6 +382,7 @@ export class ControlPlane {
     const zone = await this.getZone(zoneName);
     this.#assertExpectedRevision(zone, expectedRevision);
     const views = parseDesiredViews(input);
+    assertProviderManagedIntact(zone.views, views);
     materializeProviderViews(views);
     const updated = this.#nextRevision(zone, views);
     const affected = new Set([...zone.views.map((view) => view.name), ...views.map((view) => view.name)]);

@@ -349,6 +349,92 @@ function isBase64(value: string): boolean {
   return value.length > 0 && /^[A-Za-z0-9+/]+={0,2}$/u.test(value);
 }
 
+/**
+ * A record the provider created and still owns.
+ *
+ * These arrive through adoption like any other, but they are not descriptions of
+ * where something is -- they are the provider's own bookkeeping for a name it
+ * serves itself. Editing or deleting one through here changes DNS without
+ * changing what created it, so the binding breaks and the record comes back.
+ */
+export interface ProviderManagement {
+  /** Said back to whoever tried to change it. */
+  readonly reason: string;
+  /**
+   * True when the address cannot be reached by anyone, so no view can answer it
+   * usefully and the public answer is the only real one.
+   */
+  readonly originless: boolean;
+}
+
+/**
+ * The addresses the provider documents for originless setups: it puts one in a
+ * proxied record to mean "this name exists and I serve it myself". The packet is
+ * intercepted at the edge and never sent, which is why the address is one that
+ * is reserved and reachable by nobody.
+ *
+ * Deliberately these two exact addresses rather than the blocks they belong to.
+ * `192.0.2.0/24` is documentation space (RFC 5737) and `2001:db8::/32` likewise
+ * (RFC 3849) -- both are perfectly ordinary things to find in a test fixture or
+ * an example zone, and treating every address in them as a placeholder would
+ * quietly stop answering records that mean exactly what they say. The pair named
+ * here is the pair the provider's own documentation names.
+ */
+const ORIGINLESS_V4: readonly string[] = ["192.0.2.0"];
+
+/** Hostnames whose records a provider service owns, though the value still works. */
+const MANAGED_CNAME_SUFFIXES: readonly string[] = [".r2.dev"];
+
+export function providerManagement(record: { readonly type: RecordType; readonly content: string }): ProviderManagement | undefined {
+  const content = record.content.trim();
+  if (record.type === "A" && isOriginlessV4(content)) {
+    return { reason: "the provider serves this name itself and keeps a reserved placeholder address here", originless: true };
+  }
+  if (record.type === "AAAA" && isOriginlessV6(content)) {
+    return { reason: "the provider serves this name itself and keeps a reserved placeholder address here", originless: true };
+  }
+  if (record.type === "CNAME") {
+    const target = content.replace(/\.$/u, "").toLowerCase();
+    if (MANAGED_CNAME_SUFFIXES.some((suffix) => target.endsWith(suffix))) {
+      // The value is a real hostname that resolves, so it is served as stored;
+      // only changing it here is refused, because what created it would not know.
+      return { reason: `the provider service at ${target} owns this record`, originless: false };
+    }
+  }
+  return undefined;
+}
+
+function isOriginlessV4(content: string): boolean {
+  return ORIGINLESS_V4.includes(content);
+}
+
+/**
+ * `100::` written any of the ways it can be written. Unlike the IPv4 side this
+ * is matched by value rather than by text, because the same address has many
+ * spellings and a provider that writes it differently tomorrow would otherwise
+ * stop being recognized.
+ */
+function isOriginlessV6(content: string): boolean {
+  const groups = ipv6Groups(content.toLowerCase());
+  if (!groups) return false;
+  return groups[0] === 0x0100 && groups.slice(1).every((group) => group === 0);
+}
+
+/** Expands an address to its eight groups, or `undefined` if it is not one. */
+function ipv6Groups(text: string): number[] | undefined {
+  if (text.includes(".")) return undefined;
+  const halves = text.split("::");
+  if (halves.length > 2) return undefined;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const filled = halves.length === 2 ? Array.from({ length: 8 - head.length - tail.length }, () => "0") : [];
+  if (filled.length < 0) return undefined;
+  const groups = [...head, ...filled, ...tail];
+  if (groups.length !== 8) return undefined;
+  const parsed = groups.map((group) => (/^[0-9a-f]{1,4}$/u.test(group) ? Number.parseInt(group, 16) : Number.NaN));
+  return parsed.some(Number.isNaN) ? undefined : parsed;
+}
+
 export function createDesiredRecord(id: string, input: unknown): DesiredRecord {
   const issues: string[] = [];
   const value = asObject(input);

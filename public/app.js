@@ -231,7 +231,12 @@ function renderRecords(state) {
       <td data-label="${escapeHtml(t("record.internalAnswer"))}"><div class="record-answer ${record.views.internal.content ? "" : "inherited"}">${escapeHtml(internal || t(overridden ? "record.overridden" : "record.noAnswer"))}</div></td>
       <td data-label="${escapeHtml(t("record.externalAnswer"))}"><div class="record-answer">${escapeHtml(record.views.external.content || t("record.noAnswer"))}${record.views.external.proxied ? `<span class="proxy-badge">${escapeHtml(t("record.proxied"))}</span>` : ""}</div></td>
       <td data-label="TTL"><span class="record-answer">${escapeHtml(formatTtl(record.views.internal.ttl))} / ${escapeHtml(formatTtl(record.views.external.ttl))}</span></td>
-      <td><div class="row-actions"><button class="row-action" type="button" data-edit-record="${index}">${escapeHtml(t("record.edit"))}</button><button class="row-action danger" type="button" data-delete-record="${index}">${escapeHtml(t("record.delete"))}</button></div></td>
+      <td><div class="row-actions"><button class="row-action" type="button" data-edit-record="${index}">${escapeHtml(t("record.edit"))}</button>${record.views.external.managed
+          // Deleting it here changes DNS without telling whatever created it,
+          // so the record comes back and what it belongs to breaks in between.
+          // Editing stays open: the internal answer is ours to set.
+          ? `<button class="row-action danger" type="button" disabled title="${escapeHtml(t("record.providerOwnedHint"))}">${escapeHtml(t("record.delete"))}</button>`
+          : `<button class="row-action danger" type="button" data-delete-record="${index}">${escapeHtml(t("record.delete"))}</button>`}</div></td>
     </tr>`;
   }).join("");
 }

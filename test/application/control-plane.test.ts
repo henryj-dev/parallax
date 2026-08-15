@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE, NotFoundError } from "../../src/application/control-plane.ts";
+import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE, NotFoundError, ProviderManagedRecordError } from "../../src/application/control-plane.ts";
 import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type DesiredChange, type ProviderAdapter, type ZoneDeletion } from "../../src/application/ports.ts";
 import type { DesiredRecord } from "../../src/domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../../src/domain/reconciliation.ts";
@@ -1133,4 +1133,72 @@ describe("ControlPlane", () => {
     provider.release();
     await applying;
   });
+
+  describe("records the provider owns", () => {
+    async function withPlaceholder(): Promise<ControlPlane> {
+      const { service } = setup();
+      await service.createZone("example.com");
+      // What adoption brings back for a name the provider serves itself. The
+      // acknowledgement is what adoption sets: `100::` is not a global address,
+      // and publishing one deliberately is a decision this refuses to make on
+      // its own -- but the record already exists at the provider.
+      await service.upsertRecord("example.com", "external", "apex", {
+        name: "@", type: "AAAA", content: "100::", ttl: 300, acknowledgeNonGlobalIp: true,
+      });
+      await service.upsertRecord("example.com", "external", "bucket", { name: "files", type: "CNAME", content: "pub-1234.r2.dev", ttl: 300 });
+      return service;
+    }
+
+    it("refuses to change one, and says where it can be changed", async () => {
+      const service = await withPlaceholder();
+      await assert.rejects(
+        service.upsertRecord("example.com", "external", "apex", { name: "@", type: "AAAA", content: "2606:4700::1", ttl: 300, acknowledgeNonGlobalIp: true }),
+        (error: unknown) => error instanceof ProviderManagedRecordError && /where it was created/u.test(error.message),
+      );
+      const zone = await service.getZone("example.com");
+      const apex = zone.views.find((view) => view.name === "external")?.records.find((record) => record.id === "apex");
+      assert.equal(apex?.content, "100::", "the refusal left the record as it was");
+    });
+
+    it("refuses to delete one", async () => {
+      const service = await withPlaceholder();
+      await assert.rejects(
+        service.deleteRecord("example.com", "external", "bucket"),
+        (error: unknown) => error instanceof ProviderManagedRecordError && /r2\.dev/u.test(error.message),
+      );
+    });
+
+    it("refuses a wholesale replace that drops one", async () => {
+      // The guard has to sit where the state is decided rather than on the two
+      // obvious doors: a `PUT` of the whole desired state would otherwise delete
+      // what `DELETE` is not allowed to.
+      const service = await withPlaceholder();
+      await assert.rejects(
+        service.replaceDesiredState("example.com", { views: [{ name: "external", records: [] }] }),
+        (error: unknown) => error instanceof ProviderManagedRecordError,
+      );
+      const zone = await service.getZone("example.com");
+      assert.equal(zone.views.find((view) => view.name === "external")?.records.length, 2, "nothing was dropped");
+    });
+
+    it("still allows the internal view to answer the same name differently", async () => {
+      // The point of the internal view. The record shape refused above is the
+      // record shape expected here, and the guard has to tell the two apart.
+      const service = await withPlaceholder();
+      const updated = await service.upsertRecord("example.com", "internal", "apex-inside", {
+        name: "@", type: "AAAA", content: "fd00::1", ttl: 60, acknowledgeNonGlobalIp: true,
+      });
+      const inside = updated.views.find((view) => view.name === "internal")?.records ?? [];
+      assert.ok(inside.some((record) => record.content === "fd00::1"), "the override was accepted");
+    });
+
+    it("lets an unrelated record in the same view still be changed", async () => {
+      const service = await withPlaceholder();
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+      const updated = await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.11", ttl: 300 });
+      const web = updated.views.find((view) => view.name === "external")?.records.find((record) => record.id === "web");
+      assert.equal(web?.content, "8.8.8.11", "the guard is about the owned record, not the view");
+    });
+  });
+
 });

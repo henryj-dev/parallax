@@ -674,6 +674,38 @@ export function readRecords(zone) {
     || left.id.localeCompare(right.id));
 }
 
+/**
+ * Mirrors `providerManagement` in `src/domain/dns.ts`.
+ *
+ * Duplicated rather than fetched because the portal is a static page with no
+ * build step, and asking the server "may I edit this?" would be a request per
+ * row. The copy is kept honest by a test that runs both over the same table: if
+ * one learns a new placeholder and the other does not, that test fails.
+ */
+export function providerManagedReason(record) {
+  const content = String(record?.content ?? "").trim();
+  if (record?.type === "A" && content === "192.0.2.0") return "originless";
+  if (record?.type === "AAAA" && isDiscardAddress(content)) return "originless";
+  if (record?.type === "CNAME" && content.replace(/\.$/u, "").toLowerCase().endsWith(".r2.dev")) return "service";
+  return "";
+}
+
+/** `100::` however it is spelled. */
+function isDiscardAddress(content) {
+  const text = content.toLowerCase();
+  if (text.includes(".")) return false;
+  const halves = text.split("::");
+  if (halves.length > 2) return false;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const filled = halves.length === 2 ? Array.from({ length: 8 - head.length - tail.length }, () => "0") : [];
+  const groups = [...head, ...filled, ...tail];
+  if (groups.length !== 8) return false;
+  const parsed = groups.map((group) => (/^[0-9a-f]{1,4}$/u.test(group) ? Number.parseInt(group, 16) : Number.NaN));
+  if (parsed.some(Number.isNaN)) return false;
+  return parsed[0] === 0x0100 && parsed.slice(1).every((group) => group === 0);
+}
+
 function toRow(external, internal) {
   const source = external ?? internal;
   const proxied = Boolean(external?.proxied);
@@ -693,6 +725,8 @@ function toRow(external, internal) {
         ttl: effectiveExternalTtl(external?.ttl ?? source.ttl ?? 300, proxied),
         proxied,
         acknowledgeNonGlobalIp: Boolean(external?.acknowledgeNonGlobalIp),
+        // Why the provider owns this record, or "" when nobody but us does.
+        managed: external ? providerManagedReason(external) : "",
       },
     },
   };

@@ -563,4 +563,100 @@ describe("DNS server", () => {
     response.writeUInt16BE(0x8180, 2);
     assert.equal(await ask(port, response, 300), undefined);
   });
+
+  describe("names the provider serves itself", () => {
+    /** A zone shaped like an adopted one: a placeholder apex that also holds mail. */
+    const WORKERS: ServedZone = {
+      name: "example.com",
+      serial: 3,
+      records: [
+        { name: "@", type: "AAAA", content: "100::", ttl: 300 },
+        { name: "@", type: "MX", content: "10 mx.example.com", ttl: 300 },
+        { name: "@", type: "TXT", content: "v=spf1 -all", ttl: 300 },
+        { name: "inside", type: "A", content: "10.17.192.11", ttl: 60 },
+      ],
+    };
+
+    async function withUpstream(zone: ServedZone) {
+      const upstreamPort = await freePort();
+      const upstream = createSocket("udp4");
+      await new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve));
+      const asked: string[] = [];
+      upstream.on("message", (message, remote) => {
+        asked.push(readName(message, 12).name);
+        upstream.send(forwardedReply(message, [0xc0, 0xde]), remote.port, remote.address);
+      });
+      closers.push(async () => { upstream.close(); });
+      const started = await start({
+        zones: () => [zone],
+        forwardTo: [`127.0.0.1#${upstreamPort}`],
+        // Deliberately excludes the loopback client below: this path must not be
+        // gated by it, because the clients that need it are the ones outside.
+        forwardAllow: ["10.99.0.0/16"],
+      });
+      return { ...started, asked };
+    }
+
+    it("asks the upstream for an address it cannot answer, though the name is ours", async () => {
+      const { port, asked } = await withUpstream(WORKERS);
+      const reply = received(await ask(port, buildQuery("example.com", TYPE.AAAA)));
+      assert.equal(reply.subarray(-2).toString("hex"), "c0de", "the answer came from the upstream");
+      assert.deepEqual(asked, ["example.com"]);
+    });
+
+    it("asks for A too, where the placeholder is the AAAA and there is no A at all", async () => {
+      // The apex holds AAAA `100::` and no A. Answering the A query from the zone
+      // is an empty section, and a browser has nowhere to go; publicly the name
+      // has an address. This is the case the whole thing exists for.
+      const { port, asked } = await withUpstream(WORKERS);
+      const reply = received(await ask(port, buildQuery("example.com", TYPE.A)));
+      assert.equal(reply.subarray(-2).toString("hex"), "c0de");
+      assert.deepEqual(asked, ["example.com"]);
+    });
+
+    it("still answers the same name's mail and text itself", async () => {
+      // Relaying the whole name would throw away every override that is not an
+      // address, which is most of what an internal view is for.
+      const { port, asked } = await withUpstream(WORKERS);
+      const mx = received(await ask(port, buildQuery("example.com", TYPE.MX)));
+      assert.equal(mx.readUInt16BE(2) & 0x0400, 0x0400, "authoritative");
+      assert.equal(readAnswers(mx).length, 1);
+      const txt = received(await ask(port, buildQuery("example.com", TYPE.TXT)));
+      assert.equal(readAnswers(txt).length, 1);
+      assert.deepEqual(asked, [], "the upstream was never asked");
+    });
+
+    it("answers ordinary names in the zone itself", async () => {
+      const { port, asked } = await withUpstream(WORKERS);
+      const reply = received(await ask(port, buildQuery("inside.example.com", TYPE.A)));
+      assert.equal(reply.readUInt16BE(2) & 0x0400, 0x0400);
+      assert.deepEqual(readAnswers(reply).map((record) => [...record.data]), [[10, 17, 192, 11]]);
+      assert.deepEqual(asked, []);
+    });
+
+    it("answers the placeholder as stored when there is no upstream to ask", async () => {
+      // Without somewhere to ask, the desired state is all there is. Refusing
+      // would replace an answer that is merely useless with no answer at all.
+      const { port } = await start({ zones: () => [WORKERS] });
+      const reply = received(await ask(port, buildQuery("example.com", TYPE.AAAA)));
+      assert.equal(reply.readUInt16BE(2) & 0x0400, 0x0400, "authoritative");
+      assert.equal(readAnswers(reply).length, 1, "the placeholder itself");
+    });
+
+    it("keeps serving a record whose value works, though the provider owns it", async () => {
+      // The r2 case: locked against editing, but the target resolves, so there is
+      // nothing to relay and the stored value is the answer.
+      const zone: ServedZone = {
+        name: "example.com",
+        serial: 4,
+        records: [{ name: "files", type: "CNAME", content: "pub-1234.r2.dev", ttl: 300 }],
+      };
+      const { port, asked } = await withUpstream(zone);
+      const reply = received(await ask(port, buildQuery("files.example.com", TYPE.A)));
+      assert.equal(reply.readUInt16BE(2) & 0x0400, 0x0400, "authoritative");
+      assert.equal(readAnswers(reply).length, 1, "the CNAME answers for every type");
+      assert.deepEqual(asked, [], "nothing was relayed");
+    });
+  });
+
 });

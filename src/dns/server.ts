@@ -2,7 +2,7 @@ import { createSocket, type Socket } from "node:dgram";
 import { lookup } from "node:dns/promises";
 import { connect, createServer, isIP, type Server, type Socket as TcpSocket } from "node:net";
 import { performance } from "node:perf_hooks";
-import type { RecordType } from "../domain/dns.ts";
+import { providerManagement, type RecordType } from "../domain/dns.ts";
 import { encodeRdata, encodeSoa, rrType } from "./rdata.ts";
 import {
   CLASS_IN, MIN_UDP_PAYLOAD, RCODE, TYPE, WireFormatError,
@@ -108,14 +108,7 @@ export function createDnsServer(options: DnsServerOptions): {
       if (error instanceof WireFormatError) return undefined;
       throw error;
     }
-    const zone = matchZone(options.zones(), query.question.name);
-    if (!zone) {
-      if (forwardTo.length === 0) {
-        return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
-      }
-      if (!cidrsContain(forwardAllow, clientAddress)) {
-        return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
-      }
+    const relay = async (): Promise<Buffer> => {
       if (activeForwards >= maxConcurrentForwards) {
         return writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: false }, Number.MAX_SAFE_INTEGER);
       }
@@ -127,6 +120,30 @@ export function createDnsServer(options: DnsServerOptions): {
         activeForwards -= 1;
       }
       return forwarded ?? writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: false }, Number.MAX_SAFE_INTEGER);
+    };
+
+    const zone = matchZone(options.zones(), query.question.name);
+    if (!zone) {
+      if (forwardTo.length === 0) {
+        return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
+      }
+      if (!cidrsContain(forwardAllow, clientAddress)) {
+        return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
+      }
+      return relay();
+    }
+    // A name the provider serves itself carries a placeholder address that
+    // nobody can reach, so answering it from the desired state sends the client
+    // somewhere that does not exist. The public answer is the only real one, and
+    // it is not ours to hold: it changes without our records changing.
+    //
+    // Deliberately not behind `forwardAllow`. That gate exists so this cannot be
+    // used as an open resolver, and this path cannot be: it relays only names
+    // inside a zone we serve, and only those carrying a placeholder. Gating it
+    // would break the case it exists for -- a client outside the allowed range
+    // asking for one of our own names.
+    if (forwardTo.length > 0 && servedByProvider(zone, query.question.name, query.question.type)) {
+      return relay();
     }
     const parts = answerFromZone(query, zone, negativeTtl, options.onUnservable);
     return writeReply(parts, overTcp ? Number.MAX_SAFE_INTEGER : query.udpPayloadSize);
@@ -190,6 +207,23 @@ export function createDnsServer(options: DnsServerOptions): {
 }
 
 /** The longest zone whose apex the name sits at or under. */
+/**
+ * Whether an address query for this name must be answered by the upstream.
+ *
+ * Only address queries. A name whose A or AAAA is a placeholder still holds its
+ * own MX and TXT, and those are exactly what an internal view is for -- relaying
+ * the whole name would throw away every override that is not an address. So the
+ * question type decides, and one placeholder among the addresses is enough:
+ * where the apex has AAAA `100::` and no A at all, a browser asks for A and the
+ * honest answer is the public one, not an empty section.
+ */
+function servedByProvider(zone: ServedZone, name: string, type: number): boolean {
+  if (type !== TYPE.A && type !== TYPE.AAAA) return false;
+  return zone.records.some((record) => (record.type === "A" || record.type === "AAAA")
+    && absolute(record.name, zone.name) === name
+    && providerManagement(record)?.originless === true);
+}
+
 function matchZone(zones: readonly ServedZone[], name: string): ServedZone | undefined {
   let best: ServedZone | undefined;
   for (const zone of zones) {

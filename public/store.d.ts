@@ -36,6 +36,8 @@ export interface RecordViewValue {
   ttl: number;
   proxied?: boolean;
   acknowledgeNonGlobalIp?: boolean;
+  /** Why the provider owns this record, or "" when nobody but us does. */
+  managed?: string;
 }
 
 /**
@@ -106,6 +108,7 @@ export interface Store {
 
 export function createStore(client: unknown): Store;
 export function readRecords(zone: unknown): RecordRow[];
+export function providerManagedReason(record: unknown): string;
 export function desiredState(state: unknown): unknown;
 export function isNonGlobalAddress(value: string): boolean;
 export const ERROR_SCOPES: readonly string[];

@@ -292,6 +292,32 @@ TCP_STATUS=$(dig +tcp +noall +comments +time=3 +tries=1 -p "$DNSPORT" @127.0.0.1
 grep -q tcp "$WORK/upstream.log" || fail "the upstream was never asked over TCP"
 ok "UDP relayed to UDP and TCP to TCP, each answer returned as it was"
 
+echo "== a name the provider serves itself is asked upstream, though it is ours =="
+# The placeholder a provider leaves for a name it answers at its own edge. It is
+# inside a zone this listener is authoritative for, so the ordinary path would
+# answer it -- with an address no client can reach. NOTIMP is the stub's marker,
+# and only the stub can produce it.
+put wk wk AAAA "100::"
+put wkmail wk MX "10 mx.example.com"
+put bucket files CNAME "pub-1234.r2.dev"
+for _ in $(seq 1 "$REFRESH_WAIT"); do [ "$(status wk.example.com AAAA)" = "NOTIMP" ] && break; sleep 1; done
+[ "$(status wk.example.com AAAA)" = "NOTIMP" ] \
+  || fail "the placeholder was answered locally, status was '$(status wk.example.com AAAA)'"
+# The apex case: no A record at all beside the placeholder AAAA. Answering from
+# the zone is an empty section, and a browser has nowhere to go.
+[ "$(status wk.example.com A)" = "NOTIMP" ] \
+  || fail "an A query for a provider-served name was not relayed, status was '$(status wk.example.com A)'"
+ok "both address types for a provider-served name reached the upstream"
+
+# Relaying the whole name would throw away every override that is not an address.
+[ "$(status wk.example.com MX)" = "NOERROR" ] || fail "the MX at the same name was not answered locally"
+[ -n "$(short wk.example.com MX)" ] || fail "the MX at the same name returned nothing"
+ok "the same name's mail is still answered from the internal view"
+
+# A record the provider owns whose value does resolve: nothing to relay.
+[ "$(answer files.example.com CNAME)" != "" ] || fail "the provider-service CNAME was not answered"
+ok "a provider-owned record whose value works is served as stored"
+
 echo "== a change made through the API is served at once, not at the next refresh =="
 # The listener is told when this process commits, so this must not need the
 # timer. The bound is under the refresh interval on purpose: at or above it,
