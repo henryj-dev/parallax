@@ -102,7 +102,9 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
       ownershipSecret: config.ownershipSecret ?? "",
     })
     : undefined;
-  const fallbackDomains = credentialStore ? new FallbackDomainService({ secrets: credentialStore }) : undefined;
+  const fallbackDomains = credentialStore
+    ? new FallbackDomainService({ secrets: credentialStore, ownershipSecret: config.ownershipSecret ?? "" })
+    : undefined;
 
   const applyProviderSettings = (current: ParallaxSettings): void => {
     provider.setFallback(

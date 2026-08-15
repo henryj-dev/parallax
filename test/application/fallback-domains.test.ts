@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import { CloudflareFallbackDomains, FallbackDomainForbiddenError, type FallbackDomain } from "../../src/adapters/cloudflare-fallback.ts";
 import { CredentialNotFoundError } from "../../src/application/cloudflare-credentials.ts";
 import { FallbackDomainService, type ProfileSecretReader } from "../../src/application/fallback-domains.ts";
+import { ownershipComment } from "../../src/adapters/ownership.ts";
 
 /** The provider's list, and a record of every request made against it. */
 function stubProvider(initial: FallbackDomain[]) {
@@ -167,5 +168,102 @@ describe("fallback domains", () => {
     });
     await assert.rejects(service.list("main"), (error: unknown) =>
       error instanceof Error && !error.message.includes("tok-secret") && error.message.includes("[redacted]"));
+  });
+});
+
+describe("keeping the overrides in step with the zones", () => {
+  const SECRET = "a-secret-long-enough-to-sign-with-000000000000";
+  const marker = (suffix: string) => ownershipComment(`fallback/${suffix}`, "entry", SECRET);
+
+  /** The live list: other teams' entries, the defaults, and one of ours. */
+  const OTHERS: FallbackDomain[] = [
+    { suffix: "hackers.com", dnsServer: ["15.165.65.2"] },
+    { suffix: "kosaf.go.kr", dnsServer: ["168.126.63.1", "168.126.63.2"] },
+    { suffix: "localhost" },
+  ];
+
+  function syncing(initial: FallbackDomain[]) {
+    const provider = stubProvider(initial);
+    const service = new FallbackDomainService({
+      secrets: { getProfileSecret: async (name) => ({ name, accountId: "acct-1", token: "tok-secret" }) },
+      ownershipSecret: SECRET,
+      createClient: (options) => new CloudflareFallbackDomains({ ...options, fetch: provider.fetch }),
+    });
+    return { provider, service };
+  }
+
+  it("adds an entry for a zone that has none, and derives it rather than being told", async () => {
+    const { service } = syncing(OTHERS);
+    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.deepEqual(plan.add.map((entry) => entry.suffix), ["tinyuniver.se"]);
+    assert.deepEqual(plan.add[0]?.dnsServer, ["10.17.192.70"]);
+    assert.equal(plan.untouched, 3, "everyone else's entries are counted, not planned");
+  });
+
+  it("never writes over an entry it did not create", async () => {
+    // Somebody added this suffix by hand. Taking it over would move another
+    // team's DNS on the strength of a name collision.
+    const { service, provider } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.0.0.9"] }]);
+    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.deepEqual(plan.conflict.map((entry) => entry.suffix), ["tinyuniver.se"]);
+    assert.deepEqual(plan.add, []);
+    assert.deepEqual(plan.update, []);
+    await service.sync("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.equal(provider.calls.filter((call) => call.method === "PUT").length, 0, "a conflict writes nothing");
+  });
+
+  it("keeps every other entry when it does write", async () => {
+    const { service, provider } = syncing(OTHERS);
+    const { domains } = await service.sync("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.equal(domains.length, 4);
+    for (const entry of OTHERS) {
+      const kept = domains.find((domain) => domain.suffix === entry.suffix);
+      assert.deepEqual(kept?.dnsServer, entry.dnsServer, `${entry.suffix} survived unchanged`);
+    }
+  });
+
+  it("moves its own entry when the resolver changes, and leaves the marker verifiable", async () => {
+    const { service } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.17.239.78"], description: marker("tinyuniver.se") }]);
+    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.deepEqual(plan.update.map((entry) => entry.dnsServer), [["10.17.192.70"]]);
+    assert.equal(plan.add.length + plan.remove.length, 0);
+  });
+
+  it("removes its own entry for a zone it no longer holds", async () => {
+    const { service } = syncing([...OTHERS, { suffix: "gone.example", dnsServer: ["10.17.192.70"], description: marker("gone.example") }]);
+    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.deepEqual(plan.remove.map((entry) => entry.suffix), ["gone.example"]);
+  });
+
+  it("does not accept a marker minted for another suffix", async () => {
+    // The marker is signed for the suffix it sits on, so lifting one onto a
+    // different entry does not make that entry ours to delete.
+    const { service } = syncing([...OTHERS, { suffix: "hackers.co.kr", dnsServer: ["15.165.65.2"], description: marker("tinyuniver.se") }]);
+    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.deepEqual(plan.remove, [], "not ours, so not removed");
+    assert.deepEqual(plan.add.map((entry) => entry.suffix), ["tinyuniver.se"]);
+  });
+
+  it("reports nothing to do without writing", async () => {
+    const { service, provider } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"], description: marker("tinyuniver.se") }]);
+    const { plan } = await service.sync("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.equal(plan.unchanged, 1);
+    assert.equal(provider.calls.filter((call) => call.method === "PUT").length, 0);
+  });
+
+  it("refuses to plan without a signing secret, rather than treating every entry as unowned", async () => {
+    // Without the secret nothing verifies, so every entry would look like
+    // somebody else's -- and every zone would look like it needed adding.
+    const provider = stubProvider(OTHERS);
+    const service = new FallbackDomainService({
+      secrets: { getProfileSecret: async (name) => ({ name, accountId: "acct-1", token: "tok-secret" }) },
+      createClient: (options) => new CloudflareFallbackDomains({ ...options, fetch: provider.fetch }),
+    });
+    await assert.rejects(service.plan("main", ["tinyuniver.se"], "10.17.192.70"), /OWNERSHIP_SECRET/u);
+  });
+
+  it("refuses to plan with no resolver address", async () => {
+    const { service } = syncing(OTHERS);
+    await assert.rejects(service.plan("main", ["tinyuniver.se"], "  "), /fallbackResolver/u);
   });
 });

@@ -1,4 +1,5 @@
 import { CloudflareFallbackDomains, type FallbackDomain } from "../adapters/cloudflare-fallback.ts";
+import { ownershipComment, readOwnershipComment } from "../adapters/ownership.ts";
 import { CredentialNotFoundError } from "./cloudflare-credentials.ts";
 
 /**
@@ -16,6 +17,8 @@ export interface ProfileSecretReader {
 
 export interface FallbackDomainServiceOptions {
   readonly secrets: ProfileSecretReader;
+  /** Signs the marker that says which entries are this control plane's to change. */
+  readonly ownershipSecret?: string;
   /** Overridden in tests; the real one talks to the provider. */
   readonly createClient?: (options: { token: string; accountId: string; policyId?: string }) => CloudflareFallbackDomains;
 }
@@ -26,12 +29,26 @@ export interface FallbackDomainChange {
   readonly outcome: "added" | "updated" | "removed" | "unchanged";
 }
 
+/** One suffix's place in the difference between the zones and the live list. */
+export interface FallbackPlan {
+  readonly add: FallbackDomain[];
+  readonly update: FallbackDomain[];
+  readonly remove: FallbackDomain[];
+  /** Suffixes somebody else's entry already covers. Never written over. */
+  readonly conflict: { suffix: string; reason: string }[];
+  readonly unchanged: number;
+  /** Entries in the list that are nobody's business of ours. */
+  readonly untouched: number;
+}
+
 export class FallbackDomainService {
   readonly #secrets: ProfileSecretReader;
+  readonly #ownershipSecret: string;
   readonly #createClient: NonNullable<FallbackDomainServiceOptions["createClient"]>;
 
   constructor(options: FallbackDomainServiceOptions) {
     this.#secrets = options.secrets;
+    this.#ownershipSecret = options.ownershipSecret ?? "";
     this.#createClient = options.createClient
       ?? ((input) => new CloudflareFallbackDomains(input));
   }
@@ -78,6 +95,95 @@ export class FallbackDomainService {
     // that the override is gone, when it may be spelled differently and still live.
     if (next.length === current.length) return { domains: current, outcome: "unchanged" };
     return { domains: await client.replace(next), outcome: "removed" };
+  }
+
+  /**
+   * Works out what the override list would have to become for it to match the
+   * zones this control plane holds, and touches nothing else.
+   *
+   * The list is not ours. It is one setting shared by every override an
+   * organization has, and the one seen here already carried six belonging to
+   * other networks. So an entry is only this control plane's to change if it
+   * carries a marker signed for that exact suffix -- the same marker, the same
+   * secret and the same reasoning as a published DNS record. A suffix we want
+   * that somebody else already covers is a conflict, reported and left alone,
+   * because overwriting it is how one team's DNS quietly becomes another's.
+   */
+  async plan(profile: string, zones: readonly string[], resolver: string, policyId?: string): Promise<FallbackPlan> {
+    if (!this.#ownershipSecret) {
+      throw new Error("PARALLAX_OWNERSHIP_SECRET is required to tell this control plane's overrides from everyone else's");
+    }
+    if (!resolver.trim()) {
+      throw new Error("no fallbackResolver is set, so there is no address to send these zones to");
+    }
+    const wanted = new Map(zones.map((zone) => [normalizeSuffix(zone), normalizeSuffix(zone)]));
+    const current = await (await this.#client(profile, policyId)).list();
+
+    const add: FallbackDomain[] = [];
+    const update: FallbackDomain[] = [];
+    const remove: FallbackDomain[] = [];
+    const conflict: { suffix: string; reason: string }[] = [];
+    let unchanged = 0;
+    let untouched = 0;
+
+    for (const entry of current) {
+      const suffix = normalizeSuffix(entry.suffix);
+      if (!this.#owns(entry)) {
+        if (wanted.has(suffix)) {
+          conflict.push({ suffix, reason: "an entry for this suffix exists that Parallax did not create" });
+          wanted.delete(suffix);
+        } else untouched += 1;
+        continue;
+      }
+      if (!wanted.has(suffix)) {
+        // Ours, and no longer describes a zone we hold. Leaving it would send
+        // devices to this resolver for a name it has stopped answering for.
+        remove.push(entry);
+        continue;
+      }
+      wanted.delete(suffix);
+      const desired = this.#entry(suffix, resolver);
+      if (sameEntry(entry, desired)) unchanged += 1;
+      else update.push(desired);
+    }
+    for (const suffix of wanted.keys()) add.push(this.#entry(suffix, resolver));
+    return { add, update, remove, conflict, unchanged, untouched };
+  }
+
+  /**
+   * Applies a plan. Reads again rather than trusting the list the plan was built
+   * from: between the two the list may have moved, and this writes all of it.
+   */
+  async sync(profile: string, zones: readonly string[], resolver: string, policyId?: string): Promise<{ plan: FallbackPlan; domains: FallbackDomain[] }> {
+    const plan = await this.plan(profile, zones, resolver, policyId);
+    if (plan.add.length === 0 && plan.update.length === 0 && plan.remove.length === 0) {
+      return { plan, domains: await this.list(profile, policyId) };
+    }
+    const client = await this.#client(profile, policyId);
+    const current = await client.list();
+    const removing = new Set(plan.remove.map((entry) => normalizeSuffix(entry.suffix)));
+    const replacing = new Map(plan.update.map((entry) => [normalizeSuffix(entry.suffix), entry]));
+    const next = current
+      .filter((entry) => !(this.#owns(entry) && removing.has(normalizeSuffix(entry.suffix))))
+      .map((entry) => (this.#owns(entry) ? replacing.get(normalizeSuffix(entry.suffix)) ?? entry : entry));
+    return { plan, domains: await client.replace([...next, ...plan.add]) };
+  }
+
+  #entry(suffix: string, resolver: string): FallbackDomain {
+    return {
+      suffix,
+      dnsServer: [resolver.trim()],
+      description: ownershipComment(`fallback/${suffix}`, "entry", this.#ownershipSecret),
+    };
+  }
+
+  /**
+   * Whether this control plane wrote the entry. Bound to the suffix it sits on,
+   * so a marker cannot be moved to a suffix it was not minted for.
+   */
+  #owns(entry: FallbackDomain): boolean {
+    if (!this.#ownershipSecret) return false;
+    return readOwnershipComment(entry.description, this.#ownershipSecret, `fallback/${normalizeSuffix(entry.suffix)}`) !== undefined;
   }
 
   async #client(profile: string, policyId?: string): Promise<CloudflareFallbackDomains> {

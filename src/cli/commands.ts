@@ -155,6 +155,12 @@ function splitList(value: unknown): string[] {
     : [];
 }
 
+/** The apexes bound to one credential profile: what its overrides must cover. */
+async function profileZones(context: CommandContext, profile: string): Promise<string[]> {
+  const bindings = await requireCredentials(context).listZones();
+  return bindings.filter((binding) => binding.profile === profile).map((binding) => binding.zone);
+}
+
 function requireFallbackDomains(context: CommandContext): FallbackDomainService {
   const service = context.runtime.fallbackDomains;
   if (!service) {
@@ -584,6 +590,30 @@ const COMMANDS: readonly Command[] = [
       dnsServer: splitList(input["dns-server"]),
       ...(optionalText(input.description) ? { description: String(input.description) } : {}),
     }, optionalText(input.policy)),
+  },
+  {
+    name: "fallback preview",
+    summary: "Show what syncing the overrides with this profile's zones would change",
+    role: "admin",
+    options: [
+      { name: "profile", summary: "Stored credential profile to authenticate with", required: true },
+      { name: "policy", summary: "Device settings profile id; the account default when absent" },
+    ],
+    run: async (context, input) => await requireFallbackDomains(context)
+      .plan(String(input.profile), await profileZones(context, String(input.profile)),
+        requireSettings(context).current().fallbackResolver, optionalText(input.policy)),
+  },
+  {
+    name: "fallback sync",
+    summary: "Make the overrides match this profile's zones, touching nothing else",
+    role: "admin",
+    options: [
+      { name: "profile", summary: "Stored credential profile to authenticate with", required: true },
+      { name: "policy", summary: "Device settings profile id; the account default when absent" },
+    ],
+    run: async (context, input) => await requireFallbackDomains(context)
+      .sync(String(input.profile), await profileZones(context, String(input.profile)),
+        requireSettings(context).current().fallbackResolver, optionalText(input.policy)),
   },
   {
     name: "fallback delete",

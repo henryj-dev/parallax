@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { DomainValidationError } from "../domain/dns.ts";
 import type { SettingsRepository } from "./ports.ts";
 
@@ -20,6 +21,16 @@ export interface ParallaxSettings {
   readonly revisionRetention: number;
   /** Days of audit history kept per zone; 0 keeps every entry. */
   readonly auditRetentionDays: number;
+  /**
+   * Address a client-side resolver override should send this control plane's
+   * zones to. Empty means Parallax manages no overrides at all.
+   *
+   * Given rather than derived. The listener's own host is usually `0.0.0.0`,
+   * which is not an address anything can be told to ask, and the address a
+   * device must use is a fact about the network in front of it -- a Service, a
+   * gateway, a published address -- that this process cannot see from inside.
+   */
+  readonly fallbackResolver: string;
 }
 
 export const DEFAULT_SETTINGS: ParallaxSettings = Object.freeze({
@@ -29,6 +40,7 @@ export const DEFAULT_SETTINGS: ParallaxSettings = Object.freeze({
   trustForwardedHeaders: false,
   revisionRetention: 100,
   auditRetentionDays: 365,
+  fallbackResolver: "",
 });
 
 /** Bounds keep date arithmetic and whole-store retention work predictable. */
@@ -200,7 +212,20 @@ export function parseSettings(stored: Record<string, unknown>): ParallaxSettings
     trustForwardedHeaders: readBoolean(merged.trustForwardedHeaders, "trustForwardedHeaders"),
     revisionRetention: readCount(merged.revisionRetention, "revisionRetention", MAX_REVISION_RETENTION),
     auditRetentionDays: readCount(merged.auditRetentionDays, "auditRetentionDays", MAX_AUDIT_RETENTION_DAYS),
+    fallbackResolver: readResolver(merged.fallbackResolver),
   };
+}
+
+/**
+ * One address, or nothing. A hostname is refused: the device asking is outside
+ * this network and may resolve a name differently, or not at all -- and the one
+ * thing it cannot do while being told where to resolve names is resolve a name.
+ */
+function readResolver(value: unknown): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (text === "") return "";
+  if (!isIP(text)) throw new DomainValidationError(["fallbackResolver must be an IP address"]);
+  return text;
 }
 
 function readPatch(patch: unknown): Record<string, unknown> {
