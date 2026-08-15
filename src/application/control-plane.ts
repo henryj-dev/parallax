@@ -424,6 +424,36 @@ export class ControlPlane {
     }
     const taken = new Set(views.flatMap((candidate) => candidate.records.map((record) => record.id)));
     const adopted: DesiredRecord[] = [];
+    // Records the provider owns are refreshed in place rather than left behind.
+    //
+    // Every other record is the operator's, and adoption deliberately does not
+    // take those over: a later difference is a conflict for a person to settle.
+    // These have no person to settle it. They cannot be edited here -- that is
+    // the point of them -- so if the provider changes one and this only ever
+    // added, the desired state would keep a value the world no longer has, with
+    // no way left to correct it. Refusing to edit them is only honest if
+    // adopting again is the way to catch up, which is what the refusal says.
+    //
+    // Matched on name and type, and only where each side has exactly one record
+    // there. A name may hold a whole RRset, and picking one of several to carry
+    // somebody else's value would silently rewrite the wrong one -- so an
+    // ambiguous case is left alone and surfaces as a conflict, which is a person's
+    // to settle.
+    const refreshed: DesiredRecord[] = [];
+    for (const record of actual) {
+      if (record.managed) continue;
+      const desiredHere = target.records.filter((desired) => desired.name === record.name && desired.type === record.type);
+      const actualHere = actual.filter((candidate) => candidate.name === record.name && candidate.type === record.type);
+      if (desiredHere.length !== 1 || actualHere.length !== 1) continue;
+      const existing = desiredHere[0] as DesiredRecord;
+      // The stored copy is the locked one; what the provider now holds may be
+      // anything, including an ordinary address that is no longer locked at all.
+      if (!providerManagement(existing)) continue;
+      if (existing.content === record.content && existing.ttl === record.ttl) continue;
+      existing.content = record.content;
+      existing.ttl = record.ttl;
+      refreshed.push(existing);
+    }
     for (const record of actual) {
       // Already Parallax's, or already described by a record that matches it.
       if (record.managed) continue;
@@ -434,15 +464,16 @@ export class ControlPlane {
       adopted.push(desired);
       target.records.push(desired);
     }
-    if (adopted.length === 0) return { zone, adopted, seen: actual.length };
+    if (adopted.length === 0 && refreshed.length === 0) return { zone, adopted, refreshed, seen: actual.length };
 
     if (view === "external") target.records = normalizeExternalRecords(target.records);
     ensureUniqueRecordKeys(target.records);
     materializeProviderViews(views);
     const updated = this.#nextRevision(zone, views);
-    await this.#commitDesiredChange(zone, updated, "records.adopted", actor, { view, adopted: adopted.length },
+    await this.#commitDesiredChange(zone, updated, "records.adopted", actor,
+      { view, adopted: adopted.length, ...(refreshed.length > 0 ? { refreshed: refreshed.length } : {}) },
       new Set(views.map((candidate) => candidate.name)), expectedRevision);
-    return { zone: updated, adopted, seen: actual.length };
+    return { zone: updated, adopted, refreshed, seen: actual.length };
   }
 
   async listRevisions(zoneName: string, page?: PageRequest): Promise<Paged<"revisions", ZoneRevision>> {
@@ -972,6 +1003,12 @@ export interface AdoptionResult {
   readonly zone: Zone;
   /** Records now described that were not before. */
   readonly adopted: DesiredRecord[];
+  /**
+   * Records the provider owns whose stored copy was brought back into line with
+   * it. Reported separately because nothing was newly described: the count of
+   * adopted records stays honest about what it means.
+   */
+  readonly refreshed: DesiredRecord[];
   /**
    * How many records the provider listed for this view. Counting only the types
    * this control plane supports, so comparing it against the provider's own

@@ -1192,6 +1192,43 @@ describe("ControlPlane", () => {
       assert.ok(inside.some((record) => record.content === "fd00::1"), "the override was accepted");
     });
 
+    it("still follows the provider when it changes one there", async () => {
+      // The lock is on changing it *here*. Adoption is the provider telling us
+      // what it now holds, and refusing that would freeze the desired state
+      // against the very source it is supposed to describe -- the record would
+      // read one way in Parallax and answer another way in the world.
+      const { service, provider } = setup();
+      await service.createZone("example.com");
+      provider.seed("example.com/external", [
+        { id: "a", name: "@", type: "AAAA", content: "100::", ttl: 300, providerId: "cf-1", managed: false },
+      ]);
+      await service.adoptProviderRecords("example.com", "external", "operator");
+
+      provider.seed("example.com/external", [
+        { id: "a", name: "@", type: "AAAA", content: "2606:4700::1", ttl: 300, providerId: "cf-1", managed: false },
+      ]);
+      const { zone } = await service.adoptProviderRecords("example.com", "external", "operator");
+      const apex = zone.views.find((view) => view.name === "external")?.records.find((record) => record.name === "@");
+      assert.equal(apex?.content, "2606:4700::1", "adoption followed the provider through the lock");
+    });
+
+    it("leaves an ambiguous name alone rather than rewriting one of an RRset", async () => {
+      // Two records at the same name and type. Refreshing "the" record there
+      // means choosing one, and the wrong choice moves somebody else's value.
+      const { service, provider } = setup();
+      await service.createZone("example.com");
+      provider.seed("example.com/external", [
+        { id: "a", name: "@", type: "AAAA", content: "100::", ttl: 300, providerId: "cf-1", managed: false },
+      ]);
+      await service.adoptProviderRecords("example.com", "external", "operator");
+      provider.seed("example.com/external", [
+        { id: "a", name: "@", type: "AAAA", content: "2606:4700::1", ttl: 300, providerId: "cf-1", managed: false },
+        { id: "b", name: "@", type: "AAAA", content: "2606:4700::2", ttl: 300, providerId: "cf-2", managed: false },
+      ]);
+      const { refreshed } = await service.adoptProviderRecords("example.com", "external", "operator");
+      assert.equal(refreshed.length, 0, "nothing was rewritten on a guess");
+    });
+
     it("lets an unrelated record in the same view still be changed", async () => {
       const service = await withPlaceholder();
       await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
