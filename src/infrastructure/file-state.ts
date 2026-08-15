@@ -1,9 +1,10 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { RevisionConflictError, type ApplyStatus, type DesiredChange, type PageRequest, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
-import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
-import { InMemoryApplyLock } from "./in-memory.ts";
+import { mergeApplyStatus, RevisionConflictError, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type DesiredChange, type PageRequest, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { assertPersistedDesiredViewsValid } from "../application/control-plane.ts";
+import { AUDIT_ACTIONS, createDesiredRecord, normalizeZoneName, readPersistedViewName, type AuditEntry, type Zone, type ZoneRevision } from "../domain/dns.ts";
+import { ensurePrivateDirectory, withFileLock } from "./atomic-file.ts";
 
 interface PersistedState {
   version: 1;
@@ -15,16 +16,13 @@ interface PersistedState {
 }
 
 /**
- * A dependency-free, durable repository for a single Parallax process.
+ * A dependency-free, durable repository for file-backed Parallax processes.
  *
- * Zone and apply-status changes share one serialized write queue so every
- * successful method call is represented by one atomic replacement of the
- * state file.
+ * A local queue and a cross-process file lock serialize zone/status changes;
+ * every mutation re-reads under the lock and makes one atomic replacement.
  */
 export class FileStateRepository implements ZoneRepository, StatusRepository {
   readonly #path: string;
-  #state: PersistedState | undefined;
-  #loadPromise: Promise<PersistedState> | undefined;
   #writeTail: Promise<void> = Promise.resolve();
 
   constructor(path: string) {
@@ -32,17 +30,19 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
     this.#path = path;
   }
 
-  list(): Promise<Zone[]>;
+  list(page?: PageRequest): Promise<Zone[]>;
   list(zone: string): Promise<ApplyStatus[]>;
-  async list(zone?: string): Promise<Zone[] | ApplyStatus[]> {
+  async list(zoneOrPage?: string | PageRequest): Promise<Zone[] | ApplyStatus[]> {
     const state = await this.#readState();
-    if (zone !== undefined) {
+    if (typeof zoneOrPage === "string") {
       return Object.values(state.statuses)
-        .filter((status) => status.zone === zone)
+        .filter((status) => status.zone === zoneOrPage)
         .map(clone)
         .sort((left, right) => left.view.localeCompare(right.view));
     }
-    return Object.values(state.zones).map(clone).sort((left, right) => left.name.localeCompare(right.name));
+    const names = Object.keys(state.zones).sort((left, right) => left.localeCompare(right));
+    const selected = zoneOrPage ? names.slice(zoneOrPage.offset, zoneOrPage.offset + zoneOrPage.limit) : names;
+    return selected.map((name) => clone(state.zones[name]!));
   }
 
   get(name: string): Promise<Zone | undefined>;
@@ -63,10 +63,8 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
     await this.#mutate((state) => {
       if (isZone(value)) state.zones[value.name] = clone(value);
       else {
-        const existing = state.statuses[statusKey(value.zone, value.view)];
-        if (!existing || existing.desiredRevision <= value.desiredRevision) {
-          state.statuses[statusKey(value.zone, value.view)] = clone(value);
-        }
+        const key = statusKey(value.zone, value.view);
+        state.statuses[key] = mergeApplyStatus(state.statuses[key], clone(value));
       }
     });
   }
@@ -144,11 +142,12 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
     });
   }
 
-  async appendAudit(input: Omit<AuditEntry, "id">): Promise<AuditEntry> {
+  async appendAudit(input: Omit<AuditEntry, "id">, retention?: AuditRetentionPolicy): Promise<AuditEntry> {
     return this.#mutate((state) => {
       const entry = clone({ ...input, id: state.nextAuditId });
       state.nextAuditId += 1;
       state.audit.push(entry);
+      applyAuditRetention(state, input.zone, retention);
       return clone(entry);
     });
   }
@@ -172,51 +171,43 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
 
   async #readState(): Promise<PersistedState> {
     await this.#writeTail;
-    return this.#load();
+    return this.#readFile();
   }
 
   #mutate<T>(operation: (state: PersistedState) => T): Promise<T> {
-    const result = this.#writeTail.then(async () => {
-      const draft = clone(await this.#load());
+    const result = this.#writeTail.then(() => withFileLock(this.#path, async () => {
+      // Always re-read after the cross-process lock is held. A cached snapshot
+      // here turns a successful CLI/replica write into the next writer's loss.
+      const draft = clone(await this.#readFile());
       const value = operation(draft);
       await this.#writeAtomically(draft);
-      this.#state = draft;
       return value;
-    });
+    }));
     this.#writeTail = result.then(() => undefined, () => undefined);
     return result;
   }
 
-  #load(): Promise<PersistedState> {
-    if (this.#state) return Promise.resolve(this.#state);
-    if (!this.#loadPromise) {
-      this.#loadPromise = this.#readFile().then((state) => {
-        this.#state = state;
-        return state;
-      }).catch((error: unknown) => {
-        this.#loadPromise = undefined;
-        throw error;
-      });
-    }
-    return this.#loadPromise;
-  }
-
   async #readFile(): Promise<PersistedState> {
+    await ensurePrivateDirectory(dirname(this.#path));
     let source: string;
     try {
+      await chmod(this.#path, 0o600);
       source = await readFile(this.#path, "utf8");
     } catch (error) {
       if (isNodeError(error) && error.code === "ENOENT") return emptyState();
       throw error;
     }
     const parsed: unknown = JSON.parse(source);
-    if (!isPersistedState(parsed)) throw new Error(`unsupported or invalid state file: ${this.#path}`);
-    return clone(parsed);
+    try {
+      return readPersistedState(parsed);
+    } catch (error) {
+      throw new Error(`unsupported or invalid state file: ${this.#path}`, { cause: error });
+    }
   }
 
   async #writeAtomically(state: PersistedState): Promise<void> {
     const directory = dirname(this.#path);
-    await mkdir(directory, { recursive: true });
+    await ensurePrivateDirectory(directory);
     const temporaryPath = join(directory, `.${basename(this.#path)}.${process.pid}.${randomUUID()}.tmp`);
     try {
       // Flush the replacement and the directory entry so a crash after this
@@ -245,13 +236,21 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
 export function createFileStateAdapters(path: string): {
   zones: ZoneRepository;
   statuses: StatusRepository;
-  applyLock: InMemoryApplyLock;
+  applyLock: ApplyLock;
 } {
   const repository = new FileStateRepository(path);
-  // This backend is intentionally single-process. The shared per-zone lock
-  // coordinates ControlPlane instances from this bundle; multi-host
-  // deployments must use PostgreSQL for cross-process apply coordination.
-  return { zones: repository, statuses: repository, applyLock: new InMemoryApplyLock() };
+  return { zones: repository, statuses: repository, applyLock: new FileApplyLock(path) };
+}
+
+/** Holds a per-zone lock file across provider work and the following state commit. */
+class FileApplyLock implements ApplyLock {
+  readonly #statePath: string;
+  constructor(statePath: string) { this.#statePath = statePath; }
+
+  withZoneLock<T>(zone: string, operation: () => Promise<T>): Promise<T> {
+    const key = createHash("sha256").update(zone, "utf8").digest("hex");
+    return withFileLock(`${this.#statePath}.zone-${key}`, operation);
+  }
 }
 
 /** Trims a single zone's history in the same replacement as the change itself. */
@@ -268,7 +267,11 @@ function applyRetention(state: PersistedState, zone: string, retention: Retentio
       state.revisions[zone] = Object.fromEntries(keep.map((revision) => [String(revision), revisions[String(revision)] as ZoneRevision]));
     }
   }
-  const before = retention.deleteAuditBefore;
+  applyAuditRetention(state, zone, retention);
+}
+
+function applyAuditRetention(state: PersistedState, zone: string, retention: AuditRetentionPolicy | undefined): void {
+  const before = retention?.deleteAuditBefore;
   if (before) state.audit = state.audit.filter((entry) => entry.zone !== zone || entry.at >= before);
 }
 
@@ -292,19 +295,162 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }
 
-function isPersistedState(value: unknown): value is PersistedState {
-  if (value === null || typeof value !== "object") return false;
-  const candidate = value as Partial<PersistedState>;
-  if (candidate.version !== 1
-    || candidate.zones === null || typeof candidate.zones !== "object" || Array.isArray(candidate.zones)
-    || !Array.isArray(candidate.audit)
-    || candidate.statuses === null || typeof candidate.statuses !== "object" || Array.isArray(candidate.statuses)
-    || typeof candidate.nextAuditId !== "number" || !Number.isSafeInteger(candidate.nextAuditId) || candidate.nextAuditId < 1) return false;
-  if (candidate.revisions === undefined) {
-    candidate.revisions = Object.fromEntries(Object.values(candidate.zones).map((zone) => {
-      const snapshot = zone as Zone;
-      return [snapshot.name, { [String(snapshot.revision)]: clone(snapshot) }];
-    }));
+function readPersistedState(value: unknown): PersistedState {
+  const candidate = readObject(value, "state document");
+  if (candidate.version !== 1) throw new Error("unsupported state document version");
+
+  const rawZones = readObject(candidate.zones, "zones");
+  const zoneEntries = Object.entries(rawZones).map(([key, rawZone]) => {
+    const zone = readZoneSnapshot(rawZone);
+    if (zone.name !== key) throw new Error(`zone key ${key} does not match snapshot name ${zone.name}`);
+    return [key, zone] as const;
+  });
+  const zones = Object.fromEntries(zoneEntries);
+
+  if (!Array.isArray(candidate.audit)) throw new Error("audit must be an array");
+  const audit = candidate.audit.map(readAuditEntry);
+  const auditIds = new Set(audit.map((entry) => entry.id));
+  if (auditIds.size !== audit.length) throw new Error("audit ids must be unique");
+
+  const rawStatuses = readObject(candidate.statuses, "statuses");
+  const statusEntries = Object.entries(rawStatuses).map(([key, rawStatus]) => {
+    const status = readApplyStatus(rawStatus);
+    if (statusKey(status.zone, status.view) !== key) throw new Error("status key does not match its zone and view");
+    return [key, status] as const;
+  });
+  const statuses = Object.fromEntries(statusEntries);
+
+  const revisions = candidate.revisions === undefined
+    ? Object.fromEntries(zoneEntries.map(([name, zone]) => [name, { [String(zone.revision)]: clone(zone) }]))
+    : readRevisionMap(candidate.revisions);
+  const nextAuditId = readPositiveInteger(candidate.nextAuditId, "nextAuditId");
+  const greatestAuditId = audit.reduce((greatest, entry) => Math.max(greatest, entry.id), 0);
+  if (nextAuditId <= greatestAuditId) throw new Error("nextAuditId must be greater than every stored audit id");
+
+  return { version: 1, zones, audit, statuses, revisions, nextAuditId };
+}
+
+function readRevisionMap(value: unknown): Record<string, Record<string, ZoneRevision>> {
+  const rawRevisions = readObject(value, "revisions");
+  return Object.fromEntries(Object.entries(rawRevisions).map(([zoneName, rawZoneRevisions]) => {
+    if (normalizeZoneName(zoneName) !== zoneName) throw new Error(`revision zone key ${zoneName} is not normalized`);
+    const revisions = Object.fromEntries(Object.entries(readObject(rawZoneRevisions, `revisions for ${zoneName}`))
+      .map(([revisionKey, rawRevision]) => {
+        const snapshot = readZoneSnapshot(rawRevision);
+        if (snapshot.name !== zoneName || String(snapshot.revision) !== revisionKey) {
+          throw new Error(`revision key ${zoneName}/${revisionKey} does not match its snapshot`);
+        }
+        return [revisionKey, snapshot] as const;
+      }));
+    return [zoneName, revisions] as const;
+  }));
+}
+
+function readZoneSnapshot(value: unknown): Zone {
+  const zone = readObject(value, "zone snapshot");
+  const name = readString(zone.name, "zone name");
+  if (normalizeZoneName(name) !== name) throw new Error("zone name is not normalized");
+  const revision = readPositiveInteger(zone.revision, "zone revision");
+  const createdAt = readTimestamp(zone.createdAt, "zone createdAt");
+  const updatedAt = readTimestamp(zone.updatedAt, "zone updatedAt");
+  if (!Array.isArray(zone.views)) throw new Error("zone views must be an array");
+  const viewNames = new Set<string>();
+  const views = zone.views.map((rawView, viewIndex) => {
+    const view = readObject(rawView, `zone view ${viewIndex}`);
+    const name = readPersistedViewName(readString(view.name, "view name"));
+    if (viewNames.has(name)) throw new Error(`duplicate view ${name}`);
+    viewNames.add(name);
+    if (!Array.isArray(view.records)) throw new Error(`records for view ${name} must be an array`);
+    const recordIds = new Set<string>();
+    const records = view.records.map((rawRecord, recordIndex) => {
+      const record = readObject(rawRecord, `record ${recordIndex}`);
+      const id = readString(record.id, "record id");
+      if (recordIds.has(id)) throw new Error(`duplicate record ${id}`);
+      recordIds.add(id);
+      return createDesiredRecord(id, record);
+    });
+    return { name, records };
+  });
+  assertPersistedDesiredViewsValid(views);
+  return { name, revision, views, createdAt, updatedAt };
+}
+
+function readAuditEntry(value: unknown): AuditEntry {
+  const audit = readObject(value, "audit entry");
+  const action = readString(audit.action, "audit action");
+  if (!AUDIT_ACTIONS.some((candidate) => candidate === action)) throw new Error(`unknown audit action ${action}`);
+  const zone = readString(audit.zone, "audit zone");
+  if (normalizeZoneName(zone) !== zone) throw new Error("audit zone is not normalized");
+  const actor = readString(audit.actor, "audit actor");
+  if (/[\u0000-\u001f\u007f]/u.test(actor)) throw new Error("audit actor contains control characters");
+  const entry: AuditEntry = {
+    id: readPositiveInteger(audit.id, "audit id"),
+    zone,
+    revision: readPositiveInteger(audit.revision, "audit revision"),
+    action: action as AuditEntry["action"],
+    actor,
+    at: readTimestamp(audit.at, "audit timestamp"),
+    detail: clone(readObject(audit.detail, "audit detail")),
+  };
+  for (const field of ["added", "removed", "changed"] as const) {
+    if (audit[field] !== undefined) entry[field] = readNonNegativeInteger(audit[field], `audit ${field}`);
   }
-  return candidate.revisions !== null && typeof candidate.revisions === "object" && !Array.isArray(candidate.revisions);
+  return entry;
+}
+
+function readApplyStatus(value: unknown): ApplyStatus {
+  const raw = readObject(value, "apply status");
+  const zone = readString(raw.zone, "status zone");
+  if (normalizeZoneName(zone) !== zone) throw new Error("status zone is not normalized");
+  const view = readPersistedViewName(readString(raw.view, "status view"));
+  const state = readString(raw.state, "status state");
+  if (state !== "pending" && state !== "applied" && state !== "failed") throw new Error(`unknown status state ${state}`);
+  const status: ApplyStatus = {
+    zone,
+    view,
+    desiredRevision: readNonNegativeInteger(raw.desiredRevision, "desired revision"),
+    appliedRevision: readNonNegativeInteger(raw.appliedRevision, "applied revision"),
+    state,
+  };
+  if (status.appliedRevision > status.desiredRevision) throw new Error("applied revision exceeds desired revision");
+  if (raw.lastAttemptAt !== undefined) status.lastAttemptAt = readTimestamp(raw.lastAttemptAt, "last attempt timestamp");
+  if (raw.error !== undefined) status.error = readString(raw.error, "status error");
+  if (raw.completedOperations !== undefined) {
+    status.completedOperations = readNonNegativeInteger(raw.completedOperations, "completed operations");
+  }
+  if (raw.plannedOperations !== undefined) {
+    status.plannedOperations = readNonNegativeInteger(raw.plannedOperations, "planned operations");
+  }
+  if ((status.completedOperations === undefined) !== (status.plannedOperations === undefined)
+    || (status.completedOperations ?? 0) > (status.plannedOperations ?? 0)) {
+    throw new Error("invalid apply operation progress");
+  }
+  return status;
+}
+
+function readObject(value: unknown, field: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`${field} must be an object`);
+  return value as Record<string, unknown>;
+}
+
+function readString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${field} must be a non-empty string`);
+  return value;
+}
+
+function readPositiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new Error(`${field} must be a positive integer`);
+  return value;
+}
+
+function readNonNegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`${field} must be a non-negative integer`);
+  return value;
+}
+
+function readTimestamp(value: unknown, field: string): string {
+  if (typeof value !== "string") throw new Error(`${field} must be an ISO timestamp`);
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) throw new Error(`${field} must be an ISO timestamp`);
+  return date.toISOString();
 }

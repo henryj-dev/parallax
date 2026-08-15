@@ -43,7 +43,39 @@ describe("HTTP API", () => {
     await handler(incoming, response);
     assert.equal(status, 200);
     assert.equal(responseBody, undefined);
-    assert.equal(headers["content-length"], String(JSON.stringify({ zones: [] }).length));
+    assert.equal(headers["content-length"], String(JSON.stringify({
+      zones: [], limit: 50, offset: 0, hasMore: false,
+    }).length));
+  });
+
+  it("attaches a trusted transport client key without requiring a socket on mocks", async () => {
+    const adapters = createInMemoryAdapters();
+    const token = "node-handler-admin-token-000000000000";
+    const handler = createNodeHandler(
+      { controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) },
+      { enabled: true, tokens: [{ token, role: "admin", subject: "owner" }], maxFailedAttempts: 1, lockoutMs: 60_000 },
+      { trustForwardedHeaders: true },
+    );
+    const call = async (forwardedFor: string, authorization: string): Promise<number> => {
+      const incoming = Readable.from([]) as IncomingMessage;
+      incoming.method = "GET";
+      incoming.url = "/api/v1/zones";
+      incoming.headers = { host: "localhost", "x-forwarded-for": forwardedFor, authorization };
+      let status = 0;
+      const response = {
+        set statusCode(code: number) { status = code; },
+        setHeader() { return this; },
+        end() { return this; },
+      } as unknown as ServerResponse;
+      await handler(incoming, response);
+      return status;
+    };
+
+    assert.equal(await call("spoofed-prefix, 203.0.113.10", "Bearer wrong-token-value-long-enough"), 401);
+    assert.equal(await call("203.0.113.20", `Bearer ${token}`), 200);
+    assert.equal(await call("different-prefix, 203.0.113.10", "Bearer another-wrong-token-value"), 429,
+      "a client cannot reset or evade its bucket by changing a prepended forwarded value");
+    assert.equal(await call("203.0.113.30", "Bearer wrong-token-value-long-enough"), 401);
   });
 
   it("adopts provider records over HTTP and refuses the call without a view", async () => {
@@ -165,6 +197,26 @@ describe("HTTP API", () => {
     assert.equal((await api(request("/api/v1/zones/example.com/history?limit=abc"))).status, 400);
   });
 
+  it("bounds the alphabetical zone listing and reports whether more remain", async () => {
+    const api = setup();
+    for (const name of ["charlie.example", "alpha.example", "bravo.example"]) {
+      await api(request("/api/v1/zones", "POST", { name }));
+    }
+
+    const first = await (await api(request("/api/v1/zones?limit=2"))).json() as {
+      zones: Array<{ name: string }>; limit: number; offset: number; hasMore: boolean;
+    };
+    assert.deepEqual(first.zones.map((zone) => zone.name), ["alpha.example", "bravo.example"]);
+    assert.deepEqual([first.limit, first.offset, first.hasMore], [2, 0, true]);
+
+    const second = await (await api(request("/api/v1/zones?limit=2&offset=2"))).json() as {
+      zones: Array<{ name: string }>; hasMore: boolean;
+    };
+    assert.deepEqual(second.zones.map((zone) => zone.name), ["charlie.example"]);
+    assert.equal(second.hasMore, false);
+    assert.equal((await api(request("/api/v1/zones?offset=nope"))).status, 400);
+  });
+
   it("withdraws published records when deleting a zone and reports what it removed", async () => {
     const adapters = createInMemoryAdapters();
     const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
@@ -183,12 +235,13 @@ describe("HTTP API", () => {
         { view: "external", id: "root", name: "@", type: "A", content: "8.8.8.8" },
         { view: "internal", id: "internal-root-a-utrwak", name: "@", type: "A", content: "8.8.8.8" },
       ],
+      abandonedProviderTargets: [],
     });
     assert.deepEqual(await adapters.provider.list("example.com/external"), []);
     assert.deepEqual(await adapters.provider.list("example.com/internal"), []);
   });
 
-  it("abandons published records only when the caller opts in explicitly", async () => {
+  it("abandons only unreadable provider targets when the caller opts in explicitly", async () => {
     const adapters = createInMemoryAdapters();
     const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
     await api(request("/api/v1/zones", "POST", { name: "example.com" }));
@@ -196,11 +249,23 @@ describe("HTTP API", () => {
       name: "@", type: "A", content: "8.8.8.8", ttl: 300,
     }));
     await api(request("/api/v1/zones/example.com/apply", "POST"));
+    const originalList = adapters.provider.list.bind(adapters.provider);
+    adapters.provider.list = async (target: string) => {
+      if (target === "example.com/internal") throw new Error("provider is gone");
+      return originalList(target);
+    };
 
     const deleted = await api(request("/api/v1/zones/example.com?abandonProviderRecords=true", "DELETE"));
+    adapters.provider.list = originalList;
     assert.equal(deleted.status, 200);
-    assert.deepEqual((await deleted.json() as { removedProviderRecords: unknown[] }).removedProviderRecords, []);
-    assert.equal((await adapters.provider.list("example.com/external")).length, 1);
+    const result = await deleted.json() as {
+      removedProviderRecords: Array<{ view: string }>;
+      abandonedProviderTargets: Array<{ view: string; target: string }>;
+    };
+    assert.deepEqual(result.removedProviderRecords.map((record) => record.view), ["external"]);
+    assert.deepEqual(result.abandonedProviderTargets, [{ view: "internal", target: "example.com/internal" }]);
+    assert.deepEqual(await adapters.provider.list("example.com/external"), []);
+    assert.equal((await adapters.provider.list("example.com/internal")).length, 1);
     assert.equal((await api(request("/api/v1/zones/other.com?abandonProviderRecords=yes", "DELETE"))).status, 400);
   });
 
@@ -290,8 +355,12 @@ describe("HTTP API", () => {
     assert.equal((await api(request("/api/v1/zones/example.com/apply", "POST"))).status, 200);
     const status = await (await api(request("/api/v1/zones/example.com/status"))).json() as { statuses: Array<{ state: string }> };
     assert.equal(status.statuses[0]?.state, "applied");
-    const history = await (await api(request("/api/v1/zones/example.com/history"))).json() as { entries: unknown[] };
-    assert.equal(history.entries.length, 2);
+    const history = await (await api(request("/api/v1/zones/example.com/history"))).json() as {
+      entries: Array<{ action: string }>;
+    };
+    assert.equal(history.entries.filter((entry) => entry.action.startsWith("provider.apply.")).length, 4);
+    assert.ok(history.entries.some((entry) => entry.action === "record.upserted"));
+    assert.ok(history.entries.some((entry) => entry.action === "zone.created"));
     assert.equal((await api(request("/api/v1/zones/example.com/views/external/records/root", "DELETE"))).status, 200);
     assert.equal((await api(request("/api/v1/zones/example.com", "DELETE"))).status, 200);
   });

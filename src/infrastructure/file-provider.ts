@@ -1,10 +1,11 @@
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { ProviderAdapter } from "../application/ports.ts";
 import { RECORD_TYPES, type DesiredRecord } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
+import { ensurePrivateDirectory, withFileLock } from "./atomic-file.ts";
 
 interface FileProviderState {
   version: 1;
@@ -19,7 +20,6 @@ export interface FileProviderAdapterOptions {
 /** A small durable provider implementation suitable for local and single-node deployments. */
 export class FileProviderAdapter implements ProviderAdapter {
   readonly #path: string;
-  #state?: FileProviderState;
   #queue: Promise<void> = Promise.resolve();
 
   constructor(options: FileProviderAdapterOptions) {
@@ -35,7 +35,9 @@ export class FileProviderAdapter implements ProviderAdapter {
   }
 
   async apply(target: string, operation: Exclude<ReconcileOperation, { kind: "conflict" }>): Promise<void> {
-    await this.#serialized(async () => {
+    await this.#serialized(() => withFileLock(this.#path, async () => {
+      // The lock protects the whole read/modify/rename transaction. Reading
+      // before it would let a second process's completed change be overwritten.
       const currentState = await this.#load();
       const state = structuredClone(currentState);
       const targetKey = normalizeTarget(target);
@@ -57,25 +59,23 @@ export class FileProviderAdapter implements ProviderAdapter {
       if (records.length === 0) delete state.targets[targetKey];
       else state.targets[targetKey] = records;
       await persistAtomically(this.#path, state);
-      this.#state = state;
-    });
+    }));
   }
 
   async #load(): Promise<FileProviderState> {
-    if (this.#state) return this.#state;
+    await ensurePrivateDirectory(dirname(this.#path));
     let contents: string;
     try {
+      await chmod(this.#path, 0o600);
       contents = await readFile(this.#path, "utf8");
     } catch (error) {
       if (isNodeError(error, "ENOENT")) {
-        this.#state = { version: 1, nextId: 1, targets: {} };
-        return this.#state;
+        return { version: 1, nextId: 1, targets: {} };
       }
       throw error;
     }
     try {
-      this.#state = parseState(JSON.parse(contents) as unknown);
-      return this.#state;
+      return parseState(JSON.parse(contents) as unknown);
     } catch (error) {
       throw new Error(`invalid file provider state at ${this.#path}`, { cause: error });
     }
@@ -149,7 +149,7 @@ function cloneRecord(record: ProviderRecord): ProviderRecord {
 
 async function persistAtomically(path: string, state: FileProviderState): Promise<void> {
   const directory = dirname(path);
-  await mkdir(directory, { recursive: true });
+  await ensurePrivateDirectory(directory);
   const temporaryPath = `${path}.${randomUUID()}.tmp`;
   const serialized = `${JSON.stringify(state, null, 2)}\n`;
   let temporaryExists = false;

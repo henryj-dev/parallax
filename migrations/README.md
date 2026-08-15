@@ -1,60 +1,42 @@
 # Migrations
 
-Applied with `parallax migrate`, which replays **every file in this directory in
-name order, on every run**. There is no version table deciding what to skip.
+`parallax migrate` applies a fixed, target-specific manifest. It refuses to
+connect to PostgreSQL if the trusted migrations directory contains an
+unexpected SQL file or a manifest entry is missing.
 
-## The constraint that makes that safe
+Every applied file is recorded in `parallax_schema_migrations` with its SHA-256
+checksum. A later run skips an entry whose checksum matches and fails closed if
+an already-applied file changed. Migration files are therefore immutable: fix
+or extend an installed schema with a new numbered file, never by editing an old
+one.
 
-Each file must be re-appliable with no effect the second time:
+## Transaction and concurrency model
 
-- every object created with `IF NOT EXISTS`
-- each file wrapped in its own `BEGIN` / `COMMIT`
-- no irreversible DDL — nothing that drops or rewrites data
+Each checked-in SQL file has exactly one outer `BEGIN` / `COMMIT` wrapper so it
+is still safe to run directly with `psql`. The application runner removes that
+wrapper and owns the transaction:
 
-## Why this is a constraint and not a preference
+1. `BEGIN`
+2. execute the migration body
+3. insert its checksum ledger row
+4. `COMMIT`
 
-A deployment can run the command as an init container, which means **the schema
-is applied every time a pod starts** — not once, by a person, at a moment they
-chose. A restart applies it. A node moving applies it. Scaling out applies it,
-concurrently, which is why `applyMigrations` takes a session advisory lock.
+The schema change and ledger entry are consequently indivisible. A crash cannot
+leave an applied migration unrecorded and cause it to be replayed next time.
+A session advisory lock serializes the complete manifest across concurrent init
+containers, while every manifest entry remains its own transaction.
 
-So a file that is not re-appliable does not fail during review. It fails the
-next time something reschedules a pod, which may be weeks later and will not
-look like it was caused by the migration.
+## Adding a migration
 
-## Changing something 001 already created
+Name it `NNN_short_description.sql`, continuing the sequence, and add the exact
+filename to the appropriate `MIGRATION_FILES` target in
+`src/infrastructure/migrations.ts`. Keep the single outer transaction wrapper.
+An unlisted file is treated as possible SQL injection and is never executed.
 
-`CREATE TABLE IF NOT EXISTS` does not revisit a table that exists, so editing a
-column, a default, or a constraint in `001` reaches only databases that have not
-been created yet. Every installation already running keeps what it was created
-with, while the file reads as though it were fixed -- which is worse than not
-fixing it, because the next person believes the file.
+Prefer additive, compatibility-preserving DDL. Existing installations may run
+old and new application replicas during a rollout, so a migration should not
+drop or reinterpret data that the previous version still uses.
 
-Changing something that already exists takes a new file with a statement that
-says so. Guard it on the catalog rather than re-running the change, so that
-re-applying it on every pod start costs a lookup:
-
-```sql
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'the_new_name') THEN
-    ALTER TABLE ... DROP CONSTRAINT IF EXISTS the_old_name;
-    ALTER TABLE ... ADD CONSTRAINT the_new_name CHECK (...) NOT VALID;
-  END IF;
-END $$;
-```
-
-`IF NOT EXISTS` does not apply to constraints, which is why the guard names the
-new constraint instead. `NOT VALID` skips the scan of existing rows; it is only
-sound when the new rule accepts everything the old one did. See
-`003_audit_actions.sql`.
-
-## Adding one
-
-Name it `NNN_short_description.sql`, continuing the sequence.
-
-Re-runnability is checked behaviourally, not by inspection: `pnpm verify:postgres`
-applies the whole set to a fresh PostgreSQL, applies it again, and asserts the
-second run succeeds and the schema is unchanged — then runs three applications
-concurrently and asserts the same. Run it before adding a migration, because it
-is the only thing standing between an irreversible statement and a pod restart.
+Run `pnpm verify:postgres` before merging. It exercises the manifest and
+checksum ledger against real PostgreSQL, verifies that a second run is a no-op,
+and runs concurrent migrators under the advisory lock.

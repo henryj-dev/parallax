@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE } from "../../src/application/control-plane.ts";
+import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE, NotFoundError } from "../../src/application/control-plane.ts";
 import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type DesiredChange, type ProviderAdapter, type ZoneDeletion } from "../../src/application/ports.ts";
 import type { DesiredRecord } from "../../src/domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../../src/domain/reconciliation.ts";
@@ -87,6 +87,22 @@ function setup(): { service: ControlPlane; provider: ReturnType<typeof createInM
 }
 
 describe("ControlPlane", () => {
+  it("bounds public zone pages while preserving the complete internal listing", async () => {
+    const { service } = setup();
+    for (const zone of ["charlie.example", "alpha.example", "bravo.example"]) {
+      await service.createZone(zone);
+    }
+
+    const first = await service.listZonePage({ limit: 2, offset: 0 });
+    assert.deepEqual(first.zones.map((zone) => zone.name), ["alpha.example", "bravo.example"]);
+    assert.deepEqual([first.limit, first.offset, first.hasMore], [2, 0, true]);
+
+    const second = await service.listZonePage({ limit: 2, offset: 2 });
+    assert.deepEqual(second.zones.map((zone) => zone.name), ["charlie.example"]);
+    assert.equal(second.hasMore, false);
+    assert.equal((await service.listZones()).length, 3, "trusted snapshot consumers still receive every zone");
+  });
+
   it("blocks non-global external addresses until the operator explicitly acknowledges them", async () => {
     const { service } = setup();
     await service.createZone("example.com");
@@ -353,6 +369,27 @@ describe("ControlPlane", () => {
       "the provider's records stay unmanaged -- whoever maintained them still does");
   });
 
+  it("refuses an adoption that would make the materialized internal view invalid", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "internal", "inside", {
+      name: "www", type: "A", content: "10.0.0.1", ttl: 60,
+    });
+    provider.seed("example.com/external", [{
+      id: "foreign", providerId: "cf-1", managed: false,
+      name: "www", type: "CNAME", content: "target.example.net", ttl: 300,
+    }]);
+
+    await assert.rejects(
+      service.adoptProviderRecords("example.com", "external", "alice"),
+      /CNAME record at www cannot coexist/,
+    );
+
+    const zone = await service.getZone("example.com");
+    assert.equal(zone.revision, 2);
+    assert.deepEqual(zone.views.map((view) => view.name), ["internal"]);
+  });
+
   it("adopts a record whose provider reports proxied on a type that cannot be proxied", async () => {
     const { service, provider } = setup();
     await service.createZone("example.com");
@@ -479,6 +516,33 @@ describe("ControlPlane", () => {
     const status = (await service.apply("example.com", "external")).statuses[0];
     assert.equal(status?.error, "provider operation failed");
     assert.equal(status?.completedOperations, 0, "how far it got is safe to report even when the reason is not");
+    const audit = (await service.audit("example.com")).entries;
+    assert.deepEqual(audit.slice(0, 2).map((entry) => entry.action), [
+      "provider.apply.failed",
+      "provider.apply.started",
+    ]);
+    assert.deepEqual(audit.slice(0, 2).map((entry) => entry.detail.completedOperations), [0, undefined]);
+    assert.doesNotMatch(JSON.stringify(audit.slice(0, 2)), /super-secret|api\.example/i);
+  });
+
+  it("writes actor-bound audit records before and after provider mutations", async () => {
+    const { service } = setup();
+    await service.createZone("example.com", "alice");
+    await service.upsertRecord("example.com", "external", "www", {
+      name: "www", type: "A", content: "8.8.8.8", ttl: 60,
+    }, "alice");
+
+    await service.apply("example.com", "external", undefined, "alice");
+
+    const entries = (await service.audit("example.com")).entries.slice(0, 2);
+    assert.deepEqual(entries.map((entry) => entry.action), [
+      "provider.apply.completed",
+      "provider.apply.started",
+    ]);
+    assert.ok(entries.every((entry) => entry.actor === "alice"));
+    assert.equal(entries[0]?.detail.completedOperations, 1);
+    assert.equal(entries[1]?.detail.plannedOperations, 1);
+    assert.doesNotMatch(JSON.stringify(entries), /credential|secret|token/i);
   });
 
   it("prevents apply when desired state collides with an unmanaged record", async () => {
@@ -724,6 +788,32 @@ describe("ControlPlane", () => {
     assert.deepEqual((await adapters.zones.listRevisions("example.com")).map((item) => item.revision), [6, 7, 8]);
   });
 
+  it("ages out write-ahead provider audits during apply without touching another zone or revisions", async () => {
+    const adapters = createInMemoryAdapters();
+    let now = new Date("2026-01-01T00:00:00.000Z");
+    const service = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider, {
+      now: () => now,
+    }, adapters.applyLock, { auditRetentionDays: 30 });
+    await service.createZone("example.com", "alice");
+    await service.upsertRecord("example.com", "external", "root", {
+      name: "@", type: "A", content: "8.8.8.8", ttl: 60,
+    }, "alice");
+    await service.apply("example.com", "external", undefined, "alice");
+    await service.createZone("other.example", "alice");
+
+    now = new Date("2026-03-01T00:00:00.000Z");
+    await service.apply("example.com", "external", undefined, "alice");
+
+    assert.deepEqual((await service.audit("example.com")).entries.map((entry) => entry.action), [
+      "provider.apply.completed",
+      "provider.apply.started",
+    ]);
+    assert.equal((await service.audit("other.example")).entries.length, 1,
+      "applying one zone must not age out another zone's audit history");
+    assert.deepEqual((await adapters.zones.listRevisions("example.com")).map((revision) => revision.revision), [1, 2],
+      "provider audit retention must not alter immutable desired revisions");
+  });
+
   it("keeps every revision and audit entry when retention is not configured", async () => {
     const { service } = setup();
     await service.createZone("example.com");
@@ -819,16 +909,59 @@ describe("ControlPlane", () => {
     assert.deepEqual(await provider.list("example.com/external"), []);
   });
 
-  it("abandons provider records only when the caller asks for it explicitly", async () => {
+  it("leaves a write-ahead audit trail when zone withdrawal fails part way through", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com", "alice");
+    await service.upsertRecord("example.com", "external", "root", {
+      name: "@", type: "A", content: "8.8.8.8", ttl: 60,
+    }, "alice");
+    await service.apply("example.com", undefined, undefined, "alice");
+    const originalApply = provider.apply.bind(provider);
+    provider.apply = async (target, operation) => {
+      if (target === "example.com/internal") throw new Error("DELETE token=provider-secret failed");
+      return originalApply(target, operation);
+    };
+
+    await assert.rejects(service.deleteZone("example.com", "bob"), /provider-secret/);
+    provider.apply = originalApply;
+
+    assert.equal((await provider.list("example.com/external")).length, 0);
+    assert.equal((await provider.list("example.com/internal")).length, 1);
+    assert.equal((await service.getZone("example.com")).revision, 2, "desired state remains available for repair");
+    const purgeAudit = (await service.audit("example.com")).entries
+      .filter((entry) => entry.detail.operation === "zone-delete");
+    assert.deepEqual(purgeAudit.map((entry) => entry.action), [
+      "provider.apply.failed",
+      "provider.apply.started",
+      "provider.apply.completed",
+      "provider.apply.started",
+    ]);
+    assert.ok(purgeAudit.every((entry) => entry.actor === "bob"));
+    assert.equal(purgeAudit[0]?.detail.error, "provider operation failed");
+    assert.doesNotMatch(JSON.stringify(purgeAudit), /provider-secret|DELETE token/i);
+  });
+
+  it("withdraws reachable targets and explicitly abandons only unreadable ones", async () => {
     const { service, provider } = setup();
     await service.createZone("example.com");
     await service.upsertRecord("example.com", "external", "root", { name: "@", type: "A", content: "8.8.8.8", ttl: 60 });
     await service.apply("example.com");
+    const originalList = provider.list.bind(provider);
+    provider.list = async (target: string) => {
+      if (target === "example.com/internal") throw new Error("provider is gone");
+      return originalList(target);
+    };
 
     const result = await service.deleteZone("example.com", "bob", undefined, { abandonProviderRecords: true });
+    provider.list = originalList;
 
-    assert.deepEqual(result.removedProviderRecords, []);
-    assert.equal((await provider.list("example.com/external")).length, 1);
+    assert.deepEqual(result.removedProviderRecords.map((record) => `${record.view}/${record.name}`), ["external/@"]);
+    assert.deepEqual(result.abandonedProviderTargets, [{ view: "internal", target: "example.com/internal" }]);
+    assert.deepEqual(await provider.list("example.com/external"), []);
+    assert.equal((await provider.list("example.com/internal")).length, 1);
+    const deleted = (await service.audit("example.com")).entries[0];
+    assert.equal(deleted?.detail.providerRecordsAbandoned, true);
+    assert.deepEqual(deleted?.detail.providerTargetsAbandoned, ["example.com/internal"]);
   });
 
   it("reports mismatched or impossible applied revisions as pending without a future applied state", async () => {
@@ -872,6 +1005,52 @@ describe("ControlPlane", () => {
     assert.equal((await provider.list("example.com/external")).length, 0);
   });
 
+  it("carries an unfinished removed-view tombstone across unrelated edits and retires it once applied", async () => {
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "root", {
+      name: "@", type: "A", content: "8.8.8.1", ttl: 60,
+    });
+    await service.apply("example.com");
+
+    await service.replaceDesiredState("example.com", { views: [] });
+    const edited = await service.upsertRecord("example.com", "internal", "inside", {
+      name: "inside", type: "A", content: "10.0.0.1", ttl: 60,
+    });
+    const pending = (await service.status("example.com")).statuses.find((status) => status.view === "external");
+    assert.equal(pending?.desiredRevision, edited.revision);
+    assert.equal(pending?.state, "pending");
+
+    await service.apply("example.com");
+    assert.deepEqual(await provider.list("example.com/external"), []);
+
+    await service.upsertRecord("example.com", "internal", "inside", {
+      name: "inside", type: "A", content: "10.0.0.2", ttl: 60,
+    });
+    assert.equal((await service.status("example.com")).statuses.some((status) => status.view === "external"), false);
+    const callCount = provider.calls.length;
+    await service.apply("example.com");
+    assert.equal(provider.calls.slice(callCount).some((call) => call.target === "example.com/external"), false);
+  });
+
+  it("carries an unaffected applied view forward to the zone's new revision", async () => {
+    const { service } = setup();
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "root", {
+      name: "@", type: "A", content: "8.8.8.1", ttl: 60,
+    });
+    await service.apply("example.com", "external");
+
+    const changed = await service.upsertRecord("example.com", "internal", "inside", {
+      name: "inside", type: "A", content: "10.0.0.1", ttl: 60,
+    });
+    const external = (await service.status("example.com")).statuses.find((status) => status.view === "external");
+    assert.equal(external?.state, "applied");
+    assert.equal(external?.desiredRevision, changed.revision);
+    assert.equal(external?.appliedRevision, changed.revision);
+    assert.equal(external?.lastAttemptAt, "2026-08-08T00:00:00.000Z");
+  });
+
   it("records provider listing failures as failed apply status", async () => {
     const { service, provider } = setup();
     await service.createZone("example.com");
@@ -884,7 +1063,8 @@ describe("ControlPlane", () => {
 
   it("keeps a newer desired revision pending when it arrives during apply", async () => {
     const provider = new DelayedProvider();
-    const service = new ControlPlane(new InMemoryZoneRepository(), new InMemoryStatusRepository(), provider);
+    const state = new InMemoryZoneRepository();
+    const service = new ControlPlane(state, state, provider);
     await service.createZone("example.com");
     await service.upsertRecord("example.com", "external", "root", { name: "@", type: "A", content: "8.8.8.1", ttl: 60 });
     const applying = service.apply("example.com");
@@ -898,6 +1078,41 @@ describe("ControlPlane", () => {
     assert.equal(status.desiredRevision, 3);
     assert.equal(status.statuses[0]?.state, "pending");
     assert.equal(status.statuses[0]?.appliedRevision, 2);
+    assert.ok(status.statuses[0]?.lastAttemptAt, "the newer revision must retain evidence that the provider was reached");
+  });
+
+  it("does not let another replica edit between provider withdrawal and deletion commit", async () => {
+    const provider = new DelayedProvider();
+    const state = new InMemoryZoneRepository();
+    const lock = new InMemoryApplyLock();
+    const deletingReplica = new ControlPlane(state, state, provider, undefined, lock);
+    const editingReplica = new ControlPlane(state, state, provider, undefined, lock);
+    await deletingReplica.createZone("example.com");
+    const zone = await deletingReplica.upsertRecord("example.com", "external", "root", {
+      name: "@", type: "A", content: "8.8.8.8", ttl: 60,
+    });
+    const record = zone.views.find((view) => view.name === "external")!.records[0]!;
+    provider.seed("example.com/external", [{ ...record, providerId: "published", managed: true }]);
+    await state.save({
+      zone: "example.com", view: "external", desiredRevision: zone.revision,
+      appliedRevision: zone.revision, state: "applied", lastAttemptAt: "2026-08-08T00:00:00.000Z",
+    });
+
+    const deleting = deletingReplica.deleteZone("example.com");
+    await provider.started;
+    const editing = editingReplica.upsertRecord("example.com", "external", "root", {
+      name: "@", type: "A", content: "8.8.4.4", ttl: 60,
+    });
+    const early = await Promise.race([
+      editing.then(() => "edited", () => "rejected"),
+      new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 20)),
+    ]);
+    assert.equal(early, "waiting", "the other replica must wait while deletion owns the zone lock");
+
+    provider.release();
+    await deleting;
+    await assert.rejects(editing, NotFoundError);
+    assert.deepEqual(await provider.list("example.com/external"), []);
   });
 
   it("does not let a slow provider for one zone block another zone", async () => {

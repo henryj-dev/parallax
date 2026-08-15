@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -43,6 +43,26 @@ describe("FileProviderAdapter", () => {
 
     assert.equal((await adapter.list("example.com/external")).length, 12);
     assert.deepEqual((await readdir(directory)).sort(), ["provider.json"]);
+  });
+
+  it("locks and re-reads changes made by independent adapter instances", async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "parallax-provider-shared-"));
+    context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(directory, { recursive: true, force: true })); });
+    const path = join(directory, "private", "provider.json");
+    const left = new FileProviderAdapter({ path });
+    const right = new FileProviderAdapter({ path });
+    await Promise.all([left.list("example.com/external"), right.list("example.com/external")]);
+
+    await Promise.all(Array.from({ length: 16 }, (_, index) => (index % 2 === 0 ? left : right).apply("example.com/external", {
+      kind: "create",
+      desired: { id: `record-${index}`, name: `host-${index}`, type: "A", content: `192.0.2.${index + 1}`, ttl: 60 },
+    })));
+
+    const records = await left.list("example.com/external");
+    assert.equal(records.length, 16);
+    assert.equal(new Set(records.map((record) => record.providerId)).size, 16);
+    assert.equal((await stat(join(directory, "private"))).mode & 0o777, 0o700);
+    assert.deepEqual((await readdir(join(directory, "private"))).sort(), ["provider.json"]);
   });
 
   it("rejects corrupt persisted state instead of silently discarding it", async (context) => {

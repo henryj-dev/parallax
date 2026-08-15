@@ -15,7 +15,7 @@ const root = new URL("../../", import.meta.url);
  */
 describe("audit actions", () => {
   it("are all permitted by the constraint the database enforces", async () => {
-    const sql = await readFile(fileURLToPath(new URL("migrations/003_audit_actions.sql", root)), "utf8");
+    const sql = await readFile(fileURLToPath(new URL("migrations/004_security_invariants.sql", root)), "utf8");
     const list = sql.slice(sql.indexOf("CHECK (action IN ("));
     const allowed = new Set([...list.matchAll(/'([a-z.]+)'/gu)].map((match) => match[1]));
     assert.deepEqual([...allowed].sort(), [...AUDIT_ACTIONS].sort(),

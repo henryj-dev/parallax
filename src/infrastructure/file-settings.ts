@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type {
   AccessTokenRepository,
@@ -7,6 +7,7 @@ import type {
   SettingsRepository,
   StoredAccessToken,
 } from "../application/ports.ts";
+import { ensurePrivateDirectory, withFileLock } from "./atomic-file.ts";
 
 interface ConfigurationDocument {
   version: 1;
@@ -22,7 +23,6 @@ interface ConfigurationDocument {
  */
 export class FileConfigurationStore {
   readonly #path: string;
-  #document: ConfigurationDocument | undefined;
   #writeTail: Promise<void> = Promise.resolve();
 
   constructor(path: string) {
@@ -32,27 +32,37 @@ export class FileConfigurationStore {
 
   get settings(): SettingsRepository {
     return {
-      read: async () => ({ ...(await this.#load()).settings }),
+      read: async () => ({ ...(await this.#readLatest()).settings }),
       write: async (values) => {
         await this.#mutate((document) => {
           document.settings = { ...document.settings, ...values };
         });
       },
+      update: async (operation) => this.#mutate(async (document) => {
+        const replacement = await operation(structuredClone(document.settings));
+        document.settings = { ...document.settings, ...replacement.patch };
+        return replacement.result;
+      }),
     };
   }
 
   get credentials(): CredentialRepository {
     return {
-      read: async () => (await this.#load()).credentials,
+      read: async () => (await this.#readLatest()).credentials,
       write: async (sealed) => {
         await this.#mutate((document) => { document.credentials = sealed; });
       },
+      update: async (operation) => this.#mutate((document) => {
+        const update = operation(document.credentials);
+        document.credentials = update.document;
+        return update.result;
+      }),
     };
   }
 
   get accessTokens(): AccessTokenRepository {
     return {
-      list: async () => (await this.#load()).accessTokens.map((token) => ({ ...token })),
+      list: async () => (await this.#readLatest()).accessTokens.map((token) => ({ ...token })),
       create: async (token) => {
         await this.#mutate((document) => {
           if (document.accessTokens.some((existing) => existing.digest === token.digest)) {
@@ -61,44 +71,56 @@ export class FileConfigurationStore {
           document.accessTokens.push({ ...token });
         });
       },
-      delete: async (id) => this.#mutate((document) => {
+      revoke: async (id, retainedAdministratorCount) => this.#mutate((document) => {
         const index = document.accessTokens.findIndex((token) => token.id === id);
-        if (index < 0) return false;
+        if (index < 0) return "not-found";
+        const target = document.accessTokens[index];
+        if (target?.role === "admin") {
+          const storedAdministrators = document.accessTokens
+            .filter((token, tokenIndex) => tokenIndex !== index && token.role === "admin").length;
+          if (storedAdministrators + retainedAdministratorCount === 0) return "last-admin";
+        }
         document.accessTokens.splice(index, 1);
-        return true;
+        return "deleted";
       }),
     };
   }
 
   async #load(): Promise<ConfigurationDocument> {
-    if (this.#document) return this.#document;
+    await ensurePrivateDirectory(dirname(this.#path));
     let source: string;
     try {
+      await chmod(this.#path, 0o600);
       source = await readFile(this.#path, "utf8");
     } catch (error) {
       if (!isMissingFile(error)) throw error;
-      this.#document = { version: 1, settings: {}, accessTokens: [] };
-      return this.#document;
+      return { version: 1, settings: {}, accessTokens: [] };
     }
-    this.#document = parseDocument(JSON.parse(source) as unknown);
-    return this.#document;
+    return parseDocument(JSON.parse(source) as unknown);
   }
 
-  #mutate<T>(operation: (document: ConfigurationDocument) => T): Promise<T> {
-    const result = this.#writeTail.then(async () => {
+  async #readLatest(): Promise<ConfigurationDocument> {
+    await this.#writeTail;
+    return this.#load();
+  }
+
+  #mutate<T>(operation: (document: ConfigurationDocument) => T | Promise<T>): Promise<T> {
+    const result = this.#writeTail.then(() => withFileLock(this.#path, async () => {
+      // Re-read only after obtaining the cross-process lock. A snapshot read
+      // before the lock can overwrite a CLI or replica change made while this
+      // process was waiting.
       const draft = structuredClone(await this.#load());
-      const value = operation(draft);
+      const value = await operation(draft);
       await this.#writeAtomically(draft);
-      this.#document = draft;
       return value;
-    });
+    }));
     this.#writeTail = result.then(() => undefined, () => undefined);
     return result;
   }
 
   async #writeAtomically(document: ConfigurationDocument): Promise<void> {
     const directory = dirname(this.#path);
-    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await ensurePrivateDirectory(directory);
     const temporaryPath = join(directory, `.${basename(this.#path)}.${process.pid}.${randomUUID()}.tmp`);
     try {
       const file = await open(temporaryPath, "wx", 0o600);
@@ -109,6 +131,12 @@ export class FileConfigurationStore {
         await file.close();
       }
       await rename(temporaryPath, this.#path);
+      const directoryHandle = await open(directory, "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
     } catch (error) {
       await unlink(temporaryPath).catch(() => undefined);
       throw error;
@@ -121,6 +149,10 @@ function parseDocument(value: unknown): ConfigurationDocument {
   const settings = isObject(value.settings) ? value.settings : {};
   const credentials = typeof value.credentials === "string" ? value.credentials : undefined;
   const accessTokens = Array.isArray(value.accessTokens) ? value.accessTokens.map(readAccessToken) : [];
+  if (new Set(accessTokens.map((token) => token.id)).size !== accessTokens.length
+    || new Set(accessTokens.map((token) => token.digest)).size !== accessTokens.length) {
+    throw new Error("duplicate stored access token");
+  }
   return { version: 1, settings, ...(credentials ? { credentials } : {}), accessTokens };
 }
 
@@ -131,6 +163,14 @@ function readAccessToken(value: unknown): StoredAccessToken {
     || typeof value.digest !== "string"
     || typeof value.createdAt !== "string"
     || (value.role !== "admin" && value.role !== "editor" && value.role !== "viewer")) {
+    throw new Error("invalid stored access token");
+  }
+  const digest = Buffer.from(value.digest, "base64url");
+  const createdAt = new Date(value.createdAt);
+  if (value.id.length === 0 || value.id.length > 128 || /[\u0000-\u001f\u007f]/u.test(value.id)
+    || value.subject.trim().length === 0 || value.subject.length > 128 || /[\u0000-\u001f\u007f]/u.test(value.subject)
+    || !/^[A-Za-z0-9_-]{43}$/u.test(value.digest) || digest.byteLength !== 32 || digest.toString("base64url") !== value.digest
+    || Number.isNaN(createdAt.valueOf()) || createdAt.toISOString() !== value.createdAt) {
     throw new Error("invalid stored access token");
   }
   return { id: value.id, subject: value.subject, role: value.role, digest: value.digest, createdAt: value.createdAt };

@@ -200,10 +200,10 @@ const PAGING = [
 const COMMANDS: readonly Command[] = [
   {
     name: "zone list",
-    summary: "List every zone and its desired revision",
+    summary: "List zones and their desired revisions",
     role: "viewer",
-    options: [],
-    run: async ({ runtime }) => ({ zones: await requireControlPlane(runtime).listZones() }),
+    options: PAGING,
+    run: ({ runtime }, input) => requireControlPlane(runtime).listZonePage(page(input)),
   },
   {
     name: "zone get",
@@ -242,7 +242,7 @@ const COMMANDS: readonly Command[] = [
     options: [
       ZONE,
       EXPECTED,
-      { name: "abandonProviderRecords", summary: "Leave published records at the provider", type: "boolean" },
+      { name: "abandonProviderRecords", summary: "Abandon only provider targets that cannot be read; withdraw every reachable target", type: "boolean" },
     ],
     run: ({ runtime, actor }, input) => requireControlPlane(runtime).deleteZone(
       String(input.zone),
@@ -300,10 +300,11 @@ const COMMANDS: readonly Command[] = [
     summary: "Reconcile a zone's providers with its desired state",
     role: "editor",
     options: [ZONE, VIEW, EXPECTED],
-    run: ({ runtime }, input) => requireControlPlane(runtime).apply(
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).apply(
       String(input.zone),
       input.view === undefined ? undefined : String(input.view),
       expectedRevisionOf(input),
+      actor,
     ),
   },
   {

@@ -51,19 +51,55 @@ export function buildReconcilePlan(desired: DesiredRecord[], actual: ProviderRec
 
     const unmanaged = candidates.filter((candidate) => !candidate.managed);
     if (unmanaged.length > 0) {
+      const managed = candidates.filter((candidate) => candidate.managed);
+      if (managed.length > 0) {
+        // An unmanaged twin must never displace a record whose ownership marker
+        // still verifies. Keep reconciling the managed set and surface the twin
+        // as drift for an operator to resolve explicitly. Without this branch an
+        // exact unmanaged copy caused the managed record to be deleted, silently
+        // transferring control of the RRset to whoever created the copy.
+        const managedPlan = buildReconcilePlan(wanted, managed);
+        for (const operation of managedPlan.operations) {
+          if (operation.kind === "create") creates.push(operation);
+          else if (operation.kind === "update") updates.push(operation);
+          else if (operation.kind === "delete") deletes.push(operation);
+          else conflicts.push(operation);
+        }
+        for (const candidate of unmanaged) {
+          conflicts.push({
+            kind: "conflict",
+            actual: candidate,
+            ...(wanted[0] ? { desired: wanted[0] } : {}),
+            reason: "an unmanaged provider record duplicates a managed RRset",
+          });
+        }
+        continue;
+      }
       const remaining = [...unmanaged];
       for (const record of wanted) {
         const exactIndex = remaining.findIndex((candidate) => sameRecord(record, candidate));
         if (exactIndex >= 0) remaining.splice(exactIndex, 1);
-        else conflicts.push({
-          kind: "conflict",
-          actual: unmanaged[0] as ProviderRecord,
-          desired: record,
-          reason: "an unmanaged provider record already owns this name and type",
-        });
+        else {
+          const collision = remaining.shift() ?? unmanaged[0] as ProviderRecord;
+          conflicts.push({
+            kind: "conflict",
+            actual: collision,
+            desired: record,
+            reason: "an unmanaged provider record already owns this name and type",
+          });
+        }
       }
-      for (const candidate of candidates.filter((item) => item.managed)) {
-        deletes.push({ kind: "delete", providerId: candidate.providerId, actual: candidate });
+      // An exact unmanaged copy only proves that one desired value is live.
+      // Any remaining value in the same RRset is live as well, and therefore
+      // changes resolver answers even though Parallax would otherwise report
+      // the plan as converged. Surface every surplus value and fail closed.
+      for (const candidate of remaining) {
+        conflicts.push({
+          kind: "conflict",
+          actual: candidate,
+          ...(wanted[0] ? { desired: wanted[0] } : {}),
+          reason: "an unmanaged provider RRset contains a value outside desired state",
+        });
       }
       continue;
     }

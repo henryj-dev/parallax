@@ -54,6 +54,38 @@ describe("managed-only reconciliation", () => {
     assert.deepEqual(plan.operations, [{ kind: "delete", providerId: "provider-b", actual: duplicate }]);
   });
 
+  it("never disowns a managed record when an unmanaged exact copy appears", () => {
+    const managed: ProviderRecord = { ...desired, providerId: "managed-copy", managed: true };
+    const decoy: ProviderRecord = { ...desired, id: "foreign", providerId: "foreign-copy", managed: false };
+    const plan = buildReconcilePlan([desired], [decoy, managed]);
+
+    assert.equal(plan.summary.conflict, 1);
+    assert.equal(plan.summary.delete, 0);
+    assert.equal(plan.operations.some((operation) => operation.kind === "delete"
+      && operation.providerId === managed.providerId), false);
+  });
+
+  it("fails closed when an unmanaged RRset has the desired value plus an extra value", () => {
+    const exact: ProviderRecord = { ...desired, id: "foreign-exact", providerId: "foreign-exact", managed: false };
+    const extra: ProviderRecord = {
+      ...desired,
+      id: "foreign-extra",
+      content: "192.0.2.99",
+      providerId: "foreign-extra",
+      managed: false,
+    };
+
+    const plan = buildReconcilePlan([desired], [extra, exact]);
+
+    assert.deepEqual(plan.summary, { create: 0, update: 0, delete: 0, conflict: 1 });
+    assert.deepEqual(plan.operations, [{
+      kind: "conflict",
+      actual: extra,
+      desired,
+      reason: "an unmanaged provider RRset contains a value outside desired state",
+    }]);
+  });
+
   it("uses managed record identity when one value is edited or removed", () => {
     const second: DesiredRecord = { ...desired, id: "root-two", content: "192.0.2.11" };
     const firstActual: ProviderRecord = { ...desired, providerId: "provider-first", managed: true };

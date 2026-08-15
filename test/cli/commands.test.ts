@@ -18,19 +18,38 @@ import type { Role } from "../../src/security/http-authorization.ts";
 
 class MemorySettingsRepository implements SettingsRepository {
   values: Record<string, unknown> = {};
-  async read(): Promise<Record<string, unknown>> { return { ...this.values }; }
+  #tail: Promise<void> = Promise.resolve();
+  async read(): Promise<Record<string, unknown>> {
+    await this.#tail;
+    return { ...this.values };
+  }
   async write(patch: Record<string, unknown>): Promise<void> { this.values = { ...this.values, ...patch }; }
+  update<T>(
+    operation: (current: Record<string, unknown>) => Promise<{ patch: Record<string, unknown>; result: T }>,
+  ): Promise<T> {
+    const result = this.#tail.then(async () => {
+      const replacement = await operation({ ...this.values });
+      await this.write(replacement.patch);
+      return replacement.result;
+    });
+    this.#tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
 }
 
 class MemoryAccessTokenRepository implements AccessTokenRepository {
   tokens: StoredAccessToken[] = [];
   async list(): Promise<StoredAccessToken[]> { return this.tokens.map((token) => ({ ...token })); }
   async create(token: StoredAccessToken): Promise<void> { this.tokens.push({ ...token }); }
-  async delete(id: string): Promise<boolean> {
+  async revoke(id: string, retainedAdministratorCount: number): Promise<"deleted" | "not-found" | "last-admin"> {
     const index = this.tokens.findIndex((token) => token.id === id);
-    if (index < 0) return false;
+    if (index < 0) return "not-found";
+    if (this.tokens[index]?.role === "admin"
+      && this.tokens.filter((token, tokenIndex) => tokenIndex !== index && token.role === "admin").length + retainedAdministratorCount === 0) {
+      return "last-admin";
+    }
     this.tokens.splice(index, 1);
-    return true;
+    return "deleted";
   }
 }
 
@@ -70,8 +89,11 @@ describe("command layer", () => {
       "internal:applied",
     ]);
 
-    const listed = await runCommand(parallax, "zone list") as { zones: Array<{ name: string }> };
+    const listed = await runCommand(parallax, "zone list") as {
+      zones: Array<{ name: string }>; limit: number; offset: number; hasMore: boolean;
+    };
     assert.deepEqual(listed.zones.map((zone) => zone.name), ["example.com"]);
+    assert.deepEqual([listed.limit, listed.offset, listed.hasMore], [50, 0, false]);
 
     const deleted = await runCommand(parallax, "zone delete", { zone: "example.com" }) as {
       removedProviderRecords: unknown[];
@@ -166,6 +188,10 @@ describe("command layer", () => {
     };
     assert.equal(page.limit, 1);
     assert.equal(page.entries.length, 1);
+    const zones = await runCommand(parallax, "zone list", { limit: "1", offset: "0" }) as {
+      zones: unknown[]; limit: number; offset: number;
+    };
+    assert.deepEqual([zones.zones.length, zones.limit, zones.offset], [1, 1, 0]);
     await assert.rejects(runCommand(parallax, "history", { limit: "lots" }), /--limit must be a number/);
   });
 
@@ -181,6 +207,9 @@ describe("command layer", () => {
 describe("command line parsing", () => {
   it("matches the longest command path before reading options", () => {
     assert.deepEqual(parseInvocation(["zone", "list"]), { name: "zone list", input: {} });
+    assert.deepEqual(parseInvocation(["zone", "list", "--limit", "2", "--offset=1"]), {
+      name: "zone list", input: { limit: "2", offset: "1" },
+    });
     assert.deepEqual(parseInvocation(["credential", "profile", "set", "--name", "a", "--token", "b"]), {
       name: "credential profile set",
       input: { name: "a", token: "b" },

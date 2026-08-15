@@ -1,6 +1,77 @@
 import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
-import { RevisionConflictError, type ApplyLock, type ApplyStatus, type DesiredChange, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { mergeApplyStatus, RevisionConflictError, type AccessTokenRepository, type AccessTokenRevocationResult, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type DesiredChange, type PageRequest, type ProviderAdapter, type RetentionPolicy, type SettingsRepository, type SettingsRepositoryUpdate, type StatusRepository, type StoredAccessToken, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+
+/** A serialized settings repository for embedded use and concurrency tests. */
+export class InMemorySettingsRepository implements SettingsRepository {
+  #values: Record<string, unknown>;
+  #tail: Promise<void> = Promise.resolve();
+
+  constructor(initial: Record<string, unknown> = {}) {
+    this.#values = structuredClone(initial);
+  }
+
+  async read(): Promise<Record<string, unknown>> {
+    await this.#tail;
+    return structuredClone(this.#values);
+  }
+
+  async write(patch: Record<string, unknown>): Promise<void> {
+    await this.update(async () => ({ patch, result: undefined }));
+  }
+
+  update<T>(
+    operation: (current: Record<string, unknown>) => Promise<SettingsRepositoryUpdate<T>>,
+  ): Promise<T> {
+    const result = this.#tail.then(async () => {
+      const replacement = await operation(structuredClone(this.#values));
+      this.#values = { ...this.#values, ...structuredClone(replacement.patch) };
+      return replacement.result;
+    });
+    this.#tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+}
+
+/** A repository-level token invariant implementation for tests and embedded use. */
+export class InMemoryAccessTokenRepository implements AccessTokenRepository {
+  readonly #tokens = new Map<string, StoredAccessToken>();
+  #tail: Promise<void> = Promise.resolve();
+
+  async list(): Promise<StoredAccessToken[]> {
+    await this.#tail;
+    return [...this.#tokens.values()].map((token) => ({ ...token }));
+  }
+
+  async create(token: StoredAccessToken): Promise<void> {
+    await this.#enqueue(() => {
+      if ([...this.#tokens.values()].some((existing) => existing.digest === token.digest)) {
+        throw new Error("access token already exists");
+      }
+      this.#tokens.set(token.id, { ...token });
+    });
+  }
+
+  async revoke(id: string, retainedAdministratorCount: number): Promise<AccessTokenRevocationResult> {
+    return this.#enqueue(() => {
+      const target = this.#tokens.get(id);
+      if (!target) return "not-found";
+      if (target.role === "admin") {
+        const storedAdministrators = [...this.#tokens.values()]
+          .filter((token) => token.id !== id && token.role === "admin").length;
+        if (storedAdministrators + retainedAdministratorCount === 0) return "last-admin";
+      }
+      this.#tokens.delete(id);
+      return "deleted";
+    });
+  }
+
+  #enqueue<T>(operation: () => T): Promise<T> {
+    const result = this.#tail.then(operation);
+    this.#tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+}
 
 export class InMemoryApplyLock implements ApplyLock {
   readonly #tails = new Map<string, Promise<void>>();
@@ -27,14 +98,16 @@ export class InMemoryZoneRepository implements ZoneRepository, StatusRepository 
   readonly #statuses = new Map<string, ApplyStatus>();
   #nextAuditId = 1;
 
-  list(): Promise<Zone[]>;
+  list(page?: PageRequest): Promise<Zone[]>;
   list(zone: string): Promise<ApplyStatus[]>;
-  async list(zone?: string): Promise<Zone[] | ApplyStatus[]> {
-    if (zone !== undefined) {
-      return [...this.#statuses.values()].filter((status) => status.zone === zone)
+  async list(zoneOrPage?: string | PageRequest): Promise<Zone[] | ApplyStatus[]> {
+    if (typeof zoneOrPage === "string") {
+      return [...this.#statuses.values()].filter((status) => status.zone === zoneOrPage)
         .map((status) => ({ ...status })).sort((left, right) => left.view.localeCompare(right.view));
     }
-    return [...this.#zones.values()].map(cloneZone).sort((left, right) => left.name.localeCompare(right.name));
+    const zones = [...this.#zones.values()].sort((left, right) => left.name.localeCompare(right.name));
+    const selected = zoneOrPage ? zones.slice(zoneOrPage.offset, zoneOrPage.offset + zoneOrPage.limit) : zones;
+    return selected.map(cloneZone);
   }
 
   get(name: string): Promise<Zone | undefined>;
@@ -53,10 +126,8 @@ export class InMemoryZoneRepository implements ZoneRepository, StatusRepository 
   async save(value: Zone | ApplyStatus): Promise<void> {
     if ("views" in value) this.#zones.set(value.name, cloneZone(value));
     else {
-      const existing = this.#statuses.get(key(value.zone, value.view));
-      if (!existing || existing.desiredRevision <= value.desiredRevision) {
-        this.#statuses.set(key(value.zone, value.view), { ...value });
-      }
+      const statusKey = key(value.zone, value.view);
+      this.#statuses.set(statusKey, mergeApplyStatus(this.#statuses.get(statusKey), value));
     }
   }
 
@@ -115,7 +186,11 @@ export class InMemoryZoneRepository implements ZoneRepository, StatusRepository 
       const drop = [...revisions.keys()].sort((left, right) => right - left).slice(maxRevisions);
       for (const revision of drop) revisions.delete(revision);
     }
-    const before = retention.deleteAuditBefore;
+    this.#applyAuditRetention(zone, retention);
+  }
+
+  #applyAuditRetention(zone: string, retention: AuditRetentionPolicy | undefined): void {
+    const before = retention?.deleteAuditBefore;
     if (!before) return;
     for (let index = this.#audit.length - 1; index >= 0; index -= 1) {
       const entry = this.#audit[index];
@@ -142,9 +217,10 @@ export class InMemoryZoneRepository implements ZoneRepository, StatusRepository 
     this.#revisions.delete(name);
   }
 
-  async appendAudit(input: Omit<AuditEntry, "id">): Promise<AuditEntry> {
+  async appendAudit(input: Omit<AuditEntry, "id">, retention?: AuditRetentionPolicy): Promise<AuditEntry> {
     const entry: AuditEntry = structuredClone({ ...input, id: this.#nextAuditId++ });
     this.#audit.push(entry);
+    this.#applyAuditRetention(input.zone, retention);
     return structuredClone(entry);
   }
 
@@ -179,10 +255,8 @@ export class InMemoryStatusRepository implements StatusRepository {
   }
 
   async save(status: ApplyStatus): Promise<void> {
-    const existing = this.#statuses.get(key(status.zone, status.view));
-    if (!existing || existing.desiredRevision <= status.desiredRevision) {
-      this.#statuses.set(key(status.zone, status.view), { ...status });
-    }
+    const statusKey = key(status.zone, status.view);
+    this.#statuses.set(statusKey, mergeApplyStatus(this.#statuses.get(statusKey), status));
   }
 
   async deleteZone(zone: string): Promise<void> {

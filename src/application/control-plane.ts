@@ -16,7 +16,7 @@ import {
   type ZoneRevision,
 } from "../domain/dns.ts";
 import { buildReconcilePlan, type ProviderRecord, type ReconcilePlan } from "../domain/reconciliation.ts";
-import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneRepository } from "./ports.ts";
+import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneRepository } from "./ports.ts";
 
 export class NotFoundError extends Error {
   override readonly name = "NotFoundError";
@@ -39,8 +39,9 @@ export const MAX_HISTORY_PAGE_SIZE = 500;
 
 export interface DeleteZoneOptions {
   /**
-   * Leave published records at the provider instead of withdrawing them. Needed
-   * only when the provider is gone for good and the zone must still be removed.
+   * Permit deletion to continue when a published target can no longer be read.
+   * Targets that remain reachable are still withdrawn; only the unreachable
+   * targets are explicitly abandoned.
    */
   readonly abandonProviderRecords?: boolean;
 }
@@ -56,6 +57,7 @@ export interface RemovedProviderRecord {
 export interface ZoneDeletionResult {
   zone: string;
   removedProviderRecords: RemovedProviderRecord[];
+  abandonedProviderTargets: Array<{ view: string; target: string }>;
 }
 
 export type Paged<Key extends string, Item> = { [K in Key]: Item[] } & {
@@ -111,18 +113,30 @@ export class ControlPlane {
   /** Resolves the operator's settings against the current clock for one commit. */
   #retentionPolicy(): RetentionPolicy | undefined {
     const maxRevisionsPerZone = this.#retention.maxRevisionsPerZone ?? 0;
-    const auditRetentionDays = this.#retention.auditRetentionDays ?? 0;
-    if (maxRevisionsPerZone <= 0 && auditRetentionDays <= 0) return undefined;
+    const audit = this.#auditRetentionPolicy();
+    if (maxRevisionsPerZone <= 0 && !audit) return undefined;
     return {
       ...(maxRevisionsPerZone > 0 ? { maxRevisionsPerZone } : {}),
-      ...(auditRetentionDays > 0
-        ? { deleteAuditBefore: new Date(this.#clock.now().getTime() - auditRetentionDays * 86_400_000).toISOString() }
-        : {}),
+      ...audit,
     };
+  }
+
+  #auditRetentionPolicy(): AuditRetentionPolicy | undefined {
+    const auditRetentionDays = this.#retention.auditRetentionDays ?? 0;
+    return auditRetentionDays > 0
+      ? { deleteAuditBefore: new Date(this.#clock.now().getTime() - auditRetentionDays * 86_400_000).toISOString() }
+      : undefined;
   }
 
   listZones(): Promise<Zone[]> {
     return this.#zones.list();
+  }
+
+  async listZonePage(page?: PageRequest): Promise<Paged<"zones", Zone>> {
+    const bounds = boundedPage(page);
+    const fetched = await this.#zones.list({ limit: bounds.limit + 1, offset: bounds.offset });
+    const hasMore = fetched.length > bounds.limit;
+    return { zones: fetched.slice(0, bounds.limit), ...bounds, hasMore };
   }
 
   async getZone(zoneName: string): Promise<Zone> {
@@ -146,12 +160,7 @@ export class ControlPlane {
   }
 
   deleteZone(zoneName: string, actor = "system", expectedRevision?: number, options: DeleteZoneOptions = {}): Promise<ZoneDeletionResult> {
-    return this.#exclusive(zoneName, () => {
-      const zone = normalizeZoneName(zoneName);
-      // Deleting now removes provider records, so it takes the same cross-instance
-      // lock as apply and cannot interleave with a concurrent reconciliation.
-      return this.#applyLock.withZoneLock(zone, () => this.#deleteZone(zone, actor, expectedRevision, options));
-    });
+    return this.#exclusive(zoneName, () => this.#deleteZone(zoneName, actor, expectedRevision, options));
   }
 
   async #deleteZone(zoneName: string, actor: string, expectedRevision: number | undefined, options: DeleteZoneOptions): Promise<ZoneDeletionResult> {
@@ -159,9 +168,7 @@ export class ControlPlane {
     this.#assertExpectedRevision(zone, expectedRevision);
     // Withdraw published records first: if that fails the zone stays in place so
     // the operator can retry instead of being left with records nothing tracks.
-    const removedRecords = options.abandonProviderRecords === true
-      ? []
-      : await this.#purgeProviderRecords(zone);
+    const purge = await this.#purgeProviderRecords(zone, actor, options.abandonProviderRecords === true);
     const revision = zone.revision + 1;
     const retention = this.#retentionPolicy();
     try {
@@ -178,12 +185,17 @@ export class ControlPlane {
           detail: {
             before: desiredState(zone),
             after: null,
-            providerRecordsRemoved: removedRecords.length,
-            providerRecordsAbandoned: options.abandonProviderRecords === true,
+            providerRecordsRemoved: purge.removed.length,
+            providerRecordsAbandoned: purge.abandoned.length > 0,
+            providerTargetsAbandoned: purge.abandoned.map((target) => target.target),
           },
         },
       });
-      return { zone: zone.name, removedProviderRecords: removedRecords };
+      return {
+        zone: zone.name,
+        removedProviderRecords: purge.removed,
+        abandonedProviderTargets: purge.abandoned,
+      };
     } catch (error) {
       if (!(error instanceof RevisionConflictError)) throw error;
       const current = await this.#zones.get(zone.name);
@@ -199,7 +211,11 @@ export class ControlPlane {
    * state. Only records carrying Parallax's ownership marker are removed, so
    * foreign records at the same names survive exactly as they do during apply.
    */
-  async #purgeProviderRecords(zone: Zone): Promise<RemovedProviderRecord[]> {
+  async #purgeProviderRecords(
+    zone: Zone,
+    actor: string,
+    abandonUnreadable: boolean,
+  ): Promise<{ removed: RemovedProviderRecord[]; abandoned: Array<{ view: string; target: string }> }> {
     // Only the views an apply was actually attempted against. `lastAttemptAt` is
     // written by an attempt and by nothing else -- a view that merely has desired
     // state carries a pending status without one -- so it marks exactly the
@@ -223,26 +239,56 @@ export class ControlPlane {
     // one view and then failing on the next reports failure over records that
     // are already gone.
     const planned: Array<{ view: string; key: string; plan: ReconcilePlan }> = [];
+    const abandoned: Array<{ view: string; target: string }> = [];
     for (const view of published) {
       const key = targetKey(zone.name, view);
-      planned.push({ view, key, plan: buildReconcilePlan([], await this.#provider.list(key)) });
+      try {
+        planned.push({ view, key, plan: buildReconcilePlan([], await this.#provider.list(key)) });
+      } catch (error) {
+        if (!abandonUnreadable) throw error;
+        abandoned.push({ view, target: key });
+      }
     }
 
     const removed: RemovedProviderRecord[] = [];
     for (const { view, key, plan } of planned) {
-      for (const operation of plan.operations) {
-        if (operation.kind !== "delete") continue;
-        await this.#provider.apply(key, operation);
-        removed.push({
-          view,
-          id: operation.actual.id,
-          name: operation.actual.name,
-          type: operation.actual.type,
-          content: operation.actual.content,
+      const deletions = plan.operations.filter((operation) => operation.kind === "delete");
+      await this.#appendProviderAudit("provider.apply.started", zone, view, actor, {
+        operation: "zone-delete",
+        target: key,
+        plannedOperations: deletions.length,
+      });
+      let completedOperations = 0;
+      try {
+        for (const operation of deletions) {
+          await this.#provider.apply(key, operation);
+          completedOperations += 1;
+          removed.push({
+            view,
+            id: operation.actual.id,
+            name: operation.actual.name,
+            type: operation.actual.type,
+            content: operation.actual.content,
+          });
+        }
+        await this.#appendProviderAudit("provider.apply.completed", zone, view, actor, {
+          operation: "zone-delete",
+          target: key,
+          completedOperations,
+          plannedOperations: deletions.length,
         });
+      } catch (error) {
+        await this.#appendProviderAudit("provider.apply.failed", zone, view, actor, {
+          operation: "zone-delete",
+          target: key,
+          completedOperations,
+          plannedOperations: deletions.length,
+          error: publicProviderError(error),
+        });
+        throw error;
       }
     }
-    return removed;
+    return { removed, abandoned };
   }
 
   upsertRecord(zoneName: string, viewName: string, id: string, input: unknown, actor = "system", expectedRevision?: number): Promise<Zone> {
@@ -356,6 +402,7 @@ export class ControlPlane {
 
     if (view === "external") target.records = normalizeExternalRecords(target.records);
     ensureUniqueRecordKeys(target.records);
+    materializeProviderViews(views);
     const updated = this.#nextRevision(zone, views);
     await this.#commitDesiredChange(zone, updated, "records.adopted", actor, { view, adopted: adopted.length },
       new Set(views.map((candidate) => candidate.name)), expectedRevision);
@@ -442,14 +489,11 @@ export class ControlPlane {
     return { zone: zone.name, revision: zone.revision, views };
   }
 
-  apply(zoneName: string, viewName?: string, expectedRevision?: number): Promise<{ zone: string; revision: number; statuses: ApplyStatus[] }> {
-    return this.#exclusive(zoneName, () => {
-      const zone = normalizeZoneName(zoneName);
-      return this.#applyLock.withZoneLock(zone, () => this.#apply(zone, viewName, expectedRevision));
-    });
+  apply(zoneName: string, viewName?: string, expectedRevision?: number, actor = "system"): Promise<{ zone: string; revision: number; statuses: ApplyStatus[] }> {
+    return this.#exclusive(zoneName, () => this.#apply(zoneName, viewName, expectedRevision, actor));
   }
 
-  async #apply(zoneName: string, viewName?: string, expectedRevision?: number): Promise<{ zone: string; revision: number; statuses: ApplyStatus[] }> {
+  async #apply(zoneName: string, viewName: string | undefined, expectedRevision: number | undefined, actor: string): Promise<{ zone: string; revision: number; statuses: ApplyStatus[] }> {
     const zone = await this.getZone(zoneName);
     this.#assertExpectedRevision(zone, expectedRevision);
     validateExternalView(zone.views);
@@ -466,13 +510,25 @@ export class ControlPlane {
     for (const view of selected) {
       const key = targetKey(zone.name, view.name);
       const attemptedAt = this.#clock.now().toISOString();
+      let auditStarted = false;
+      let completedOperations = 0;
+      let plannedOperations = 0;
       try {
         const plan = buildReconcilePlan(view.records, await this.#provider.list(key));
         if (plan.summary.conflict > 0) throw new ConflictError("unmanaged provider records conflict with desired state");
         const planned = plan.operations.filter((operation) => operation.kind !== "conflict");
+        plannedOperations = planned.length;
+        await this.#appendProviderAudit("provider.apply.started", zone, view.name, actor, {
+          operation: "reconcile",
+          target: key,
+          plannedOperations,
+          summary: plan.summary,
+        });
+        auditStarted = true;
         for (const [index, operation] of planned.entries()) {
           try {
             await this.#provider.apply(key, operation);
+            completedOperations = index + 1;
           } catch (error) {
             throw new PartialApplyError(error, index, planned.length);
           }
@@ -486,6 +542,12 @@ export class ControlPlane {
           lastAttemptAt: attemptedAt,
         };
         await this.#statuses.save(status);
+        await this.#appendProviderAudit("provider.apply.completed", zone, view.name, actor, {
+          operation: "reconcile",
+          target: key,
+          completedOperations,
+          plannedOperations,
+        });
         results.push(status);
       } catch (error) {
         const progress = error instanceof PartialApplyError ? error : undefined;
@@ -517,9 +579,20 @@ export class ControlPlane {
           state: "failed",
           lastAttemptAt: attemptedAt,
           error: publicError,
-          ...(progress ? { completedOperations: progress.completed, plannedOperations: progress.planned } : {}),
+          ...(progress
+            ? { completedOperations: progress.completed, plannedOperations: progress.planned }
+            : auditStarted ? { completedOperations, plannedOperations } : {}),
         };
         await this.#statuses.save(status);
+        if (auditStarted) {
+          await this.#appendProviderAudit("provider.apply.failed", zone, view.name, actor, {
+            operation: "reconcile",
+            target: key,
+            completedOperations: progress?.completed ?? completedOperations,
+            plannedOperations: progress?.planned ?? plannedOperations,
+            error: publicError,
+          });
+        }
         results.push(status);
       }
     }
@@ -555,6 +628,23 @@ export class ControlPlane {
     return { entries, ...bounds, hasMore };
   }
 
+  async #appendProviderAudit(
+    action: "provider.apply.started" | "provider.apply.completed" | "provider.apply.failed",
+    zone: Zone,
+    view: string,
+    actor: string,
+    detail: Record<string, unknown>,
+  ): Promise<void> {
+    await this.#zones.appendAudit({
+      zone: zone.name,
+      revision: zone.revision,
+      action,
+      actor,
+      at: this.#clock.now().toISOString(),
+      detail: { view, ...detail },
+    }, this.#auditRetentionPolicy());
+  }
+
   #nextRevision(zone: Zone, views: Zone["views"]): Zone {
     return { ...zone, revision: zone.revision + 1, views, updatedAt: this.#clock.now().toISOString() };
   }
@@ -576,8 +666,7 @@ export class ControlPlane {
   ): Promise<void> {
     const expandedViews = new Set(affectedViews);
     if (expandedViews.has("external")) expandedViews.add("internal");
-    const statuses: ApplyStatus[] = [];
-    for (const view of expandedViews) statuses.push(await this.#pendingStatus(zone, view));
+    const statuses = await this.#statusesForDesiredChange(before, zone, expandedViews);
     const retention = this.#retentionPolicy();
     try {
       await this.#zones.commitDesiredChange({
@@ -607,16 +696,70 @@ export class ControlPlane {
     }
   }
 
-  async #pendingStatus(zone: Zone, view: string): Promise<ApplyStatus> {
-    const current = await this.#statuses.get(zone.name, view);
-    return {
-      zone: zone.name,
-      view,
-      desiredRevision: zone.revision,
-      appliedRevision: Math.min(current?.appliedRevision ?? 0, Math.max(0, zone.revision - 1)),
-      state: "pending",
-      ...(current?.lastAttemptAt ? { lastAttemptAt: current.lastAttemptAt } : {}),
-    };
+  /**
+   * Advances every provider view and every outstanding removed-view tombstone to
+   * the zone's new global revision. A change to one view must not make another
+   * view's status disappear merely because their desired revisions no longer
+   * equal the zone revision.
+   */
+  async #statusesForDesiredChange(
+    before: Zone | undefined,
+    zone: Zone,
+    affectedViews: ReadonlySet<string>,
+  ): Promise<ApplyStatus[]> {
+    const stored = before ? await this.#statuses.list(zone.name) : [];
+    // Only names are needed here. Do not materialize the previous snapshot: a
+    // deployment upgrading from a version that admitted an invalid combination
+    // must still be able to replace or delete the offending record.
+    const previousViews = providerViewNames(before?.views ?? []);
+    const nextViews = providerViewNames(zone.views);
+    const names = new Set<string>([
+      ...previousViews,
+      ...nextViews,
+      ...stored.filter((status) => isProviderView(status.view)).map((status) => status.view),
+    ]);
+
+    const statuses: ApplyStatus[] = [];
+    for (const view of [...names].sort()) {
+      const current = stored.find((status) => status.view === view);
+      const removedNow = previousViews.has(view) && !nextViews.has(view);
+      const addedNow = !previousViews.has(view) && nextViews.has(view);
+      if (!current || affectedViews.has(view) || removedNow || addedNow) {
+        statuses.push(pendingForRevision(current ?? {
+          zone: zone.name,
+          view,
+          desiredRevision: 0,
+          appliedRevision: 0,
+          state: "pending",
+        }, zone.revision, true));
+        continue;
+      }
+
+      // A completed removal remains completed across unrelated revisions. It is
+      // retained as a hidden tombstone so apply does not withdraw it again.
+      const completed = current.state === "applied"
+        && current.desiredRevision === current.appliedRevision
+        && current.desiredRevision <= (before?.revision ?? 0);
+      if (completed && (!nextViews.has(view) || current.desiredRevision === before?.revision)) {
+        statuses.push({
+          zone: zone.name,
+          view,
+          desiredRevision: zone.revision,
+          appliedRevision: zone.revision,
+          state: "applied",
+          ...(current.lastAttemptAt ? { lastAttemptAt: current.lastAttemptAt } : {}),
+        });
+        continue;
+      }
+
+      if (current.desiredRevision === before?.revision) {
+        statuses.push({ ...current, desiredRevision: zone.revision });
+        continue;
+      }
+
+      statuses.push(pendingForRevision(current, zone.revision, true));
+    }
+    return statuses;
   }
 
   async #exclusive<T>(zoneName: string, operation: () => Promise<T>): Promise<T> {
@@ -627,7 +770,11 @@ export class ControlPlane {
     this.#operationTails.set(key, current);
     await preceding;
     try {
-      return await operation();
+      // Provider reconciliation, deletion, and desired edits share one
+      // cross-instance lock. Otherwise a replica can advance the desired
+      // revision after deletion withdrew records but before its state commit,
+      // leaving a live zone whose provider was just emptied.
+      return await this.#applyLock.withZoneLock(key, operation);
     } finally {
       release();
       if (this.#operationTails.get(key) === current) this.#operationTails.delete(key);
@@ -637,6 +784,13 @@ export class ControlPlane {
 
 function targetKey(zone: string, view: string): string {
   return `${zone}/${view}`;
+}
+
+function publicProviderError(error: unknown): string {
+  return error instanceof ConflictError || error instanceof ProviderNotConfiguredError
+    || error instanceof ProviderConstraintError
+    ? error.message
+    : "provider operation failed";
 }
 
 function cloneView(view: Zone["views"][number]): Zone["views"][number] {
@@ -710,13 +864,14 @@ function desiredState(zone: Zone): { views: Zone["views"] } {
   return { views: zone.views.map(cloneView) };
 }
 
-function pendingForRevision(status: ApplyStatus, desiredRevision: number): ApplyStatus {
+function pendingForRevision(status: ApplyStatus, desiredRevision: number, keepAttempt = false): ApplyStatus {
   return {
     zone: status.zone,
     view: status.view,
     desiredRevision,
     appliedRevision: Math.min(status.appliedRevision, Math.max(0, desiredRevision - 1)),
     state: "pending",
+    ...(keepAttempt && status.lastAttemptAt ? { lastAttemptAt: status.lastAttemptAt } : {}),
   };
 }
 
@@ -742,6 +897,20 @@ function ensureUniqueRecordKeys(records: DesiredRecord[]): void {
       throw new DomainValidationError([`CNAME record at ${name} cannot coexist with another record`]);
     }
   }
+}
+
+/**
+ * Re-applies whole-view invariants when a durable backend opens a snapshot.
+ * Per-record parsing alone cannot detect duplicate RR values, CNAME siblings,
+ * external proxy constraints that span a view, or collisions introduced while
+ * materializing the derived internal view.
+ */
+export function assertPersistedDesiredViewsValid(views: Zone["views"]): void {
+  for (const view of views) ensureUniqueRecordKeys(view.records);
+  // Per-record parsing already proves shape. Do not retroactively apply newer
+  // operator-acknowledgement policy (for example non-global external IPs) to a
+  // snapshot written by an older release; only prove cross-record invariants.
+  materializeProviderViews(views, false);
 }
 
 /** Builds the complete internal view from the external baseline and sparse internal overrides. */
@@ -829,12 +998,14 @@ function adoptedId(record: ProviderRecord, taken: ReadonlySet<string>): string {
   }
 }
 
-export function materializeProviderViews(views: Zone["views"]): Zone["views"] {
+export function materializeProviderViews(views: Zone["views"], enforceExternalPolicy = true): Zone["views"] {
   const external = views.find((view) => view.name === "external");
   const overrides = views.find((view) => view.name === "internal");
   const result = views.filter((view) => view.name !== "internal").map(cloneView);
   const normalizedExternal = result.find((view) => view.name === "external");
-  if (normalizedExternal) normalizedExternal.records = normalizeExternalRecords(normalizedExternal.records);
+  if (normalizedExternal && enforceExternalPolicy) {
+    normalizedExternal.records = normalizeExternalRecords(normalizedExternal.records);
+  }
   if (!external && !overrides) return result;
   const effective = new Map<string, DesiredRecord[]>();
   for (const record of (normalizedExternal?.records ?? []).filter(isInheritable)) {
@@ -905,6 +1076,13 @@ function deterministicInternalRecordId(record: DesiredRecord): string {
  */
 function reconcilableViews(views: Zone["views"]): Zone["views"] {
   return views.filter((view) => isProviderView(view.name));
+}
+
+/** Provider-view names after split-horizon's implicit internal materialization. */
+function providerViewNames(views: Zone["views"]): Set<string> {
+  const names = new Set(views.filter((view) => isProviderView(view.name)).map((view) => view.name));
+  if (names.has("external")) names.add("internal");
+  return names;
 }
 
 function mergeRemovedViews(current: Zone["views"], removed: Zone["views"]): Zone["views"] {

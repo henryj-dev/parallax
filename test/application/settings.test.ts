@@ -7,11 +7,27 @@ import { DEFAULT_SETTINGS, SettingsService, parseSettings } from "../../src/appl
 import { DomainValidationError } from "../../src/domain/dns.ts";
 import type { SettingsRepository } from "../../src/application/ports.ts";
 import { FileConfigurationStore } from "../../src/infrastructure/file-settings.ts";
+import { InMemorySettingsRepository } from "../../src/infrastructure/in-memory.ts";
 
 class MemorySettingsRepository implements SettingsRepository {
   values: Record<string, unknown> = {};
-  async read(): Promise<Record<string, unknown>> { return { ...this.values }; }
+  #tail: Promise<void> = Promise.resolve();
+  async read(): Promise<Record<string, unknown>> {
+    await this.#tail;
+    return { ...this.values };
+  }
   async write(patch: Record<string, unknown>): Promise<void> { this.values = { ...this.values, ...patch }; }
+  update<T>(
+    operation: (current: Record<string, unknown>) => Promise<{ patch: Record<string, unknown>; result: T }>,
+  ): Promise<T> {
+    const result = this.#tail.then(async () => {
+      const replacement = await operation({ ...this.values });
+      await this.write(replacement.patch);
+      return replacement.result;
+    });
+    this.#tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
 }
 
 describe("settings", () => {
@@ -46,6 +62,9 @@ describe("settings", () => {
       { allowLocalProvider: "yes" },
       { publicOrigin: "dns.example.com" },
       { publicOrigin: "https://dns.example.com/portal" },
+      { publicOrigin: "http://dns.example.com" },
+      { revisionRetention: Number.MAX_SAFE_INTEGER },
+      { auditRetentionDays: Number.MAX_SAFE_INTEGER },
       { unknownSetting: true },
     ]) {
       await assert.rejects(settings.update(patch), /must|unknown setting/, JSON.stringify(patch));
@@ -65,6 +84,141 @@ describe("settings", () => {
     assert.deepEqual(seen, [[false, true], [true, true]]);
   });
 
+  it("does not persist a setting when runtime re-wiring rejects it", async () => {
+    const repository = new MemorySettingsRepository();
+    const service = new SettingsService(repository);
+    await service.load();
+    const seen: boolean[] = [];
+    service.onChange((candidate) => {
+      seen.push(candidate.allowLocalProvider);
+      if (candidate.allowLocalProvider) throw new Error("publisher combination is unavailable");
+    });
+
+    await assert.rejects(service.update({ allowLocalProvider: true }), /publisher combination is unavailable/);
+    assert.equal(service.current().allowLocalProvider, false);
+    assert.deepEqual(repository.values, {});
+    assert.deepEqual(seen, [true]);
+  });
+
+  it("rolls runtime wiring back when persistence fails", async () => {
+    const repository = new MemorySettingsRepository();
+    repository.write = async () => { throw new Error("store unavailable"); };
+    const service = new SettingsService(repository);
+    await service.load();
+    const seen: boolean[] = [];
+    service.onChange((candidate) => { seen.push(candidate.allowLocalProvider); });
+
+    await assert.rejects(service.update({ allowLocalProvider: true }), /store unavailable/);
+    assert.equal(service.current().allowLocalProvider, false);
+    assert.deepEqual(seen, [true, false]);
+  });
+
+  it("re-reads external changes and runs the same verifier and listeners", async () => {
+    const repository = new MemorySettingsRepository();
+    const verified: boolean[] = [];
+    const rewired: boolean[] = [];
+    const service = new SettingsService(repository, (candidate) => {
+      verified.push(candidate.allowLocalProvider);
+    });
+    await service.load();
+    service.onChange((candidate) => { rewired.push(candidate.allowLocalProvider); });
+    repository.values = { allowLocalProvider: true };
+
+    await service.refresh();
+    await service.refresh();
+    assert.equal(service.current().allowLocalProvider, true);
+    assert.deepEqual(rewired, [true], "an unchanged poll must not repeatedly re-wire providers");
+    assert.deepEqual(verified, [false, true]);
+  });
+
+  it("merges another process's file setting before applying a local patch", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "parallax-settings-replicas-"));
+    try {
+      const path = join(directory, "private", "configuration.json");
+      const left = new SettingsService(new FileConfigurationStore(path).settings);
+      const right = new SettingsService(new FileConfigurationStore(path).settings);
+      await Promise.all([left.load(), right.load()]);
+      await left.update({ allowLocalProvider: true });
+      await right.update({ revisionRetention: 7 });
+      await left.refresh();
+
+      assert.equal(left.current().allowLocalProvider, true);
+      assert.equal(left.current().revisionRetention, 7);
+      assert.equal(right.current().allowLocalProvider, true);
+      assert.equal(right.current().revisionRetention, 7);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the previous runtime wiring when an external value is unusable here", async () => {
+    const repository = new MemorySettingsRepository();
+    const service = new SettingsService(repository, (candidate) => {
+      if (candidate.coreDnsDirectory) throw new Error("publisher root unavailable");
+    });
+    await service.load();
+    repository.values = { coreDnsDirectory: "/another-host/zones" };
+
+    await assert.rejects(service.refresh(), /publisher root unavailable/);
+    assert.equal(service.current().coreDnsDirectory, "");
+  });
+
+  it("repairs an unusable external value without publishing it over the last good settings", async () => {
+    const repository = new MemorySettingsRepository();
+    const service = new SettingsService(repository, (candidate) => {
+      if (candidate.coreDnsDirectory) throw new Error("publisher root unavailable");
+    });
+    await service.load();
+    const rewired: Array<[string, number]> = [];
+    service.onChange((candidate) => {
+      rewired.push([candidate.coreDnsDirectory, candidate.revisionRetention]);
+    });
+    repository.values = { coreDnsDirectory: "/another-host/zones", revisionRetention: 7 };
+
+    await assert.rejects(
+      service.update({ auditRetentionDays: 30 }),
+      /publisher root unavailable/,
+      "an unrelated patch must not leave the durable snapshot unusable",
+    );
+    assert.deepEqual(repository.values, {
+      coreDnsDirectory: "/another-host/zones",
+      revisionRetention: 7,
+    });
+    assert.deepEqual(rewired, [], "the unusable external snapshot must never reach a listener");
+
+    const repaired = await service.update({ coreDnsDirectory: "" });
+    assert.equal(repaired.settings.coreDnsDirectory, "");
+    assert.equal(repaired.settings.revisionRetention, 7);
+    assert.deepEqual(repository.values, { coreDnsDirectory: "", revisionRetention: 7 });
+    assert.deepEqual(rewired, [["", 7]], "listeners see only the verified repaired snapshot");
+  });
+
+  it("rolls repaired runtime wiring back when the corrective write fails", async () => {
+    const repository = new MemorySettingsRepository();
+    const service = new SettingsService(repository, (candidate) => {
+      if (candidate.coreDnsDirectory) throw new Error("publisher root unavailable");
+    });
+    await service.load();
+    repository.values = { coreDnsDirectory: "/another-host/zones", revisionRetention: 7 };
+    repository.write = async () => { throw new Error("store unavailable"); };
+    const rewired: Array<[number, number]> = [];
+    service.onChange((candidate, previous) => {
+      rewired.push([candidate.revisionRetention, previous.revisionRetention]);
+    });
+
+    await assert.rejects(service.update({ coreDnsDirectory: "" }), /store unavailable/);
+
+    assert.deepEqual(rewired, [
+      [7, DEFAULT_SETTINGS.revisionRetention],
+      [DEFAULT_SETTINGS.revisionRetention, 7],
+    ], "rollback receives the attempted candidate as its previous value");
+    assert.deepEqual(service.current(), DEFAULT_SETTINGS);
+    assert.deepEqual(repository.values, {
+      coreDnsDirectory: "/another-host/zones",
+      revisionRetention: 7,
+    });
+  });
+
   it("round-trips through the file backend used when no database is configured", async () => {
     const directory = await mkdtemp(join(tmpdir(), "parallax-settings-"));
     try {
@@ -82,6 +236,42 @@ describe("settings", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("serializes invariant-coupled updates across independent file-backed replicas", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "parallax-settings-invariant-"));
+    try {
+      const path = join(directory, "private", "configuration.json");
+      const seed = new FileConfigurationStore(path);
+      await seed.settings.write({
+        publicOrigin: "https://portal.example",
+        trustForwardedHeaders: false,
+      });
+      await assertConcurrentProxyInvariant(
+        new FileConfigurationStore(path).settings,
+        new FileConfigurationStore(path).settings,
+      );
+      assert.deepEqual(await seed.settings.read(), {
+        publicOrigin: "https://portal.example",
+        trustForwardedHeaders: true,
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes invariant-coupled updates in the in-memory repository", async () => {
+    const repository = new InMemorySettingsRepository({
+      publicOrigin: "https://portal.example",
+      trustForwardedHeaders: false,
+    });
+
+    await assertConcurrentProxyInvariant(repository, repository);
+
+    assert.deepEqual(await repository.read(), {
+      publicOrigin: "https://portal.example",
+      trustForwardedHeaders: true,
+    });
   });
 
   it("refuses a setting the process could not act on, and stores nothing", async () => {
@@ -110,7 +300,7 @@ describe("settings", () => {
     // Turning on the second setting must show the verifier the first one too,
     // or a combination that cannot work would be accepted one half at a time.
     await service.update({ allowLocalProvider: true });
-    assert.deepEqual(seen, ["/srv/zones|false", "/srv/zones|true"]);
+    assert.deepEqual(seen, ["|false", "/srv/zones|false", "/srv/zones|true"]);
   });
 
   it("reports what a legal change costs instead of refusing it", async () => {
@@ -141,3 +331,45 @@ describe("settings", () => {
     assert.equal(asked, 0);
   });
 });
+
+async function assertConcurrentProxyInvariant(
+  leftRepository: SettingsRepository,
+  rightRepository: SettingsRepository,
+): Promise<void> {
+  let announceLeftEntered = (): void => {};
+  const leftEntered = new Promise<void>((resolve) => { announceLeftEntered = resolve; });
+  let releaseLeft = (): void => {};
+  const leftGate = new Promise<void>((resolve) => { releaseLeft = resolve; });
+  let rightVerifierEntered = false;
+  const invariant = (candidate: { publicOrigin: string; trustForwardedHeaders: boolean }): void => {
+    if (candidate.trustForwardedHeaders && !candidate.publicOrigin) {
+      throw new Error("trustForwardedHeaders requires publicOrigin");
+    }
+  };
+  const left = new SettingsService(leftRepository, async (candidate) => {
+    if (candidate.trustForwardedHeaders) {
+      announceLeftEntered();
+      await leftGate;
+    }
+    invariant(candidate);
+  });
+  const right = new SettingsService(rightRepository, (candidate) => {
+    if (!candidate.publicOrigin) rightVerifierEntered = true;
+    invariant(candidate);
+  });
+  await Promise.all([left.load(), right.load()]);
+
+  const leftUpdate = left.update({ trustForwardedHeaders: true });
+  await leftEntered;
+  const rightUpdate = right.update({ publicOrigin: "" });
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(rightVerifierEntered, false, "the second replica must not derive while the first holds the lock");
+  } finally {
+    releaseLeft();
+  }
+
+  const settled = await Promise.allSettled([leftUpdate, rightUpdate]);
+  assert.deepEqual(settled.map((result) => result.status), ["fulfilled", "rejected"]);
+  assert.match((settled[1] as PromiseRejectedResult).reason.message, /requires publicOrigin/);
+}

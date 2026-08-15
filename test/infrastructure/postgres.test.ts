@@ -6,6 +6,9 @@ import { RevisionConflictError } from "../../src/application/ports.ts";
 import {
   PostgresStatusRepository,
   PostgresApplyLock,
+  PostgresAccessTokenRepository,
+  PostgresCredentialRepository,
+  PostgresSettingsRepository,
   PostgresZoneRepository,
   createPostgresAdapters,
   type PgClient,
@@ -116,7 +119,7 @@ describe("PostgresZoneRepository", () => {
       ["BEGIN", "SELECT", "SELECT", "INSERT", "INSERT", "INSERT", "INSERT", "COMMIT"]);
     assert.match(pool.client.calls[5]!.text, /parallax_audit/);
     assert.match(pool.client.calls[6]!.text, /parallax_apply_statuses/);
-    assert.deepEqual(pool.client.calls[6]!.values, ["example.com", "external", 1, 0, "pending", null, null]);
+    assert.deepEqual(pool.client.calls[6]!.values, ["example.com", "external", 1, 0, "pending", null, null, null, null]);
   });
 
   it("rolls back the desired change when audit or status persistence fails", async () => {
@@ -257,6 +260,32 @@ describe("PostgresZoneRepository", () => {
     await assert.rejects(repository.list(), /views must be an array/);
   });
 
+  it("rejects structurally valid snapshots whose records violate zone invariants", async () => {
+    const zone = zoneFixture(3);
+    const corrupt: Zone = {
+      ...zone,
+      views: [{
+        name: "external",
+        records: [
+          { id: "address", name: "www", type: "A", content: "192.0.2.10", ttl: 60 },
+          { id: "alias", name: "www", type: "CNAME", content: "target.example.com.", ttl: 60 },
+        ],
+      }],
+    };
+    const repository = new PostgresZoneRepository(new FakePool(() => ({ rows: [{ snapshot: corrupt }] })));
+
+    await assert.rejects(repository.get("example.com"), /CNAME record.*cannot coexist/i);
+  });
+
+  it("pushes alphabetical zone pagination into PostgreSQL", async () => {
+    const zone = zoneFixture(1);
+    const pool = new FakePool(() => ({ rows: [{ snapshot: zone }] }));
+
+    assert.deepEqual(await new PostgresZoneRepository(pool).list({ limit: 2, offset: 3 }), [zone]);
+    assert.match(pool.calls[0]!.text, /ORDER BY name LIMIT \$1 OFFSET \$2/);
+    assert.deepEqual(pool.calls[0]!.values, [2, 3]);
+  });
+
   it("uses bigserial audit ids safely and retains parameterized zone filtering", async () => {
     const pool = new FakePool((call) => ({ rows: [{
       id: "42", zone_name: call.values?.[0] ?? "example.com", revision: 3,
@@ -268,6 +297,69 @@ describe("PostgresZoneRepository", () => {
     assert.equal(entries[0]?.id, 42);
     assert.equal(entries[0]?.at, "2026-08-08T00:00:00.000Z");
     assert.deepEqual(pool.calls[0]!.values, ["example.com"]);
+  });
+
+  it("appends and prunes same-zone audit history in one advisory-locked transaction", async () => {
+    const occurredAt = new Date("2026-03-01T00:00:00.000Z");
+    const pool = new FakePool(undefined, (call) => call.text.includes("INSERT INTO parallax_audit")
+      ? { rows: [{
+        id: "42",
+        zone_name: "example.com",
+        revision: 3,
+        action: "provider.apply.started",
+        actor: "alice",
+        occurred_at: occurredAt,
+        detail: { view: "external" },
+      }] }
+      : { rows: [] });
+    const repository = new PostgresZoneRepository(pool);
+    const appended = await repository.appendAudit({
+      zone: "example.com",
+      revision: 3,
+      action: "provider.apply.started",
+      actor: "alice",
+      at: occurredAt.toISOString(),
+      detail: { view: "external" },
+    }, { deleteAuditBefore: "2026-02-01T00:00:00.000Z" });
+
+    assert.equal(appended.id, 42);
+    assert.equal(pool.calls.length, 0, "the insert and pruning must stay on the transaction client");
+    assert.deepEqual(pool.client.calls.map((call) => call.text.split(" ")[0]),
+      ["BEGIN", "SELECT", "INSERT", "DELETE", "COMMIT"]);
+    assert.match(pool.client.calls[1]!.text, /pg_advisory_xact_lock/);
+    assert.deepEqual(pool.client.calls[1]!.values, ["example.com"]);
+    assert.deepEqual(pool.client.calls[3]!.values, ["example.com", "2026-02-01T00:00:00.000Z"]);
+    assert.equal(pool.client.released, true);
+  });
+
+  it("rolls back a retained audit append when pruning fails", async () => {
+    const failure = new Error("audit pruning unavailable");
+    const pool = new FakePool(undefined, (call) => {
+      if (call.text.includes("INSERT INTO parallax_audit")) return { rows: [{
+        id: 42,
+        zone_name: "example.com",
+        revision: 3,
+        action: "provider.apply.started",
+        actor: "alice",
+        occurred_at: new Date("2026-03-01T00:00:00.000Z"),
+        detail: {},
+      }] };
+      if (call.text.startsWith("DELETE FROM parallax_audit")) throw failure;
+      return { rows: [] };
+    });
+
+    await assert.rejects(new PostgresZoneRepository(pool).appendAudit({
+      zone: "example.com",
+      revision: 3,
+      action: "provider.apply.started",
+      actor: "alice",
+      at: "2026-03-01T00:00:00.000Z",
+      detail: {},
+    }, { deleteAuditBefore: "2026-02-01T00:00:00.000Z" }), failure);
+
+    assert.equal(pool.client.calls.at(-1)?.text, "ROLLBACK");
+    assert.equal(pool.client.calls.some((call) => call.text === "COMMIT"), false);
+    assert.equal(pool.client.released, true);
   });
 
   it("deletes zones with a parameter; schema cascades revisions and statuses but retains audit", async () => {
@@ -294,9 +386,30 @@ describe("PostgresStatusRepository", () => {
     });
 
     assert.match(pool.calls[0]!.text, /ON CONFLICT \(zone_name, view_name\) DO UPDATE/);
-    assert.match(pool.calls[0]!.text, /WHERE parallax_apply_statuses\.desired_revision <= EXCLUDED\.desired_revision/);
     assert.deepEqual(pool.calls[0]!.values,
-      ["example.com", "external", 4, 3, "failed", "2026-08-08T01:02:03.000Z", "offline"]);
+      ["example.com", "external", 4, 3, "failed", "2026-08-08T01:02:03.000Z", "offline", null, null]);
+  });
+
+  it("merges a late apply attempt without downgrading a newer desired status", async () => {
+    const pool = new FakePool();
+    await new PostgresStatusRepository(pool).save({
+      zone: "example.com", view: "external", desiredRevision: 4, appliedRevision: 3,
+      state: "applied", lastAttemptAt: "2026-08-08T01:02:03.000Z",
+    });
+
+    const statement = pool.calls[0]!.text;
+    assert.match(statement,
+      /desired_revision = GREATEST\(parallax_apply_statuses\.desired_revision, EXCLUDED\.desired_revision\)/);
+    assert.match(statement,
+      /applied_revision = GREATEST\(parallax_apply_statuses\.applied_revision, EXCLUDED\.applied_revision\)/);
+    assert.match(statement,
+      /WHEN EXCLUDED\.desired_revision >= parallax_apply_statuses\.desired_revision THEN EXCLUDED\.state/);
+    assert.match(statement,
+      /WHEN EXCLUDED\.last_attempt_at IS NULL THEN parallax_apply_statuses\.last_attempt_at/);
+    assert.match(statement,
+      /EXCLUDED\.last_attempt_at > parallax_apply_statuses\.last_attempt_at THEN EXCLUDED\.last_attempt_at/);
+    assert.doesNotMatch(statement, /WHERE parallax_apply_statuses\.desired_revision/,
+      "an older apply result must still merge its attempt timestamp into the newer row");
   });
 
   it("maps nullable database fields and sorts list queries by view", async () => {
@@ -310,12 +423,141 @@ describe("PostgresStatusRepository", () => {
     assert.deepEqual(pool.calls[0]!.values, ["example.com"]);
   });
 
+  it("round-trips persisted partial-operation progress and rejects an incomplete pair", async () => {
+    const pool = new FakePool((call) => call.text.startsWith("SELECT") ? { rows: [{
+      zone_name: "example.com", view_name: "external", desired_revision: 4, applied_revision: 3,
+      state: "failed", last_attempt_at: null, error: "offline", completed_operations: 2, planned_operations: 5,
+    }] } : { rows: [] });
+    const repository = new PostgresStatusRepository(pool);
+    assert.deepEqual(await repository.get("example.com", "external"), {
+      zone: "example.com", view: "external", desiredRevision: 4, appliedRevision: 3,
+      state: "failed", error: "offline", completedOperations: 2, plannedOperations: 5,
+    });
+    await repository.save({
+      zone: "example.com", view: "external", desiredRevision: 4, appliedRevision: 3,
+      state: "failed", completedOperations: 2, plannedOperations: 5,
+    });
+    assert.deepEqual(pool.calls[1]?.values?.slice(-2), [2, 5]);
+
+    const corrupt = new FakePool(() => ({ rows: [{
+      zone_name: "example.com", view_name: "external", desired_revision: 4, applied_revision: 3,
+      state: "failed", last_attempt_at: null, error: null, completed_operations: 2, planned_operations: null,
+    }] }));
+    await assert.rejects(new PostgresStatusRepository(corrupt).list("example.com"), /operation progress/);
+  });
+
   it("returns adapters sharing the injected pool", async () => {
     const pool = new FakePool();
     const adapters = createPostgresAdapters(pool);
     await adapters.statuses.deleteZone("example.com");
     assert.deepEqual(pool.calls[0]!.values, ["example.com"]);
     assert.ok(adapters.zones instanceof PostgresZoneRepository);
+  });
+});
+
+describe("PostgresAccessTokenRepository", () => {
+  it("checks and deletes under one transaction-wide advisory lock", async () => {
+    const pool = new FakePool(undefined, (call) => {
+      if (call.text.startsWith("SELECT role")) return { rows: [{ role: "admin" }] };
+      if (call.text.startsWith("SELECT count")) return { rows: [{ count: "1" }] };
+      if (call.text.startsWith("DELETE")) return { rows: [{ id: "admin-a" }] };
+      return { rows: [] };
+    });
+    const result = await new PostgresAccessTokenRepository(pool).revoke("admin-a", 0);
+    assert.equal(result, "deleted");
+    assert.equal(pool.calls.length, 0);
+    assert.deepEqual(pool.client.calls.map((call) => call.text.split(" ")[0]),
+      ["BEGIN", "SELECT", "SELECT", "SELECT", "DELETE", "COMMIT"]);
+    assert.match(pool.client.calls[1]!.text, /pg_advisory_xact_lock/);
+    assert.match(pool.client.calls[2]!.text, /FOR UPDATE/);
+  });
+
+  it("atomically refuses the final administrator without deleting it", async () => {
+    const pool = new FakePool(undefined, (call) => {
+      if (call.text.startsWith("SELECT role")) return { rows: [{ role: "admin" }] };
+      if (call.text.startsWith("SELECT count")) return { rows: [{ count: "0" }] };
+      return { rows: [] };
+    });
+    assert.equal(await new PostgresAccessTokenRepository(pool).revoke("only-admin", 0), "last-admin");
+    assert.equal(pool.client.calls.some((call) => call.text.startsWith("DELETE")), false);
+    assert.equal(pool.client.calls.at(-1)?.text, "COMMIT");
+  });
+});
+
+describe("PostgresCredentialRepository", () => {
+  it("derives a replacement from the locked current document in one transaction", async () => {
+    const pool = new FakePool(undefined, (call) => call.text.startsWith("SELECT document")
+      ? { rows: [{ document: "sealed-before" }] }
+      : { rows: [] });
+    const result = await new PostgresCredentialRepository(pool).update((current) => ({
+      document: `${current}-after`,
+      result: 42,
+    }));
+    assert.equal(result, 42);
+    assert.deepEqual(pool.client.calls.map((call) => call.text.split(" ")[0]),
+      ["BEGIN", "SELECT", "SELECT", "INSERT", "COMMIT"]);
+    assert.match(pool.client.calls[1]!.text, /pg_advisory_xact_lock/);
+    assert.match(pool.client.calls[2]!.text, /FOR UPDATE/);
+    assert.deepEqual(pool.client.calls[3]!.values, ["sealed-before-after"]);
+  });
+});
+
+describe("PostgresSettingsRepository", () => {
+  it("returns a null-prototype map and rejects prototype-mutating keys", async () => {
+    const safe = new PostgresSettingsRepository(new FakePool(() => ({ rows: [{ key: "auditRetentionDays", value: 30 }] })));
+    const settings = await safe.read();
+    assert.equal(Object.getPrototypeOf(settings), null);
+    assert.equal(settings.auditRetentionDays, 30);
+
+    const dangerous = new PostgresSettingsRepository(new FakePool(() => ({ rows: [{ key: "__proto__", value: { polluted: true } }] })));
+    await assert.rejects(dangerous.read(), /invalid PostgreSQL setting key/);
+    await assert.rejects(dangerous.write(Object.fromEntries([["constructor", true]])), /invalid PostgreSQL setting key/);
+  });
+
+  it("holds a global transaction lock across async derive and patch persistence", async () => {
+    const pool = new FakePool(undefined, (call) => call.text.startsWith("SELECT key")
+      ? { rows: [{ key: "publicOrigin", value: "https://portal.example" }] }
+      : { rows: [] });
+    let announceEntered = (): void => {};
+    const entered = new Promise<void>((resolve) => { announceEntered = resolve; });
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+
+    const update = new PostgresSettingsRepository(pool).update(async (current) => {
+      assert.equal(current.publicOrigin, "https://portal.example");
+      announceEntered();
+      await gate;
+      return { patch: { trustForwardedHeaders: true }, result: 42 };
+    });
+    await entered;
+
+    assert.deepEqual(pool.client.calls.map((call) => call.text.split(" ")[0]), ["BEGIN", "SELECT", "SELECT"]);
+    assert.match(pool.client.calls[1]!.text, /pg_advisory_xact_lock/);
+    assert.deepEqual(pool.client.calls[1]!.values, ["parallax-settings"]);
+    assert.match(pool.client.calls[2]!.text, /FOR UPDATE/);
+    release();
+
+    assert.equal(await update, 42);
+    assert.deepEqual(pool.client.calls.map((call) => call.text.split(" ")[0]),
+      ["BEGIN", "SELECT", "SELECT", "INSERT", "COMMIT"]);
+    assert.deepEqual(pool.client.calls[3]!.values, ["trustForwardedHeaders", "true"]);
+    assert.equal(pool.client.released, true);
+  });
+
+  it("rolls back without writing when an atomic settings derivation fails", async () => {
+    const pool = new FakePool(undefined, (call) => call.text.startsWith("SELECT key")
+      ? { rows: [{ key: "trustForwardedHeaders", value: true }] }
+      : { rows: [] });
+    const failure = new Error("merged settings are invalid");
+
+    await assert.rejects(
+      new PostgresSettingsRepository(pool).update(async () => { throw failure; }),
+      failure,
+    );
+
+    assert.equal(pool.client.calls.some((call) => call.text.startsWith("INSERT")), false);
+    assert.equal(pool.client.calls.at(-1)?.text, "ROLLBACK");
+    assert.equal(pool.client.released, true);
   });
 });
 
@@ -331,6 +573,7 @@ describe("PostgresApplyLock", () => {
       if (entered === 2) releaseGate();
       await gate;
       await adapters.statuses.list(zone);
+      await adapters.zones.saveRevision({ ...zoneFixture(1), name: zone });
     });
 
     await Promise.all([apply("first.example"), apply("second.example")]);

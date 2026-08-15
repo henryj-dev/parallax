@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
-import { RevisionConflictError, type AccessTokenRepository, type ApplyLock, type ApplyStatus, type CredentialRepository, type DesiredChange, type PageRequest, type RetentionPolicy, type SettingsRepository, type StatusRepository, type StoredAccessToken, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { assertPersistedDesiredViewsValid } from "../application/control-plane.ts";
+import { RevisionConflictError, type AccessTokenRepository, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type CredentialRepository, type DesiredChange, type PageRequest, type RetentionPolicy, type SettingsRepository, type SettingsRepositoryUpdate, type StatusRepository, type StoredAccessToken, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import { AUDIT_ACTIONS,
   createDesiredRecord,
   normalizeZoneName,
@@ -57,9 +58,12 @@ export class PostgresZoneRepository implements ZoneRepository {
     this.#pool = pool;
   }
 
-  async list(): Promise<Zone[]> {
+  async list(page?: PageRequest): Promise<Zone[]> {
     const result = await this.#pool.query<SnapshotRow>(
-      "SELECT snapshot FROM parallax_zones ORDER BY name",
+      page
+        ? "SELECT snapshot FROM parallax_zones ORDER BY name LIMIT $1 OFFSET $2"
+        : "SELECT snapshot FROM parallax_zones ORDER BY name",
+      page ? [page.limit, page.offset] : undefined,
     );
     return result.rows.map((row) => readZone(row.snapshot));
   }
@@ -238,16 +242,34 @@ export class PostgresZoneRepository implements ZoneRepository {
     await this.#pool.query("DELETE FROM parallax_zones WHERE name = $1", [name]);
   }
 
-  async appendAudit(input: Omit<AuditEntry, "id">): Promise<AuditEntry> {
+  async appendAudit(input: Omit<AuditEntry, "id">, retention?: AuditRetentionPolicy): Promise<AuditEntry> {
     const detail = readObject(input.detail, "audit detail");
-    const result = await this.#pool.query<AuditRow>(
-      `INSERT INTO parallax_audit (zone_name, revision, action, actor, occurred_at, detail)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-       RETURNING id, zone_name, revision, action, actor, occurred_at, detail`,
-      [input.zone, input.revision, input.action, input.actor, input.at, JSON.stringify(detail)],
-    );
-    if (!result.rows[0]) throw new Error("PostgreSQL did not return the inserted audit entry");
-    return readAudit(result.rows[0]);
+    const insert = async (queryable: PgQueryable): Promise<AuditEntry> => {
+      const result = await queryable.query<AuditRow>(
+        `INSERT INTO parallax_audit (zone_name, revision, action, actor, occurred_at, detail)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         RETURNING id, zone_name, revision, action, actor, occurred_at, detail`,
+        [input.zone, input.revision, input.action, input.actor, input.at, JSON.stringify(detail)],
+      );
+      if (!result.rows[0]) throw new Error("PostgreSQL did not return the inserted audit entry");
+      return readAudit(result.rows[0]);
+    };
+    if (!retention?.deleteAuditBefore) return insert(this.#pool);
+
+    const client = await this.#pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [input.zone]);
+      const entry = await insert(client);
+      await pruneAudit(client, input.zone, retention);
+      await client.query("COMMIT");
+      return entry;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async audit(zone?: string, page?: PageRequest): Promise<AuditEntry[]> {
@@ -314,7 +336,15 @@ class ContextualPgPool implements PgPool {
   }
 
   connect(): Promise<PgClient> {
-    return this.#pool.connect();
+    const active = this.#context.current();
+    if (!active) return this.#pool.connect();
+    // A repository method that starts its own transaction while an apply lock
+    // is active must reuse that lock's checked-out client. `release` belongs to
+    // the outer lock owner and is intentionally a no-op for the borrower.
+    return Promise.resolve({
+      query: <Row = Record<string, unknown>>(text: string, values?: readonly unknown[]) => active.query<Row>(text, values),
+      release: () => {},
+    });
   }
 }
 
@@ -361,34 +391,58 @@ export class PostgresSettingsRepository implements SettingsRepository {
   }
 
   async read(): Promise<Record<string, unknown>> {
-    const result = await this.#pool.query<{ key: unknown; value: unknown }>(
-      "SELECT key, value FROM parallax_settings",
-    );
-    const settings: Record<string, unknown> = {};
-    for (const row of result.rows) settings[readString(row.key, "setting key")] = row.value;
-    return settings;
+    return this.#read(this.#pool, false);
   }
 
   async write(values: Record<string, unknown>): Promise<void> {
-    const entries = Object.entries(values);
-    if (entries.length === 0) return;
+    await this.update(async () => ({ patch: values, result: undefined }));
+  }
+
+  async update<T>(
+    operation: (current: Record<string, unknown>) => Promise<SettingsRepositoryUpdate<T>>,
+  ): Promise<T> {
     const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
-      for (const [key, value] of entries) {
-        await client.query(
-          `INSERT INTO parallax_settings (key, value, updated_at)
-           VALUES ($1, $2::jsonb, now())
-           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-          [key, JSON.stringify(value ?? null)],
-        );
-      }
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", ["parallax-settings"]);
+      const current = await this.#read(client, true);
+      const replacement = await operation(current);
+      await this.#write(client, replacement.patch);
       await client.query("COMMIT");
+      return replacement.result;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
       client.release();
+    }
+  }
+
+  async #read(queryable: PgQueryable, forUpdate: boolean): Promise<Record<string, unknown>> {
+    const result = await queryable.query<{ key: unknown; value: unknown }>(
+      `SELECT key, value FROM parallax_settings ORDER BY key${forUpdate ? " FOR UPDATE" : ""}`,
+    );
+    const settings: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const row of result.rows) {
+      const key = readString(row.key, "setting key");
+      if (isDangerousObjectKey(key)) throw new Error(`invalid PostgreSQL setting key: ${key}`);
+      settings[key] = row.value;
+    }
+    return settings;
+  }
+
+  async #write(queryable: PgQueryable, values: Record<string, unknown>): Promise<void> {
+    const entries = Object.entries(values);
+    for (const [key] of entries) {
+      if (isDangerousObjectKey(key)) throw new Error(`invalid PostgreSQL setting key: ${key}`);
+    }
+    for (const [key, value] of entries) {
+      await queryable.query(
+        `INSERT INTO parallax_settings (key, value, updated_at)
+         VALUES ($1, $2::jsonb, now())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [key, JSON.stringify(value ?? null)],
+      );
     }
   }
 }
@@ -417,6 +471,32 @@ export class PostgresCredentialRepository implements CredentialRepository {
       [document],
     );
   }
+
+  async update<T>(operation: (document: string | undefined) => { document: string; result: T }): Promise<T> {
+    const client = await this.#pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", ["parallax-credential-store"]);
+      const current = await client.query<{ document: unknown }>(
+        "SELECT document FROM parallax_credential_store WHERE id = 1 FOR UPDATE",
+      );
+      const row = current.rows[0];
+      const replacement = operation(row ? readString(row.document, "credential document") : undefined);
+      await client.query(
+        `INSERT INTO parallax_credential_store (id, document, updated_at)
+         VALUES (1, $1, now())
+         ON CONFLICT (id) DO UPDATE SET document = EXCLUDED.document, updated_at = now()`,
+        [replacement.document],
+      );
+      await client.query("COMMIT");
+      return replacement.result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 }
 
 export class PostgresAccessTokenRepository implements AccessTokenRepository {
@@ -441,12 +521,49 @@ export class PostgresAccessTokenRepository implements AccessTokenRepository {
     );
   }
 
-  async delete(id: string): Promise<boolean> {
-    const result = await this.#pool.query<{ id: unknown }>(
-      "DELETE FROM parallax_access_tokens WHERE id = $1 RETURNING id",
-      [id],
-    );
-    return result.rows.length > 0;
+  async revoke(id: string, retainedAdministratorCount: number): Promise<"deleted" | "not-found" | "last-admin"> {
+    if (!Number.isSafeInteger(retainedAdministratorCount) || retainedAdministratorCount < 0) {
+      throw new TypeError("retained administrator count must be a non-negative integer");
+    }
+    const client = await this.#pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Different admin rows do not conflict under row locks, so every revoke
+      // shares one transaction-scoped lock before checking the invariant.
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", ["parallax-access-token-revoke"]);
+      const target = await client.query<{ role: unknown }>(
+        "SELECT role FROM parallax_access_tokens WHERE id = $1 FOR UPDATE",
+        [id],
+      );
+      const row = target.rows[0];
+      if (!row) {
+        await client.query("COMMIT");
+        return "not-found";
+      }
+      const role = readString(row.role, "access token role");
+      if (role === "admin") {
+        const remaining = await client.query<{ count: unknown }>(
+          "SELECT count(*) AS count FROM parallax_access_tokens WHERE role = 'admin' AND id <> $1",
+          [id],
+        );
+        const storedAdministrators = readNonNegativeInteger(remaining.rows[0]?.count, "remaining administrator count");
+        if (storedAdministrators + retainedAdministratorCount === 0) {
+          await client.query("COMMIT");
+          return "last-admin";
+        }
+      }
+      const deleted = await client.query<{ id: unknown }>(
+        "DELETE FROM parallax_access_tokens WHERE id = $1 RETURNING id",
+        [id],
+      );
+      await client.query("COMMIT");
+      return deleted.rows.length > 0 ? "deleted" : "not-found";
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 }
 
@@ -506,10 +623,12 @@ interface StatusRow {
   state: unknown;
   last_attempt_at: unknown;
   error: unknown;
+  completed_operations: unknown;
+  planned_operations: unknown;
 }
 
 const STATUS_COLUMNS = `SELECT zone_name, view_name, desired_revision, applied_revision,
-  state, last_attempt_at, error FROM parallax_apply_statuses`;
+  state, last_attempt_at, error, completed_operations, planned_operations FROM parallax_apply_statuses`;
 
 const AUDIT_COLUMNS = "SELECT id, zone_name, revision, action, actor, occurred_at, detail FROM parallax_audit";
 
@@ -552,6 +671,7 @@ function readZone(value: unknown): Zone {
     });
     return { name: viewName, records };
   });
+  assertPersistedDesiredViewsValid(views);
   return { name, revision, views, createdAt, updatedAt };
 }
 
@@ -585,6 +705,16 @@ function readStatus(row: StatusRow): ApplyStatus {
     status.lastAttemptAt = readTimestamp(row.last_attempt_at, "last attempt timestamp");
   }
   if (row.error !== null && row.error !== undefined) status.error = readString(row.error, "status error");
+  const hasCompleted = row.completed_operations !== null && row.completed_operations !== undefined;
+  const hasPlanned = row.planned_operations !== null && row.planned_operations !== undefined;
+  if (hasCompleted !== hasPlanned) throw new Error("invalid PostgreSQL status operation progress");
+  if (hasCompleted && hasPlanned) {
+    status.completedOperations = readNonNegativeInteger(row.completed_operations, "completed operations");
+    status.plannedOperations = readNonNegativeInteger(row.planned_operations, "planned operations");
+    if (status.completedOperations > status.plannedOperations) {
+      throw new Error("invalid PostgreSQL status operation progress");
+    }
+  }
   return status;
 }
 
@@ -597,6 +727,8 @@ function validateStatus(status: ApplyStatus): ApplyStatus {
     state: status.state,
     last_attempt_at: status.lastAttemptAt ?? null,
     error: status.error ?? null,
+    completed_operations: status.completedOperations ?? null,
+    planned_operations: status.plannedOperations ?? null,
   });
 }
 
@@ -613,7 +745,11 @@ async function pruneHistory(client: PgQueryable, zone: string, retention: Retent
       [zone, maxRevisions],
     );
   }
-  if (retention.deleteAuditBefore) {
+  await pruneAudit(client, zone, retention);
+}
+
+async function pruneAudit(client: PgQueryable, zone: string, retention: AuditRetentionPolicy | undefined): Promise<void> {
+  if (retention?.deleteAuditBefore) {
     await client.query(
       "DELETE FROM parallax_audit WHERE zone_name = $1 AND occurred_at < $2",
       [zone, retention.deleteAuditBefore],
@@ -622,20 +758,49 @@ async function pruneHistory(client: PgQueryable, zone: string, retention: Retent
 }
 
 async function saveStatus(queryable: PgQueryable, valid: ApplyStatus): Promise<void> {
+  // Desired state N+1 may commit while an apply of N is still talking to the
+  // provider. Revision/state follow the newer desired row, while provider
+  // progress and the latest attempt timestamp remain monotonic facts. In
+  // particular, an older apply must still contribute `last_attempt_at`: zone
+  // deletion uses it to find every target that may hold published records.
   await queryable.query(
     `INSERT INTO parallax_apply_statuses
-       (zone_name, view_name, desired_revision, applied_revision, state, last_attempt_at, error)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+       (zone_name, view_name, desired_revision, applied_revision, state, last_attempt_at, error,
+        completed_operations, planned_operations)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (zone_name, view_name) DO UPDATE SET
-       desired_revision = EXCLUDED.desired_revision,
-       applied_revision = EXCLUDED.applied_revision,
-       state = EXCLUDED.state,
-       last_attempt_at = EXCLUDED.last_attempt_at,
-       error = EXCLUDED.error
-     WHERE parallax_apply_statuses.desired_revision <= EXCLUDED.desired_revision`,
+       desired_revision = GREATEST(parallax_apply_statuses.desired_revision, EXCLUDED.desired_revision),
+       applied_revision = GREATEST(parallax_apply_statuses.applied_revision, EXCLUDED.applied_revision),
+       state = CASE
+         WHEN EXCLUDED.desired_revision >= parallax_apply_statuses.desired_revision THEN EXCLUDED.state
+         ELSE parallax_apply_statuses.state
+       END,
+       last_attempt_at = CASE
+         WHEN EXCLUDED.last_attempt_at IS NULL THEN parallax_apply_statuses.last_attempt_at
+         WHEN parallax_apply_statuses.last_attempt_at IS NULL
+           OR EXCLUDED.last_attempt_at > parallax_apply_statuses.last_attempt_at THEN EXCLUDED.last_attempt_at
+         ELSE parallax_apply_statuses.last_attempt_at
+       END,
+       error = CASE
+         WHEN EXCLUDED.desired_revision >= parallax_apply_statuses.desired_revision THEN EXCLUDED.error
+         ELSE parallax_apply_statuses.error
+       END,
+       completed_operations = CASE
+         WHEN EXCLUDED.desired_revision >= parallax_apply_statuses.desired_revision THEN EXCLUDED.completed_operations
+         ELSE parallax_apply_statuses.completed_operations
+       END,
+       planned_operations = CASE
+         WHEN EXCLUDED.desired_revision >= parallax_apply_statuses.desired_revision THEN EXCLUDED.planned_operations
+         ELSE parallax_apply_statuses.planned_operations
+       END`,
     [valid.zone, valid.view, valid.desiredRevision, valid.appliedRevision, valid.state,
-      valid.lastAttemptAt ?? null, valid.error ?? null],
+      valid.lastAttemptAt ?? null, valid.error ?? null,
+      valid.completedOperations ?? null, valid.plannedOperations ?? null],
   );
+}
+
+function isDangerousObjectKey(key: string): boolean {
+  return key === "__proto__" || key === "prototype" || key === "constructor";
 }
 
 function readObject(value: unknown, field: string): Record<string, unknown> {

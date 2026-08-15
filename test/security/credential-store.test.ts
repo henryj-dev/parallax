@@ -15,6 +15,11 @@ class MemoryCredentialRepository implements CredentialRepository {
   document: string | undefined;
   async read(): Promise<string | undefined> { return this.document; }
   async write(document: string): Promise<void> { this.document = document; }
+  async update<T>(operation: (document: string | undefined) => { document: string; result: T }): Promise<T> {
+    const replacement = operation(this.document);
+    this.document = replacement.document;
+    return replacement.result;
+  }
 }
 
 async function fixture(key = randomBytes(32)) {
@@ -178,6 +183,54 @@ describe("EncryptedCredentialStore", () => {
       { length: 20 },
       (_, index) => `zone-${index}.example.com`,
     ).sort((left, right) => left.localeCompare(right)));
+  });
+
+  it("reads replica changes fresh and atomically merges cross-instance mutations", async () => {
+    const { repository, key, store: left } = await fixture();
+    const right = new EncryptedCredentialStore({ repository, masterKey: key });
+    await left.upsertProfile("shared", { token: "first" });
+    assert.equal((await left.getProfileSecret("shared"))?.token, "first");
+
+    await right.upsertProfile("shared", { token: "rotated" });
+    assert.equal((await left.getProfileSecret("shared"))?.token, "rotated",
+      "a reader must not retain decrypted replica state indefinitely");
+
+    await Promise.all([
+      left.bindZone("one.example", { zoneId: "z1", profile: "shared" }),
+      right.bindZone("two.example", { zoneId: "z2", profile: "shared" }),
+    ]);
+    assert.deepEqual((await left.listBindings()).map((binding) => binding.zone), ["one.example", "two.example"]);
+  });
+
+  it("uses the file repository lock for credential mutations from separate stores", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "parallax-credential-lock-"));
+    directories.push(directory);
+    const path = join(directory, "private", "configuration.json");
+    const key = randomBytes(32);
+    const left = new EncryptedCredentialStore({ repository: new FileConfigurationStore(path).credentials, masterKey: key });
+    const right = new EncryptedCredentialStore({ repository: new FileConfigurationStore(path).credentials, masterKey: key });
+    await left.upsertProfile("shared", { token: "token" });
+    await Promise.all([
+      left.bindZone("one.example", { zoneId: "z1", profile: "shared" }),
+      right.bindZone("two.example", { zoneId: "z2", profile: "shared" }),
+    ]);
+    assert.deepEqual((await right.listBindings()).map((binding) => binding.zone), ["one.example", "two.example"]);
+  });
+
+  it("detects an authenticated envelope rollback after observing a newer revision", async () => {
+    const { repository, key, store } = await fixture();
+    await store.upsertProfile("p", { token: "first" });
+    const older = repository.document;
+    await store.upsertProfile("p", { token: "second" });
+    await store.listProfiles();
+    repository.document = older;
+
+    await assert.rejects(store.listProfiles(), /credential store could not be opened/);
+    // There is no external monotonic trust anchor in either supported backend.
+    // A cold process has not observed the newer revision and therefore cannot
+    // distinguish this valid old ciphertext from the current document.
+    const cold = new EncryptedCredentialStore({ repository, masterKey: key });
+    assert.equal((await cold.getProfileSecret("p"))?.token, "first");
   });
 
   it("fails closed for a wrong key without exposing secrets", async () => {

@@ -11,6 +11,8 @@ import {
   type CloudflareZoneBinding,
 } from "../security/credential-store.ts";
 
+export const CREDENTIAL_REFRESH_INTERVAL_MS = 5_000;
+
 export interface CloudflareCredentialManagerOptions {
   readonly store: EncryptedCredentialStore;
   readonly router: RoutingProviderAdapter;
@@ -33,6 +35,8 @@ export class CloudflareCredentialManager {
   readonly #environmentAdapters: ReadonlyMap<string, ProviderAdapter>;
   readonly #createAdapter: (credential: CloudflareCredentialSecret) => ProviderAdapter;
   readonly #resolveZoneId: (zone: string, token: string) => Promise<string>;
+  readonly #routedZones = new Set<string>();
+  #refreshTail: Promise<void> = Promise.resolve();
 
   constructor(options: CloudflareCredentialManagerOptions) {
     this.#store = options.store;
@@ -48,7 +52,32 @@ export class CloudflareCredentialManager {
   }
 
   async initialize(): Promise<void> {
-    for (const binding of await this.#store.listBindings()) await this.#route(binding.zone);
+    await this.refresh();
+  }
+
+  /** Reconciles live routing with credentials changed by another replica. */
+  refresh(): Promise<void> {
+    const result = this.#refreshTail.then(async () => {
+      const bindings = await this.#store.listBindings();
+      const active = new Set(bindings.map((binding) => binding.zone));
+      for (const binding of bindings) await this.#route(binding.zone);
+      for (const zone of this.#routedZones) {
+        if (active.has(zone)) continue;
+        this.#restoreEnvironmentRoute(zone);
+        this.#routedZones.delete(zone);
+      }
+    });
+    this.#refreshTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  startRefreshing(
+    intervalMs = CREDENTIAL_REFRESH_INTERVAL_MS,
+    onError: (error: unknown) => void = () => {},
+  ): () => void {
+    const timer = setInterval(() => { this.refresh().catch(onError); }, intervalMs);
+    timer.unref?.();
+    return () => clearInterval(timer);
   }
 
   /** Profiles carry the reusable account id and API token; tokens never leave the store. */
@@ -114,9 +143,8 @@ export class CloudflareCredentialManager {
     const removed = await this.#store.unbindZone(zone);
     if (!removed) return false;
     const normalizedZone = normalizeZone(zone);
-    const fallback = this.#environmentAdapters.get(normalizedZone);
-    if (fallback) this.#router.registerExternal(normalizedZone, fallback);
-    else this.#router.unregisterExternal(normalizedZone);
+    this.#restoreEnvironmentRoute(normalizedZone);
+    this.#routedZones.delete(normalizedZone);
     return true;
   }
 
@@ -208,7 +236,22 @@ export class CloudflareCredentialManager {
 
   async #route(zone: string): Promise<void> {
     const credential = await this.#store.getSecret(zone);
-    if (credential) this.#router.registerExternal(zone, this.#createAdapter(credential));
+    if (credential) {
+      this.#router.registerExternal(zone, this.#createAdapter(credential));
+      this.#routedZones.add(zone);
+    } else {
+      // A binding can disappear between the list and secret reads. Remove the
+      // old adapter in this refresh instead of leaving a revoked token live for
+      // another interval.
+      this.#restoreEnvironmentRoute(zone);
+      this.#routedZones.delete(zone);
+    }
+  }
+
+  #restoreEnvironmentRoute(zone: string): void {
+    const fallback = this.#environmentAdapters.get(zone);
+    if (fallback) this.#router.registerExternal(zone, fallback);
+    else this.#router.unregisterExternal(zone);
   }
 }
 

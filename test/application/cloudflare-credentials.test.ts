@@ -144,6 +144,46 @@ describe("CloudflareCredentialManager", () => {
     }
   });
 
+  it("refreshes routing after another replica rotates or removes a binding", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "parallax-manager-refresh-"));
+    try {
+      const path = join(directory, "configuration.json");
+      const key = randomBytes(32);
+      const firstStore = new EncryptedCredentialStore({ repository: new FileConfigurationStore(path).credentials, masterKey: key });
+      const secondStore = new EncryptedCredentialStore({ repository: new FileConfigurationStore(path).credentials, masterKey: key });
+      const router = new RoutingProviderAdapter();
+      const routed: CloudflareCredentialSecret[] = [];
+      const first = new CloudflareCredentialManager({
+        store: firstStore,
+        router,
+        ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async () => "zone-id",
+        createAdapter: (credential) => { routed.push(credential); return new SpyAdapter(); },
+      });
+      const second = new CloudflareCredentialManager({
+        store: secondStore,
+        router: new RoutingProviderAdapter(),
+        ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
+        resolveZoneId: async () => "zone-id",
+        createAdapter: () => new SpyAdapter(),
+      });
+      await second.upsertProfile("shared", { token: "first" });
+      await second.bindZone("example.com", { profile: "shared" });
+      await first.initialize();
+      assert.equal(routed.at(-1)?.token, "first");
+
+      await second.upsertProfile("shared", { token: "rotated" });
+      await first.refresh();
+      assert.equal(routed.at(-1)?.token, "rotated");
+
+      await second.unbindZone("example.com");
+      await first.refresh();
+      await assert.rejects(router.list("example.com/external"), /no provider is configured/i);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("tests supplied credentials without persisting them or exposing provider failures", async () => {
     const directory = await mkdtemp(join(tmpdir(), "parallax-manager-"));
     try {

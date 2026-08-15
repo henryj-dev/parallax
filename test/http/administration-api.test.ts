@@ -17,19 +17,38 @@ const security = {
 
 class MemorySettingsRepository implements SettingsRepository {
   values: Record<string, unknown> = {};
-  async read(): Promise<Record<string, unknown>> { return { ...this.values }; }
+  #tail: Promise<void> = Promise.resolve();
+  async read(): Promise<Record<string, unknown>> {
+    await this.#tail;
+    return { ...this.values };
+  }
   async write(patch: Record<string, unknown>): Promise<void> { this.values = { ...this.values, ...patch }; }
+  update<T>(
+    operation: (current: Record<string, unknown>) => Promise<{ patch: Record<string, unknown>; result: T }>,
+  ): Promise<T> {
+    const result = this.#tail.then(async () => {
+      const replacement = await operation({ ...this.values });
+      await this.write(replacement.patch);
+      return replacement.result;
+    });
+    this.#tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
 }
 
 class MemoryAccessTokenRepository implements AccessTokenRepository {
   tokens: StoredAccessToken[] = [];
   async list(): Promise<StoredAccessToken[]> { return this.tokens.map((token) => ({ ...token })); }
   async create(token: StoredAccessToken): Promise<void> { this.tokens.push({ ...token }); }
-  async delete(id: string): Promise<boolean> {
+  async revoke(id: string, retainedAdministratorCount: number): Promise<"deleted" | "not-found" | "last-admin"> {
     const index = this.tokens.findIndex((token) => token.id === id);
-    if (index < 0) return false;
+    if (index < 0) return "not-found";
+    if (this.tokens[index]?.role === "admin"
+      && this.tokens.filter((token, tokenIndex) => tokenIndex !== index && token.role === "admin").length + retainedAdministratorCount === 0) {
+      return "last-admin";
+    }
     this.tokens.splice(index, 1);
-    return true;
+    return "deleted";
   }
 }
 

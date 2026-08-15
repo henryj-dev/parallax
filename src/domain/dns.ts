@@ -82,6 +82,9 @@ export const AUDIT_ACTIONS = [
   "desired.replaced",
   "desired.restored",
   "records.adopted",
+  "provider.apply.started",
+  "provider.apply.completed",
+  "provider.apply.failed",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -178,7 +181,36 @@ export function validateRecordId(value: string): string {
  * `undefined` means the content is acceptable; a string is what is wrong with
  * it. Anything not listed is rejected by the type check before reaching here.
  */
+/**
+ * Reject bytes and tokens that can change the structure of a CoreDNS zone file
+ * rather than describe one RDATA value.
+ *
+ * TXT is serialized as quoted character-strings by the adapter, so a semicolon
+ * there remains data. Other record types are written in presentation form and
+ * cannot safely contain record terminators, multiline delimiters or directives.
+ */
+export function zoneFileContentIssue(type: string, content: string): string | undefined {
+  if (/[\u0000-\u001f\u007f]/u.test(content)) {
+    return `${type || "record"} content must not contain control characters`;
+  }
+  if (type !== "TXT" && /[;()]/u.test(content)) {
+    return `${type || "record"} content must not contain zone-file structural characters`;
+  }
+  if (type !== "TXT" && /(?:^|\s)\$[a-z][a-z0-9_-]*/iu.test(content)) {
+    return `${type || "record"} content must not contain zone-file directives`;
+  }
+  return undefined;
+}
+
+/** Defense in depth for adapters called without `createDesiredRecord`. */
+export function assertZoneFileSafeContent(type: string, content: string): void {
+  const issue = zoneFileContentIssue(type, content);
+  if (issue) throw new DomainValidationError([issue]);
+}
+
 function validateRecordContent(type: string, content: string): string | undefined {
+  const unsafe = zoneFileContentIssue(type, content);
+  if (unsafe) return unsafe;
   const fields = content.split(/\s+/u).filter((field) => field.length > 0);
   const quoted = [...content.matchAll(/"(?:[^"\\]|\\.)*"/gu)];
   switch (type) {

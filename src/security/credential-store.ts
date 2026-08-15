@@ -6,7 +6,8 @@ const DOCUMENT_VERSION = 2;
 const ALGORITHM = "aes-256-gcm";
 const NONCE_BYTES = 12;
 const AUTHENTICATION_TAG_BYTES = 16;
-const AAD = Buffer.from("parallax:credential-store:v1", "utf8");
+const AAD_LABEL = "parallax:credential-store:v1";
+const LEGACY_AAD = Buffer.from(AAD_LABEL, "utf8");
 /** Exported so the portal's `pattern` attribute can be checked against it. */
 export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/u;
 
@@ -97,6 +98,8 @@ interface PlaintextDocument {
 interface EncryptedEnvelope {
   version: 1;
   algorithm: "AES-256-GCM";
+  /** Monotonic within the atomic repository; absent on legacy envelopes. */
+  revision?: number;
   nonce: string;
   authenticationTag: string;
   ciphertext: string;
@@ -105,6 +108,11 @@ interface EncryptedEnvelope {
 interface StoreState {
   profiles: Map<string, StoredProfile>;
   bindings: Map<string, StoredBinding>;
+}
+
+interface OpenedState {
+  readonly state: StoreState;
+  readonly revision: number;
 }
 
 /**
@@ -116,13 +124,15 @@ interface StoreState {
  *
  * Mutations on one instance are serialized, and the sealed document is handed to
  * the repository as a single value, so a reader sees either the old set or the
- * new one and never a half-written mix.
+ * new one and never a half-written mix. Envelope revisions detect rollback after
+ * this process has observed a newer value. They cannot detect a valid old envelope
+ * replayed before a cold start without an external monotonic trust anchor.
  */
 export class EncryptedCredentialStore {
   readonly #repository: CredentialRepository;
   readonly #masterKey: Buffer;
   readonly #now: () => Date;
-  #state: StoreState | undefined;
+  #highestRevision = 0;
   #mutationTail: Promise<void> = Promise.resolve();
 
   constructor(options: EncryptedCredentialStoreOptions) {
@@ -154,8 +164,7 @@ export class EncryptedCredentialStore {
     const token = validateToken(input.token);
     const accountId = input.accountId === undefined ? undefined : validateAccountId(input.accountId);
 
-    return this.#enqueueMutation(async () => {
-      const state = await this.#load();
+    return this.#enqueueMutation(() => this.#update((state) => {
       const profile: StoredProfile = {
         name: profileName,
         ...(accountId ? { accountId } : {}),
@@ -164,18 +173,15 @@ export class EncryptedCredentialStore {
       };
       const next = cloneState(state);
       next.profiles.set(profileName, profile);
-      await this.#persist(next);
-      this.#state = next;
-      return toProfileMetadata(profile);
-    });
+      return { state: next, result: toProfileMetadata(profile) };
+    }));
   }
 
   /** Refuses while any zone still points at the profile, so routing cannot silently break. */
   async deleteProfile(name: string): Promise<boolean> {
     const profileName = normalizeProfileName(name);
-    return this.#enqueueMutation(async () => {
-      const state = await this.#load();
-      if (!state.profiles.has(profileName)) return false;
+    return this.#enqueueMutation(() => this.#update((state) => {
+      if (!state.profiles.has(profileName)) return { state, result: false };
       const bound = [...state.bindings.values()]
         .filter((binding) => binding.profile === profileName)
         .map((binding) => binding.zone)
@@ -183,10 +189,8 @@ export class EncryptedCredentialStore {
       if (bound.length > 0) throw new CredentialInUseError(bound);
       const next = cloneState(state);
       next.profiles.delete(profileName);
-      await this.#persist(next);
-      this.#state = next;
-      return true;
-    });
+      return { state: next, result: true };
+    }));
   }
 
   async listBindings(): Promise<CloudflareZoneBinding[]> {
@@ -210,8 +214,7 @@ export class EncryptedCredentialStore {
     const zoneId = validateZoneId(input.zoneId);
     const profileName = normalizeProfileName(input.profile);
 
-    return this.#enqueueMutation(async () => {
-      const state = await this.#load();
+    return this.#enqueueMutation(() => this.#update((state) => {
       if (!state.profiles.has(profileName)) {
         throw new CredentialValidationError(`credential profile ${profileName} does not exist`);
       }
@@ -223,23 +226,18 @@ export class EncryptedCredentialStore {
       };
       const next = cloneState(state);
       next.bindings.set(normalizedZone, binding);
-      await this.#persist(next);
-      this.#state = next;
-      return toBinding(binding, next.profiles.get(profileName));
-    });
+      return { state: next, result: toBinding(binding, next.profiles.get(profileName)) };
+    }));
   }
 
   async unbindZone(zone: string): Promise<boolean> {
     const normalizedZone = normalizeZone(zone);
-    return this.#enqueueMutation(async () => {
-      const state = await this.#load();
-      if (!state.bindings.has(normalizedZone)) return false;
+    return this.#enqueueMutation(() => this.#update((state) => {
+      if (!state.bindings.has(normalizedZone)) return { state, result: false };
       const next = cloneState(state);
       next.bindings.delete(normalizedZone);
-      await this.#persist(next);
-      this.#state = next;
-      return true;
-    });
+      return { state: next, result: true };
+    }));
   }
 
   /** Trusted server wiring only. API handlers must use the metadata readers instead. */
@@ -280,41 +278,65 @@ export class EncryptedCredentialStore {
   }
 
   async #load(): Promise<StoreState> {
-    if (this.#state) return this.#state;
-
     let encoded: string | undefined;
     try {
       encoded = await this.#repository.read();
     } catch {
       throw openError();
     }
-    if (encoded === undefined) {
-      this.#state = { profiles: new Map(), bindings: new Map() };
-      return this.#state;
-    }
-
     try {
-      const envelope = parseEnvelope(encoded);
-      const decipher = createDecipheriv(ALGORITHM, this.#masterKey, envelope.nonce);
-      decipher.setAAD(AAD);
-      decipher.setAuthTag(envelope.authenticationTag);
-      const plaintext = Buffer.concat([
-        decipher.update(envelope.ciphertext),
-        decipher.final(),
-      ]).toString("utf8");
-      const document = parseDocument(plaintext);
-      this.#state = {
-        profiles: new Map(document.profiles.map((profile) => [profile.name, profile])),
-        bindings: new Map(document.bindings.map((binding) => [binding.zone, binding])),
-      };
-      return this.#state;
+      const opened = this.#open(encoded);
+      this.#acceptRevision(opened.revision);
+      return opened.state;
     } catch {
       throw openError();
     }
   }
 
-  async #persist(state: StoreState): Promise<void> {
-    let sealed: string;
+  async #update<T>(operation: (state: StoreState) => { state: StoreState; result: T }): Promise<T> {
+    try {
+      const committed = await this.#repository.update((encoded) => {
+        let current: OpenedState;
+        try {
+          current = this.#open(encoded);
+        } catch {
+          throw openError();
+        }
+        if (current.revision < this.#highestRevision) throw openError();
+        const mutation = operation(current.state);
+        const revision = current.revision + 1;
+        return {
+          document: this.#seal(mutation.state, revision),
+          result: { value: mutation.result, revision },
+        };
+      });
+      this.#acceptRevision(committed.revision);
+      return committed.value;
+    } catch (error) {
+      if (error instanceof CredentialValidationError || error instanceof CredentialInUseError
+        || (error instanceof Error && (error.message === openError().message || error.message === saveError().message))) throw error;
+      throw saveError();
+    }
+  }
+
+  #open(encoded: string | undefined): OpenedState {
+    if (encoded === undefined) return { state: { profiles: new Map(), bindings: new Map() }, revision: 0 };
+    const envelope = parseEnvelope(encoded);
+    const decipher = createDecipheriv(ALGORITHM, this.#masterKey, envelope.nonce);
+    decipher.setAAD(aadForRevision(envelope.revision));
+    decipher.setAuthTag(envelope.authenticationTag);
+    const plaintext = Buffer.concat([decipher.update(envelope.ciphertext), decipher.final()]).toString("utf8");
+    const document = parseDocument(plaintext);
+    return {
+      state: {
+        profiles: new Map(document.profiles.map((profile) => [profile.name, profile])),
+        bindings: new Map(document.bindings.map((binding) => [binding.zone, binding])),
+      },
+      revision: envelope.revision,
+    };
+  }
+
+  #seal(state: StoreState, revision: number): string {
     try {
       const document: PlaintextDocument = {
         version: DOCUMENT_VERSION,
@@ -323,24 +345,25 @@ export class EncryptedCredentialStore {
       };
       const nonce = randomBytes(NONCE_BYTES);
       const cipher = createCipheriv(ALGORITHM, this.#masterKey, nonce);
-      cipher.setAAD(AAD);
+      cipher.setAAD(aadForRevision(revision));
       const ciphertext = Buffer.concat([cipher.update(JSON.stringify(document), "utf8"), cipher.final()]);
       const envelope: EncryptedEnvelope = {
         version: FILE_VERSION,
         algorithm: "AES-256-GCM",
+        revision,
         nonce: nonce.toString("base64"),
         authenticationTag: cipher.getAuthTag().toString("base64"),
         ciphertext: ciphertext.toString("base64"),
       };
-      sealed = `${JSON.stringify(envelope)}\n`;
+      return `${JSON.stringify(envelope)}\n`;
     } catch {
       throw saveError();
     }
-    try {
-      await this.#repository.write(sealed);
-    } catch {
-      throw saveError();
-    }
+  }
+
+  #acceptRevision(revision: number): void {
+    if (revision < this.#highestRevision) throw openError();
+    this.#highestRevision = revision;
   }
 }
 
@@ -409,11 +432,14 @@ function parseEnvelope(encoded: string): {
   nonce: Buffer;
   authenticationTag: Buffer;
   ciphertext: Buffer;
+  revision: number;
 } {
   const value: unknown = JSON.parse(encoded);
   if (!isObject(value)
     || value.version !== FILE_VERSION
     || value.algorithm !== "AES-256-GCM"
+    || (value.revision !== undefined && (typeof value.revision !== "number"
+      || !Number.isSafeInteger(value.revision) || value.revision < 1))
     || typeof value.nonce !== "string"
     || typeof value.authenticationTag !== "string"
     || typeof value.ciphertext !== "string") {
@@ -425,7 +451,11 @@ function parseEnvelope(encoded: string): {
   if (nonce.byteLength !== NONCE_BYTES || authenticationTag.byteLength !== AUTHENTICATION_TAG_BYTES || ciphertext.byteLength === 0) {
     throw openError();
   }
-  return { nonce, authenticationTag, ciphertext };
+  return { nonce, authenticationTag, ciphertext, revision: value.revision === undefined ? 0 : value.revision };
+}
+
+function aadForRevision(revision: number): Buffer {
+  return revision === 0 ? LEGACY_AAD : Buffer.from(`${AAD_LABEL}:revision:${revision}`, "utf8");
 }
 
 function parseDocument(encoded: string): PlaintextDocument {

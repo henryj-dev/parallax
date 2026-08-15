@@ -69,6 +69,14 @@ interface PreparedConfig {
   readonly identitySessionSecret?: string;
 }
 
+const trustedClientKeys = new WeakMap<Request, string>();
+
+/** Transport-only metadata used for per-client throttling; never read from an HTTP header. */
+export function setTrustedClientKey(request: Request, key: string): void {
+  const normalized = key.trim();
+  trustedClientKeys.set(request, normalized.length > 0 ? normalized : "unknown-client");
+}
+
 // RFC 6750 b64token syntax; excluding whitespace and header/cookie delimiters also
 // makes credential extraction unambiguous.
 const TOKEN_PATTERN = /^[A-Za-z0-9._~+\/-]+=*$/u;
@@ -159,6 +167,7 @@ export function createAuthorizedHandler(
   if (initial.enabled) preparedFor(initial);
 
   return async (request) => {
+    const clientKey = trustedClientKeys.get(request) ?? "direct-fetch-client";
     const config = resolve();
     if (!config.enabled) {
       // The actor is security-owned in both modes; a client must never be able
@@ -167,14 +176,13 @@ export function createAuthorizedHandler(
     }
     const prepared = preparedFor(config);
     const sessionMaxAge = config.sessionMaxAgeSeconds ?? DEFAULT_SESSION_MAX_AGE_SECONDS;
-    if (isSessionRoute(request)) return handleSession(request, prepared, throttle, sessionMaxAge);
+    if (isSessionRoute(request)) return handleSession(request, prepared, throttle, sessionMaxAge, clientKey);
 
     const principal = authenticateWithPreparedTokens(request, prepared);
     if (!principal) {
-      const retryAfterMs = throttle.recordFailure();
+      const retryAfterMs = throttle.recordFailure(clientKey);
       return retryAfterMs === undefined ? authenticationError(401) : tooManyAttempts(retryAfterMs);
     }
-    throttle.recordSuccess();
     if (isUnsafeMethod(request.method) && !request.headers.has("authorization") && !hasSameOrigin(request)) {
       return authenticationError(403);
     }
@@ -202,6 +210,7 @@ async function handleSession(
   prepared: PreparedConfig,
   throttle: FailureThrottle,
   maxAgeSeconds: number,
+  clientKey: string,
 ): Promise<Response> {
   if (request.method === "GET") {
     // Who the caller currently is. The portal draws itself from this: an
@@ -232,10 +241,9 @@ async function handleSession(
   }
   const principal = typeof candidate === "string" ? matchToken(candidate, prepared.tokens) : undefined;
   if (!principal) {
-    const retryAfterMs = throttle.recordFailure();
+    const retryAfterMs = throttle.recordFailure(clientKey);
     return retryAfterMs === undefined ? authenticationError(401) : tooManyAttempts(retryAfterMs);
   }
-  throttle.recordSuccess();
   return Response.json(
     { role: principal.role, subject: principal.subject, expiresIn: maxAgeSeconds },
     {
@@ -298,8 +306,7 @@ class FailureThrottle {
   readonly #limit: number;
   readonly #windowMs: number;
   readonly #now: () => number;
-  #failures = 0;
-  #windowStartedAt = 0;
+  readonly #clients = new Map<string, { failures: number; windowStartedAt: number }>();
 
   constructor(limit: number, windowMs: number, now: () => number) {
     this.#limit = Math.max(1, Math.trunc(limit));
@@ -308,20 +315,24 @@ class FailureThrottle {
   }
 
   /** Returns the retry-after delay in milliseconds once the window's budget is spent. */
-  recordFailure(): number | undefined {
+  recordFailure(clientKey: string): number | undefined {
     const now = this.#now();
-    if (this.#failures === 0 || now - this.#windowStartedAt >= this.#windowMs) {
-      this.#windowStartedAt = now;
-      this.#failures = 0;
+    let client = this.#clients.get(clientKey);
+    if (!client || now - client.windowStartedAt >= this.#windowMs) {
+      client = { failures: 0, windowStartedAt: now };
     }
-    this.#failures += 1;
-    if (this.#failures <= this.#limit) return undefined;
-    return Math.max(1, this.#windowStartedAt + this.#windowMs - now);
+    client.failures += 1;
+    // Refresh insertion order so the bounded map evicts an actually idle key,
+    // never the client whose current attempt is being counted.
+    this.#clients.delete(clientKey);
+    this.#clients.set(clientKey, client);
+    // A trusted proxy can still have many real clients. Bound idle bookkeeping
+    // without ever turning one client's failures into another's lockout.
+    if (this.#clients.size > 10_000) this.#clients.delete(this.#clients.keys().next().value as string);
+    if (client.failures <= this.#limit) return undefined;
+    return Math.max(1, client.windowStartedAt + this.#windowMs - now);
   }
 
-  recordSuccess(): void {
-    this.#failures = 0;
-  }
 }
 
 function isUnsafeMethod(method: string): boolean {
@@ -374,7 +385,14 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
 }
 
 function authenticateWithPreparedTokens(request: Request, prepared: PreparedConfig): Principal | undefined {
-  const candidate = readCandidate(request, prepared.cookieName);
+  const authorization = request.headers.get("authorization");
+  if (authorization !== null) {
+    const match = /^Bearer ([^\s]+)$/iu.exec(authorization);
+    // Explicit credentials are authoritative. A malformed or invalid Bearer
+    // value must not silently inherit the browser's OIDC identity cookie.
+    return match?.[1] === undefined ? undefined : matchToken(match[1], prepared.tokens);
+  }
+  const candidate = readCookie(request.headers.get("cookie"), prepared.cookieName);
   const byToken = candidate === undefined ? undefined : matchToken(candidate, prepared.tokens);
   if (byToken) return byToken;
   // Second, not first: a request that presented a token meant to act as that
@@ -402,15 +420,6 @@ function matchToken(candidate: string, tokens: readonly PreparedToken[]): Princi
     if (equal) match = record.principal;
   }
   return match;
-}
-
-function readCandidate(request: Request, cookieName: string): string | undefined {
-  const authorization = request.headers.get("authorization");
-  if (authorization !== null) {
-    const match = /^Bearer ([^\s]+)$/iu.exec(authorization);
-    return match?.[1];
-  }
-  return readCookie(request.headers.get("cookie"), cookieName);
 }
 
 function readCookie(header: string | null, name: string): string | undefined {

@@ -14,7 +14,7 @@ import {
 } from "../cli/commands.ts";
 import { DomainValidationError } from "../domain/dns.ts";
 import { CredentialInUseError, CredentialValidationError } from "../security/credential-store.ts";
-import { authenticate, createAuthorizedHandler, type Role, type SecurityConfig } from "../security/http-authorization.ts";
+import { authenticate, createAuthorizedHandler, setTrustedClientKey, type Role, type SecurityConfig } from "../security/http-authorization.ts";
 
 const MAX_REQUEST_BODY_BYTES = 1_048_576;
 
@@ -77,6 +77,10 @@ export function createNodeHandler(
       headers,
       ...(body.length > 0 ? { body } : {}),
     });
+    // Do not copy a client-controlled marker header into the authentication
+    // layer. The transport attaches out-of-band metadata to this Request; only
+    // a configured trusted proxy may supply the forwarded client address.
+    setTrustedClientKey(fetchRequest, requestClientKey(request, options));
     const result = await handler(fetchRequest);
     response.statusCode = result.status;
     result.headers.forEach((value, name) => response.setHeader(name, value));
@@ -88,6 +92,18 @@ export function createNodeHandler(
     }
     response.end(payload);
   };
+}
+
+function requestClientKey(request: IncomingMessage, options: NodeHandlerOptions): string {
+  const forwarded = options.trustForwardedHeaders
+    ? lastHeaderValue(request.headers["x-forwarded-for"])
+    : undefined;
+  return forwarded ?? request.socket?.remoteAddress ?? "unknown-client";
+}
+
+function lastHeaderValue(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value.at(-1) : value;
+  return raw?.split(",").at(-1)?.trim() || undefined;
 }
 
 /**
@@ -142,8 +158,9 @@ async function route(runtime: CommandRuntime, request: Request, security: Securi
     role: roleOf(request, security),
   };
 
-  // The command line, reachable over HTTP. The same dispatcher runs it, so a
-  // caller can drive anything the CLI can without a shell ever being involved.
+  // Serving commands, reachable over HTTP through the same dispatcher. The
+  // runtime intentionally has no `migrate` capability, so an HTTP admin can
+  // never turn the server's database role into a schema-changing role.
   if (segments[2] === "cli" && segments.length === 3 && method === "POST") {
     const body = await parseJson(request);
     const argv = body.argv;
@@ -186,7 +203,9 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
   if (area === "credentials") return credentialRoute(segments, method, request);
 
   if (area === "zones") {
-    if (segments.length === 3 && method === "GET") return { command: "zone list", input: {} };
+    if (segments.length === 3 && method === "GET") {
+      return { command: "zone list", input: readPageQuery(url) };
+    }
     if (segments.length === 3 && method === "POST") {
       const body = await parseJson(request);
       return { command: "zone create", input: { zone: readString(body, "name") }, status: 201, revisioned: true };

@@ -4,6 +4,7 @@ import {
   authenticate,
   authorize,
   createAuthorizedHandler,
+  setTrustedClientKey,
   type SecurityConfig,
 } from "../../src/security/http-authorization.ts";
 
@@ -162,6 +163,29 @@ describe("authorized handler", () => {
 
     clock += 60_001;
     assert.equal((await guess()).status, 401);
+  });
+
+  it("isolates failure budgets per trusted transport client", async () => {
+    const throttled = createAuthorizedHandler(
+      { ...config, maxFailedAttempts: 2, lockoutMs: 60_000 },
+      downstream,
+      () => 1_000,
+    );
+    const call = async (client: string, token: string): Promise<Response> => {
+      const incoming = request("/api/v1/zones", "GET", token);
+      setTrustedClientKey(incoming, client);
+      return throttled(incoming);
+    };
+
+    assert.equal((await call("attacker", "wrong-secret-0000000000000000000")).status, 401);
+    assert.equal((await call("attacker", "wrong-secret-0000000000000000000")).status, 401);
+    assert.equal((await call("attacker", "viewer-secret-0000000000000000000")).status, 200,
+      "a valid credential is always accepted even while failures are counted");
+    assert.equal((await call("valid-client", "viewer-secret-0000000000000000000")).status, 200);
+    assert.equal((await call("attacker", "wrong-secret-0000000000000000000")).status, 429,
+      "neither the attacker's valid credential nor another client may reset its failure budget");
+    assert.equal((await call("unrelated", "wrong-secret-0000000000000000000")).status, 401,
+      "one attacker must not globally lock out unrelated clients");
   });
 
   it("owns the audit actor even when authentication is disabled", async () => {

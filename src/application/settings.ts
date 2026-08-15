@@ -31,6 +31,11 @@ export const DEFAULT_SETTINGS: ParallaxSettings = Object.freeze({
   auditRetentionDays: 365,
 });
 
+/** Bounds keep date arithmetic and whole-store retention work predictable. */
+export const MAX_REVISION_RETENTION = 1_000_000;
+export const MAX_AUDIT_RETENTION_DAYS = 36_500;
+export const SETTINGS_REFRESH_INTERVAL_MS = 5_000;
+
 export const SETTING_KEYS = Object.freeze(Object.keys(DEFAULT_SETTINGS) as Array<keyof ParallaxSettings>);
 
 export type SettingsListener = (settings: ParallaxSettings, previous: ParallaxSettings) => void | Promise<void>;
@@ -56,9 +61,9 @@ export interface SettingsUpdate {
 }
 
 /**
- * Reads settings once at startup and keeps the cached copy authoritative for
- * this process, so a request never waits on the store to answer a question the
- * control plane asks on every call.
+ * Keeps a process-local copy so requests never wait on the store, while a
+ * bounded background refresh applies changes made by another process through
+ * the same verifier and runtime listeners as a local update.
  */
 export class SettingsService {
   readonly #repository: SettingsRepository;
@@ -66,6 +71,7 @@ export class SettingsService {
   readonly #verify: SettingsVerifier | undefined;
   readonly #advise: SettingsAdvisor | undefined;
   #settings: ParallaxSettings = DEFAULT_SETTINGS;
+  #operationTail: Promise<void> = Promise.resolve();
 
   constructor(repository: SettingsRepository, verify?: SettingsVerifier, advise?: SettingsAdvisor) {
     this.#repository = repository;
@@ -73,9 +79,16 @@ export class SettingsService {
     this.#advise = advise;
   }
 
-  async load(): Promise<ParallaxSettings> {
-    this.#settings = parseSettings(await this.#repository.read());
-    return this.#settings;
+  load(): Promise<ParallaxSettings> {
+    return this.#enqueue(async () => {
+      const candidate = parseSettings(await this.#repository.read());
+      // A value restored from disk or written by another replica must satisfy the
+      // same machine-specific invariants as an API update. Otherwise restart is a
+      // bypass around the verifier that protects filesystem and proxy boundaries.
+      await this.#verify?.(candidate, this.#settings);
+      this.#settings = candidate;
+      return this.#settings;
+    });
   }
 
   current(): ParallaxSettings {
@@ -86,26 +99,92 @@ export class SettingsService {
     this.#listeners.push(listener);
   }
 
+  /** Re-reads and applies a setting written by another process or replica. */
+  refresh(): Promise<ParallaxSettings> {
+    return this.#enqueue(() => this.#refresh());
+  }
+
+  startRefreshing(
+    intervalMs = SETTINGS_REFRESH_INTERVAL_MS,
+    onError: (error: unknown) => void = () => {},
+  ): () => void {
+    const timer = setInterval(() => { this.refresh().catch(onError); }, intervalMs);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
   /** Validates and persists a partial update, then lets the process re-wire itself. */
-  async update(patch: unknown): Promise<SettingsUpdate> {
-    const changes = readPatch(patch);
-    if (Object.keys(changes).length === 0) return { settings: this.#settings, warnings: [] };
+  update(patch: unknown): Promise<SettingsUpdate> {
+    return this.#enqueue(async () => {
+      const changes = readPatch(patch);
+      if (Object.keys(changes).length === 0) return { settings: this.#settings, warnings: [] };
+      const previous = this.#settings;
+      let transition: { candidate: ParallaxSettings; applied: SettingsListener[] } | undefined;
+      let candidate: ParallaxSettings;
+      try {
+        candidate = await this.#repository.update(async (stored) => {
+          // The backend holds its cross-process lock from this latest read
+          // through verification, runtime re-wiring, and the patch write. Two
+          // individually valid concurrent patches therefore cannot commit an
+          // invalid combination derived from the same stale snapshot.
+          const merged = parseSettings({ ...stored, ...changes });
+          await this.#verify?.(merged, previous);
+          const applied = await this.#applyListeners(merged, previous);
+          transition = { candidate: merged, applied };
+          return { patch: changes, result: merged };
+        });
+      } catch (error) {
+        if (transition) await this.#rollbackListeners(transition.applied, previous, transition.candidate);
+        throw error;
+      }
+      this.#settings = candidate;
+      return { settings: this.#settings, warnings: this.#advise?.(candidate, previous) ?? [] };
+    });
+  }
+
+  async #refresh(): Promise<ParallaxSettings> {
+    const candidate = parseSettings(await this.#repository.read());
     const previous = this.#settings;
-    const candidate = parseSettings({ ...toRecord(previous), ...changes });
-    // Verified before it is stored, so a setting the process cannot act on is
-    // refused to the person changing it. Left unchecked, the same mistake
-    // surfaces at the first apply instead -- as a deliberately redacted
-    // provider error, to somebody who was not there when the value changed.
+    if (sameSettings(candidate, previous)) return previous;
     await this.#verify?.(candidate, previous);
-    await this.#repository.write(changes);
+    await this.#applyListeners(candidate, previous);
     this.#settings = candidate;
-    for (const listener of this.#listeners) await listener(this.#settings, previous);
-    return { settings: this.#settings, warnings: this.#advise?.(candidate, previous) ?? [] };
+    return candidate;
+  }
+
+  async #applyListeners(candidate: ParallaxSettings, previous: ParallaxSettings): Promise<SettingsListener[]> {
+    const applied: SettingsListener[] = [];
+    try {
+      for (const listener of this.#listeners) {
+        await listener(candidate, previous);
+        applied.push(listener);
+      }
+      return applied;
+    } catch (error) {
+      await this.#rollbackListeners(applied, previous, candidate);
+      throw error;
+    }
+  }
+
+  async #rollbackListeners(
+    applied: SettingsListener[],
+    previous: ParallaxSettings,
+    candidate: ParallaxSettings,
+  ): Promise<void> {
+    for (const listener of [...applied].reverse()) {
+      await Promise.resolve(listener(previous, candidate)).catch(() => undefined);
+    }
+  }
+
+  #enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#operationTail.then(operation);
+    this.#operationTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 }
 
-function toRecord(settings: ParallaxSettings): Record<string, unknown> {
-  return { ...settings };
+function sameSettings(left: ParallaxSettings, right: ParallaxSettings): boolean {
+  return SETTING_KEYS.every((key) => left[key] === right[key]);
 }
 
 /** Applies stored values over the defaults, ignoring anything unrecognized. */
@@ -119,8 +198,8 @@ export function parseSettings(stored: Record<string, unknown>): ParallaxSettings
     coreDnsDirectory: readText(merged.coreDnsDirectory, "coreDnsDirectory"),
     publicOrigin: readOrigin(merged.publicOrigin),
     trustForwardedHeaders: readBoolean(merged.trustForwardedHeaders, "trustForwardedHeaders"),
-    revisionRetention: readCount(merged.revisionRetention, "revisionRetention"),
-    auditRetentionDays: readCount(merged.auditRetentionDays, "auditRetentionDays"),
+    revisionRetention: readCount(merged.revisionRetention, "revisionRetention", MAX_REVISION_RETENTION),
+    auditRetentionDays: readCount(merged.auditRetentionDays, "auditRetentionDays", MAX_AUDIT_RETENTION_DAYS),
   };
 }
 
@@ -155,9 +234,9 @@ function readText(value: unknown, field: string): string {
   return text;
 }
 
-function readCount(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new DomainValidationError([`${field} must be a non-negative integer`]);
+function readCount(value: unknown, field: string, maximum: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > maximum) {
+    throw new DomainValidationError([`${field} must be an integer between 0 and ${maximum}`]);
   }
   return value;
 }
@@ -173,6 +252,10 @@ function readOrigin(value: unknown): string {
   }
   if ((url.protocol !== "http:" && url.protocol !== "https:") || url.origin !== origin.replace(/\/$/, "")) {
     throw new DomainValidationError(["publicOrigin must be an absolute http or https origin"]);
+  }
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !loopback) {
+    throw new DomainValidationError(["publicOrigin must use https unless it is a loopback origin"]);
   }
   return url.origin;
 }

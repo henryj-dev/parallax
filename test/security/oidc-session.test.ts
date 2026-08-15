@@ -101,6 +101,17 @@ describe("identity sign-in", () => {
 
     const anonymous = await handler(new Request(`https://parallax.example${SESSION_PATH}`));
     assert.equal(anonymous.status, 401, "it must not describe a caller that has not authenticated");
+
+    for (const authorization of ["Bearer wrong-token-value-that-is-long-enough", "Basic malformed"]) {
+      const explicitFailure = await handler(new Request(`https://parallax.example${SESSION_PATH}`, {
+        headers: {
+          authorization,
+          cookie: `${IDENTITY_COOKIE}=${encodeURIComponent(session)}`,
+        },
+      }));
+      assert.equal(explicitFailure.status, 401,
+        "an explicit invalid Authorization header must not fall back to the browser identity");
+    }
   });
 
   it("refuses a callback whose state is not the one this browser was given", async () => {

@@ -27,11 +27,14 @@ export class ProviderConstraintError extends Error {
  * Bounds what a zone's history keeps. Applied inside the same atomic commit as
  * the change that produced it, so storage cannot grow without limit.
  */
-export interface RetentionPolicy {
-  /** Newest snapshots to keep for the zone. Omit or use 0 to keep every one. */
-  readonly maxRevisionsPerZone?: number;
+export interface AuditRetentionPolicy {
   /** ISO timestamp; audit entries for the zone recorded before it are removed. */
   readonly deleteAuditBefore?: string;
+}
+
+export interface RetentionPolicy extends AuditRetentionPolicy {
+  /** Newest snapshots to keep for the zone. Omit or use 0 to keep every one. */
+  readonly maxRevisionsPerZone?: number;
 }
 
 export interface DesiredChange {
@@ -49,10 +52,24 @@ export interface ZoneDeletion {
 }
 
 /** Key/value persistence for operator-owned settings. */
+export interface SettingsRepositoryUpdate<T> {
+  /** Only these keys are written; every other latest stored value is retained. */
+  readonly patch: Record<string, unknown>;
+  readonly result: T;
+}
+
 export interface SettingsRepository {
   read(): Promise<Record<string, unknown>>;
   /** Writes only the supplied keys, leaving every other setting untouched. */
   write(values: Record<string, unknown>): Promise<void>;
+  /**
+   * Derives a patch asynchronously from the latest values under one exclusive
+   * backend lock or transaction. If the callback or write fails, no patch is
+   * committed. The callback must not recursively access this repository.
+   */
+  update<T>(
+    operation: (current: Record<string, unknown>) => Promise<SettingsRepositoryUpdate<T>>,
+  ): Promise<T>;
 }
 
 /**
@@ -63,6 +80,14 @@ export interface SettingsRepository {
 export interface CredentialRepository {
   read(): Promise<string | undefined>;
   write(document: string): Promise<void>;
+  /**
+   * Atomically derives a replacement from the latest document.
+   *
+   * Whole-document credential stores must keep the read, callback and write
+   * under one backend lock/transaction; otherwise two replicas can silently
+   * discard each other's profile or binding changes.
+   */
+  update<T>(operation: (document: string | undefined) => { document: string; result: T }): Promise<T>;
 }
 
 export interface StoredAccessToken {
@@ -74,10 +99,17 @@ export interface StoredAccessToken {
   readonly createdAt: string;
 }
 
+export type AccessTokenRevocationResult = "deleted" | "not-found" | "last-admin";
+
 export interface AccessTokenRepository {
   list(): Promise<StoredAccessToken[]>;
   create(token: StoredAccessToken): Promise<void>;
-  delete(id: string): Promise<boolean>;
+  /**
+   * Atomically enforces the last-administrator invariant and removes the token.
+   * `retainedAdministratorCount` counts administrators outside this repository,
+   * such as immutable environment break-glass tokens.
+   */
+  revoke(id: string, retainedAdministratorCount: number): Promise<AccessTokenRevocationResult>;
 }
 
 /** A bounded window over an otherwise unbounded history listing. */
@@ -87,7 +119,8 @@ export interface PageRequest {
 }
 
 export interface ZoneRepository {
-  list(): Promise<Zone[]>;
+  /** Alphabetical by name. Without a page, returns every zone for trusted internal consumers. */
+  list(page?: PageRequest): Promise<Zone[]>;
   get(name: string): Promise<Zone | undefined>;
   save(zone: Zone): Promise<void>;
   /** Atomically stores a new immutable snapshot and makes it the current zone. */
@@ -100,7 +133,8 @@ export interface ZoneRepository {
   listRevisions(zone: string, page?: PageRequest): Promise<ZoneRevision[]>;
   getRevision(zone: string, revision: number): Promise<ZoneRevision | undefined>;
   delete(name: string): Promise<void>;
-  appendAudit(entry: Omit<AuditEntry, "id">): Promise<AuditEntry>;
+  /** Atomically appends the entry and applies same-zone audit retention. */
+  appendAudit(entry: Omit<AuditEntry, "id">, retention?: AuditRetentionPolicy): Promise<AuditEntry>;
   /** Newest first. Without a page the complete history is returned. */
   audit(zone?: string, page?: PageRequest): Promise<AuditEntry[]>;
 }
@@ -134,10 +168,35 @@ export interface ApplyStatus {
   plannedOperations?: number;
 }
 
+/**
+ * Merges a status write that may have raced a newer desired-state commit.
+ *
+ * The newer desired revision owns the visible state/error/progress, while an
+ * older apply is still allowed to contribute evidence that the provider was
+ * reached and how far the published revision advanced. Discarding that
+ * `lastAttemptAt` makes zone deletion forget a target that may now be live.
+ */
+export function mergeApplyStatus(existing: ApplyStatus | undefined, incoming: ApplyStatus): ApplyStatus {
+  if (!existing) return { ...incoming };
+  const selected = incoming.desiredRevision >= existing.desiredRevision ? incoming : existing;
+  const { lastAttemptAt: _selectedAttempt, ...base } = selected;
+  const lastAttemptAt = !existing.lastAttemptAt
+    ? incoming.lastAttemptAt
+    : !incoming.lastAttemptAt
+      ? existing.lastAttemptAt
+      : existing.lastAttemptAt >= incoming.lastAttemptAt ? existing.lastAttemptAt : incoming.lastAttemptAt;
+  return {
+    ...base,
+    desiredRevision: Math.max(existing.desiredRevision, incoming.desiredRevision),
+    appliedRevision: Math.max(existing.appliedRevision, incoming.appliedRevision),
+    ...(lastAttemptAt ? { lastAttemptAt } : {}),
+  };
+}
+
 export interface StatusRepository {
   get(zone: string, view: string): Promise<ApplyStatus | undefined>;
   list(zone: string): Promise<ApplyStatus[]>;
-  /** Saves unless a newer desired revision is already present for this zone/view. */
+  /** Merges provider-attempt evidence without downgrading a newer desired revision. */
   save(status: ApplyStatus): Promise<void>;
   deleteZone(zone: string): Promise<void>;
 }
