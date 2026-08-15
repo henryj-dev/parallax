@@ -9,14 +9,21 @@ import { BlockList, isIP } from "node:net";
  * can be validated; providers that model part of it as a separate field, as
  * Cloudflare does with MX priority, split and rejoin it in their adapter.
  *
- * Left out on purpose: SOA, and the DNSSEC records. Those describe the zone's
- * authority rather than its contents, every provider generates and signs them
- * itself, and a control plane that published its own would be overwriting the
- * provider's answer to a question it did not ask.
+ * Left out on purpose: SOA, and the DNSSEC records a signer produces for the zone
+ * it is signing -- `RRSIG`, `NSEC`, `NSEC3`. Those describe the zone's own
+ * authority, every provider generates them itself, and publishing our own would
+ * overwrite the provider's answer to a question we did not ask.
+ *
+ * `DS` and `DNSKEY` are here despite being DNSSEC records, because they are not
+ * that. A `DS` sits in the *parent* and delegates to a signed child, which is an
+ * operator's decision about somebody else's zone; `DNSKEY` is offered by
+ * providers for the same kind of hand-managed case. Excluding them as "DNSSEC"
+ * confused what a signer emits with what a delegation needs.
  */
 export const RECORD_TYPES = [
-  "A", "AAAA", "CAA", "CERT", "CNAME", "DNAME", "HINFO", "HTTPS", "MX", "NAPTR",
-  "NS", "OPENPGPKEY", "PTR", "SMIMEA", "SRV", "SSHFP", "SVCB", "TLSA", "TXT", "URI",
+  "A", "AAAA", "CAA", "CERT", "CNAME", "DNAME", "DNSKEY", "DS", "HINFO", "HTTPS",
+  "LOC", "MX", "NAPTR", "NS", "OPENPGPKEY", "PTR", "SMIMEA", "SRV", "SSHFP",
+  "SVCB", "TLSA", "TXT", "URI",
 ] as const;
 /** The only views Parallax can reconcile; every provider target is `<zone>/<view>`. */
 export const PROVIDER_VIEWS = ["external", "internal"] as const;
@@ -243,6 +250,21 @@ function validateRecordContent(type: string, content: string): string | undefine
     case "SSHFP":
       return fields.length === 3 && isUnsigned(fields[0], 8) && isUnsigned(fields[1], 8) && isHex(fields[2] as string)
         ? undefined : "SSHFP content must be an algorithm, a type and hexadecimal data, as in `4 2 ab12…`";
+    case "DS":
+      // The parent's pointer at a signed child: which key, signed how, digested how.
+      return fields.length === 4 && isUnsigned(fields[0], 16) && isUnsigned(fields[1], 8)
+        && isUnsigned(fields[2], 8) && isHex(fields[3] as string)
+        && hasDigestLengthFor(fields[2] as string, fields[3] as string)
+        ? undefined
+        : "DS content must be a key tag, an algorithm, a digest type and a digest of that type's length, as in `12345 8 2 <64 hex characters>`";
+    case "DNSKEY":
+      return fields.length === 4 && isUnsigned(fields[0], 16) && isUnsigned(fields[1], 8)
+        && isUnsigned(fields[2], 8) && isBase64(fields[3] as string)
+        ? undefined : "DNSKEY content must be flags, a protocol, an algorithm and base64 key data, as in `257 3 13 mdss…`";
+    case "LOC":
+      return isValidLocation(fields)
+        ? undefined
+        : "LOC content must be a latitude, a longitude and an altitude, as in `51 30 12.748 N 0 7 39.611 W 0.00m`";
     case "NAPTR":
       return fields.length >= 6 && isUnsigned(fields[0], 16) && isUnsigned(fields[1], 16) && quoted.length === 3
         ? undefined : 'NAPTR content must be two numbers, three quoted strings and a replacement, as in `100 10 "s" "SIP+D2U" "" _sip._udp.example.com`';
@@ -265,6 +287,53 @@ function validateRecordContent(type: string, content: string): string | undefine
     default:
       return undefined;
   }
+}
+
+/**
+ * `d1 [m1 [s1]] N|S  d2 [m2 [s2]] E|W  alt[m] [size[m] [hp[m] [vp[m]]]]`
+ *
+ * Read by walking to each hemisphere letter rather than by counting fields,
+ * because the minutes and seconds are optional on either side independently --
+ * a pattern that would need four alternatives to write as one expression, and
+ * that is exactly where such an expression stops being checkable by eye.
+ */
+function isValidLocation(fields: readonly string[]): boolean {
+  const northSouth = fields.findIndex((field) => /^[NS]$/iu.test(field));
+  const eastWest = fields.findIndex((field) => /^[EW]$/iu.test(field));
+  if (northSouth < 1 || northSouth > 3) return false;
+  if (eastWest <= northSouth || eastWest - northSouth > 4) return false;
+  const angle = (parts: readonly string[], limit: number): boolean =>
+    parts.length >= 1 && parts.length <= 3
+    && isBoundedNumber(parts[0], 0, limit) && (parts[1] === undefined || isBoundedNumber(parts[1], 0, 59))
+    && (parts[2] === undefined || isBoundedNumber(parts[2], 0, 59.999));
+  if (!angle(fields.slice(0, northSouth), 90)) return false;
+  if (!angle(fields.slice(northSouth + 1, eastWest), 180)) return false;
+  const rest = fields.slice(eastWest + 1);
+  // Altitude is required; size and the two precisions have defaults.
+  return rest.length >= 1 && rest.length <= 4
+    && rest.every((value) => isBoundedNumber(value.replace(/m$/iu, ""), -100_000, 42_849_672.95));
+}
+
+function isBoundedNumber(value: string | undefined, low: number, high: number): boolean {
+  if (value === undefined || !/^-?\d+(?:\.\d+)?$/u.test(value)) return false;
+  const parsed = Number(value);
+  return parsed >= low && parsed <= high;
+}
+
+/**
+ * A digest whose length contradicts its digest type is not a record a resolver
+ * will read -- measured: `dig` refuses to parse the answer and reports the
+ * message as malformed, so the name simply stops resolving. The provider
+ * accepts it, the plan converges, and nothing says what happened.
+ *
+ * Types this does not know are left alone: the registry gains entries, and
+ * refusing a digest because this list is old would be the opposite mistake.
+ */
+const DIGEST_BYTES: Readonly<Record<string, number>> = { "1": 20, "2": 32, "3": 32, "4": 48 };
+
+function hasDigestLengthFor(digestType: string, digest: string): boolean {
+  const expected = DIGEST_BYTES[digestType];
+  return expected === undefined || digest.length === expected * 2;
 }
 
 function isUnsigned(value: string | undefined, bits: number): boolean {

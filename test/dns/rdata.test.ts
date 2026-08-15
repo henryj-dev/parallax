@@ -20,6 +20,11 @@ const SAMPLES: Record<RecordType, { content: string; wire: string }> = {
   CERT: { content: "1 12345 8 aGVsbG8=", wire: "000130390868656c6c6f" },
   CNAME: { content: "origin.example.net", wire: "066f726967696e076578616d706c65036e657400" },
   DNAME: { content: "target.example.net", wire: "06746172676574076578616d706c65036e657400" },
+  DNSKEY: { content: "257 3 13 mdsswUyr3DPW132mOi8V9xESWE8=", wire: "0101030d99db2cc14cabdc33d6d77da63a2f15f71112584f" },
+  DS: { content: "12345 8 2 abababababababababababababababababababababababababababababababab", wire: "30390802abababababababababababababababababababababababababababababababab" },
+  // RFC 1876's own example. The three size bytes are the defaults it names, and
+  // the coordinates are unsigned offsets from the equator and the meridian.
+  LOC: { content: "51 30 12.748 N 0 7 39.611 W 0.00m", wire: "001216138b0d2c8c7ff8fca500989680" },
   HINFO: { content: '"Intel" "Linux"', wire: "05496e74656c054c696e7578" },
   HTTPS: { content: "1 . alpn=h2,h3", wire: "00010000010006026832026833" },
   MX: { content: "10 mail.example.com", wire: "000a046d61696c076578616d706c6503636f6d00" },

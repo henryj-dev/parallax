@@ -10,6 +10,11 @@ const SAMPLES: Record<string, { good: string; bad: string }> = {
   CERT: { good: "1 12345 8 aGVsbG8=", bad: "1 12345 8" },
   CNAME: { good: "origin.example.net", bad: "not a hostname" },
   DNAME: { good: "target.example.net", bad: "not a hostname" },
+  DNSKEY: { good: "257 3 13 mdsswUyr3DPW132mOi8V9xESWE8=", bad: "257 3 13 not base64!" },
+  // The bad one is well-formed except for its length: digest type 2 is SHA-256,
+  // and a resolver refuses to parse an answer whose digest is not 32 bytes.
+  DS: { good: "12345 8 2 abababababababababababababababababababababababababababababababab", bad: "12345 8 2 abab" },
+  LOC: { good: "51 30 12.748 N 0 7 39.611 W 0.00m", bad: "51 30 12.748 0 7 39.611 0.00m" },
   HINFO: { good: '"Intel" "Linux"', bad: "Intel Linux" },
   HTTPS: { good: "1 . alpn=h2,h3", bad: "alpn=h2" },
   MX: { good: "10 mail.example.com", bad: "mail.example.com" },

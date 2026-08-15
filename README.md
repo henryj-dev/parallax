@@ -675,10 +675,18 @@ own, and a zone file needs hostnames made absolute -- an `MX` target written as
 `mail.example.com.example.com`. Both are put back the way they were written when
 the record is read again, so neither shows up as drift.
 
-`SOA` and the DNSSEC records are not managed. They describe the zone's authority
-rather than its contents, every provider generates and signs them itself, and
-publishing our own would overwrite the provider's answer to a question we did
-not ask. An apex `NS` record is also not inherited by the internal view: it
+`SOA` and the records a signer emits for the zone it is signing -- `RRSIG`,
+`NSEC`, `NSEC3` -- are not managed. They describe the zone's own authority, every
+provider generates them itself, and publishing ours would overwrite the
+provider's answer to a question we did not ask. `DS` and `DNSKEY` are managed
+despite being DNSSEC records, because they are not that: a `DS` sits in the
+*parent* and delegates to a signed child, which is a decision an operator makes
+about somebody else's zone.
+
+A `DS` whose digest length contradicts its digest type is refused when it is
+saved. Such a record publishes cleanly and then stops resolving -- a resolver
+reports the answer as malformed rather than reading it -- which is the failure
+this control plane exists to make visible rather than discover later. An apex `NS` record is also not inherited by the internal view: it
 names the servers that answer for the zone, which is a fact about each provider,
 and copying it inward would delegate the internal view away from itself.
 
@@ -727,7 +735,7 @@ are added at the provider by hand.
 
 Two limits worth knowing before you rely on it:
 
-- A provider may hold types Parallax does not manage -- `SOA` and the DNSSEC
+- A provider may hold types Parallax does not manage -- `SOA` and the signer's
   records, which every provider generates for itself. Those are skipped rather
   than adopted. Compare `seen` against the provider's own record count to see
   how many that is.

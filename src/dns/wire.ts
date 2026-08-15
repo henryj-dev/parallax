@@ -22,8 +22,9 @@ export const CLASS_IN = 1;
  */
 export const TYPE = Object.freeze({
   A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, HINFO: 13, MX: 15, TXT: 16, AAAA: 28,
-  SRV: 33, NAPTR: 35, CERT: 37, DNAME: 39, OPT: 41, SSHFP: 44, TLSA: 52,
-  SMIMEA: 53, OPENPGPKEY: 61, SVCB: 64, HTTPS: 65, URI: 256, CAA: 257, ANY: 255,
+  LOC: 29, SRV: 33, NAPTR: 35, CERT: 37, DNAME: 39, OPT: 41, DS: 43, SSHFP: 44,
+  DNSKEY: 48, TLSA: 52, SMIMEA: 53, OPENPGPKEY: 61, SVCB: 64, HTTPS: 65,
+  URI: 256, CAA: 257, ANY: 255,
 } as const satisfies Record<RecordType | "SOA" | "OPT" | "ANY", number>);
 
 const TYPE_NAMES = new Map<number, string>(Object.entries(TYPE).map(([name, value]) => [value as number, name]));

@@ -56,6 +56,15 @@ const ENCODERS: Record<RecordType, Encoder> = {
   NAPTR: (content) => encodeNaptr(content),
   SVCB: (_content, fields) => encodeServiceBinding(fields, "SVCB"),
   HTTPS: (_content, fields) => encodeServiceBinding(fields, "HTTPS"),
+  DS: (_content, fields) => {
+    exactly(fields, 4, "DS", "a key tag, an algorithm, a digest type and hexadecimal data");
+    return Buffer.concat([uint16(fields[0]), uint8(fields[1]), uint8(fields[2]), hex(fields[3])]);
+  },
+  DNSKEY: (_content, fields) => {
+    exactly(fields, 4, "DNSKEY", "flags, a protocol, an algorithm and base64 key data");
+    return Buffer.concat([uint16(fields[0]), uint8(fields[1]), uint8(fields[2]), base64(fields[3])]);
+  },
+  LOC: (_content, fields) => encodeLocation(fields),
 };
 
 export function encodeRdata(type: RecordType, content: string): Buffer {
@@ -169,6 +178,55 @@ const SVC_PARAM_KEYS = Object.freeze({
  * both, and finding that out from a browser that quietly stopped upgrading is
  * the failure this encoder exists to prevent.
  */
+/**
+ * RFC 1876. The three sizes are not stored as numbers but as one byte each:
+ * a mantissa in the high nibble and a power of ten in the low one, counting
+ * centimetres. Encoding is therefore lossy by design -- 1m and 1.004m are the
+ * same byte -- which is why the round trip is checked against what a resolver
+ * reads back rather than against what was written.
+ *
+ * Latitude and longitude are unsigned offsets from a midpoint, so the equator
+ * and the prime meridian are 2^31 rather than zero, and altitude counts from
+ * 100km below the reference spheroid.
+ */
+function encodeLocation(fields: readonly string[]): Buffer {
+  const northSouth = fields.findIndex((field) => /^[NS]$/iu.test(field));
+  const eastWest = fields.findIndex((field) => /^[EW]$/iu.test(field));
+  if (northSouth < 0 || eastWest <= northSouth) throw new WireFormatError("LOC needs a latitude and a longitude");
+  const latitude = arcThousandths(fields.slice(0, northSouth), (fields[northSouth] as string).toUpperCase() === "S");
+  const longitude = arcThousandths(fields.slice(northSouth + 1, eastWest), (fields[eastWest] as string).toUpperCase() === "W");
+  const rest = fields.slice(eastWest + 1).map((value) => Number(value.replace(/m$/iu, "")));
+  if (rest.length === 0 || rest.some((value) => !Number.isFinite(value))) throw new WireFormatError("LOC needs an altitude");
+  const out = Buffer.alloc(16);
+  out.writeUInt8(0, 0);
+  out.writeUInt8(centimetreExponent(rest[1] ?? 1), 1);
+  out.writeUInt8(centimetreExponent(rest[2] ?? 10_000), 2);
+  out.writeUInt8(centimetreExponent(rest[3] ?? 10), 3);
+  out.writeUInt32BE(2_147_483_648 + latitude, 4);
+  out.writeUInt32BE(2_147_483_648 + longitude, 8);
+  out.writeUInt32BE(Math.round((rest[0] as number) * 100) + 10_000_000, 12);
+  return out;
+}
+
+/** Degrees, minutes and seconds to thousandths of an arcsecond. */
+function arcThousandths(parts: readonly string[], negative: boolean): number {
+  const [degrees = "0", minutes = "0", seconds = "0"] = parts;
+  const total = Math.round(((Number(degrees) * 60 + Number(minutes)) * 60 + Number(seconds)) * 1000);
+  return negative ? -total : total;
+}
+
+function centimetreExponent(metres: number): number {
+  const centimetres = Math.round(metres * 100);
+  if (centimetres <= 0) return 0;
+  let exponent = 0;
+  let mantissa = centimetres;
+  while (mantissa > 9 && exponent < 9) {
+    mantissa = Math.round(mantissa / 10);
+    exponent += 1;
+  }
+  return (Math.min(mantissa, 9) << 4) | exponent;
+}
+
 function encodeServiceBinding(fields: string[], type: string): Buffer {
   atLeast(fields, 2, type, "a priority and a target");
   const priority = uint16(fields[0]);
