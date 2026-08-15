@@ -165,6 +165,100 @@ describe("CoreDnsFileAdapter", () => {
     await assert.rejects(() => adapter.list("example.com/internal"), /line 2 is not a record this adapter understands/);
   });
 
+  it("fails closed on includes, generators, and record types it cannot reconcile", async () => {
+    for (const unsafe of [
+      "$INCLUDE /etc/passwd",
+      "$GENERATE 1-10 host$ A 192.0.2.$",
+      "opaque 60 IN TYPE65000 \\# 1 ff",
+    ]) {
+      const original = `$ORIGIN example.com.\n${unsafe}\n`;
+      const store = memoryFiles(original);
+      const adapter = new CoreDnsFileAdapter({ files: store.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
+
+      await assert.rejects(() => adapter.list("example.com/internal"), /unsupported/);
+      await assert.rejects(() => adapter.apply("example.com/internal", {
+        kind: "create",
+        desired: { id: "safe", name: "safe", type: "A", content: "10.0.0.1", ttl: 60 },
+      }), /unsupported/);
+      assert.equal(store.read(), original);
+      assert.deepEqual(store.reloads, []);
+    }
+  });
+
+  it("tracks mid-file $ORIGIN and writes managed owners absolutely", async () => {
+    const store = memoryFiles([
+      "$ORIGIN example.com.",
+      "$TTL 60",
+      "@ IN SOA ns.example.com. hostmaster.example.com. 7 3600 600 604800 300",
+      "$ORIGIN sub.example.com.",
+      "web IN A 10.0.0.1",
+      "mail IN MX 10 mx",
+      "",
+    ].join("\n"));
+    const adapter = new CoreDnsFileAdapter({ files: store.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
+
+    assert.deepEqual((await adapter.list("example.com/internal")).map((record) => [record.name, record.type, record.content]), [
+      ["web.sub", "A", "10.0.0.1"],
+      ["mail.sub", "MX", "10 mx.sub.example.com"],
+    ]);
+
+    await adapter.apply("example.com/internal", {
+      kind: "create",
+      desired: { id: "portal", name: "portal", type: "A", content: "10.0.0.2", ttl: 60 },
+    });
+    assert.match(store.read(), /^portal\.example\.com\. 60 IN A 10\.0\.0\.2 ; parallax-managed:/m);
+    assert.equal((await adapter.list("example.com/internal")).find((record) => record.id === "portal")?.name, "portal");
+  });
+
+  it("refuses ambiguous duplicate managed record ids without changing the file", async () => {
+    const marker = ownershipComment("example.com/internal", "duplicate", OWNERSHIP_SECRET);
+    const original = `$ORIGIN example.com.\none 60 IN A 10.0.0.1 ; ${marker}\ntwo 60 IN A 10.0.0.2 ; ${marker}\n`;
+    const store = memoryFiles(original);
+    const adapter = new CoreDnsFileAdapter({ files: store.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
+
+    await assert.rejects(() => adapter.list("example.com/internal"), /duplicate managed record id duplicate/);
+    await assert.rejects(() => adapter.apply("example.com/internal", {
+      kind: "update", providerId: "managed:duplicate",
+      desired: { id: "duplicate", name: "one", type: "A", content: "10.0.0.9", ttl: 60 },
+    }), /duplicate managed record id duplicate/);
+    assert.equal(store.read(), original);
+    assert.deepEqual(store.reloads, []);
+  });
+
+  it("updates and deletes the complete physical span of a managed multiline record", async () => {
+    const marker = ownershipComment("example.com/internal", "multi", OWNERSHIP_SECRET);
+    const original = [
+      "$ORIGIN example.com.",
+      "@ 3600 IN SOA ns.example.com. hostmaster.example.com. 7 3600 600 604800 300",
+      "multi 60 IN TXT (",
+      '  "first"',
+      '  "second"',
+      `) ; ${marker}`,
+      "tail 60 IN A 10.0.0.3",
+      "",
+    ].join("\n");
+
+    const updatedStore = memoryFiles(original);
+    const updated = new CoreDnsFileAdapter({ files: updatedStore.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
+    await updated.apply("example.com/internal", {
+      kind: "update", providerId: "managed:multi",
+      desired: { id: "multi", name: "multi", type: "TXT", content: "replacement", ttl: 60 },
+    });
+    assert.doesNotMatch(updatedStore.read(), /first|second|^\)/m);
+    assert.equal((await updated.list("example.com/internal")).find((record) => record.id === "multi")?.content, "replacement");
+    assert.equal((await updated.list("example.com/internal")).find((record) => record.name === "tail")?.content, "10.0.0.3");
+
+    const deletedStore = memoryFiles(original);
+    const deleted = new CoreDnsFileAdapter({ files: deletedStore.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
+    await deleted.apply("example.com/internal", {
+      kind: "delete", providerId: "managed:multi",
+      actual: { id: "multi", providerId: "managed:multi", managed: true, name: "multi", type: "TXT", content: "firstsecond", ttl: 60 },
+    });
+    assert.doesNotMatch(deletedStore.read(), /first|second|^\)/m);
+    assert.equal((await deleted.list("example.com/internal")).some((record) => record.id === "multi"), false);
+    assert.equal((await deleted.list("example.com/internal")).find((record) => record.name === "tail")?.content, "10.0.0.3");
+  });
+
   it("refuses to mutate unmanaged provider ids", async () => {
     const store = memoryFiles("www 60 IN A 192.0.2.1\n");
     const adapter = new CoreDnsFileAdapter({ files: store.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
@@ -172,5 +266,20 @@ describe("CoreDnsFileAdapter", () => {
       () => adapter.apply("example.com/internal", { kind: "delete", providerId: "line:1", actual: { id: "line-1", providerId: "line:1", managed: false, name: "www", type: "A", content: "192.0.2.1", ttl: 60 } }),
       /unmanaged/,
     );
+  });
+
+  it("refuses unsafe RDATA even when the adapter is called without domain parsing", async () => {
+    const store = memoryFiles();
+    const adapter = new CoreDnsFileAdapter({ files: store.files, pathForTarget: () => "/zones/example.com.db", ownershipSecret: OWNERSHIP_SECRET });
+
+    await assert.rejects(adapter.apply("example.com/internal", {
+      kind: "create",
+      desired: {
+        id: "injected", name: "svc", type: "HTTPS",
+        content: "1 . alpn=h2\n@ 60 IN A 6.6.6.6", ttl: 300,
+      },
+    }), /control characters/);
+    assert.equal(store.read(), "");
+    assert.deepEqual(store.reloads, []);
   });
 });

@@ -1,5 +1,5 @@
 import type { ProviderAdapter } from "../application/ports.ts";
-import { RECORD_TYPES, type DesiredRecord, type RecordType } from "../domain/dns.ts";
+import { assertZoneFileSafeContent, RECORD_TYPES, type DesiredRecord, type RecordType } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 import { ownershipComment, readOwnershipComment } from "./ownership.ts";
 
@@ -19,6 +19,7 @@ export interface CoreDnsFileAdapterOptions {
 
 interface ParsedLine {
   lineIndex: number;
+  endLineExclusive: number;
   record: ProviderRecord;
   ownership?: { recordId: string };
 }
@@ -46,16 +47,20 @@ export class CoreDnsFileAdapter implements ProviderAdapter {
     const path = this.#pathForTarget(target);
     const zone = zoneFromTarget(target);
     const original = await this.#files.read(path) ?? "";
+    // A create is unsafe too when the existing file contains a record we do not
+    // understand: appending could create a duplicate RRset next to it.
+    const parsed = parseDocument(original, target, this.#ownershipSecret);
     const lines = original.length === 0 ? [`$ORIGIN ${zone}.`] : original.replace(/\n$/, "").split("\n");
     if (operation.kind === "create") {
       lines.push(formatRecord(target, operation.desired, this.#ownershipSecret));
     } else {
       if (operation.kind === "delete" && !operation.actual.managed) throw new Error(`refusing to delete unmanaged CoreDNS record ${operation.providerId}`);
-      const parsed = parseDocument(lines.join("\n"), target, this.#ownershipSecret);
       const existing = parsed.find((line) => line.record.providerId === operation.providerId && line.record.managed);
       if (!existing) throw new Error(`managed CoreDNS record ${operation.providerId} does not exist`);
-      if (operation.kind === "update") lines[existing.lineIndex] = formatRecord(target, operation.desired, this.#ownershipSecret);
-      else lines.splice(existing.lineIndex, 1);
+      const physicalLines = existing.endLineExclusive - existing.lineIndex;
+      if (operation.kind === "update") {
+        lines.splice(existing.lineIndex, physicalLines, formatRecord(target, operation.desired, this.#ownershipSecret));
+      } else lines.splice(existing.lineIndex, physicalLines);
     }
     const nextContents = advanceZoneSerial(`${lines.join("\n")}\n`, zone);
     await this.#files.write(path, nextContents);
@@ -64,6 +69,7 @@ export class CoreDnsFileAdapter implements ProviderAdapter {
 }
 
 const RECORD_CLASSES = new Set(["IN", "CS", "CH", "HS"]);
+const IGNORED_RECORD_TYPES = new Set(["SOA"]);
 
 /**
  * Reads every resource record in an RFC 1035 zone file, including the common
@@ -77,12 +83,22 @@ function parseDocument(contents: string, target: string, ownershipSecret: string
   const zone = zoneFromTarget(target);
   const lines = contents.split("\n");
   let defaultTtl: number | undefined;
-  let lastOwner = "@";
+  let origin = zone;
+  let lastOwner = zone;
 
   for (const logical of readLogicalRecords(lines)) {
-    const directive = /^\$(TTL|ORIGIN|INCLUDE)\b\s*(\S*)/i.exec(logical.text.trim());
-    if (directive) {
-      if (directive[1]?.toUpperCase() === "TTL") defaultTtl = parseTtl(directive[2] ?? "");
+    const directive = /^\$([A-Z][A-Z0-9_-]*)\b(?:\s+(.*))?$/iu.exec(logical.text.trim());
+    if (directive?.[1]) {
+      const name = directive[1].toUpperCase();
+      const value = directive[2]?.trim() ?? "";
+      if (name === "TTL") {
+        defaultTtl = parseTtl(value);
+        if (defaultTtl === undefined) throw new Error(`CoreDNS zone file line ${logical.startLine + 1} has an invalid $TTL`);
+      } else if (name === "ORIGIN") {
+        origin = resolveOrigin(value, origin, zone, logical.startLine);
+      } else {
+        throw new Error(`CoreDNS zone file line ${logical.startLine + 1} uses unsupported $${name}`);
+      }
       continue;
     }
 
@@ -90,9 +106,13 @@ function parseDocument(contents: string, target: string, ownershipSecret: string
     if (!fields) {
       throw new Error(`CoreDNS zone file line ${logical.startLine + 1} is not a record this adapter understands`);
     }
-    lastOwner = fields.owner;
-    if (!isManagedType(fields.type)) continue;
-    const content = parseContent(fields.type, fields.rdata);
+    const owner = logical.inheritsOwner ? fields.owner : resolveOwner(fields.owner, origin);
+    lastOwner = owner;
+    if (!isManagedType(fields.type)) {
+      if (IGNORED_RECORD_TYPES.has(fields.type)) continue;
+      throw new Error(`CoreDNS zone file line ${logical.startLine + 1} has unsupported record type ${fields.type}`);
+    }
+    const content = parseContent(fields.type, fields.rdata, origin);
     if (content === undefined) {
       throw new Error(`CoreDNS zone file line ${logical.startLine + 1} has ${fields.type} data this adapter cannot read`);
     }
@@ -102,23 +122,33 @@ function parseDocument(contents: string, target: string, ownershipSecret: string
     const lineNumber = logical.startLine + 1;
     result.push({
       lineIndex: logical.startLine,
+      endLineExclusive: logical.endLineExclusive,
       ...(ownership ? { ownership } : {}),
       record: {
         id: managed ? ownership.recordId : `line-${lineNumber}`,
         providerId: managed ? `managed:${ownership.recordId}` : `line:${lineNumber}`,
         managed,
-        name: normalizeOwner(fields.owner, zone),
+        name: normalizeOwner(owner, zone),
         type: fields.type,
         content,
         ttl: fields.ttl,
       },
     });
   }
+  const seenProviderIds = new Set<string>();
+  for (const line of result) {
+    if (!line.record.managed) continue;
+    if (seenProviderIds.has(line.record.providerId)) {
+      throw new Error(`CoreDNS zone file has duplicate managed record id ${line.record.id}`);
+    }
+    seenProviderIds.add(line.record.providerId);
+  }
   return result;
 }
 
 interface LogicalRecord {
   startLine: number;
+  endLineExclusive: number;
   text: string;
   comment?: string;
   /** The record omitted its owner name and inherits the previous one. */
@@ -139,6 +169,7 @@ function readLogicalRecords(lines: string[]): LogicalRecord[] {
     } else {
       open = {
         startLine: index,
+        endLineExclusive: index + 1,
         text: split.record.trim(),
         inheritsOwner: /^[ \t]/.test(raw),
         depth: 0,
@@ -146,15 +177,14 @@ function readLogicalRecords(lines: string[]): LogicalRecord[] {
       };
     }
     open.depth += parenthesisDelta(split.record);
+    open.endLineExclusive = index + 1;
+    if (open.depth < 0) throw new Error(`CoreDNS zone file line ${index + 1} closes an unopened parenthesis`);
     if (open.depth > 0) continue;
     const { depth: _depth, ...completed } = open;
     records.push(completed);
     open = undefined;
   }
-  if (open) {
-    const { depth: _depth, ...completed } = open;
-    records.push(completed);
-  }
+  if (open) throw new Error(`CoreDNS zone file line ${open.startLine + 1} has an unterminated parenthesized record`);
   return records;
 }
 
@@ -281,18 +311,48 @@ function withAbsoluteHostname(type: string, content: string, absolute: boolean):
   return fields.join("");
 }
 
+function resolveOrigin(value: string, currentOrigin: string, zone: string, lineIndex: number): string {
+  if (value.length === 0 || /\s/u.test(value)) {
+    throw new Error(`CoreDNS zone file line ${lineIndex + 1} has an invalid $ORIGIN`);
+  }
+  const resolved = value.endsWith(".")
+    ? value.slice(0, -1).toLowerCase()
+    : `${value.toLowerCase()}.${currentOrigin}`;
+  if (resolved !== zone && !resolved.endsWith(`.${zone}`)) {
+    throw new Error(`CoreDNS zone file line ${lineIndex + 1} moves $ORIGIN outside ${zone}`);
+  }
+  return resolved;
+}
+
+function resolveOwner(owner: string, origin: string): string {
+  const normalized = owner.toLowerCase();
+  if (normalized === "@") return origin;
+  return normalized.endsWith(".") ? normalized.slice(0, -1) : `${normalized}.${origin}`;
+}
+
 function formatRecord(target: string, record: DesiredRecord, ownershipSecret: string): string {
+  assertZoneFileSafeContent(record.type, record.content);
+  const zone = zoneFromTarget(target);
+  const owner = record.name === "@" ? `${zone}.` : `${record.name}.${zone}.`;
   const content = record.type === "TXT"
     ? quoteDnsText(record.content)
     : withAbsoluteHostname(record.type, record.content, true);
-  return `${record.name} ${record.ttl} IN ${record.type} ${content} ; ${ownershipComment(target, record.id, ownershipSecret)}`;
+  return `${owner} ${record.ttl} IN ${record.type} ${content} ; ${ownershipComment(target, record.id, ownershipSecret)}`;
 }
 
-function parseContent(type: RecordType, raw: string): string | undefined {
+function parseContent(type: RecordType, raw: string, origin: string): string | undefined {
   if (type === "TXT") {
     return parseDnsText(raw);
   }
-  return withAbsoluteHostname(type, type === "CNAME" ? raw.toLowerCase() : raw, false);
+  const index = HOSTNAME_FIELD[type];
+  if (index === undefined) return raw;
+  const fields = raw.split(/(\s+)/u);
+  const position = index * 2;
+  const field = fields[position];
+  if (field === undefined || field === ".") return raw;
+  const hostname = field.endsWith(".") ? field.slice(0, -1) : `${field}.${origin}`;
+  fields[position] = type === "CNAME" ? hostname.toLowerCase() : hostname;
+  return fields.join("");
 }
 
 function splitRecordAndComment(line: string): { record: string; comment?: string } {
@@ -392,7 +452,8 @@ function normalizeOwner(owner: string, zone: string): string {
   const normalized = owner.toLowerCase().replace(/\.$/, "");
   if (normalized === "@" || normalized === zone) return "@";
   const suffix = `.${zone}`;
-  return normalized.endsWith(suffix) ? normalized.slice(0, -suffix.length) : normalized;
+  if (!normalized.endsWith(suffix)) throw new Error(`CoreDNS record owner ${owner} is outside ${zone}`);
+  return normalized.slice(0, -suffix.length);
 }
 
 function advanceZoneSerial(contents: string, zone: string): string {
@@ -400,7 +461,7 @@ function advanceZoneSerial(contents: string, zone: string): string {
   if (soa) {
     if (soa.value >= 0xffff_ffff) throw new Error(`CoreDNS SOA serial is exhausted for ${zone}`);
     let result = `${contents.slice(0, soa.start)}${soa.value + 1}${contents.slice(soa.end)}`;
-    if (!hasNameServer(result, zone)) result = appendLine(result, `@ 3600 IN NS ns1.${zone}.`);
+    if (!hasNameServer(result, zone)) result = appendLine(result, `${zone}. 3600 IN NS ns1.${zone}.`);
     return ensureTrailingNewline(result);
   }
 

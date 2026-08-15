@@ -77,6 +77,7 @@ echo "== starting Parallax against the same directory =="
 HOST=127.0.0.1 PORT="$APPPORT" \
 PARALLAX_STATE_FILE="$WORK/state.json" \
 PARALLAX_CONFIG_FILE="$WORK/configuration.json" \
+PARALLAX_COREDNS_ROOT="$WORK" \
 PARALLAX_OWNERSHIP_SECRET="verify-ownership-secret-that-is-at-least-32-bytes" \
   node "$ROOT/src/index.ts" > "$WORK/app.log" 2>&1 &
 APP_PID=$!
@@ -87,7 +88,7 @@ done
 curl -sf "http://127.0.0.1:${APPPORT}/health/live" >/dev/null || { cat "$WORK/app.log" >&2; fail "app did not start"; }
 
 curl -sf -X PUT -H 'content-type: application/json' \
-  -d "{\"coreDnsDirectory\":\"${ZONES}\",\"allowLocalProvider\":true}" \
+  -d "{\"coreDnsDirectory\":\"${ZONES}\"}" \
   "http://127.0.0.1:${APPPORT}/api/v1/settings" >/dev/null \
   || { cat "$WORK/app.log" >&2; fail "the provider settings were not accepted"; }
 # Proves the wiring took, rather than assuming it did -- the failure this
@@ -104,7 +105,11 @@ curl -sf -X PUT -H 'content-type: application/json' \
   "$API/zones/example.com/views/internal/records/legacy" >/dev/null
 CONFLICTS=$(curl -sf "$API/zones/example.com/preview?view=internal" \
   | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).views.internal.summary.conflict))')
-[ "$CONFLICTS" = "1" ] || fail "expected 1 conflict against the hand-written record, found $CONFLICTS"
+# Two, not one: the hand-written RRset holds two values and the desired state
+# holds neither. One conflict says the name is taken; the second says a value is
+# live that nothing asked for. Reporting only the first would let an operator
+# resolve the collision and still be serving an answer they never chose.
+[ "$CONFLICTS" = "2" ] || fail "expected 2 conflicts against the hand-written RRset, found $CONFLICTS"
 ok "reconciliation reports the collision instead of duplicating the RRset"
 
 echo "== a fresh name applies and resolves over DNS =="
