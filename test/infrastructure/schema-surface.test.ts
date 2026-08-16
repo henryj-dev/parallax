@@ -106,10 +106,20 @@ describe("where the schema can be changed from", () => {
     // as the first half of its push gate: pass this, then trust the `git diff`.
     // A single import of a package would make that gate stop running without
     // announcing it -- the failure would be silence at the moment of a deploy.
+    //
+    // Every way in, not only the one at the top of the file. A static `import`
+    // is what a reader looks for; `await import(…)` and `require(…)` reach the
+    // same package and were invisible to an earlier version of this assertion.
+    // On a machine with the packages installed -- which is where this is
+    // written -- that version passed while the gate it protects would have died.
     const source = await readFile(join(ROOT, "test/infrastructure/schema-surface.test.ts"), "utf8");
-    const imported = [...source.matchAll(/^import[^"']*["']([^"']+)["']/gmu)].map((match) => match[1] as string);
-    const external = imported.filter((specifier) => !specifier.startsWith("node:") && !specifier.startsWith("."));
-    assert.deepEqual(external, [], "this file may import node builtins and relative paths only");
+    const specifiers = [
+      ...source.matchAll(/^import[^"']*["']([^"']+)["']/gmu),
+      ...source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']/gu),
+      ...source.matchAll(/\brequire\s*\(\s*["']([^"']+)["']/gu),
+    ].map((match) => match[1] as string);
+    const external = specifiers.filter((specifier) => !specifier.startsWith("node:") && !specifier.startsWith("."));
+    assert.deepEqual(external, [], "this file may reach node builtins and relative paths only, by any means");
   });
 
   it("watches the directory the .sql files are in", async () => {
