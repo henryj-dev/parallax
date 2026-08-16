@@ -273,7 +273,18 @@ const COMMANDS: readonly Command[] = [
       const result = await requireControlPlane(context.runtime).adoptProviderRecords(
         String(input.zone), String(input.view), context.actor, expectedRevisionOf(input),
       );
-      return { zone: result.zone.name, revision: result.zone.revision, seen: result.seen, adopted: result.adopted };
+      // Everything the operation decided, not a subset of it. `refreshed` and
+      // `warnings` were dropped here, so a locked record brought back into line
+      // was reported nowhere and adoption's effect on what this process answers
+      // for could not reach a terminal at all.
+      return {
+        zone: result.zone.name,
+        revision: result.zone.revision,
+        seen: result.seen,
+        adopted: result.adopted,
+        refreshed: result.refreshed,
+        warnings: result.warnings,
+      };
     },
   },
   {

@@ -487,7 +487,9 @@ export class ControlPlane {
       adopted.push(desired);
       target.records.push(desired);
     }
-    if (adopted.length === 0 && refreshed.length === 0) return { zone, adopted, refreshed, seen: actual.length };
+    if (adopted.length === 0 && refreshed.length === 0) {
+      return { zone, adopted, refreshed, warnings: [], seen: actual.length };
+    }
 
     if (view === "external") target.records = normalizeExternalRecords(target.records);
     ensureUniqueRecordKeys(target.records);
@@ -496,7 +498,7 @@ export class ControlPlane {
     await this.#commitDesiredChange(zone, updated, "records.adopted", actor,
       { view, adopted: adopted.length, ...(refreshed.length > 0 ? { refreshed: refreshed.length } : {}) },
       new Set(views.map((candidate) => candidate.name)), expectedRevision);
-    return { zone: updated, adopted, refreshed, seen: actual.length };
+    return { zone: updated, adopted, refreshed, warnings: authorityWarnings(zone, updated), seen: actual.length };
   }
 
   async listRevisions(zoneName: string, page?: PageRequest): Promise<Paged<"revisions", ZoneRevision>> {
@@ -898,6 +900,45 @@ export class ControlPlane {
   }
 }
 
+/**
+ * What adopting just changed about the names this process answers for.
+ *
+ * The internal view is materialized from the external one, so filling an empty
+ * external view fills the internal one too -- and a zone with a non-empty
+ * internal view is one the built-in listener claims authority for. That is a
+ * large change hidden inside a small-sounding one: `seen` and `adopted` describe
+ * records, and the thing that moved is which questions this process will answer
+ * for a whole domain.
+ *
+ * Two consequences are worth naming separately because they are the two that
+ * were actually met. A name nobody adopted is now NXDOMAIN inside, since an
+ * authority does not forward what it does not hold. And a record the provider
+ * proxies now answers with its origin inside, because the origin is what the
+ * desired state holds -- the edge address was never ours to know.
+ */
+function authorityWarnings(before: Zone, after: Zone): string[] {
+  const internalRecords = (zone: Zone): DesiredRecord[] =>
+    materializeProviderViews(zone.views).find((view) => view.name === "internal")?.records ?? [];
+  if (internalRecords(before).length > 0) return [];
+  const now = internalRecords(after);
+  if (now.length === 0) return [];
+
+  const warnings = [
+    `${after.name} is now answered by this process rather than forwarded:`
+    + ` ${now.length} name(s) are described, and any other name under ${after.name} answers NXDOMAIN inside.`
+    + " Adopt the rest, or the internal view is incomplete for the names it is missing",
+  ];
+  const proxied = (after.views.find((view) => view.name === "external")?.records ?? [])
+    .filter((record) => record.proxied === true).length;
+  if (proxied > 0) {
+    warnings.push(
+      `${proxied} proxied record(s) now answer with their origin inside instead of the provider's edge.`
+      + " Override them in the internal view if inside traffic is meant to go through the provider",
+    );
+  }
+  return warnings;
+}
+
 function targetKey(zone: string, view: string): string {
   return `${zone}/${view}`;
 }
@@ -1058,6 +1099,14 @@ export interface AdoptionResult {
    * adopted records stays honest about what it means.
    */
   readonly refreshed: DesiredRecord[];
+  /**
+   * What adoption changed beyond the desired state, said where the operator is
+   * looking. Filling an empty internal view turns the built-in listener into the
+   * authority for that whole zone, and nothing about `seen` and `adopted` shows
+   * it: a name nobody adopted becomes NXDOMAIN inside, and a proxied name starts
+   * answering with its origin instead of the provider's edge.
+   */
+  readonly warnings: string[];
   /**
    * How many records the provider listed for this view. Counting only the types
    * this control plane supports, so comparing it against the provider's own

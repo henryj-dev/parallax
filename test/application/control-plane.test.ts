@@ -1319,4 +1319,45 @@ describe("ControlPlane", () => {
     });
   });
 
+
+  describe("what adopting changes beyond the records", () => {
+    it("says the listener has become the authority for the whole zone", async () => {
+      // The incident: a judgement command in a deploy request was `zone adopt`,
+      // it succeeded, and the listener quietly went from forwarding the zone to
+      // answering for it. `seen` and `adopted` describe records; what moved was
+      // which questions this process answers for a domain.
+      const { service, provider } = setup();
+      await service.createZone("mail.example");
+      provider.seed("mail.example/external", [
+        { id: "a", name: "admin", type: "A", content: "8.8.8.10", ttl: 300, providerId: "cf-1", managed: false },
+        { id: "b", name: "www", type: "A", content: "8.8.8.11", ttl: 300, providerId: "cf-2", managed: false, proxied: true },
+      ]);
+
+      const { warnings } = await service.adoptProviderRecords("mail.example", "external", "operator");
+      assert.equal(warnings.length, 2);
+      assert.match(warnings[0] ?? "", /answered by this process rather than forwarded/u);
+      assert.match(warnings[0] ?? "", /NXDOMAIN inside/u, "the names nobody adopted");
+      assert.match(warnings[1] ?? "", /1 proxied record\(s\) now answer with their origin/u);
+    });
+
+    it("says nothing when the zone was already answered here", async () => {
+      // Only the transition is worth a warning. Repeating it on every later
+      // adoption would train the reader to skip the line that matters.
+      const { service, provider } = setup();
+      await service.createZone("mail.example");
+      provider.seed("mail.example/external", [
+        { id: "a", name: "admin", type: "A", content: "8.8.8.10", ttl: 300, providerId: "cf-1", managed: false },
+      ]);
+      await service.adoptProviderRecords("mail.example", "external", "operator");
+
+      provider.seed("mail.example/external", [
+        { id: "a", name: "admin", type: "A", content: "8.8.8.10", ttl: 300, providerId: "cf-1", managed: false },
+        { id: "b", name: "extra", type: "A", content: "8.8.8.12", ttl: 300, providerId: "cf-3", managed: false },
+      ]);
+      const { adopted, warnings } = await service.adoptProviderRecords("mail.example", "external", "operator");
+      assert.equal(adopted.length, 1, "it did adopt something");
+      assert.deepEqual(warnings, [], "and the authority did not change");
+    });
+  });
+
 });
