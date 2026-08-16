@@ -15,7 +15,7 @@ Parallax는 split-horizon DNS 컨트롤 플레인이자 운영 포털입니다. 
 - 외부 레코드를 보존하는 결정적 `managed-only` 동기화
 - 원자적 파일 쓰기를 사용하는 단일 노드 JSON 상태 및 프로바이더 상태 저장
 - 트랜잭션과 불변 리비전을 지원하는 선택적 PostgreSQL 기준 저장소
-- 선택적으로 사용하는 Cloudflare API 및 CoreDNS RFC 1035 존 파일 어댑터
+- 선택적으로 사용하는 Cloudflare API 어댑터
 - 내부 뷰를 desired state에서 바로 UDP/TCP로 응답하고, 나머지 이름은 상위 리졸버로
   넘기는 선택적 내장 DNS 리스너
 - 관리자 포털에서 관리하는 암호화된 쓰기 전용 Cloudflare 자격 증명
@@ -59,10 +59,8 @@ pnpm start
 | `PARALLAX_STATE_FILE` | 데이터베이스가 없을 때 존·리비전·상태·감사 기록 파일 |
 | `PARALLAX_CONFIG_FILE` | 데이터베이스가 없을 때 설정·자격 증명·접근 토큰 파일 |
 | `PARALLAX_PROVIDER_STATE_FILE` | 로컬 프로바이더가 켜져 있을 때만 사용하는 상태 파일 |
-| `PARALLAX_COREDNS_ROOT` | 저장된 `coreDnsDirectory`를 가두는 배포 소유 루트. CoreDNS 발행을 켜기 전에 반드시 설정 |
 | `PARALLAX_OWNERSHIP_SECRET` | 관리 레코드 소유권 마커에 서명하는 32바이트 이상 시크릿 |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장 자격 증명을 암호화하는 정확히 32바이트 키(base64 또는 64자 16진수) |
-| `PARALLAX_POWERDNS_DATABASE_URL` | PowerDNS 자체 데이터베이스. 같은 PostgreSQL TLS 정책이 적용되며, CoreDNS 대신 여기로 내부 뷰를 발행할 때 사용 |
 | `PARALLAX_DNS_PORT` | 이 프로세스가 내부 뷰에 대해 직접 DNS로 응답한다. 설정하지 않으면 포트를 열지 않는다 |
 | `PARALLAX_DNS_HOST` | DNS 리스너가 바인드할 주소. 기본값은 `HOST`이고, 지정하지 않았다면 루프백이다 |
 | `PARALLAX_DNS_FORWARD_TO` | 관리 존 밖의 이름을 넘길 상위 리졸버 목록(`host` 또는 `host#port`, 쉼표 구분). 비어 있으면 넘기지 않고 `REFUSED`로 답한다 |
@@ -124,7 +122,6 @@ sudo chmod 0700 /var/lib/parallax
 | 설정 | 효과 |
 | --- | --- |
 | `allowLocalProvider` | 실제 프로바이더가 없을 때 로컬 파일에 게시. 기본값은 꺼짐이므로 라우팅되지 않는 대상은 성공으로 보고되지 않고 실패합니다 |
-| `coreDnsDirectory` | `PARALLAX_COREDNS_ROOT` 아래의 내부 뷰용 RFC 1035 존 파일 디렉터리. 비우면 비활성 |
 | `publicOrigin` | 브라우저가 포털에 접속하는 HTTPS origin. 루프백에서만 HTTP 허용 |
 | `trustForwardedHeaders` | 리버스 프록시 헤더 신뢰. 전달된 호스트가 보안 origin을 정하지 못하도록 `publicOrigin`이 있어야 설정 가능 |
 | `revisionRetention` | 존별 보관 리비전 스냅샷 수. `0`은 전부 보관 |
@@ -271,20 +268,6 @@ Cloudflare [TTL](https://developers.cloudflare.com/dns/manage-dns-records/refere
 있지만, Parallax는 프로바이더 요금제 기능을 명시적으로 설정하기 전까지
 일반 요금제의 하한인 60초를 적용합니다.
 
-CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일을
-만들 때 SOA와 NS 레코드를 추가하고, 관리 레코드를 변경할 때마다 32비트 SOA serial을
-증가시킨 뒤 파일을 원자적으로 교체합니다. CoreDNS가 serial 변경을 감지하도록
-`auto` 플러그인 또는 0이 아닌 재로드 간격을 지정한 `file` 플러그인을 설정해야
-합니다. 파일은 다른 사용자로 실행되는 CoreDNS가 읽을 수 있도록 `0644` 모드로
-기록하고 파일과 디렉터리를 모두 `fsync`합니다. 기존 비 Parallax 레코드와 권한
-데이터는 유지하며, 서명된 소유권 마커가 있는 레코드만 변경합니다.
-
-`coreDnsDirectory`는 배포가 환경변수로 고정한 `PARALLAX_COREDNS_ROOT` 아래에 있어야
-합니다. 루트 자체가 심볼릭 링크이거나, 설정 경로가 루트를 벗어나거나 심볼릭 링크를
-통해 밖으로 빠지거나, 쓸 수 없으면 설정을 저장하기 전에 거부합니다. 존 파일 읽기도
-마지막 경로 요소를 따라가지 않는 방식으로 열고, 연 직후 실제 경로와 inode를 다시
-확인합니다. 관리자 설정이 서비스 사용자의 임의 파일 쓰기 권한으로 확대되지 않도록
-루트는 설정 파일과 별개인 배포 소유의 불변 디렉터리로 두십시오.
 
 기존 존 파일을 읽을 때는 일반적인 RFC 1035 표기를 모두 처리합니다. `$TTL`을
 상속하는 레코드, 앞 레코드의 소유자 이름을 상속하는 레코드, 선택적 `class` 필드,
@@ -296,27 +279,17 @@ CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일
 번째 응답을 게시할 수 있기 때문입니다. 저장 경계와 어댑터 양쪽에서 제어 문자,
 `zone-file` 구조 문자, `directive` 주입도 거부합니다.
 
-### 내부 뷰가 클라이언트에 닿는 세 가지 방법
+### 내부 뷰가 클라이언트에 닿는 방법
 
-둘은 내부 뷰를 다른 DNS 서버로 **발행**하고 그 서버가 응답합니다. 나머지 하나는 이
-프로세스가 **직접** 응답합니다.
+이 프로세스가 목표 상태를 읽어 **직접 응답**합니다. 발행 단계가 없습니다 — 다른 DNS
+서버에 쓰지 않고, 소유권 마커를 남기지 않으며, 프로바이더와 비교하지도 않습니다.
+`apply` 가 관여하지 않는 이유이자, 변경이 조정 이후가 아니라 한 번의 갱신 안에 드러나는
+이유입니다.
 
-| | `coreDnsDirectory` | `PARALLAX_POWERDNS_DATABASE_URL` | `PARALLAX_DNS_PORT` |
-| --- | --- | --- | --- |
-| 응답 형태 | RFC 1035 존 파일 | PowerDNS 데이터베이스의 행 | 이 프로세스가 직접 응답 |
-| 필요한 것 | 두 프로세스가 닿는 파일시스템 | 데이터베이스 외에 없음 | 없음 |
-| 클러스터에서는 | 재시작을 견디는 볼륨 | 볼륨 불필요 | 볼륨 불필요 |
-| 변경이 응답되기까지 | `reload` 주기, 약 1초 | 리졸버의 캐시 TTL | 즉시. 다른 곳에서 바꿨다면 한 번의 갱신(5초) |
-| 조정(reconcile) | 함 | 함 | 안 함 |
-
-**발행하는 둘은 배타적이고, 리스너는 아닙니다.** `coreDnsDirectory`와
-`PARALLAX_POWERDNS_DATABASE_URL`을 둘 다 설정하면 기동을 거부합니다 — 잘못된 쪽이
-서비스 중이라는 걸 알게 됐을 때 아무도 기억하지 못할 우선순위 규칙으로 푸는 대신에.
-`PARALLAX_DNS_PORT`는 종류가 다르고 그 규칙에 들어가지 않습니다. 아무것도 발행하지
-않고, 소유권 마커를 쓰지 않으며, 프로바이더와 비교하지도 않습니다. 목표 상태를 읽어
-응답할 뿐입니다 — `apply`가 관여하지 않는 이유이자, 변경이 조정 이후가 아니라 한 번의
-갱신 안에 드러나는 이유입니다. 발행하는 쪽과 함께 켜는 것은 응답하는 서버가 둘이라는
-뜻이고, 클라이언트가 어느 쪽에 묻는지는 배포가 정합니다.
+이전 버전은 CoreDNS 존 파일이나 PowerDNS 데이터베이스로 **발행**할 수도 있었고, 둘 다
+제거했습니다. 그것들은 이 프로세스가 스스로 답할 수 없었기 때문에 있었고, 이제 답합니다.
+함께 사라진 것은 **Parallax 가 죽어도 내부 뷰가 살아 있는 유일한 구성**입니다 — 그 성질이
+필요한 배포는 뒤에 발행할 곳이 아니라 앞에 둘 DNS 서버가 필요합니다.
 
 리스너는 `PARALLAX_DNS_PORT`가 포트를 지정할 때만 열리고, 그때 `PARALLAX_DNS_HOST`
 — 없으면 `HOST`, 그것도 지정하지 않았다면 루프백 — 에 바인드합니다. 포트를 하나
@@ -359,7 +332,7 @@ CoreDNS 출력은 RFC 1035 형식의 권한 존입니다. Parallax가 새 파일
 
 **와일드카드는 리터럴이 아니라 전개됩니다.** `*` 나 `*.eu` 로 된 레코드는 그 아래 이름들에
 응답하고, 가장 가까운 것이 이기며, 존재하는 이름 위로는 답하지 않습니다. 같은 desired
-state 를 두고 존 파일·PowerDNS·Cloudflare 가 모두 그렇게 하므로, 여기서만 다르게 굴면
+state 를 두고 Cloudflare 가 그렇게 하므로, 여기서만 다르게 굴면
 어느 발행 경로를 골랐느냐에 따라 같은 이름이 다르게 풀립니다.
 
 **readiness 는 리스너를 내부 뷰의 서비스 수단으로 인정합니다.** DNS 를 직접 응답하고
@@ -372,39 +345,6 @@ state 를 두고 존 파일·PowerDNS·Cloudflare 가 모두 그렇게 하므로
 존 파일 쪽은 **휘발성 볼륨이 아니라 영속 저장소**가 필요합니다. 존 파일에는 아무도 사본을
 갖고 있지 않은 레코드 — 운영자가 손으로 관리하는 것 — 도 함께 있기 때문입니다. 잃으면
 그것들이 사라집니다.
-
-PowerDNS에는 레코드마다 소유권을 적을 자리가 없어서, Parallax가 PowerDNS 데이터베이스에
-테이블 하나를 추가합니다:
-
-```sh
-parallax migrate --target powerdns
-```
-
-Parallax 데이터베이스가 아니라 거기에 두는 이유는, **소유권이 프로바이더만 보고도 답해질 수
-있어야** 하기 때문입니다 — Cloudflare 코멘트나 존 파일 주석이 주는 것과 같은 성질입니다.
-PowerDNS에서 레코드를 직접 지우면 마커도 함께 사라지므로, 없는 행을 소유했다고 주장하는
-일이 생기지 않습니다.
-
-이 어댑터는 PowerDNS 데이터베이스에 직접 SQL을 쓰므로 DNSSEC 서명 존은 변경하지
-않습니다. 서명 존의 `ordername`은 NSEC/NSEC3 모드와 정정(rectification) 결과에 따라
-달라지며 이를 추측하면 DNSSEC 부재 증명(denial proof)을 손상할 수 있습니다. 활성
-`cryptokeys`가 있으면 `apply`를 fail-closed로 거부하므로, 서명 존은 `API-RECTIFY`가
-설정된 PowerDNS API나 `pdnsutil`처럼 해당 모드를 아는 경로로 관리해야 합니다.
-
-어느 쪽이든 존은 DNS 엔진에 이미 있어야 합니다. PowerDNS는 `domains` 테이블에 있는 것을
-서비스하고, Parallax는 존을 만드는 것이 아니라 존에 레코드를 발행합니다.
-
-PowerDNS를 띄우기 전에 알아야 할 것이 둘 있습니다. **둘 다 Parallax가 실패한 것처럼
-보이지만 아닙니다.**
-
-**PowerDNS는 존 목록을 `zone-cache-refresh-interval` 초 동안 캐시합니다. 기본 300입니다.**
-돌고 있는 동안 추가된 존은 그 시간이 지날 때까지 `REFUSED`로 답합니다 — `apply`는
-`applied`라고 하고, 행은 데이터베이스에 있고, 이름은 응답되지 않습니다. Parallax는 운영자가
-아무 때나 만든 존에 레코드를 넣으므로 이 용도에서는 `0`으로 두십시오. 실측: 기본값이면
-기동 후 추가한 존이 `REFUSED`, `0`이면 같은 존이 즉시 응답합니다.
-
-**기동하면서 컨트롤 소켓을 만듭니다.** `readOnlyRootFilesystem: true`라면 `/var/run/pdns`가
-쓰기 가능해야 합니다. 휘발성 볼륨이 맞습니다 — 컨트롤 소켓이 재시작을 견딜 이유는 없습니다.
 
 ### 클라이언트 쪽 리졸버 오버라이드
 
@@ -517,8 +457,8 @@ pnpm cli token issue --subject deploy-bot --role editor
 fail-closed 상태를 유지하지만, 로컬 `settings set` 명령은 복구 경로로 사용할 수
 있습니다. 이 명령은 설정 저장소만 초기화하고, 최신 저장값에 패치를 합친 전체 후보를
 검증한 뒤 기록합니다. 프로바이더, 토큰, 컨트롤 플레인은 시작하지 않습니다. 예를 들어
-다른 머신에만 유효한 CoreDNS 경로는
-`pnpm cli settings set --values '{"coreDnsDirectory":""}'`로 비울 수 있습니다. 패치를
+이 머신이 쓸 수 없는 디렉터리를 가리키는 로컬 프로바이더는
+`pnpm cli settings set --values '{"allowLocalProvider":false}'`로 끌 수 있습니다. 패치를
 합친 뒤에도 저장 불변식이 하나라도 유효하지 않으면 아무것도 기록하지 않고 거부합니다.
 
 CLI와 서버는 같은 저장소의 최신 값을 읽습니다. 파일 백엔드도 읽기마다 다시 열고 변경은
@@ -652,8 +592,6 @@ UID 10001로 실행되며 애플리케이션 디렉터리에는 쓸 수 없습�
 
 ```sh
 pnpm verify:postgres    # Docker PostgreSQL: 마이그레이션, 재시작, 잠금, 보관 정책
-pnpm verify:coredns     # Docker CoreDNS + dig: 존 로드, SOA reload, 충돌 탐지
-pnpm verify:powerdns    # Docker PowerDNS + PostgreSQL + dig: 발행, 충돌, 회수
 pnpm verify:proxy       # Docker nginx TLS 종단: Origin, 쿠키, HSTS, readiness
 pnpm verify:dns         # 내장 리스너에 dig 로 질의: 전 타입, TC, 릴레이
 pnpm verify:cloudflare  # 옵트인. 실제 토큰이 필요하며 없으면 건너뜀
@@ -673,7 +611,7 @@ pnpm audit              # 의존성 취약점 점검
 `trustForwardedHeaders`와 `publicOrigin`이 각각 이를 복구하는지, 그리고 교차 사이트
 Origin은 여전히 거부되는지 확인합니다.
 
-`verify:postgres`, `verify:coredns`, `verify:powerdns`, `verify:proxy`는 Docker가
+`verify:postgres`, `verify:proxy`는 Docker가
 필요하며 종료 시 컨테이너를 제거합니다.
 
 통과한 실행은 그 실행이 돈 커밋에 대한 증거일 뿐입니다. Cloudflare 검증은 `ef61201`에서

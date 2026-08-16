@@ -476,7 +476,6 @@ function fillSettingsForm(state) {
   const form = $("#settings-form");
   form.elements.allowLocalProvider.checked = Boolean(state.settings.allowLocalProvider);
   form.elements.trustForwardedHeaders.checked = Boolean(state.settings.trustForwardedHeaders);
-  form.elements.coreDnsDirectory.value = state.settings.coreDnsDirectory ?? "";
   form.elements.publicOrigin.value = state.settings.publicOrigin ?? "";
   form.elements.revisionRetention.value = String(state.settings.revisionRetention ?? 0);
   form.elements.auditRetentionDays.value = String(state.settings.auditRetentionDays ?? 0);
@@ -863,7 +862,6 @@ $("#settings-form").addEventListener("submit", async (event) => {
   await store.saveSettings({
     allowLocalProvider: form.elements.allowLocalProvider.checked,
     trustForwardedHeaders: form.elements.trustForwardedHeaders.checked,
-    coreDnsDirectory: String(form.elements.coreDnsDirectory.value).trim(),
     publicOrigin: String(form.elements.publicOrigin.value).trim(),
     revisionRetention: Number(form.elements.revisionRetention.value),
     auditRetentionDays: Number(form.elements.auditRetentionDays.value),

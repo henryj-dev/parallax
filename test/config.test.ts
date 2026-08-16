@@ -40,7 +40,6 @@ describe("configuration", () => {
     // environment must not quietly take effect.
     const config = readConfig({
       PARALLAX_ALLOW_LOCAL_PROVIDER: "true",
-      PARALLAX_COREDNS_DIRECTORY: "/srv/coredns/zones",
       PARALLAX_PUBLIC_ORIGIN: "https://dns.example.com",
       PARALLAX_TRUST_FORWARDED_HEADERS: "true",
       PARALLAX_REVISION_RETENTION: "5",
@@ -90,10 +89,6 @@ describe("configuration", () => {
   it("fails closed on malformed and cleartext remote PostgreSQL configuration", () => {
     assert.throws(() => readConfig({ DATABASE_URL: "host=db dbname=parallax" }), /must be a PostgreSQL URL/);
     assert.throws(() => readConfig({ DATABASE_URL: "postgres://u:p@db/parallax" }), /must verify PostgreSQL TLS/);
-    assert.throws(
-      () => readConfig({ PARALLAX_POWERDNS_DATABASE_URL: "postgres://u:p@powerdns/pdns?sslmode=prefer" }),
-      /PARALLAX_POWERDNS_DATABASE_URL must verify PostgreSQL TLS/,
-    );
     assert.equal(readConfig({ DATABASE_URL: "postgres://u:p@localhost/parallax" }).databaseUrl, "postgres://u:p@localhost/parallax");
     assert.equal(readConfig({
       DATABASE_URL: "postgres://u:p@db/parallax",

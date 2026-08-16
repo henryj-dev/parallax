@@ -410,7 +410,4 @@ server.listen(config.port, config.host, () => {
   if (config.databaseUrl && usesPlaintextPostgres(config.databaseUrl)) {
     console.warn("parallax: DATABASE_URL does not request TLS; zone data and audit history cross the network in cleartext. Append ?sslmode=verify-full unless PostgreSQL is reached over a trusted local socket.");
   }
-  if (config.powerDnsDatabaseUrl && usesPlaintextPostgres(config.powerDnsDatabaseUrl)) {
-    console.warn("parallax: PARALLAX_POWERDNS_DATABASE_URL does not request TLS; DNS state crosses the network in cleartext. Append ?sslmode=verify-full unless PostgreSQL is reached over a trusted local socket.");
-  }
 });

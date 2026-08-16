@@ -15,7 +15,7 @@ resulting changes, and applies only records explicitly managed by Parallax.
 - Deterministic `managed-only` reconciliation that leaves foreign records alone
 - Durable single-node JSON state and provider state with atomic writes
 - Optional PostgreSQL source of truth with transactional immutable revisions
-- Optional Cloudflare API and CoreDNS RFC 1035 zone-file adapters
+- Optional Cloudflare API adapter
 - Optional built-in DNS listener that answers the internal view from the desired
   state over UDP and TCP, and relays every other name to an upstream
 - Encrypted, write-only Cloudflare credential management from the admin portal
@@ -57,10 +57,8 @@ bind, how to reach the store, and the keys that protect what is stored.
 | `PARALLAX_STATE_FILE` | Zones, revisions, statuses and audit, when no database is configured |
 | `PARALLAX_CONFIG_FILE` | Settings, credentials and access tokens, when no database is configured |
 | `PARALLAX_PROVIDER_STATE_FILE` | Local provider state, used only while the local provider is enabled |
-| `PARALLAX_COREDNS_ROOT` | Deployment-owned root that confines the stored `coreDnsDirectory`; required before CoreDNS publishing can be enabled |
 | `PARALLAX_OWNERSHIP_SECRET` | 32+ byte secret that signs managed-record ownership markers |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | Exactly 32 bytes as base64 or 64 hexadecimal characters; encrypts stored credentials |
-| `PARALLAX_POWERDNS_DATABASE_URL` | PowerDNS's own database, subject to the same PostgreSQL TLS policy, when the internal view is published into it |
 | `PARALLAX_DNS_PORT` | Answer DNS for the internal view from this process. Unset leaves the port unbound |
 | `PARALLAX_DNS_HOST` | Address the DNS listener binds; defaults to `HOST`, which is loopback unless set |
 | `PARALLAX_DNS_FORWARD_TO` | Comma-separated upstreams (`host` or `host#port`) for names outside every zone. Empty answers `REFUSED` instead of relaying |
@@ -135,7 +133,6 @@ wiring and reports the refresh failure.
 | Setting | Effect |
 | --- | --- |
 | `allowLocalProvider` | Publish to a local file when no real provider is configured. Off by default, so an unrouted target fails loudly instead of reporting success |
-| `coreDnsDirectory` | Directory of RFC 1035 zone files beneath `PARALLAX_COREDNS_ROOT`; empty disables it |
 | `publicOrigin` | HTTPS origin browsers reach the portal at (HTTP is accepted only on loopback) |
 | `trustForwardedHeaders` | Trust proxy headers; requires `publicOrigin` so forwarded host/protocol never choose the security origin |
 | `revisionRetention` | Newest revision snapshots kept per zone; `0` keeps every one |
@@ -350,51 +347,19 @@ Cloudflare Enterprise zones can support a 30-second minimum, but Parallax keeps
 the non-Enterprise 60-second safety floor until provider plan capabilities are
 configured explicitly.
 
-CoreDNS output is an RFC 1035-style authoritative zone: Parallax adds SOA and
-NS records when it creates a file, increments the 32-bit SOA serial for every
-managed mutation, and atomically replaces the file with mode `0644` so a CoreDNS
-process running as another user can read it. Configure CoreDNS with the `auto`
-plugin or the `file` plugin's nonzero `reload` interval so it observes serial
-changes. Existing non-Parallax records and authority data are retained; Parallax
-only updates records carrying its signed ownership marker.
-
-Set `PARALLAX_COREDNS_ROOT` to a deployment-owned directory before enabling the
-stored `coreDnsDirectory` setting. The selected directory must stay beneath that
-root both lexically and after resolving symlinks; the setting is rejected before
-it is persisted when the boundary or writeability check fails.
-
-Reading an existing zone file covers the common RFC 1035 forms: records that
-inherit `$TTL`, records that inherit the previous owner name, an optional class
-field, and parenthesized multi-line records. A record line Parallax cannot read
-is an error rather than an absent record, because treating it as absent would let
-reconciliation publish a second answer beside one it never saw.
-`$ORIGIN` is tracked while parsing and new managed records are written with
-absolute owner names. `$INCLUDE`, `$GENERATE`, unknown directives or record
-types, duplicate ownership ids, and malformed multi-line spans all fail closed
-before the file is written or CoreDNS is reloaded.
-
 ### Publishing the internal view
 
-The internal view reaches clients three ways. Two of them publish it into a DNS
-server that then answers for it; the third answers from this process directly.
+The internal view is answered by this process, out of the desired state. There is
+no publishing step: nothing is written to another DNS server, no ownership marker
+is involved, and nothing is compared against a provider. That is why `apply` is
+not part of it and why a change appears within one refresh rather than after a
+reconcile.
 
-| | `coreDnsDirectory` | `PARALLAX_POWERDNS_DATABASE_URL` | `PARALLAX_DNS_PORT` |
-| --- | --- | --- | --- |
-| Served as | RFC 1035 zone files | rows in PowerDNS's database | answers from this process |
-| Needs | a filesystem both processes reach | nothing beyond the database | nothing |
-| In a cluster | a volume that must survive restarts | no volume | no volume |
-| Change is served after | `reload` interval, about a second | the resolver's cache TTL | at once, or one refresh (5s) for a change made elsewhere |
-| Reconciles | yes | yes | no |
-
-**The two publishers are exclusive; the listener is not.** Configuring
-`coreDnsDirectory` and `PARALLAX_POWERDNS_DATABASE_URL` together is refused at
-startup rather than resolved by a precedence rule nobody would remember when the
-wrong one turned out to be serving. `PARALLAX_DNS_PORT` is a different kind of
-thing and does not enter that rule: it publishes nothing, writes no ownership
-marker, and compares nothing against a provider. It reads the desired state and
-answers, which is why `apply` is not involved and why a change appears within
-one refresh rather than after a reconcile. Running it beside a publisher is two
-servers answering, and which one clients ask is the deployment's decision.
+Earlier versions could instead publish the view into CoreDNS zone files or a
+PowerDNS database, and both are gone. They existed because this process could not
+answer for itself; it can. What went with them is the one arrangement where
+Parallax being down did not take the internal view with it -- a deployment that
+needs that property needs a DNS server in front, not a publisher behind.
 
 The listener is off unless `PARALLAX_DNS_PORT` names a port, and then it binds
 `PARALLAX_DNS_HOST` -- or `HOST`, which is loopback unless a deployment said
@@ -441,9 +406,9 @@ database, or the command line writing to the same file.
 
 **Wildcards are expanded, not taken literally.** A record named `*` or `*.eu`
 answers for the names below it, the closest one wins, and neither answers over a
-name that exists. That is what a zone file, PowerDNS and Cloudflare all do with
-the same desired state, and a listener that disagreed would resolve a name
-differently depending on which publisher a deployment happened to use.
+name that exists. That is what Cloudflare does with the same
+desired state, and a listener that disagreed would resolve a name differently
+inside and outside.
 
 **Readiness counts the listener as serving the internal view.** A deployment
 that answers DNS itself and configures no provider at all is ready. Without
@@ -453,47 +418,6 @@ zone scan runs at most once at a time in the background. Zone or provider-route
 changes invalidate it immediately, and a failed or ten-second-stale refresh is
 not ready.
 
-The zone-file shape needs persistent storage and not an ephemeral volume,
-because a zone file also holds records nobody else has a copy of -- the ones an
-operator maintains by hand. Losing it loses those.
-
-PowerDNS has no per-record field to mark ownership with, so Parallax adds one
-table to PowerDNS's own database:
-
-```sh
-parallax migrate --target powerdns
-```
-
-It lives there, not in Parallax's database, because ownership has to be
-answerable from the provider alone -- the same property a Cloudflare comment or
-a zone-file comment gives. A record deleted directly in PowerDNS takes its
-marker with it, so the table can never claim a row that is no longer there.
-
-Either way the zone must already exist in the DNS engine: PowerDNS serves what
-its `domains` table lists, and Parallax publishes records into a zone rather
-than creating one.
-
-The direct-SQL adapter refuses mutations when PowerDNS reports an active DNSSEC
-key. `ordername` depends on the zone's NSEC/NSEC3 mode and must be calculated by
-PowerDNS rectification; guessing it in SQL would corrupt denial proofs. Keep the
-published zone unsigned, or use a future API/rectify-capable adapter for signed
-zones.
-
-Two things about running PowerDNS are worth knowing before the first zone,
-because both look like Parallax failing when they are not:
-
-**PowerDNS caches the list of zones for `zone-cache-refresh-interval` seconds,
-300 by default.** A zone added while it is running is answered with `REFUSED`
-until that expires -- `apply` reports `applied`, the rows are in the database,
-and the name does not resolve. Parallax adds records to zones an operator
-creates whenever they like, so set the interval to `0` for this use. Measured:
-with the default a zone added after startup is `REFUSED`; with `0` the same
-zone resolves at once.
-
-**It writes a control socket at startup**, so `readOnlyRootFilesystem: true`
-needs a writable `/var/run/pdns`. An ephemeral volume is right -- a control
-socket has no reason to survive a restart.
-
 ### Pointing a resolver at the internal view
 
 Whatever answers the internal view is authoritative for the zone, so it replies
@@ -502,11 +426,9 @@ forwarder accepts and does not fall back from. That is why the internal view has
 to be complete before anything is pointed at it, and why [adoption](#adopting-records-that-already-exist)
 exists.
 
-**A publisher is not the resolver clients should be given.** CoreDNS and
-PowerDNS serving the internal view answer for that zone and refuse everything
-else -- `REFUSED` to `google.com` is the server saying the question is not its to
-answer, which is correct and is not a fault. Clients point at a forwarder, and
-the forwarder sends the one zone here and the rest upstream:
+Clients can be pointed at the listener directly, because it forwards what it is
+not authoritative for. A forwarder in front still works and is what an existing
+network usually has:
 
 ```
 client → forwarder ──(example.com)──→ the internal view
@@ -660,8 +582,8 @@ remains fail-closed, but the local `settings set` command is still available as
 a recovery path. It initializes only the settings repository, merges the patch
 with the latest stored values, and verifies the complete repaired snapshot
 before writing; it does not start providers, tokens, or the control plane. For
-example, clear a CoreDNS path that belongs to another machine with
-`pnpm cli settings set --values '{"coreDnsDirectory":""}'`. A patch that leaves
+example, turn off a local provider whose directory this machine cannot write with
+`pnpm cli settings set --values '{"allowLocalProvider":false}'`. A patch that leaves
 any stored invariant invalid is rejected and writes nothing.
 
 The CLI reads the same store as the server, so a change made in one is visible
@@ -919,8 +841,6 @@ Unit and HTTP tests use in-memory fakes. These scripts exercise the real thing:
 
 ```sh
 pnpm verify:postgres    # Docker PostgreSQL: migration, restart, locks, retention
-pnpm verify:coredns     # Docker CoreDNS + dig: zone load, SOA reload, conflicts
-pnpm verify:powerdns    # Docker PowerDNS + PostgreSQL + dig: publish, conflict, withdraw
 pnpm verify:proxy       # Docker nginx over TLS: origin, cookies, HSTS, readiness
 pnpm verify:dns         # dig against the built-in listener: every type, TC, relay
 pnpm verify:cloudflare  # opt-in; needs a real scoped token, skips without one
@@ -945,7 +865,7 @@ the misconfigured case, where the `https` Origin is refused, so the checks that
 follow cannot pass vacuously; then it proves `trustForwardedHeaders` and
 `publicOrigin` each repair it, and that a cross-site Origin is still refused.
 
-`verify:postgres`, `verify:coredns`, `verify:powerdns`, and `verify:proxy` need
+`verify:postgres` and `verify:proxy` need
 Docker and remove their containers on exit.
 
 A passing run is evidence about the commit it ran on and nothing else. The

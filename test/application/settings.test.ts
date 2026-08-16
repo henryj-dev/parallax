@@ -154,26 +154,26 @@ describe("settings", () => {
   it("keeps the previous runtime wiring when an external value is unusable here", async () => {
     const repository = new MemorySettingsRepository();
     const service = new SettingsService(repository, (candidate) => {
-      if (candidate.coreDnsDirectory) throw new Error("publisher root unavailable");
+      if (candidate.publicOrigin) throw new Error("publisher root unavailable");
     });
     await service.load();
-    repository.values = { coreDnsDirectory: "/another-host/zones" };
+    repository.values = { publicOrigin: "https://another.example" };
 
     await assert.rejects(service.refresh(), /publisher root unavailable/);
-    assert.equal(service.current().coreDnsDirectory, "");
+    assert.equal(service.current().publicOrigin, "");
   });
 
   it("repairs an unusable external value without publishing it over the last good settings", async () => {
     const repository = new MemorySettingsRepository();
     const service = new SettingsService(repository, (candidate) => {
-      if (candidate.coreDnsDirectory) throw new Error("publisher root unavailable");
+      if (candidate.publicOrigin) throw new Error("publisher root unavailable");
     });
     await service.load();
     const rewired: Array<[string, number]> = [];
     service.onChange((candidate) => {
-      rewired.push([candidate.coreDnsDirectory, candidate.revisionRetention]);
+      rewired.push([candidate.publicOrigin, candidate.revisionRetention]);
     });
-    repository.values = { coreDnsDirectory: "/another-host/zones", revisionRetention: 7 };
+    repository.values = { publicOrigin: "https://another.example", revisionRetention: 7 };
 
     await assert.rejects(
       service.update({ auditRetentionDays: 30 }),
@@ -181,32 +181,32 @@ describe("settings", () => {
       "an unrelated patch must not leave the durable snapshot unusable",
     );
     assert.deepEqual(repository.values, {
-      coreDnsDirectory: "/another-host/zones",
+      publicOrigin: "https://another.example",
       revisionRetention: 7,
     });
     assert.deepEqual(rewired, [], "the unusable external snapshot must never reach a listener");
 
-    const repaired = await service.update({ coreDnsDirectory: "" });
-    assert.equal(repaired.settings.coreDnsDirectory, "");
+    const repaired = await service.update({ publicOrigin: "" });
+    assert.equal(repaired.settings.publicOrigin, "");
     assert.equal(repaired.settings.revisionRetention, 7);
-    assert.deepEqual(repository.values, { coreDnsDirectory: "", revisionRetention: 7 });
+    assert.deepEqual(repository.values, { publicOrigin: "", revisionRetention: 7 });
     assert.deepEqual(rewired, [["", 7]], "listeners see only the verified repaired snapshot");
   });
 
   it("rolls repaired runtime wiring back when the corrective write fails", async () => {
     const repository = new MemorySettingsRepository();
     const service = new SettingsService(repository, (candidate) => {
-      if (candidate.coreDnsDirectory) throw new Error("publisher root unavailable");
+      if (candidate.publicOrigin) throw new Error("publisher root unavailable");
     });
     await service.load();
-    repository.values = { coreDnsDirectory: "/another-host/zones", revisionRetention: 7 };
+    repository.values = { publicOrigin: "https://another.example", revisionRetention: 7 };
     repository.write = async () => { throw new Error("store unavailable"); };
     const rewired: Array<[number, number]> = [];
     service.onChange((candidate, previous) => {
       rewired.push([candidate.revisionRetention, previous.revisionRetention]);
     });
 
-    await assert.rejects(service.update({ coreDnsDirectory: "" }), /store unavailable/);
+    await assert.rejects(service.update({ publicOrigin: "" }), /store unavailable/);
 
     assert.deepEqual(rewired, [
       [7, DEFAULT_SETTINGS.revisionRetention],
@@ -214,7 +214,7 @@ describe("settings", () => {
     ], "rollback receives the attempted candidate as its previous value");
     assert.deepEqual(service.current(), DEFAULT_SETTINGS);
     assert.deepEqual(repository.values, {
-      coreDnsDirectory: "/another-host/zones",
+      publicOrigin: "https://another.example",
       revisionRetention: 7,
     });
   });
@@ -225,12 +225,12 @@ describe("settings", () => {
       const path = join(directory, "configuration.json");
       const first = new SettingsService(new FileConfigurationStore(path).settings);
       await first.load();
-      await first.update({ coreDnsDirectory: "/srv/coredns/zones", auditRetentionDays: 30 });
+      await first.update({ publicOrigin: "https://srv.example", auditRetentionDays: 30 });
 
       const restarted = new SettingsService(new FileConfigurationStore(path).settings);
       assert.deepEqual(await restarted.load(), {
         ...DEFAULT_SETTINGS,
-        coreDnsDirectory: "/srv/coredns/zones",
+        publicOrigin: "https://srv.example",
         auditRetentionDays: 30,
       });
     } finally {
@@ -277,30 +277,30 @@ describe("settings", () => {
   it("refuses a setting the process could not act on, and stores nothing", async () => {
     const repository = new MemorySettingsRepository();
     const service = new SettingsService(repository, (candidate) => {
-      if (candidate.coreDnsDirectory) throw new DomainValidationError(["coreDnsDirectory is not writable (EROFS)"]);
+      if (candidate.publicOrigin) throw new DomainValidationError(["publicOrigin is not writable (EROFS)"]);
     });
     await service.load();
 
     await assert.rejects(
-      service.update({ coreDnsDirectory: "/read-only/zones" }),
-      /coreDnsDirectory is not writable \(EROFS\)/,
+      service.update({ publicOrigin: "https://read-only.example" }),
+      /publicOrigin is not writable \(EROFS\)/,
     );
     // A refused setting must leave no trace: stored, cached, or announced.
     assert.deepEqual(repository.values, {});
-    assert.equal(service.current().coreDnsDirectory, "");
+    assert.equal(service.current().publicOrigin, "");
   });
 
   it("verifies the merged result rather than the patch alone", async () => {
     const seen: string[] = [];
     const service = new SettingsService(new MemorySettingsRepository(), (candidate) => {
-      seen.push(`${candidate.coreDnsDirectory}|${candidate.allowLocalProvider}`);
+      seen.push(`${candidate.publicOrigin}|${candidate.allowLocalProvider}`);
     });
     await service.load();
-    await service.update({ coreDnsDirectory: "/srv/zones" });
+    await service.update({ publicOrigin: "https://srv2.example" });
     // Turning on the second setting must show the verifier the first one too,
     // or a combination that cannot work would be accepted one half at a time.
     await service.update({ allowLocalProvider: true });
-    assert.deepEqual(seen, ["|false", "/srv/zones|false", "/srv/zones|true"]);
+    assert.deepEqual(seen, ["|false", "https://srv2.example|false", "https://srv2.example|true"]);
   });
 
   it("reports what a legal change costs instead of refusing it", async () => {

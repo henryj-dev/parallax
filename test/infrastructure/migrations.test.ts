@@ -67,7 +67,6 @@ describe("database migrations", () => {
     await cp(resolve(import.meta.dirname, "../../migrations"), join(project, "migrations"), { recursive: true });
 
     assert.equal(findMigrationsDirectory(entrypoint), join(project, "migrations"));
-    assert.equal(findMigrationsDirectory(entrypoint, "powerdns"), join(project, "migrations", "powerdns"));
   });
 
   it("runs only the fixed manifest and records checksums so a replay is skipped", async () => {

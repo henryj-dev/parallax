@@ -16,13 +16,9 @@ export interface ParallaxConfig {
   stateFile: string;
   /** Local provider state file, used only when the local provider is enabled. */
   providerStateFile: string;
-  /** Immutable deployment-owned root beneath which CoreDNS files may be written. */
-  coreDnsRoot?: string;
   /** Settings, credentials and tokens file used when no database is configured. */
   configurationFile: string;
   databaseUrl?: string;
-  /** PowerDNS's own database, when the internal view is published into it. */
-  powerDnsDatabaseUrl?: string;
   /** Signs managed-record ownership markers. Rotating it orphans existing records. */
   ownershipSecret?: string;
   /** Encrypts stored provider credentials. Without it, credentials cannot be used. */
@@ -93,12 +89,6 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     "DATABASE_URL",
     allowPlaintextPostgres,
   );
-  const powerDnsDatabaseUrl = readPostgresConnection(
-    environment.PARALLAX_POWERDNS_DATABASE_URL,
-    "PARALLAX_POWERDNS_DATABASE_URL",
-    allowPlaintextPostgres,
-  );
-  const coreDnsRoot = environment.PARALLAX_COREDNS_ROOT?.trim() || undefined;
   return {
     host: environment.HOST?.trim() || "127.0.0.1",
     port: readPort(environment.PORT),
@@ -106,8 +96,6 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     providerStateFile: environment.PARALLAX_PROVIDER_STATE_FILE?.trim() || "data/provider-state.json",
     configurationFile: environment.PARALLAX_CONFIG_FILE?.trim() || "data/parallax-config.json",
     ...(databaseUrl ? { databaseUrl } : {}),
-    ...(powerDnsDatabaseUrl ? { powerDnsDatabaseUrl } : {}),
-    ...(coreDnsRoot ? { coreDnsRoot } : {}),
     ...(ownershipSecret ? { ownershipSecret } : {}),
     ...(credentialMasterKey ? { credentialMasterKey } : {}),
     bootstrapTokens: readBootstrapTokens(environment.PARALLAX_AUTH_TOKENS),

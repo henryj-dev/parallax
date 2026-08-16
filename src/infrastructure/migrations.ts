@@ -22,10 +22,10 @@ import type { CloseablePgPool } from "./postgres.ts";
 /** A distinct key, so a migration run cannot be confused with a zone's apply lock. */
 const MIGRATION_LOCK = "parallax:migrations";
 
-/** Which database a run targets. PowerDNS keeps its records in its own. */
-export type MigrationTarget = "parallax" | "powerdns";
+/** Which database a run targets. Only this control plane's own, now. */
+export type MigrationTarget = "parallax";
 
-export const MIGRATION_TARGETS: readonly MigrationTarget[] = ["parallax", "powerdns"];
+export const MIGRATION_TARGETS: readonly MigrationTarget[] = ["parallax"];
 
 export interface MigrationRun {
   readonly directory: string;
@@ -39,7 +39,6 @@ const MIGRATION_FILES: Readonly<Record<MigrationTarget, readonly string[]>> = {
     "003_audit_actions.sql",
     "004_security_invariants.sql",
   ],
-  powerdns: ["001_ownership.sql"],
 };
 
 /**

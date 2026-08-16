@@ -11,8 +11,6 @@ import type { SettingsRepository } from "./ports.ts";
 export interface ParallaxSettings {
   /** Publish to a local file when no real provider is configured for a target. */
   readonly allowLocalProvider: boolean;
-  /** Directory of RFC 1035 zone files for the internal view; empty disables it. */
-  readonly coreDnsDirectory: string;
   /** Absolute origin browsers reach the portal at; empty derives it per request. */
   readonly publicOrigin: string;
   /** Trust `X-Forwarded-Proto`/`X-Forwarded-Host` from a reverse proxy. */
@@ -35,7 +33,6 @@ export interface ParallaxSettings {
 
 export const DEFAULT_SETTINGS: ParallaxSettings = Object.freeze({
   allowLocalProvider: false,
-  coreDnsDirectory: "",
   publicOrigin: "",
   trustForwardedHeaders: false,
   revisionRetention: 100,
@@ -207,7 +204,6 @@ export function parseSettings(stored: Record<string, unknown>): ParallaxSettings
   }
   return {
     allowLocalProvider: readBoolean(merged.allowLocalProvider, "allowLocalProvider"),
-    coreDnsDirectory: readText(merged.coreDnsDirectory, "coreDnsDirectory"),
     publicOrigin: readOrigin(merged.publicOrigin),
     trustForwardedHeaders: readBoolean(merged.trustForwardedHeaders, "trustForwardedHeaders"),
     revisionRetention: readCount(merged.revisionRetention, "revisionRetention", MAX_REVISION_RETENTION),
