@@ -148,6 +148,27 @@ MX_DRIFT=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.view
 [ "$MX_DRIFT" = "0" ] || fail "an MX record Parallax wrote proposes $MX_DRIFT operations against itself"
 ok "MX round-trips: the preference comes back where it was written"
 
+echo "== SRV and URI round-trip the same field, which MX could not prove =="
+# The same separate-priority field, and the reason MX alone was not enough: an
+# MX content is a hostname, so a leading number can only be the priority. An SRV
+# content starts with its weight and a URI content with its own, so the rule
+# "there is already a number in front" reads a different number and drops the
+# priority. Adopting an SRV from a live zone failed on exactly that.
+for spec in "verifysrv:SRV:1 0 443 mail.${CF_ZONE}:_autodiscover._tcp" \
+            "verifyuri:URI:5 10 \"https://${CF_ZONE}/\":_uri"; do
+  IFS=':' read -r id type value label <<< "$spec"
+  curl -sf -X PUT -H 'content-type: application/json' \
+    -d "{\"name\":\"${label}.${LABEL}\",\"type\":\"${type}\",\"content\":\"${value}\",\"ttl\":300}" \
+    "$API/zones/${CF_ZONE}/views/external/records/${id}" >/dev/null \
+    || fail "the control plane refused the ${type} record"
+done
+curl -sf -X POST "$API/zones/${CF_ZONE}/apply?view=external" | json 'v.statuses[0].state' | grep -qx applied \
+  || fail "the SRV and URI records did not apply"
+PRIORITY_DRIFT=$(curl -sf "$API/zones/${CF_ZONE}/preview?view=external" | json 'v.views.external.operations.length')
+[ "$PRIORITY_DRIFT" = "0" ] \
+  || fail "SRV/URI records Parallax wrote propose $PRIORITY_DRIFT operations against themselves"
+ok "SRV and URI come back with their priority where it was written"
+
 echo "== a TXT record survives Cloudflare's quoting =="
 # Cloudflare returns TXT in presentation form -- each character-string in double
 # quotes, split at 255 characters whether or not it was written that way. The

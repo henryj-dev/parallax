@@ -329,9 +329,26 @@ function hasSeparatePriority(type: string): boolean {
   return type === "MX" || type === "SRV" || type === "URI";
 }
 
+/**
+ * How many whitespace-separated fields the complete presentation form has, for
+ * the three types Cloudflare keeps a priority out of `content` for.
+ *
+ * Counting is the only way to tell whether the priority is already there. The
+ * previous test -- does the content begin with a number -- is right for `MX`,
+ * whose content is a hostname, and wrong for the other two: an `SRV` content
+ * begins with its weight and a `URI` content with its own, so the leading digit
+ * that was read as "the priority is present" was a different number entirely.
+ * The priority was then dropped, and adopting an `SRV` from Cloudflare failed
+ * validation with a content one field short.
+ */
+const COMPLETE_FIELDS: Readonly<Record<string, number>> = { MX: 2, SRV: 4, URI: 3 };
+
 function joinPriority(type: string, content: string, priority: number | undefined): string {
   if (!hasSeparatePriority(type) || priority === undefined) return content;
-  return /^\d+\s/u.test(content) ? content : `${priority} ${content}`;
+  const complete = COMPLETE_FIELDS[type];
+  if (complete === undefined) return content;
+  const fields = content.trim().split(/\s+/u).filter((field) => field !== "").length;
+  return fields === complete - 1 ? `${priority} ${content}` : content;
 }
 
 /** Splits the leading priority back out, for the field Cloudflare expects it in. */

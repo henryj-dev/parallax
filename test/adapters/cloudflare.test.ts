@@ -87,6 +87,13 @@ describe("CloudflareProviderAdapter", () => {
           { id: "mx", name: "example.com", type: "MX", content: "mail.example.net", priority: 10, ttl: 300 },
           // Already in presentation form: the priority must not be added twice.
           { id: "srv", name: "_sip.example.com", type: "SRV", content: "10 5 5060 sip.example.net", priority: 10, ttl: 300 },
+          // The shape a live zone actually returns: weight, port and target, with
+          // the priority in its own field. This one begins with a digit as well,
+          // which is why "does it start with a number" could not tell the two
+          // apart -- and why adopting an SRV failed until it counted fields.
+          { id: "srv-live", name: "_autodiscover._tcp.example.com", type: "SRV", content: "0 443 mx.example.com", priority: 1, ttl: 300 },
+          // Same shape one field down: weight and target, priority separate.
+          { id: "uri", name: "_ftp.example.com", type: "URI", content: '10 "ftp://ftp.example.com/"', priority: 5, ttl: 300 },
         ],
         result_info: { page: 1, total_pages: 1 },
       });
@@ -96,6 +103,8 @@ describe("CloudflareProviderAdapter", () => {
     assert.deepEqual((await adapter.list("example.com/external")).map((record) => record.content), [
       "10 mail.example.net",
       "10 5 5060 sip.example.net",
+      "1 0 443 mx.example.com",
+      '5 10 "ftp://ftp.example.com/"',
     ]);
 
     await adapter.apply("example.com/external", {
