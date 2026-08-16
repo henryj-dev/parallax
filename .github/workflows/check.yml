@@ -14,6 +14,8 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    # A hung test would otherwise sit for six hours. Bounded, it reports.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       # `engines` claims Node 24 and up, and nothing has ever run there: this
@@ -42,6 +44,7 @@ jobs:
   # nobody there would have been told.
   deployment-gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
