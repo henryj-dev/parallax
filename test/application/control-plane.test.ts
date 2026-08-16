@@ -1287,6 +1287,24 @@ describe("ControlPlane", () => {
       assert.ok(views.external, "the view that does publish is still planned");
     });
 
+    it("deletes a zone without demanding an abandon for a view it answered itself", async () => {
+      // The third door. Deletion withdraws what was published, and the set of
+      // targets comes from the statuses -- which now include the view this
+      // process answers. Nothing was ever published through a provider for it,
+      // so asking to withdraw fails for want of one, and "delete this zone"
+      // becomes a demand to acknowledge abandoning records that never existed.
+      const adapters = createInMemoryAdapters();
+      const service = new ControlPlane(adapters.zones, adapters.statuses, withoutInternalPublisher(adapters),
+        undefined, undefined, {}, (target) => target.endsWith("/internal"));
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+      await service.apply("example.com");
+
+      const result = await service.deleteZone("example.com");
+      assert.deepEqual(result.abandonedProviderTargets, [], "nothing was abandoned, because nothing was published");
+      await assert.rejects(service.getZone("example.com"), NotFoundError);
+    });
+
     it("still fails when nothing publishes it and nothing answers it either", async () => {
       // Without the listener there is nowhere for the internal view to go, and
       // that is a real failure worth the red -- the guard must not swallow it.

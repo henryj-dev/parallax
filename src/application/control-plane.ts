@@ -277,11 +277,17 @@ export class ControlPlane {
     // or not a provider backs it. Asking an unconfigured provider to list its
     // records is how deleting a zone came to fail outright on any deployment
     // that publishes to Cloudflare alone.
+    //
+    // A view this process answers out of the desired state is not in that set
+    // either. It has a status like any other, but nothing was ever published
+    // through a provider for it, so there is nothing to withdraw -- and asking
+    // would fail for want of a provider, turning "delete this zone" into a
+    // demand to acknowledge abandoning records that never existed.
     const published = [...new Set(
       (await this.#statuses.list(zone.name))
         .filter((status) => status.lastAttemptAt !== undefined && isProviderView(status.view))
         .map((status) => status.view),
-    )].sort();
+    )].sort().filter((view) => !this.#answeredHere(targetKey(zone.name, view)));
 
     // Every target is read before any is written. The ordering above promises
     // that a failure leaves the zone in place to retry, and that promise is only
