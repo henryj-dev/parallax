@@ -270,6 +270,10 @@ function renderLens(state) {
 function renderSync(state) {
   const desired = state.status?.desiredRevision ?? state.activeZone.revision ?? 0;
   const statuses = state.status?.statuses ?? [];
+  // A zone that holds no records has no target to reconcile, so nothing ever
+  // writes a status for it. Reading that absence as "pending" tells someone the
+  // system has not caught up yet, when there is nothing for it to catch up to.
+  if (statuses.length === 0 && state.records.length === 0) return renderNothingToSync();
   const forView = (view) => {
     const found = statuses.find((status) => status.view === view);
     return {
@@ -297,6 +301,21 @@ function renderSync(state) {
   const percent = desired > 0 ? Math.min(100, Math.round((applied / desired) * 100)) : overall === "applied" ? 100 : 0;
   $("#revision-progress").style.width = `${percent}%`;
   $("#revision-caption").textContent = desired ? t("sync.progress", { applied, desired }) : t("sync.noneApplied");
+}
+
+/** The panel for a zone that has nothing in it yet: idle, not behind. */
+function renderNothingToSync() {
+  for (const prefix of ["internal", "external"]) {
+    const label = $(`#${prefix}-sync`);
+    label.className = "target-status";
+    label.textContent = t("sync.empty");
+    $(`#${prefix}-sync-detail`).textContent = t("sync.emptyDetail");
+  }
+  const chip = $("#sync-overall");
+  chip.className = "status-chip";
+  chip.textContent = t("sync.empty");
+  $("#revision-progress").style.width = "0%";
+  $("#revision-caption").textContent = t("sync.emptyDetail");
 }
 
 /**
