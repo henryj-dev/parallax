@@ -1,4 +1,5 @@
 import { createApiClient } from "./api-client.js";
+import { syncPanel } from "./panels.js";
 import { createStore, isNonGlobalAddress, ERROR_SCOPES, HISTORY_PAGE_SIZE } from "./store.js";
 import { effectiveExternalTtl, isValidDnsOnlyTtl } from "./ttl.js";
 import {
@@ -268,39 +269,24 @@ function renderLens(state) {
 }
 
 function renderSync(state) {
-  const desired = state.status?.desiredRevision ?? state.activeZone.revision ?? 0;
-  const statuses = state.status?.statuses ?? [];
-  // A zone that holds no records has no target to reconcile, so nothing ever
-  // writes a status for it. Reading that absence as "pending" tells someone the
-  // system has not caught up yet, when there is nothing for it to catch up to.
-  if (statuses.length === 0 && state.records.length === 0) return renderNothingToSync();
-  const forView = (view) => {
-    const found = statuses.find((status) => status.view === view);
-    return {
-      state: String(found?.state ?? "pending").toLowerCase(),
-      appliedRevision: Number(found?.appliedRevision ?? 0),
-      error: found?.error ?? "",
-    };
-  };
-  const targets = { internal: forView("internal"), external: forView("external") };
-  for (const [prefix, target] of Object.entries(targets)) {
+  const panel = syncPanel(state);
+  if (panel.kind === "empty") return renderNothingToSync();
+  for (const prefix of ["internal", "external"]) {
+    const view = panel.views[prefix];
     const label = $(`#${prefix}-sync`);
-    label.className = `target-status ${target.state}`;
-    label.textContent = t(`status.${target.state}`);
-    $(`#${prefix}-sync-detail`).textContent = target.error
-      ? localizeProviderError(target.error, t)
-      : t("sync.appliedRevision", { revision: target.appliedRevision });
+    label.className = `target-status ${view.state}`;
+    label.textContent = t(`status.${view.state}`);
+    $(`#${prefix}-sync-detail`).textContent = view.error
+      ? localizeProviderError(view.error, t)
+      : t("sync.appliedRevision", { revision: view.appliedRevision });
   }
-  const overall = [targets.internal.state, targets.external.state].includes("failed")
-    ? "failed"
-    : [targets.internal.state, targets.external.state].every((value) => value === "applied") ? "applied" : "pending";
   const chip = $("#sync-overall");
-  chip.className = `status-chip ${overall}`;
-  chip.textContent = t(`status.${overall}`);
-  const applied = Math.min(targets.internal.appliedRevision, targets.external.appliedRevision);
-  const percent = desired > 0 ? Math.min(100, Math.round((applied / desired) * 100)) : overall === "applied" ? 100 : 0;
-  $("#revision-progress").style.width = `${percent}%`;
-  $("#revision-caption").textContent = desired ? t("sync.progress", { applied, desired }) : t("sync.noneApplied");
+  chip.className = `status-chip ${panel.overall}`;
+  chip.textContent = t(`status.${panel.overall}`);
+  $("#revision-progress").style.width = `${panel.percent}%`;
+  $("#revision-caption").textContent = panel.desired
+    ? t("sync.progress", { applied: panel.applied, desired: panel.desired })
+    : t("sync.noneApplied");
 }
 
 /** The panel for a zone that has nothing in it yet: idle, not behind. */
