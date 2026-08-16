@@ -1335,9 +1335,31 @@ describe("ControlPlane", () => {
 
       const { warnings } = await service.adoptProviderRecords("mail.example", "external", "operator");
       assert.equal(warnings.length, 2);
-      assert.match(warnings[0] ?? "", /answered by this process rather than forwarded/u);
+      assert.match(warnings[0] ?? "", /is now answered by this process rather than forwarded/u);
       assert.match(warnings[0] ?? "", /NXDOMAIN inside/u, "the names nobody adopted");
       assert.match(warnings[1] ?? "", /1 proxied record\(s\) now answer with their origin/u);
+    });
+
+    it("shows the same thing without doing it, and says so in the conditional", async () => {
+      // The lesson from the incident: finding out that adopting takes authority
+      // for a zone should not require taking it. A dry run that reported the
+      // change as done would give the reading back its cost.
+      const { service, provider } = setup();
+      await service.createZone("mail.example");
+      provider.seed("mail.example/external", [
+        { id: "a", name: "admin", type: "A", content: "8.8.8.10", ttl: 300, providerId: "cf-1", managed: false },
+        { id: "b", name: "www", type: "A", content: "8.8.8.11", ttl: 300, providerId: "cf-2", managed: false, proxied: true },
+      ]);
+
+      const preview = await service.adoptProviderRecords("mail.example", "external", "operator", undefined, true);
+      assert.equal(preview.adopted.length, 2, "it says what it would adopt");
+      assert.equal(preview.warnings.length, 2, "and what that would change");
+      assert.match(preview.warnings[0] ?? "", /would be answered/u, "not `is now`, because it is not");
+      assert.match(preview.warnings[1] ?? "", /would answer with their origin/u);
+
+      const stored = await service.getZone("mail.example");
+      assert.equal(stored.revision, 1, "and nothing was written");
+      assert.deepEqual(stored.views, [], "the zone is still empty");
     });
 
     it("says nothing when the zone was already answered here", async () => {

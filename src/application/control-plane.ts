@@ -429,11 +429,11 @@ export class ControlPlane {
    * changes is that Parallax now knows the record exists, which is what the
    * internal view needs in order to derive from it.
    */
-  adoptProviderRecords(zoneName: string, viewName: string, actor = "system", expectedRevision?: number): Promise<AdoptionResult> {
-    return this.#exclusive(zoneName, () => this.#adoptProviderRecords(zoneName, viewName, actor, expectedRevision));
+  adoptProviderRecords(zoneName: string, viewName: string, actor = "system", expectedRevision?: number, dryRun = false): Promise<AdoptionResult> {
+    return this.#exclusive(zoneName, () => this.#adoptProviderRecords(zoneName, viewName, actor, expectedRevision, dryRun));
   }
 
-  async #adoptProviderRecords(zoneName: string, viewName: string, actor: string, expectedRevision?: number): Promise<AdoptionResult> {
+  async #adoptProviderRecords(zoneName: string, viewName: string, actor: string, expectedRevision?: number, dryRun = false): Promise<AdoptionResult> {
     const zone = await this.getZone(zoneName);
     this.#assertExpectedRevision(zone, expectedRevision);
     const view = validateViewName(viewName);
@@ -495,10 +495,17 @@ export class ControlPlane {
     ensureUniqueRecordKeys(target.records);
     materializeProviderViews(views);
     const updated = this.#nextRevision(zone, views);
+    const warnings = authorityWarnings(zone, updated, dryRun);
+    // Everything above decided what would happen; nothing has been written yet.
+    // A dry run stops here, which is the whole point: adopting is what turns a
+    // forwarded zone into one this process is the authority for, so finding that
+    // out should not require doing it. The zone reported back is the unchanged
+    // one, because that is what is still stored.
+    if (dryRun) return { zone, adopted, refreshed, warnings, seen: actual.length };
     await this.#commitDesiredChange(zone, updated, "records.adopted", actor,
       { view, adopted: adopted.length, ...(refreshed.length > 0 ? { refreshed: refreshed.length } : {}) },
       new Set(views.map((candidate) => candidate.name)), expectedRevision);
-    return { zone: updated, adopted, refreshed, warnings: authorityWarnings(zone, updated), seen: actual.length };
+    return { zone: updated, adopted, refreshed, warnings, seen: actual.length };
   }
 
   async listRevisions(zoneName: string, page?: PageRequest): Promise<Paged<"revisions", ZoneRevision>> {
@@ -916,23 +923,29 @@ export class ControlPlane {
  * proxies now answers with its origin inside, because the origin is what the
  * desired state holds -- the edge address was never ours to know.
  */
-function authorityWarnings(before: Zone, after: Zone): string[] {
+function authorityWarnings(before: Zone, after: Zone, wouldBe: boolean): string[] {
   const internalRecords = (zone: Zone): DesiredRecord[] =>
     materializeProviderViews(zone.views).find((view) => view.name === "internal")?.records ?? [];
   if (internalRecords(before).length > 0) return [];
   const now = internalRecords(after);
   if (now.length === 0) return [];
 
+  // A dry run has changed nothing, so it must not say anything has changed. The
+  // whole value of reading before writing is lost if the reading reports the
+  // write as done.
+  const became = wouldBe ? "would be" : "is now";
+  const answer = wouldBe ? "would answer" : "answers";
   const warnings = [
-    `${after.name} is now answered by this process rather than forwarded:`
-    + ` ${now.length} name(s) are described, and any other name under ${after.name} answers NXDOMAIN inside.`
+    `${after.name} ${became} answered by this process rather than forwarded:`
+    + ` ${now.length} name(s) are described, and any other name under ${after.name} ${answer} NXDOMAIN inside.`
     + " Adopt the rest, or the internal view is incomplete for the names it is missing",
   ];
   const proxied = (after.views.find((view) => view.name === "external")?.records ?? [])
     .filter((record) => record.proxied === true).length;
   if (proxied > 0) {
     warnings.push(
-      `${proxied} proxied record(s) now answer with their origin inside instead of the provider's edge.`
+      `${proxied} proxied record(s) ${wouldBe ? "would answer" : "now answer"} with their origin inside`
+      + " instead of the provider's edge."
       + " Override them in the internal view if inside traffic is meant to go through the provider",
     );
   }

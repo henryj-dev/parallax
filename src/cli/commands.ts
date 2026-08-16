@@ -268,10 +268,11 @@ const COMMANDS: readonly Command[] = [
       ZONE,
       { name: "view", summary: "internal or external", required: true },
       { name: "expectedRevision", summary: "Refuse if the zone moved on", type: "number" },
+      { name: "dryRun", summary: "Report what adopting would do, and change nothing", type: "boolean" },
     ],
     run: async (context, input) => {
       const result = await requireControlPlane(context.runtime).adoptProviderRecords(
-        String(input.zone), String(input.view), context.actor, expectedRevisionOf(input),
+        String(input.zone), String(input.view), context.actor, expectedRevisionOf(input), input.dryRun === true,
       );
       // Everything the operation decided, not a subset of it. `refreshed` and
       // `warnings` were dropped here, so a locked record brought back into line
