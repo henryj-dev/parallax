@@ -35,6 +35,36 @@ async function typescriptFiles(directory: string): Promise<string[]> {
   return found;
 }
 
+/**
+ * Every way a module can be reached, in one place so it can be tested.
+ *
+ * A scan that finds nothing and a scan that is broken give the same answer --
+ * an empty list -- and an assertion that the list holds no packages cannot tell
+ * those apart. Inline, it could not be run over anything but the file itself,
+ * so there was no way to show it still worked. Measured: breaking the static
+ * pattern left all four assertions green while the guard was dead.
+ */
+function specifiersIn(source: string): string[] {
+  return [
+    ...source.matchAll(/^import[^"']*["']([^"']+)["']/gmu),
+    ...source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']/gu),
+    ...source.matchAll(/\brequire\s*\(\s*["']([^"']+)["']/gu),
+  ].map((match) => match[1] as string);
+}
+
+/**
+ * One sample holding all three forms -- the control.
+ *
+ * Builtins only, deliberately: this file scans its own source, so a sample
+ * naming a package would be found there and reported as the very thing the
+ * scan exists to forbid.
+ */
+const EVERY_FORM = [
+  'import { readFile } from "node:fs"',
+  'await import("node:os")',
+  'require("node:url")',
+].join("\n");
+
 /** Every document that states the check, and the paths each one states. */
 const DOCUMENTS = ["README.md", "README.ko.md"] as const;
 
@@ -112,13 +142,13 @@ describe("where the schema can be changed from", () => {
     // same package and were invisible to an earlier version of this assertion.
     // On a machine with the packages installed -- which is where this is
     // written -- that version passed while the gate it protects would have died.
+    // The control comes first: silence from the scan means nothing until the
+    // scan is shown to speak.
+    assert.deepEqual([...specifiersIn(EVERY_FORM)].sort(), ["node:fs", "node:os", "node:url"],
+      "the scan must find all three ways in, or its empty answer below is not evidence");
+
     const source = await readFile(join(ROOT, "test/infrastructure/schema-surface.test.ts"), "utf8");
-    const specifiers = [
-      ...source.matchAll(/^import[^"']*["']([^"']+)["']/gmu),
-      ...source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']/gu),
-      ...source.matchAll(/\brequire\s*\(\s*["']([^"']+)["']/gu),
-    ].map((match) => match[1] as string);
-    const external = specifiers.filter((specifier) => !specifier.startsWith("node:") && !specifier.startsWith("."));
+    const external = specifiersIn(source).filter((specifier) => !specifier.startsWith("node:") && !specifier.startsWith("."));
     assert.deepEqual(external, [], "this file may reach node builtins and relative paths only, by any means");
   });
 
