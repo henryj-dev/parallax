@@ -1,6 +1,6 @@
 import { TOKEN_REFRESH_INTERVAL_MS, type AccessTokenService } from "../application/access-tokens.ts";
 import type { CloudflareCredentialManager } from "../application/cloudflare-credentials.ts";
-import type { FallbackDomainService } from "../application/fallback-domains.ts";
+import { overridableZones, type FallbackDomainService } from "../application/fallback-domains.ts";
 import { NotFoundError, type ControlPlane } from "../application/control-plane.ts";
 import type { SettingsService } from "../application/settings.ts";
 import { DomainValidationError } from "../domain/dns.ts";
@@ -155,10 +155,22 @@ function splitList(value: unknown): string[] {
     : [];
 }
 
-/** The apexes bound to one credential profile: what its overrides must cover. */
+/**
+ * The apexes bound to one credential profile that this process actually answers
+ * for -- which is what its overrides must cover, and nothing more.
+ *
+ * The listener leaves a zone with an empty internal view out of its snapshot, so
+ * it claims no authority for it and the query goes upstream. Sending devices
+ * here for such a zone buys nothing and costs a dependency: their mail domain
+ * would resolve through this process for no reason, and stop resolving with it.
+ *
+ * So both sides read the same rule from the same function rather than agreeing
+ * by hand. A zone that stops being served stops being pointed at, in the same
+ * revision, without anybody remembering to do it.
+ */
 async function profileZones(context: CommandContext, profile: string): Promise<string[]> {
   const bindings = await requireCredentials(context).listZones();
-  return bindings.filter((binding) => binding.profile === profile).map((binding) => binding.zone);
+  return overridableZones(bindings, await requireControlPlane(context.runtime).listZones(), profile);
 }
 
 function requireFallbackDomains(context: CommandContext): FallbackDomainService {

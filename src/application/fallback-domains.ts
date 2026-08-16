@@ -1,5 +1,7 @@
 import { CloudflareFallbackDomains, type FallbackDomain } from "../adapters/cloudflare-fallback.ts";
 import { ownershipComment, readOwnershipComment } from "../adapters/ownership.ts";
+import { servedZones } from "../dns/snapshot.ts";
+import type { Zone } from "../domain/dns.ts";
 import { CredentialNotFoundError } from "./cloudflare-credentials.ts";
 
 /**
@@ -27,6 +29,28 @@ export interface FallbackDomainChange {
   readonly domains: FallbackDomain[];
   /** What the write did, so a no-op is never reported as a change. */
   readonly outcome: "added" | "updated" | "removed" | "unchanged";
+}
+
+/**
+ * The zones one credential profile should have overrides for.
+ *
+ * Both the listener and this read the same rule from the same function, rather
+ * than agreeing by hand: a zone whose internal view is empty is left out of the
+ * listener's snapshot, so it claims no authority and the query goes upstream.
+ * Pointing devices here for such a zone buys nothing and costs a dependency --
+ * a mail domain would resolve through this process for no reason, and stop
+ * resolving with it. A zone that stops being served stops being pointed at in
+ * the same revision, with nobody remembering to do it.
+ */
+export function overridableZones(
+  bindings: readonly { readonly zone: string; readonly profile: string }[],
+  zones: readonly Zone[],
+  profile: string,
+): string[] {
+  const served = new Set(servedZones(zones).map((zone) => zone.name));
+  return bindings
+    .filter((binding) => binding.profile === profile && served.has(binding.zone))
+    .map((binding) => binding.zone);
 }
 
 /** One suffix's place in the difference between the zones and the live list. */

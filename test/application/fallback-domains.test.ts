@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { CloudflareFallbackDomains, FallbackDomainForbiddenError, type FallbackDomain } from "../../src/adapters/cloudflare-fallback.ts";
 import { CredentialNotFoundError } from "../../src/application/cloudflare-credentials.ts";
-import { FallbackDomainService, type ProfileSecretReader } from "../../src/application/fallback-domains.ts";
+import { FallbackDomainService, overridableZones, type ProfileSecretReader } from "../../src/application/fallback-domains.ts";
+import type { Zone } from "../../src/domain/dns.ts";
 import { ownershipComment } from "../../src/adapters/ownership.ts";
 
 /** The provider's list, and a record of every request made against it. */
@@ -289,5 +290,41 @@ describe("keeping the overrides in step with the zones", () => {
   it("refuses to plan with no resolver address", async () => {
     const { service } = syncing(OTHERS);
     await assert.rejects(service.plan("main", ["tinyuniver.se"], "  "), /fallbackResolver/u);
+  });
+});
+
+describe("which zones get an override at all", () => {
+  const zone = (name: string, internal: { id: string; name: string; type: "A"; content: string; ttl: number }[]): Zone => ({
+    name, revision: 1, createdAt: "2026-08-16T00:00:00.000Z", updatedAt: "2026-08-16T00:00:00.000Z",
+    views: internal.length > 0 ? [{ name: "internal", records: internal }] : [],
+  });
+  const record = { id: "a", name: "www", type: "A" as const, content: "10.17.192.11", ttl: 60 };
+  const BINDINGS = [
+    { zone: "tinyuniver.se", profile: "main" },
+    { zone: "tinymail.app", profile: "main" },
+    { zone: "other.example", profile: "second" },
+  ];
+
+  it("leaves out a zone the listener does not answer for", () => {
+    // A zone with no internal records is left out of the listener's snapshot, so
+    // it claims no authority and the query goes upstream. Sending devices here
+    // for it would add a dependency and buy nothing -- which is what a live
+    // preview caught before anything was written.
+    const zones = [zone("tinyuniver.se", [record]), zone("tinymail.app", [])];
+    assert.deepEqual(overridableZones(BINDINGS, zones, "main"), ["tinyuniver.se"]);
+  });
+
+  it("includes it again once it has something to answer", () => {
+    const zones = [zone("tinyuniver.se", [record]), zone("tinymail.app", [record])];
+    assert.deepEqual(overridableZones(BINDINGS, zones, "main"), ["tinyuniver.se", "tinymail.app"]);
+  });
+
+  it("keeps to the profile it was asked about", () => {
+    const zones = [zone("tinyuniver.se", [record]), zone("other.example", [record])];
+    assert.deepEqual(overridableZones(BINDINGS, zones, "second"), ["other.example"]);
+  });
+
+  it("leaves out a zone that is bound but not held here", () => {
+    assert.deepEqual(overridableZones(BINDINGS, [zone("tinyuniver.se", [record])], "main"), ["tinyuniver.se"]);
   });
 });
