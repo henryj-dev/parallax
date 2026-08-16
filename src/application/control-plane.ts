@@ -550,8 +550,17 @@ export class ControlPlane {
     const views: Record<string, PreviewPlan> = {};
     let firstFailure: unknown;
     for (const view of selected) {
+      const key = targetKey(zone.name, view.name);
+      // Nothing is published for a view this process answers out of the desired
+      // state, so there is no provider to compare against and no plan to make.
+      // Reporting that as an unreadable view says the operator cannot see what
+      // would happen, when what would happen is nothing.
+      if (this.#answeredHere(key)) {
+        views[view.name] = { operations: [], summary: { create: 0, update: 0, delete: 0, conflict: 0, untouched: 0 } };
+        continue;
+      }
       try {
-        const actual = await this.#provider.list(targetKey(zone.name, view.name));
+        const actual = await this.#provider.list(key);
         views[view.name] = buildReconcilePlan(view.records, actual);
       } catch (error) {
         // Asking for one view by name is asking about that view, so a failure

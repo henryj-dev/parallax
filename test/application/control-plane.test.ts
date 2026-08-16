@@ -1269,6 +1269,24 @@ describe("ControlPlane", () => {
       assert.equal(internal?.error, undefined, "nothing failed, so nothing is reported");
     });
 
+    it("does not call a view it answers itself unreadable in a preview", async () => {
+      // Reported from the portal: adopting records, then previewing, showed the
+      // internal view as an error -- "no provider is configured" -- on the screen
+      // an operator reads before applying. `bc16ff2` fixed the same reasoning for
+      // `apply` and left this door open, so the status went green and the preview
+      // stayed red about the same view.
+      const adapters = createInMemoryAdapters();
+      const service = new ControlPlane(adapters.zones, adapters.statuses, withoutInternalPublisher(adapters),
+        undefined, undefined, {}, (target) => target.endsWith("/internal"));
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+
+      const { views } = await service.preview("example.com");
+      assert.equal(views.internal?.error, undefined, "there is no provider to read, and that is not a failure");
+      assert.deepEqual(views.internal?.operations, [], "and nothing to do about it");
+      assert.ok(views.external, "the view that does publish is still planned");
+    });
+
     it("still fails when nothing publishes it and nothing answers it either", async () => {
       // Without the listener there is nowhere for the internal view to go, and
       // that is a real failure worth the red -- the guard must not swallow it.
