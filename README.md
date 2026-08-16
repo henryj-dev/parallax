@@ -739,6 +739,17 @@ Re-running it is safe: records already described are skipped, so a second run
 adopts nothing and does not create a revision. Run it again whenever records
 are added at the provider by hand.
 
+`--dryRun` reports what adopting would describe, and what it would change about
+the answers given here, without writing any of it:
+
+```sh
+pnpm cli zone adopt --zone example.com --view external --dryRun
+```
+
+It exists because adopting is a write dressed as a question. Finding out that it
+would make this process the authority for a zone should not require making it
+so, and before this the only way to see the effect was to have it.
+
 Two limits worth knowing before you rely on it:
 
 - A provider may hold types Parallax does not manage -- `SOA` and the signer's
