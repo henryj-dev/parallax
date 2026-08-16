@@ -113,7 +113,37 @@ function format(result: unknown): string {
     const body = rows.length === 0 ? `no ${key}` : rows.map((row) => summarize(row)).join("\n");
     return context === "{}" ? body : `${context}\n${body}`;
   }
-  return summarize(result);
+  return render(record, "");
+}
+
+/**
+ * Scalars on one line, then a labelled block for everything nested.
+ *
+ * Printing only the scalars is what this used to do, and for `preview` that
+ * meant the entire plan -- every operation and every count -- was dropped, so
+ * the command whose whole purpose is to say what would change said `zone=… 
+ * revision=3` whether or not anything would. Nothing looked wrong; there was
+ * simply nothing there to look at.
+ */
+function render(value: unknown, indent: string): string {
+  if (value === null || typeof value !== "object") return `${indent}${String(value)}`;
+  const record = value as Record<string, unknown>;
+  const lines: string[] = [];
+  const scalars = Object.entries(record)
+    .filter(([, item]) => item === null || typeof item !== "object")
+    .map(([key, item]) => `${key}=${String(item)}`);
+  if (scalars.length > 0) lines.push(`${indent}${scalars.join(" ")}`);
+  for (const [key, item] of Object.entries(record)) {
+    if (item === null || typeof item !== "object") continue;
+    if (Array.isArray(item)) {
+      lines.push(`${indent}${key}: ${item.length === 0 ? "none" : ""}`.trimEnd());
+      for (const entry of item) lines.push(render(entry, `${indent}  `));
+    } else {
+      lines.push(`${indent}${key}:`);
+      lines.push(render(item, `${indent}  `));
+    }
+  }
+  return lines.length === 0 ? `${indent}{}` : lines.join("\n");
 }
 
 function summarize(value: unknown): string {
