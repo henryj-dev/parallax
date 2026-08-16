@@ -1,0 +1,50 @@
+name: check
+
+# What ran by hand until now. A deployment applies its own gate at push time, so
+# it only sees a commit once somebody pushes the mirror -- sometimes days later.
+# This closes the window at the commit instead of at the deploy.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # `engines` claims Node 24 and up, and nothing has ever run there: this
+      # repository is developed on 26. A floor nobody stands on is a claim, not a
+      # requirement -- so both ends run, and `fail-fast: false` keeps a failure on
+      # one from hiding the other's result.
+      matrix:
+        node: [24, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm run check:portal
+      - run: pnpm build
+      - run: pnpm test
+
+  # The schema-surface check is also the first half of a deployment's push gate,
+  # which runs it straight from a checkout with nothing installed. The file
+  # asserts that about its own imports, but an assertion about imports is not the
+  # same as the thing running that way -- so it runs that way here. If this job
+  # fails while `gate` passes, that deployment's gate has stopped working and
+  # nobody there would have been told.
+  deployment-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --test test/infrastructure/schema-surface.test.ts
