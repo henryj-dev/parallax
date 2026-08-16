@@ -200,6 +200,30 @@ describe("keeping the overrides in step with the zones", () => {
     assert.equal(plan.untouched, 3, "everyone else's entries are counted, not planned");
   });
 
+  it("claims an unsigned entry that already sends the name where this would", async () => {
+    // What `fallback set` leaves behind, and what a person typing into the
+    // dashboard leaves behind. Refusing it forever would report a conflict that
+    // can only be cleared by deleting the entry -- and deleting it drops the
+    // internal view for every device until the next write lands.
+    const { service, provider } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"], description: "internal view" }]);
+    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.deepEqual(plan.adopt.map((entry) => entry.suffix), ["tinyuniver.se"]);
+    assert.deepEqual(plan.conflict, []);
+    const { domains } = await service.sync("main", ["tinyuniver.se"], "10.17.192.70");
+    const claimed = domains.find((entry) => entry.suffix === "tinyuniver.se");
+    assert.deepEqual(claimed?.dnsServer, ["10.17.192.70"], "where it points did not move");
+    assert.notEqual(claimed?.description, "internal view", "only the marker changed");
+    assert.equal(domains.length, OTHERS.length + 1, "nobody else's entry moved");
+    void provider;
+  });
+
+  it("still refuses an unsigned entry that sends the name somewhere else", async () => {
+    const { service } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.0.0.9"] }]);
+    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.deepEqual(plan.adopt, [], "claiming it would move where the name resolves");
+    assert.deepEqual(plan.conflict.map((entry) => entry.suffix), ["tinyuniver.se"]);
+  });
+
   it("never writes over an entry it did not create", async () => {
     // Somebody added this suffix by hand. Taking it over would move another
     // team's DNS on the strength of a name collision.

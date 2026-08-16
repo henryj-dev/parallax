@@ -34,6 +34,11 @@ export interface FallbackPlan {
   readonly add: FallbackDomain[];
   readonly update: FallbackDomain[];
   readonly remove: FallbackDomain[];
+  /**
+   * Entries nobody signed that already say exactly what this would say. Claimed
+   * by stamping the marker on them, which changes nothing a device can observe.
+   */
+  readonly adopt: FallbackDomain[];
   /** Suffixes somebody else's entry already covers. Never written over. */
   readonly conflict: { suffix: string; reason: string }[];
   readonly unchanged: number;
@@ -121,6 +126,7 @@ export class FallbackDomainService {
 
     const add: FallbackDomain[] = [];
     const update: FallbackDomain[] = [];
+    const adopt: FallbackDomain[] = [];
     const remove: FallbackDomain[] = [];
     const conflict: { suffix: string; reason: string }[] = [];
     let unchanged = 0;
@@ -130,8 +136,16 @@ export class FallbackDomainService {
       const suffix = normalizeSuffix(entry.suffix);
       if (!this.#owns(entry)) {
         if (wanted.has(suffix)) {
-          conflict.push({ suffix, reason: "an entry for this suffix exists that Parallax did not create" });
           wanted.delete(suffix);
+          // Claimed only when it already resolves where this would send it. The
+          // write then changes nothing a device can observe -- it just records
+          // whose entry it is, so the next sync can maintain it instead of
+          // reporting it forever. Anything else is somebody's decision, not ours.
+          const desired = this.#entry(suffix, resolver);
+          if (sameServers(entry, desired)) adopt.push(desired);
+          else {
+            conflict.push({ suffix, reason: "an entry for this suffix sends it somewhere else, and Parallax did not create it" });
+          }
         } else untouched += 1;
         continue;
       }
@@ -147,7 +161,7 @@ export class FallbackDomainService {
       else update.push(desired);
     }
     for (const suffix of wanted.keys()) add.push(this.#entry(suffix, resolver));
-    return { add, update, remove, conflict, unchanged, untouched };
+    return { add, update, remove, adopt, conflict, unchanged, untouched };
   }
 
   /**
@@ -156,16 +170,16 @@ export class FallbackDomainService {
    */
   async sync(profile: string, zones: readonly string[], resolver: string, policyId?: string): Promise<{ plan: FallbackPlan; domains: FallbackDomain[] }> {
     const plan = await this.plan(profile, zones, resolver, policyId);
-    if (plan.add.length === 0 && plan.update.length === 0 && plan.remove.length === 0) {
+    if (plan.add.length === 0 && plan.update.length === 0 && plan.remove.length === 0 && plan.adopt.length === 0) {
       return { plan, domains: await this.list(profile, policyId) };
     }
     const client = await this.#client(profile, policyId);
     const current = await client.list();
     const removing = new Set(plan.remove.map((entry) => normalizeSuffix(entry.suffix)));
-    const replacing = new Map(plan.update.map((entry) => [normalizeSuffix(entry.suffix), entry]));
+    const replacing = new Map([...plan.update, ...plan.adopt].map((entry) => [normalizeSuffix(entry.suffix), entry]));
     const next = current
       .filter((entry) => !(this.#owns(entry) && removing.has(normalizeSuffix(entry.suffix))))
-      .map((entry) => (this.#owns(entry) ? replacing.get(normalizeSuffix(entry.suffix)) ?? entry : entry));
+      .map((entry) => replacing.get(normalizeSuffix(entry.suffix)) ?? entry);
     return { plan, domains: await client.replace([...next, ...plan.add]) };
   }
 
@@ -205,6 +219,11 @@ export class FallbackDomainService {
 /** Case, a trailing dot and a leading dot are spelling, not identity. */
 function normalizeSuffix(suffix: string): string {
   return suffix.trim().toLowerCase().replace(/^\.+/u, "").replace(/\.+$/u, "");
+}
+
+/** The part a device acts on: where the name goes. */
+function sameServers(left: FallbackDomain, right: FallbackDomain): boolean {
+  return [...(left.dnsServer ?? [])].join(",") === [...(right.dnsServer ?? [])].join(",");
 }
 
 function sameEntry(left: FallbackDomain, right: FallbackDomain): boolean {
