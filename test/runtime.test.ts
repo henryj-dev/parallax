@@ -69,6 +69,9 @@ describe("runtime filesystem policy", () => {
         "--values",
         JSON.stringify({ allowLocalProvider: false }),
       ], {
+        // Bounded for the same reason as everywhere else a child is awaited: a
+        // process that never exits must fail rather than stop the clock.
+        timeout: 60_000,
         env: {
           ...process.env,
           DATABASE_URL: "",

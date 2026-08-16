@@ -7,6 +7,15 @@ import { after, before, describe, it } from "node:test";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Long enough for a cold start, and bounded.
+ *
+ * Without it a child that never exits makes the test wait forever: the run does
+ * not fail, it stops saying anything, and a hang has to be read off a clock by
+ * whoever notices. A killed child is a sentence.
+ */
+const CLI_TIMEOUT_MS = 60_000;
 const ENTRY = join(import.meta.dirname, "../../cmd/parallax/main.ts");
 
 /**
@@ -33,7 +42,7 @@ describe("command-line output", () => {
       PARALLAX_CONFIG_FILE: join(directory, "config.json"),
       PARALLAX_PROVIDER_STATE_FILE: join(directory, "provider.json"),
     };
-    const cli = (...argv: string[]) => execFileAsync(process.execPath, [ENTRY, ...argv], { env: environment });
+    const cli = (...argv: string[]) => execFileAsync(process.execPath, [ENTRY, ...argv], { env: environment, timeout: CLI_TIMEOUT_MS });
     await cli("settings", "set", "--values", '{"allowLocalProvider":true}');
     await cli("zone", "create", "--zone", "demo.test");
     await cli("record", "set", "--zone", "demo.test", "--view", "external", "--id", "web",
@@ -43,7 +52,7 @@ describe("command-line output", () => {
   after(async () => { await rm(directory, { recursive: true, force: true }); });
 
   it("prints the plan a preview found, not only the zone it was asked about", async () => {
-    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "preview", "--zone", "demo.test"], { env: environment });
+    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "preview", "--zone", "demo.test"], { env: environment, timeout: CLI_TIMEOUT_MS });
     assert.match(stdout, /zone=demo\.test/u);
     assert.match(stdout, /kind=create/u, "the operation itself");
     assert.match(stdout, /name=www type=A content=8\.8\.8\.10/u, "and what it would write");
@@ -53,14 +62,14 @@ describe("command-line output", () => {
 
   it("says which view each part of the plan belongs to", async () => {
     // A plan without its view is a list of changes with no answer to "where".
-    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "preview", "--zone", "demo.test"], { env: environment });
+    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "preview", "--zone", "demo.test"], { env: environment, timeout: CLI_TIMEOUT_MS });
     assert.match(stdout, /external:/u);
     assert.match(stdout, /internal:/u);
   });
 
   it("still prints a plain result on one line", async () => {
     // The nested rendering must not turn every ordinary result into a tree.
-    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "zone", "get", "--zone", "demo.test"], { env: environment });
+    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "zone", "get", "--zone", "demo.test"], { env: environment, timeout: CLI_TIMEOUT_MS });
     assert.match(stdout.split("\n")[0] ?? "", /name=demo\.test revision=\d+/u);
   });
 });
