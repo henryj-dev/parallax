@@ -35,18 +35,42 @@ async function typescriptFiles(directory: string): Promise<string[]> {
   return found;
 }
 
-/** The paths the README tells a deployment to diff, taken from the README. */
-async function documentedPaths(): Promise<string[]> {
-  const readme = await readFile(join(ROOT, "README.md"), "utf8");
+/** Every document that states the check, and the paths each one states. */
+const DOCUMENTS = ["README.md", "README.ko.md"] as const;
+
+async function documentedPaths(file: string): Promise<string[]> {
+  const readme = await readFile(join(ROOT, file), "utf8");
   const command = /git diff --name-only [^\n]*? -- ([^\n]+)/u.exec(readme);
-  assert.ok(command, "the README must document the schema-change check");
+  assert.ok(command, `${file} must document the schema-change check`);
   return (command[1] as string).trim().split(/\s+/u);
+}
+
+/**
+ * The paths, once, after checking that every document agrees on them.
+ *
+ * Reading one document was the same mistake one translation down. The command a
+ * deployment actually ran came out of the Korean README, and dropping a path
+ * from that copy alone left every assertion here passing -- a third copy avoided
+ * and then walked back in through the translation.
+ */
+async function agreedPaths(): Promise<string[]> {
+  const stated = await Promise.all(DOCUMENTS.map(async (file) => [file, await documentedPaths(file)] as const));
+  const [first, ...rest] = stated;
+  assert.ok(first, "there is at least one document to read");
+  for (const [file, paths] of rest) {
+    assert.deepEqual(paths, first[1], `${file} states different paths from ${first[0]}; a stale translation is a stale check`);
+  }
+  return first[1];
 }
 
 describe("where the schema can be changed from", () => {
   it("keeps every DDL statement inside the paths the check watches", async () => {
-    const watched = await documentedPaths();
-    const files = await typescriptFiles(join(ROOT, "src"));
+    const watched = await agreedPaths();
+    // `cmd/` is thin and is not where schema would live, but it is compiled and
+    // copied into the image, so a statement there would ship and the check would
+    // not see it. Scanning it costs nothing and stops the name from promising
+    // more than the body does.
+    const files = (await Promise.all(["src", "cmd"].map((directory) => typescriptFiles(join(ROOT, directory))))).flat();
     assert.ok(files.length > 0, "there is source to scan");
 
     const stray: string[] = [];
@@ -65,7 +89,7 @@ describe("where the schema can be changed from", () => {
     // If the DDL moved and the README moved with it, the test above still
     // passes and proves nothing. This asserts the watched set is where the
     // schema really is: at least one watched path contains a statement.
-    const watched = await documentedPaths();
+    const watched = await agreedPaths();
     const candidates = watched.filter((path) => path.endsWith(".ts"));
     assert.ok(candidates.length > 0, "the check must watch at least one source file");
 
@@ -77,8 +101,19 @@ describe("where the schema can be changed from", () => {
     assert.ok(holding.length > 0, `none of ${candidates.join(", ")} holds DDL; has it moved?`);
   });
 
+  it("runs without anything installed, because a deployment gate depends on that", async () => {
+    // stardust runs this file straight from a checkout, with no `pnpm install`,
+    // as the first half of its push gate: pass this, then trust the `git diff`.
+    // A single import of a package would make that gate stop running without
+    // announcing it -- the failure would be silence at the moment of a deploy.
+    const source = await readFile(join(ROOT, "test/infrastructure/schema-surface.test.ts"), "utf8");
+    const imported = [...source.matchAll(/^import[^"']*["']([^"']+)["']/gmu)].map((match) => match[1] as string);
+    const external = imported.filter((specifier) => !specifier.startsWith("node:") && !specifier.startsWith("."));
+    assert.deepEqual(external, [], "this file may import node builtins and relative paths only");
+  });
+
   it("watches the directory the .sql files are in", async () => {
-    const watched = await documentedPaths();
+    const watched = await agreedPaths();
     const sql = (await readdir(join(ROOT, "migrations"))).filter((name) => name.endsWith(".sql"));
     assert.ok(sql.length > 0, "there are migrations to watch");
     assert.ok(watched.some((path) => path.replace(/\/$/u, "") === "migrations"),
