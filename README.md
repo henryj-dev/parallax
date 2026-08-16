@@ -722,6 +722,19 @@ that Parallax now knows they exist. If one of them later changes at the
 provider, the difference appears as a conflict in `preview` -- naming both
 values -- rather than being silently overwritten in either direction.
 
+**It does change what this process answers, though.** The internal view is
+materialized from the external one, so filling an empty external view fills the
+internal one -- and a zone with a non-empty internal view is one the built-in
+listener claims authority for. Adoption touches nothing at the provider and
+changes the answers given here, which are two different halves of the same
+operation and are easy to hold only one of.
+
+Two consequences follow immediately. A name nobody adopted answers NXDOMAIN
+inside, because an authority does not forward what it does not hold. And a
+record the provider proxies answers with its origin inside, because the origin
+is what the desired state holds -- the edge address was never ours to know.
+Adoption reports both the first time a zone crosses into being answered here.
+
 Re-running it is safe: records already described are skipped, so a second run
 adopts nothing and does not create a revision. Run it again whenever records
 are added at the provider by hand.
