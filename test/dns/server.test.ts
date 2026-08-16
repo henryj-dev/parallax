@@ -76,14 +76,28 @@ async function freePort(host = "127.0.0.1"): Promise<number> {
   return port;
 }
 
+/**
+ * `undefined` means the listener said nothing. It must not mean anything else.
+ *
+ * This used to answer `undefined` when the client socket itself failed, which
+ * reads identically to silence from the server and is a different fact
+ * entirely. A burst opens a socket per query, so the first thing to give out
+ * under load is the test's own descriptors -- and then the report was that the
+ * listener had dropped queries, at a millisecond, with no errno anywhere. A
+ * defect in the harness wearing the costume of a defect in the subject.
+ *
+ * So a failure to send throws, carrying its errno, and silence stays silence.
+ */
 function ask(port: number, message: Buffer, timeoutMs = 2000, host = "127.0.0.1"): Promise<Buffer | undefined> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const socket = createSocket(isIP(host) === 6 ? "udp6" : "udp4");
-    const done = (value: Buffer | undefined): void => { clearTimeout(timer); socket.close(); resolve(value); };
-    const timer = setTimeout(() => done(undefined), timeoutMs);
-    socket.once("message", (reply) => done(reply));
-    socket.once("error", () => done(undefined));
-    socket.send(message, port, host);
+    const settle = (finish: () => void): void => { clearTimeout(timer); socket.close(); finish(); };
+    const failed = (error: Error): void => settle(() => reject(
+      new Error(`the query never left this test (${error.message}); the listener was never asked`, { cause: error })));
+    const timer = setTimeout(() => settle(() => resolve(undefined)), timeoutMs);
+    socket.once("message", (reply) => settle(() => resolve(reply)));
+    socket.once("error", failed);
+    socket.send(message, port, host, (error) => { if (error) failed(error); });
   });
 }
 

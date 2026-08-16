@@ -12,6 +12,7 @@
     "dev": "node --env-file-if-exists=.env --watch src/index.ts",
     "start": "node --env-file-if-exists=.env dist/src/index.js",
     "test": "node --test --test-timeout=120000",
+    "test:ci": "node --test --test-timeout=120000 --test-reporter=tap",
     "test:coverage": "node --test --test-timeout=120000 --experimental-test-coverage",
     "test:watch": "node --test --watch",
     "verify:cloudflare": "bash scripts/verify-cloudflare.sh",

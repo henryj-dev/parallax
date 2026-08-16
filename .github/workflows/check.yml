@@ -34,7 +34,14 @@ jobs:
       - run: pnpm check
       - run: pnpm run check:portal
       - run: pnpm build
-      - run: pnpm test
+      # TAP rather than the readable reporter, because the readable one keeps
+      # every failure's reason for a final summary. A run that is cancelled or
+      # killed before that summary prints leaves a bare "\u2716 <name>" and no way
+      # to tell what was expected -- which is what happened on the run that
+      # hung: the failing line was there, its reason never arrived. TAP says it
+      # inline, at the moment of the failure, so a log that stops early still
+      # carries the answer.
+      - run: pnpm run test:ci
 
   # The schema-surface check is also the first half of a deployment's push gate,
   # which runs it straight from a checkout with nothing installed. The file
