@@ -754,6 +754,45 @@ there. `seen` above zero with nothing adopted means the view was already
 complete. `seen` of zero means the provider offered nothing this control plane
 could read, which is the type limit below rather than an empty zone.
 
+### Client-side resolver overrides
+
+A device on the provider's own client asks the provider's resolver for
+everything, so a name this control plane answers privately does not exist for
+it. The provider's answer is a per-suffix override pointing at a local resolver,
+and Parallax keeps that list in step with the zones it holds:
+
+```sh
+pnpm cli settings set --patch '{"fallbackResolver":"10.0.0.53"}'
+pnpm cli fallback preview --profile production   # what would change
+pnpm cli fallback sync --profile production      # make it so
+```
+
+The suffix is the apex and covers every name beneath it. The address is
+configuration rather than inference: the listener binds `0.0.0.0`, which is not
+an address anything can be told to ask, and what a device must use is a fact
+about the network in front of this process.
+
+**The list is not yours.** It is one account-wide setting shared by every
+override an organization has, and the provider offers no way to add or remove a
+single entry -- every write replaces all of it. So Parallax reads before it
+writes, and it only changes an entry whose description carries a marker signed
+for that exact suffix, the same marker a published record carries. An entry it
+did not sign is reported and left alone. The exception is narrow: an unsigned
+entry for a zone you hold that already sends the name where Parallax would is
+claimed by stamping the marker on it, which changes nothing a device can see.
+
+Only zones this process actually answers for get an override. A zone whose
+internal view is empty is left out of the listener's snapshot, so it claims no
+authority and the query goes upstream; pointing devices here for it would buy
+nothing and cost a dependency. Both sides read that from the same function, so a
+zone that stops being served stops being pointed at in the same revision.
+
+**A change does not take effect at once.** The client refreshes its
+configuration on its own schedule, so the first lookup after a write may still
+answer the old way. Judge the change a few minutes later, and judge it on a name
+whose internal answer differs from its public one -- a name that resolves to the
+provider's edge either way cannot tell you whether the override is in force.
+
 **Adopting does not take the records over.** A desired record identical to an
 unmanaged one produces no operation, so the provider's copies stay exactly as
 they are, unmanaged, and whoever maintained them still does. What changes is
