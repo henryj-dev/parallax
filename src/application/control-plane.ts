@@ -125,6 +125,7 @@ export class ControlPlane {
   readonly #clock: Clock;
   readonly #applyLock: ApplyLock;
   readonly #retention: RetentionSettings;
+  readonly #answeredHere: (target: string) => boolean;
   readonly #operationTails = new Map<string, Promise<void>>();
 
   constructor(
@@ -134,6 +135,21 @@ export class ControlPlane {
     clock: Clock = { now: () => new Date() },
     applyLock: ApplyLock = { withZoneLock: (_zone, operation) => operation() },
     retention: RetentionSettings = {},
+    /**
+     * Whether this process answers a target itself and publishes it nowhere.
+     *
+     * The built-in listener reads the desired state and answers from it, so
+     * there is nothing to reconcile and no lag between wanting a record and
+     * serving it. Without this, applying such a view finds no provider and
+     * records a failure -- which says the system is broken while it is doing
+     * exactly what it was configured to do, and says it on the front page.
+     *
+     * Both halves of that question -- is anything publishing this, and does the
+     * listener answer for it -- are answered where the process is assembled.
+     * Asking here would mean this knowing which adapter is routed where, which
+     * is the router's business and not the control plane's.
+     */
+    answeredHere: (target: string) => boolean = () => false,
   ) {
     this.#zones = zones;
     this.#statuses = statuses;
@@ -141,6 +157,7 @@ export class ControlPlane {
     this.#clock = clock;
     this.#applyLock = applyLock;
     this.#retention = retention;
+    this.#answeredHere = answeredHere;
   }
 
   /** Resolves the operator's settings against the current clock for one commit. */
@@ -581,6 +598,23 @@ export class ControlPlane {
       let completedOperations = 0;
       let plannedOperations = 0;
       try {
+        // Nothing is published for a view this process answers out of the
+        // desired state, so what is served is that revision already. Recording
+        // it as applied is not a convenience: `appliedRevision` is the revision
+        // being answered, and here it equals the desired one by construction.
+        if (this.#answeredHere(key)) {
+          const served: ApplyStatus = {
+            zone: zone.name,
+            view: view.name,
+            desiredRevision: zone.revision,
+            appliedRevision: zone.revision,
+            state: "applied",
+            lastAttemptAt: attemptedAt,
+          };
+          await this.#statuses.save(served);
+          results.push(served);
+          continue;
+        }
         const plan = buildReconcilePlan(view.records, await this.#provider.list(key));
         if (plan.summary.conflict > 0) throw new ConflictError("unmanaged provider records conflict with desired state");
         const planned = plan.operations.filter((operation) => operation.kind !== "conflict");

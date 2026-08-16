@@ -146,7 +146,14 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
   const controlPlane = new ControlPlane(zones, persisted.statuses, provider, undefined, persisted.applyLock, {
     get maxRevisionsPerZone() { return settings.current().revisionRetention; },
     get auditRetentionDays() { return settings.current().auditRetentionDays; },
-  });
+  },
+  // The listener answers the internal view and only that, out of the desired
+  // state. Where it is running and nothing publishes that view, applying it has
+  // nothing to reconcile -- so the revision being served is the desired one.
+  //
+  // A zone whose views cannot be composed never reaches this: `apply`
+  // materializes them first and fails before any target is considered.
+  (target) => config.dns !== undefined && target.endsWith("/internal") && !provider.isConfigured(target));
 
   return {
     controlPlane,

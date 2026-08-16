@@ -1238,4 +1238,49 @@ describe("ControlPlane", () => {
     });
   });
 
+
+  describe("a view this process answers itself", () => {
+    /** Publishes the external view and refuses the internal one, as a deployment does. */
+    function withoutInternalPublisher(adapters: ReturnType<typeof createInMemoryAdapters>): ProviderAdapter {
+      return {
+        list: async (target) => {
+          if (target.endsWith("/internal")) throw new ProviderNotConfiguredError(`no provider is configured for ${target}`);
+          return adapters.provider.list(target);
+        },
+        apply: (target, operation) => adapters.provider.apply(target, operation),
+      };
+    }
+
+    it("reports the desired revision as applied instead of failing for want of a provider", async () => {
+      // What the portal showed: an internal view with no publisher, in a
+      // deployment whose listener answers it, rendered as a red failure on the
+      // front page while the system was doing exactly what it was configured to.
+      const adapters = createInMemoryAdapters();
+      const service = new ControlPlane(adapters.zones, adapters.statuses, withoutInternalPublisher(adapters),
+        undefined, undefined, {}, (target) => target.endsWith("/internal"));
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+      const zone = await service.getZone("example.com");
+
+      const { statuses } = await service.apply("example.com");
+      const internal = statuses.find((status) => status.view === "internal");
+      assert.equal(internal?.state, "applied");
+      assert.equal(internal?.appliedRevision, zone.revision, "the revision being answered is the desired one");
+      assert.equal(internal?.error, undefined, "nothing failed, so nothing is reported");
+    });
+
+    it("still fails when nothing publishes it and nothing answers it either", async () => {
+      // Without the listener there is nowhere for the internal view to go, and
+      // that is a real failure worth the red -- the guard must not swallow it.
+      const adapters = createInMemoryAdapters();
+      const service = new ControlPlane(adapters.zones, adapters.statuses, withoutInternalPublisher(adapters));
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.11", ttl: 300 });
+      const { statuses } = await service.apply("example.com");
+      const internal = statuses.find((status) => status.view === "internal");
+      assert.equal(internal?.state, "failed");
+      assert.match(internal?.error ?? "", /no provider is configured/u);
+    });
+  });
+
 });
