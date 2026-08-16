@@ -13,7 +13,24 @@ export type ReconcileOperation =
 
 export interface ReconcilePlan {
   operations: ReconcileOperation[];
-  summary: { create: number; update: number; delete: number; conflict: number };
+  summary: {
+    create: number;
+    update: number;
+    delete: number;
+    conflict: number;
+    /**
+     * Records the provider holds that this control plane neither owns nor
+     * describes, and so will not act on.
+     *
+     * Counted because an empty operation list has two meanings and only one of
+     * them is safe to assume. "Nothing to do" and "there is nothing there" look
+     * identical, and a reader who takes the second when the first is true
+     * concludes that records are gone when they are sitting at the provider
+     * untouched. Adoption describes without taking over, so this is the ordinary
+     * state of a zone somebody else also maintains -- not an anomaly.
+     */
+    untouched: number;
+  };
 }
 
 export function buildReconcilePlan(desired: DesiredRecord[], actual: ProviderRecord[]): ReconcilePlan {
@@ -21,6 +38,7 @@ export function buildReconcilePlan(desired: DesiredRecord[], actual: ProviderRec
   const updates: ReconcileOperation[] = [];
   const creates: ReconcileOperation[] = [];
   const conflicts: ReconcileOperation[] = [];
+  let untouched = 0;
   const actualByKey = new Map<string, ProviderRecord[]>();
   for (const record of actual) {
     const key = recordKey(record);
@@ -45,6 +63,9 @@ export function buildReconcilePlan(desired: DesiredRecord[], actual: ProviderRec
     if (wanted.length === 0) {
       for (const candidate of candidates) {
         if (candidate.managed) deletes.push({ kind: "delete", providerId: candidate.providerId, actual: candidate });
+        // Not ours and not described: the only place a provider record produces
+        // no operation at all. Everywhere else an unmanaged record is a conflict.
+        else untouched += 1;
       }
       continue;
     }
@@ -133,7 +154,7 @@ export function buildReconcilePlan(desired: DesiredRecord[], actual: ProviderRec
   }
 
   const operations = [...deletes, ...updates, ...creates, ...conflicts];
-  const summary = { create: 0, update: 0, delete: 0, conflict: 0 };
+  const summary = { create: 0, update: 0, delete: 0, conflict: 0, untouched };
   for (const operation of operations) summary[operation.kind] += 1;
   return { operations, summary };
 }

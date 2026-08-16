@@ -561,7 +561,7 @@ export class ControlPlane {
         const expected = error instanceof ConflictError || error instanceof ProviderNotConfiguredError;
         views[view.name] = {
           operations: [],
-          summary: { create: 0, update: 0, delete: 0, conflict: 0 },
+          summary: { create: 0, update: 0, delete: 0, conflict: 0, untouched: 0 },
           error: expected ? (error as Error).message : "provider could not be read",
         };
       }

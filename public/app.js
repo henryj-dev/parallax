@@ -370,6 +370,13 @@ function renderPlan(state) {
       return `<article class="plan-operation"><span class="operation-kind ${escapeHtml(kind)}">${escapeHtml(t(`operation.${kind}`))}</span><div><b>${escapeHtml(displayName(record.name ?? t("plan.record")))} ${escapeHtml(record.type ?? "")}</b><small>${escapeHtml(localizeViewName(operation.target, t))} · ${escapeHtml(record.content ?? t("plan.reconciled"))}</small></div></article>`;
     }).join("")
     : `<div class="mini-empty">${escapeHtml(t("plan.noDrift"))}</div>`);
+  // Nothing to do is not the same as nothing being there. Records the provider
+  // holds that Parallax neither owns nor describes produce no operation, so an
+  // empty plan reads as an empty zone unless the count is said out loud.
+  const untouched = entries.reduce((total, [, plan]) => total + Number(plan?.summary?.untouched ?? 0), 0);
+  if (untouched > 0) {
+    content.innerHTML += `<div class="mini-empty">${escapeHtml(t(pluralKey("plan.untouched", untouched), { count: untouched }))}</div>`;
+  }
   $("#apply-from-plan").disabled = operations.length === 0 && !state.dirty;
 }
 
