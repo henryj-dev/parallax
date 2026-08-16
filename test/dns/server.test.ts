@@ -57,6 +57,8 @@ function readAnswers(reply: Buffer): { name: string; type: number; ttl: number; 
  * Asserts a reply arrived before reading it. Without this a test that got
  * nothing back reads `undefined & mask` as 0 and passes for NOERROR.
  */
+const delay = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+
 function received(reply: Buffer | undefined): Buffer {
   assert.ok(reply, "no reply arrived");
   return reply;
@@ -656,6 +658,68 @@ describe("DNS server", () => {
       assert.equal(reply.readUInt16BE(2) & 0x0400, 0x0400, "authoritative");
       assert.equal(readAnswers(reply).length, 1, "the CNAME answers for every type");
       assert.deepEqual(asked, [], "nothing was relayed");
+    });
+  });
+
+
+  describe("many clients at once", () => {
+    it("answers every one of a burst, not most of them", async () => {
+      // A deployment measured this from its gateway and saw no losses. That is an
+      // observation of one listener under one load; this is the assertion, and it
+      // fails if a shared buffer or a shared parse ever starts serving one
+      // client's answer to another.
+      const { port } = await start({ zones: () => [EXAMPLE] });
+      const replies = await Promise.all(Array.from({ length: 120 }, (_unused, index) =>
+        ask(port, buildQuery("www.example.com", TYPE.A, 0x1000 + index))));
+
+      assert.equal(replies.filter((reply) => reply !== undefined).length, 120, "every query was answered");
+      for (const [index, reply] of replies.entries()) {
+        const message = received(reply);
+        assert.equal(message.readUInt16BE(0), 0x1000 + index, "each answer carries its own query's id");
+        assert.equal(readAnswers(message).length, 2, "and the whole RRset, not a truncated share of it");
+      }
+    });
+
+    it("refuses past the concurrent forward limit rather than queueing without bound", async () => {
+      // The limit exists so a burst of names this listener does not hold cannot
+      // hold open more upstream work than the process can carry. Reached, it must
+      // answer SERVFAIL -- a client can retry that. Silence it cannot.
+      const upstreamPort = await freePort();
+      const upstream = createSocket("udp4");
+      await new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve));
+      const held: { message: Buffer; port: number; address: string }[] = [];
+      upstream.on("message", (message, remote) => { held.push({ message, port: remote.port, address: remote.address }); });
+      closers.push(async () => { upstream.close(); });
+
+      const { port } = await start({
+        zones: () => [EXAMPLE],
+        forwardTo: [`127.0.0.1#${upstreamPort}`],
+        maxConcurrentForwards: 2,
+      });
+
+      // Two queries occupy both slots and are left unanswered upstream.
+      const occupying = [
+        ask(port, buildQuery("first.example.org", TYPE.A, 0x2001), 6_000),
+        ask(port, buildQuery("second.example.org", TYPE.A, 0x2002), 6_000),
+      ];
+      for (let waited = 0; held.length < 2 && waited < 200; waited += 1) await delay(10);
+      assert.equal(held.length, 2, "both slots are in use");
+
+      const overflow = received(await ask(port, buildQuery("third.example.org", TYPE.A, 0x2003)));
+      assert.equal(overflow.readUInt16BE(2) & 0x000f, RCODE.SERVFAIL, "the third is refused, not dropped");
+
+      // Releasing one returns its slot, and the next query is forwarded again.
+      for (const request of held) {
+        const reply = Buffer.from(request.message);
+        reply.writeUInt16BE(0x8180, 2);
+        upstream.send(reply, request.port, request.address);
+      }
+      await Promise.all(occupying);
+      for (let waited = 0; held.length < 3 && waited < 200; waited += 1) {
+        void ask(port, buildQuery("fourth.example.org", TYPE.A, 0x2004), 500);
+        await delay(10);
+      }
+      assert.ok(held.length > 2, "a completed forward frees its slot");
     });
   });
 
