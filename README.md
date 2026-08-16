@@ -122,6 +122,20 @@ itself before the restart:
 The first three stop the process, which a readiness probe reports. The fourth
 starts cleanly and fails at the first write, which it does not.
 
+**Whether a release changes the schema is a question with a mechanical answer.**
+It matters because a deployment that replaces pods one at a time runs both
+versions at once for a few seconds, and the older one has to tolerate the newer
+schema for that long. Rather than reading commit messages for it:
+
+```sh
+git diff --name-only <deployed>..<new> -- migrations/ src/infrastructure/migrations.ts
+```
+
+Empty output means the schema is untouched and the versions may overlap. Any
+output means they may not: deploy that release without overlap, then go back.
+The second path is included because the table that records which migrations have
+run lives there rather than in a `.sql` file.
+
 Everything else -- provider wiring, retention, proxy origin, access tokens and
 provider credentials -- is stored alongside the zones and managed from the
 portal's **Provider settings** screen. A local change takes effect immediately;
