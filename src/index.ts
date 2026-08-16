@@ -9,6 +9,7 @@ import { resolve } from "node:path";
 import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "./config.ts";
 import { createDnsServer, type ServedZone } from "./dns/server.ts";
 import { servedZones } from "./dns/snapshot.ts";
+import { PORTAL_ASSETS } from "./http/portal-assets.ts";
 import { createNodeHandler, requestOrigin } from "./http/api.ts";
 import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.ts";
 import { createReadinessMonitor } from "./http/readiness.ts";
@@ -125,16 +126,7 @@ function findPublicDirectory(): string {
 
 const publicDirectory = findPublicDirectory();
 
-const staticFiles = new Map([
-  ["/", { file: "index.html", type: "text/html; charset=utf-8" }],
-  ["/index.html", { file: "index.html", type: "text/html; charset=utf-8" }],
-  ["/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
-  ["/app.js", { file: "app.js", type: "text/javascript; charset=utf-8" }],
-  ["/api-client.js", { file: "api-client.js", type: "text/javascript; charset=utf-8" }],
-  ["/store.js", { file: "store.js", type: "text/javascript; charset=utf-8" }],
-  ["/ttl.js", { file: "ttl.js", type: "text/javascript; charset=utf-8" }],
-  ["/i18n.js", { file: "i18n.js", type: "text/javascript; charset=utf-8" }],
-]);
+const staticFiles = PORTAL_ASSETS;
 
 const handleRequest: RequestListener = (request, response) => {
   void route(request, response).catch((error: unknown) => {

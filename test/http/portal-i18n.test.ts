@@ -117,13 +117,12 @@ describe("portal internationalization", () => {
     assert.equal(escapeHtml(translated), "Zone was not created: &lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
   });
 
-  it("wires an accessible persisted language selector and serves every portal module", async () => {
-    const [html, app, store, client, server] = await Promise.all([
+  it("wires an accessible persisted language selector and keeps the portal layered", async () => {
+    const [html, app, store, client] = await Promise.all([
       readFile(new URL("../../public/index.html", import.meta.url), "utf8"),
       readFile(new URL("../../public/app.js", import.meta.url), "utf8"),
       readFile(new URL("../../public/store.js", import.meta.url), "utf8"),
       readFile(new URL("../../public/api-client.js", import.meta.url), "utf8"),
-      readFile(new URL("../../src/index.ts", import.meta.url), "utf8"),
     ]);
     assert.match(html, /id="locale-select"[^>]+data-i18n-aria-label="language\.label"/);
     assert.match(html, /<option value="en"[^>]+data-i18n="language\.english"/);
@@ -151,9 +150,11 @@ describe("portal internationalization", () => {
       assert.match(app, new RegExp(`^  ${scope}: "#`, "m"), scope);
     }
 
-    for (const file of ["i18n.js", "app.js", "store.js", "api-client.js", "ttl.js"]) {
-      assert.ok(server.includes(`file: "${file}"`), file);
-    }
+    // Which modules are served is checked in portal-assets.test.ts, against the
+    // imports the portal actually declares. The list that used to sit here named
+    // five files by hand, so it agreed with the server about those five and knew
+    // nothing about a sixth -- which is how `panels.js` reached production
+    // unserved under an assertion called "serves every portal module".
     assert.equal(createTranslator("ko")("meta.title"), "Parallax — DNS 관측소");
   });
 });
