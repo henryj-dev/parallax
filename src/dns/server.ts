@@ -149,6 +149,34 @@ export function createDnsServer(options: DnsServerOptions): {
     return writeReply(parts, overTcp ? Number.MAX_SAFE_INTEGER : query.udpPayloadSize);
   }
 
+  /**
+   * Closes whatever is open, including a half-open bind.
+   *
+   * Tolerates a socket that never bound: `close()` on one of those throws
+   * rather than doing nothing, and the failure path this exists for is exactly
+   * where that happens.
+   */
+  const shutdown = async (): Promise<void> => {
+    for (const socket of tcpSockets) socket.destroy();
+    tcpSockets.clear();
+    const [closingUdp, closingTcp] = [udp, tcp];
+    udp = undefined;
+    tcp = undefined;
+    // A late error with no listener left is thrown, not ignored.
+    closingUdp?.on("error", () => undefined);
+    closingTcp?.on("error", () => undefined);
+    await Promise.all([
+      new Promise<void>((resolve) => {
+        if (!closingUdp) return resolve();
+        try { closingUdp.close(resolve); } catch { resolve(); }
+      }),
+      new Promise<void>((resolve) => {
+        if (!closingTcp) return resolve();
+        try { closingTcp.close(() => resolve()); } catch { resolve(); }
+      }),
+    ]);
+  };
+
   return {
     async listen(port, host) {
       const binding = await resolveHost(host);
@@ -191,18 +219,28 @@ export function createDnsServer(options: DnsServerOptions): {
         socket.on("error", () => socket.destroy());
       });
       tcp.maxConnections = maxTcpConnections;
-      await Promise.all([
+      // Both transports or neither.
+      //
+      // `Promise.all` rejects the moment one bind fails, while the other goes
+      // on to succeed -- and then nobody owns it. The caller saw a throw, so it
+      // never received the server and has nothing to close; the socket stays
+      // bound for the life of the process. A port race is enough to reach this:
+      // a port is only free until something else takes it.
+      //
+      // That is what an eight-minute silence in a test run turned out to be.
+      // Every test had finished and the process would not leave, holding a UDP
+      // socket and a TCP server that nothing had a reference to.
+      const bound = await Promise.allSettled([
         new Promise<void>((resolve, reject) => { udp?.once("error", reject); udp?.bind(port, binding.address, resolve); }),
         new Promise<void>((resolve, reject) => { tcp?.once("error", reject); tcp?.listen(port, binding.address, resolve); }),
       ]);
+      const failed = bound.find((result) => result.status === "rejected");
+      if (failed) {
+        await shutdown();
+        throw failed.reason;
+      }
     },
-    async close() {
-      for (const socket of tcpSockets) socket.destroy();
-      await Promise.all([
-        new Promise<void>((resolve) => { if (udp) udp.close(resolve); else resolve(); }),
-        new Promise<void>((resolve) => { if (tcp) tcp.close(() => resolve()); else resolve(); }),
-      ]);
-    },
+    close: shutdown,
   };
 }
 

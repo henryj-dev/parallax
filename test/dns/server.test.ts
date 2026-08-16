@@ -154,6 +154,35 @@ describe("DNS server", () => {
     return { port, server };
   }
 
+  it("leaves nothing bound when one transport cannot take the port", async () => {
+    // A free port is only free until somebody takes it, and this suite finds
+    // ports by probing and letting go. Under a loaded machine another test wins
+    // the race, one of the two binds fails, and `listen` throws -- at which
+    // point whatever bound first has no owner. Nobody can close it, because the
+    // caller never received the server.
+    //
+    // That is what the eight-minute silence was: every test in this file had
+    // finished and the process would not leave, holding a UDP socket and a TCP
+    // server that no `after` hook knew about.
+    const port = await freePort();
+    const squatter = createServer();
+    await new Promise<void>((resolve) => squatter.listen(port, "127.0.0.1", resolve));
+    closers.push(async () => { await new Promise<void>((resolve) => squatter.close(() => resolve())); });
+
+    const server = createDnsServer({ zones: () => [EXAMPLE] });
+    await assert.rejects(() => server.listen(port, "127.0.0.1"), "the TCP half cannot have the port");
+
+    // The UDP half is the one that would have bound. Take the port without
+    // `reuseAddr` -- a socket still holding it makes this fail, which is the
+    // whole assertion.
+    const probe = createSocket("udp4");
+    await new Promise<void>((resolve, reject) => {
+      probe.once("error", reject);
+      probe.bind(port, "127.0.0.1", resolve);
+    });
+    await new Promise<void>((resolve) => probe.close(resolve));
+  });
+
   it("answers from the snapshot it is given, over UDP and over TCP", async () => {
     const { port } = await start({ zones: () => [EXAMPLE] });
 
