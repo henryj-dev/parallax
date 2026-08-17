@@ -78,14 +78,25 @@ function rcodeOf(reply: Buffer | undefined): number {
  * reached a timeout on a loaded machine and never on this one.
  */
 async function freePort(host = "127.0.0.1"): Promise<number> {
-  const probe = createServer();
-  await new Promise<void>((resolve) => probe.listen(0, host, resolve));
-  const port = (probe.address() as AddressInfo).port;
-  await new Promise<void>((resolve) => probe.close(() => resolve()));
-  const datagram = createSocket(isIP(host) === 6 ? "udp6" : "udp4");
-  await bound(datagram, port, host);
-  await new Promise<void>((resolve) => datagram.close(resolve));
-  return port;
+  for (let attempt = 8; ; attempt -= 1) {
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, host, resolve));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const datagram = createSocket(isIP(host) === 6 ? "udp6" : "udp4");
+    try {
+      await bound(datagram, port, host);
+    } catch (error) {
+      // Free for TCP and taken for UDP is a real answer, not an error: ask the
+      // kernel for another one rather than handing back a port half of the
+      // caller cannot have.
+      datagram.close();
+      if (attempt <= 1 || (error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+      continue;
+    }
+    await new Promise<void>((resolve) => datagram.close(resolve));
+    return port;
+  }
 }
 
 /**
@@ -152,6 +163,20 @@ function askOverTcp(port: number, message: Buffer, split = false, host = "127.0.
   });
 }
 
+/**
+ * A datagram socket already holding its port, and the port it took.
+ *
+ * Asking for a free port and then binding it is two steps with a gap, and the
+ * gap is where another test takes it. Binding to 0 and reading back what the
+ * kernel gave has no gap: nothing else can be holding a port this socket is
+ * already on.
+ */
+async function upstreamOn(host = "127.0.0.1"): Promise<{ socket: ReturnType<typeof createSocket>; port: number }> {
+  const socket = createSocket(isIP(host) === 6 ? "udp6" : "udp4");
+  await bound(socket, 0, host);
+  return { socket, port: (socket.address() as AddressInfo).port };
+}
+
 const EXAMPLE: ServedZone = {
   name: "example.com",
   serial: 12,
@@ -189,11 +214,23 @@ describe("DNS server", () => {
     options: Partial<Parameters<typeof createDnsServer>[0]> & { zones: () => readonly ServedZone[] },
     host = "127.0.0.1",
   ) {
-    const port = await freePort(host);
-    const server = createDnsServer(options);
-    await server.listen(port, host);
-    closers.push(() => server.close());
-    return { port, server };
+    // The listener needs one port for both transports, so it cannot be handed a
+    // socket already holding one the way the upstreams are. That leaves a gap
+    // between asking and binding, and something else can take it there. The
+    // listener now leaves nothing bound when it fails, so trying again is safe
+    // -- and a collision is rare enough that a second attempt settles it.
+    for (let attempt = 3; ; attempt -= 1) {
+      const port = await freePort(host);
+      const server = createDnsServer(options);
+      try {
+        await server.listen(port, host);
+      } catch (error) {
+        if (attempt <= 1 || (error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+        continue;
+      }
+      closers.push(() => server.close());
+      return { port, server };
+    }
   }
 
   it("leaves nothing bound when one transport cannot take the port", async () => {
@@ -344,9 +381,7 @@ describe("DNS server", () => {
   });
 
   it("hands a name outside every zone to an upstream, and relays the bytes unchanged", async () => {
-    const upstreamPort = await freePort();
-    const upstream = createSocket("udp4");
-    await bound(upstream, upstreamPort, "127.0.0.1");
+    const { socket: upstream, port: upstreamPort } = await upstreamOn();
     upstream.on("message", (message, remote) => {
       // Answer with something this server could not have synthesized, so the
       // test can tell a relayed reply from a locally built one.
@@ -362,13 +397,9 @@ describe("DNS server", () => {
   });
 
   it("ignores forged-source and mismatched upstream datagrams until a valid response arrives", async () => {
-    const upstreamPort = await freePort();
-    const upstream = createSocket("udp4");
+    const { socket: upstream, port: upstreamPort } = await upstreamOn();
     const rogue = createSocket("udp4");
-    await Promise.all([
-      bound(upstream, upstreamPort, "127.0.0.1"),
-      bound(rogue, 0, "127.0.0.1"),
-    ]);
+    await bound(rogue, 0, "127.0.0.1");
     closers.push(async () => { upstream.close(); rogue.close(); });
     upstream.on("message", (message, remote) => {
       const valid = forwardedReply(message, [0xbe, 0xef]);
@@ -399,9 +430,7 @@ describe("DNS server", () => {
   });
 
   it("allows forwarding only for explicitly permitted client networks", async () => {
-    const upstreamPort = await freePort();
-    const upstream = createSocket("udp4");
-    await bound(upstream, upstreamPort, "127.0.0.1");
+    const { socket: upstream, port: upstreamPort } = await upstreamOn();
     let receivedQueries = 0;
     upstream.on("message", () => { receivedQueries += 1; });
     closers.push(async () => { upstream.close(); });
@@ -437,9 +466,7 @@ describe("DNS server", () => {
   });
 
   it("bounds simultaneous upstream work and returns SERVFAIL at capacity", async () => {
-    const upstreamPort = await freePort();
-    const upstream = createSocket("udp4");
-    await bound(upstream, upstreamPort, "127.0.0.1");
+    const { socket: upstream, port: upstreamPort } = await upstreamOn();
     let firstMessage: { message: Buffer; port: number; address: string } | undefined;
     let signalFirst = (): void => {};
     const sawFirst = new Promise<void>((resolve) => { signalFirst = resolve; });
@@ -604,10 +631,8 @@ describe("DNS server", () => {
     // A client reaches TCP because it was told the UDP answer was truncated.
     // Relaying that query over UDP hands back another truncated answer, and the
     // client has no move left -- it already did the thing TC asks for.
-    const upstreamPort = await freePort();
     const overUdp: number[] = [];
-    const udpUpstream = createSocket("udp4");
-    await bound(udpUpstream, upstreamPort, "127.0.0.1");
+    const { socket: udpUpstream, port: upstreamPort } = await upstreamOn();
     udpUpstream.on("message", (message, remote) => {
       overUdp.push(1);
       const truncated = Buffer.from(message.subarray(0, 12));
@@ -665,9 +690,7 @@ describe("DNS server", () => {
     };
 
     async function withUpstream(zone: ServedZone) {
-      const upstreamPort = await freePort();
-      const upstream = createSocket("udp4");
-      await bound(upstream, upstreamPort, "127.0.0.1");
+      const { socket: upstream, port: upstreamPort } = await upstreamOn();
       const asked: string[] = [];
       upstream.on("message", (message, remote) => {
         asked.push(readName(message, 12).name);
@@ -769,9 +792,7 @@ describe("DNS server", () => {
       // The limit exists so a burst of names this listener does not hold cannot
       // hold open more upstream work than the process can carry. Reached, it must
       // answer SERVFAIL -- a client can retry that. Silence it cannot.
-      const upstreamPort = await freePort();
-      const upstream = createSocket("udp4");
-      await bound(upstream, upstreamPort, "127.0.0.1");
+      const { socket: upstream, port: upstreamPort } = await upstreamOn();
       const held: { message: Buffer; port: number; address: string }[] = [];
       upstream.on("message", (message, remote) => { held.push({ message, port: remote.port, address: remote.address }); });
       closers.push(async () => { upstream.close(); });
