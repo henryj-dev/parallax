@@ -16,25 +16,46 @@ const PUBLIC = join(import.meta.dirname, "../../public");
  * That shipped. `panels.js` was added, the allowlist was not, and the live
  * portal was dead until somebody fetched the file by hand and read `Not found`.
  */
+/** Counting a second way, so the first way has to still be counting. */
+function occurrences(source: string, needle: string): number {
+  return source.split(needle).length - 1;
+}
+
 describe("every module the portal imports is served", () => {
   it("serves each relative import declared by a portal script", async () => {
     const scripts = (await readdir(PUBLIC)).filter((name) => name.endsWith(".js"));
     assert.ok(scripts.length > 0, "the portal has scripts to check");
 
     const missing: string[] = [];
+    let matched = 0;
+    let plain = 0;
     for (const script of scripts) {
       const source = await readFile(join(PUBLIC, script), "utf8");
+      plain += occurrences(source, 'from "./');
       for (const match of source.matchAll(/(?:^|\s)(?:import|export)[^;]*?from\s+"(\.\/[^"]+)"/gu)) {
+        matched += 1;
         const specifier = (match[1] as string).replace(/^\.\//u, "");
         if (!PORTAL_ASSETS.has(`/${specifier}`)) missing.push(`${script} imports ${specifier}`);
       }
     }
+    // An empty `missing` is what a working scan gives and what a scan that read
+    // nothing gives, and the assertion below cannot tell them apart. Measured:
+    // stop the pattern matching and this file stayed green -- the guard that
+    // exists because a live portal went blank would have been gone, silently.
+    assert.ok(plain > 0, "the portal imports its own modules; finding none means this stopped looking");
+    assert.equal(matched, plain, "the pattern and a plain count of `from \"./` disagree, so the pattern is missing imports");
     assert.deepEqual(missing, [], "a portal module imports something the server will not serve");
   });
 
   it("serves each script the page itself loads", async () => {
     const html = await readFile(join(PUBLIC, "index.html"), "utf8");
     const sources = [...html.matchAll(/<script[^>]*\ssrc="([^"]+)"/gu)].map((match) => match[1] as string);
+    // Same shape, one worse: an empty list makes the loop below run zero times,
+    // so the test asserts nothing at all and still passes. Counting the tags a
+    // different way is what makes the loop's silence mean something.
+    const carryingSrc = [...html.matchAll(/<script\b[^>]*>/gu)].filter((tag) => tag[0].includes("src=")).length;
+    assert.ok(carryingSrc > 0, "the page loads at least one script");
+    assert.equal(sources.length, carryingSrc, "a script tag carries a src this did not read");
     for (const source of sources) {
       if (/^https?:/u.test(source)) continue;
       assert.ok(PORTAL_ASSETS.has(source.startsWith("/") ? source : `/${source}`), `index.html loads ${source}`);

@@ -8,6 +8,23 @@ const run = promisify(execFile);
 const root = fileURLToPath(new URL("../../", import.meta.url));
 
 /**
+ * Bounded, like every other place a child is awaited here.
+ *
+ * This file was missed when those bounds went in, because that sweep searched
+ * for the name the other files gave the function rather than for the thing
+ * itself -- and this one calls it `run`.
+ */
+const TSC_TIMEOUT_MS = 120_000;
+
+/** How a problem is picked out of `tsc` output, in one place so it can be tested. */
+function problemsIn(output: string): string[] {
+  return output.split("\n").filter((line) => line.startsWith("public/"));
+}
+
+/** One line of real `tsc` output -- the sample the parse has to recognise. */
+const SAMPLE_PROBLEM = "public/app.js(12,3): error TS2339: Property 'nope' does not exist on type 'Store'.";
+
+/**
  * The portal is plain JavaScript that nothing compiles, so a call to a name
  * that does not exist, or a store command that was renamed, is a valid file
  * that throws the moment that code path runs. The other tests over these files
@@ -19,9 +36,27 @@ const root = fileURLToPath(new URL("../../", import.meta.url));
  */
 describe("portal types", () => {
   it("type-checks cleanly", async () => {
-    const output = await run("node_modules/.bin/tsc", ["-p", "tsconfig.portal.json"], { cwd: root })
-      .then(() => "", (error: { stdout?: string }) => error.stdout ?? "");
-    const errors = output.split("\n").filter((line) => line.startsWith("public/"));
+    // The control. No errors is what a clean check gives, what a check that
+    // read no portal files gives, and -- before this -- what a `tsc` that never
+    // started gave, because the rejection carried no stdout to parse and an
+    // absent string parses into an empty list of problems.
+    const listed = await run("node_modules/.bin/tsc",
+      ["-p", "tsconfig.portal.json", "--listFilesOnly"], { cwd: root, timeout: TSC_TIMEOUT_MS });
+    const read = listed.stdout.split("\n").filter((line) => line.includes("/public/"));
+    assert.ok(read.length > 0, "tsc must be reading the portal, or a clean answer below is not about the portal");
+
+    const checked = await run("node_modules/.bin/tsc", ["-p", "tsconfig.portal.json"], { cwd: root, timeout: TSC_TIMEOUT_MS })
+      .then(() => ({ ran: true, output: "", code: undefined as unknown }),
+        (error: { stdout?: string; code?: unknown }) => ({ ran: error.stdout !== undefined, output: error.stdout ?? "", code: error.code }));
+    assert.ok(checked.ran, `tsc did not run (${String(checked.code)}); a check that never started is not a check that passed`);
+
+    // And the last control: on a clean tree there are no errors to find, so a
+    // parse that recognises nothing looks exactly like a portal with nothing
+    // wrong. One line of real `tsc` output settles which it is.
+    assert.deepEqual(problemsIn(SAMPLE_PROBLEM), [SAMPLE_PROBLEM],
+      "the parse must recognise a tsc error, or finding none below is not evidence");
+
+    const errors = problemsIn(checked.output);
     assert.deepEqual(errors, [], `the portal does not type-check:\n${errors.join("\n")}`);
   });
 });
