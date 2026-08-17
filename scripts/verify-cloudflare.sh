@@ -12,6 +12,12 @@
 #
 # The token needs `Zone -> DNS -> Edit` for the records and `Zone -> Zone -> Read`,
 # which Parallax uses once to resolve the domain to its zone id.
+#
+# Not covered here: the two account-scoped lookups adoption uses to tell which
+# names Workers and R2 publish for themselves, which need an account id plus
+# `Account -> Workers Scripts -> Read` and `Account -> Workers R2 Storage -> Read`.
+# So the request shapes for those are what Cloudflare's schema documents, not what
+# a real account was observed to answer -- the gap this file exists to close.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

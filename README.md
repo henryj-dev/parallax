@@ -390,9 +390,29 @@ The token needs two zone permissions, scoped to the domains it manages:
 | `Zone` → `DNS` → `Edit` | every record read and write; this is the whole runtime surface |
 | `Zone` → `Zone` → `Read` | resolving a domain to its zone ID, once, when a binding is created |
 
-No account-level permission is needed. The zone ID is resolved at bind time and
-stored, so applying never exercises the second permission -- a compromised
-process can do no more with it than one without it.
+The zone ID is resolved at bind time and stored, so applying never exercises the
+second permission -- a compromised process can do no more with it than one
+without it.
+
+Two account permissions are optional, and only adoption uses them. They are what
+lets a record a Cloudflare service publishes for itself be shown as that service
+and locked against editing -- a Workers custom domain as `Worker` and the name of
+the worker, an R2 custom domain as `R2` and the name of the bucket. A DNS record
+does not carry that: over the records API a Workers custom domain and a
+hand-written `CNAME` are the same object, so the answer comes from the service
+that holds the binding.
+
+| Permission | Why |
+| --- | --- |
+| `Account` → `Workers Scripts` → `Read` | which hostnames in this zone are Workers custom domains, and for which worker |
+| `Account` → `Workers R2 Storage` → `Read` | which hostnames are R2 custom domains, and for which bucket |
+
+Both need the profile to carry an account ID, because these endpoints are
+account-scoped where DNS is zone-scoped. Without them -- no account ID, a token
+without the permission, a provider with no such services -- a zone still
+reconciles and every record still publishes; adopting reports that it could not
+read who owns what, and leaves the records already marked as service-owned
+marked. It never unlocks one on the strength of a lookup that failed.
 
 Use a minimum-scope Cloudflare API token. When authentication is configured,
 the portal asks for an access token and keeps it only in the current browser

@@ -581,7 +581,7 @@ export class ControlPlane {
       return { owned, warnings: [] };
     } catch (error) {
       return {
-        warnings: [`which names Workers and R2 own could not be read, so records already marked as theirs keep that mark and no new ones gained it: ${error instanceof Error ? error.message : String(error)}`],
+        warnings: [`which names Workers and R2 own could not be read, so records already marked as theirs keep that mark and no new ones gained it: ${error instanceof Error ? error.message : String(error)}. A refusal here usually means the token lacks Account -> Workers Scripts -> Read or Account -> Workers R2 Storage -> Read`],
       };
     }
   }
