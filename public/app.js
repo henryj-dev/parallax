@@ -220,6 +220,11 @@ function renderWorkspace(state) {
   renderHistory(state);
 }
 
+/** The proxy badge belongs to the external record, which is the only side proxied. */
+function proxyBadge(record) {
+  return record.views.external.proxied ? `<span class="proxy-badge">${escapeHtml(t("record.proxied"))}</span>` : "";
+}
+
 function renderRecords(state) {
   $("#records-empty").hidden = state.records.length > 0;
   $(".table-wrap").hidden = state.records.length === 0;
@@ -228,22 +233,38 @@ function renderRecords(state) {
       && candidate.type === record.type && candidate.views.internal.content);
     const internal = record.views.internal.content || (overridden ? "" : record.views.external.content);
     // A record its provider owns is shown the way the provider shows it: the
-    // service in the type column and the worker or bucket as the answer, with
-    // both buttons closed. Reading the stored CNAME as a target is what invites
-    // the edit that breaks the binding, and the edit cannot be made here
-    // anyway -- a button that only fails is worse than one that is not offered.
+    // service in the type column, and the worker or bucket as the answer on
+    // both sides. Reading the stored CNAME as a target is what invites the edit
+    // that breaks the binding -- and inside is where that reading was worst,
+    // because the placeholder shown there is the one address the resolver
+    // deliberately never answers: it relays the query to the public answer, so
+    // what a client gets inside is the service, exactly as it says here.
+    //
+    // No buttons at all rather than dead ones. Nothing on this row can be
+    // changed from this page, so an action that exists only to refuse is noise
+    // where the row already says what it is; the reason stays on the row, for
+    // anyone who hovers it wondering where the controls went.
     const owned = Boolean(record.views.external.managed);
-    const hint = escapeHtml(t("record.providerOwnedHint"));
-    return `<tr>
+    // What the provider serves, said the same way on both sides, with the
+    // stored DNS value on hover for whoever needs it.
+    const service = escapeHtml(record.views.external.label);
+    const stored = ` title="${escapeHtml(record.views.external.content)}"`;
+    const inside = owned
+      ? `<div class="record-answer"${stored}>${service}</div>`
+      : `<div class="record-answer ${record.views.internal.content ? "" : "inherited"}">${escapeHtml(internal || t(overridden ? "record.overridden" : "record.noAnswer"))}</div>`;
+    const outside = owned
+      ? `<div class="record-answer"${stored}>${service}${proxyBadge(record)}</div>`
+      : `<div class="record-answer">${escapeHtml(record.views.external.content || t("record.noAnswer"))}${proxyBadge(record)}</div>`;
+    const actions = owned
+      ? ""
+      : `<div class="row-actions"><button class="row-action" type="button" data-edit-record="${index}">${escapeHtml(t("record.edit"))}</button>`
+        + `<button class="row-action danger" type="button" data-delete-record="${index}">${escapeHtml(t("record.delete"))}</button></div>`;
+    return `<tr${owned ? ` class="provider-owned" title="${escapeHtml(t("record.providerOwnedHint"))}"` : ""}>
       <td><span class="record-identity"><b>${escapeHtml(displayName(record.name))}</b><small${owned ? ' class="service-type"' : ""}>${escapeHtml(record.typeLabel || record.type)}</small></span></td>
-      <td data-label="${escapeHtml(t("record.internalAnswer"))}"><div class="record-answer ${record.views.internal.content ? "" : "inherited"}">${escapeHtml(internal || t(overridden ? "record.overridden" : "record.noAnswer"))}</div></td>
-      <td data-label="${escapeHtml(t("record.externalAnswer"))}"><div class="record-answer"${owned ? ` title="${escapeHtml(record.views.external.content)}"` : ""}>${escapeHtml(record.views.external.label || record.views.external.content || t("record.noAnswer"))}${record.views.external.proxied ? `<span class="proxy-badge">${escapeHtml(t("record.proxied"))}</span>` : ""}</div></td>
+      <td data-label="${escapeHtml(t("record.internalAnswer"))}">${inside}</td>
+      <td data-label="${escapeHtml(t("record.externalAnswer"))}">${outside}</td>
       <td data-label="TTL"><span class="record-answer">${escapeHtml(formatTtl(record.views.internal.ttl))} / ${escapeHtml(formatTtl(record.views.external.ttl))}</span></td>
-      <td><div class="row-actions">${owned
-          ? `<button class="row-action" type="button" disabled title="${hint}">${escapeHtml(t("record.view"))}</button>`
-            + `<button class="row-action danger" type="button" disabled title="${hint}">${escapeHtml(t("record.delete"))}</button>`
-          : `<button class="row-action" type="button" data-edit-record="${index}">${escapeHtml(t("record.edit"))}</button>`
-            + `<button class="row-action danger" type="button" data-delete-record="${index}">${escapeHtml(t("record.delete"))}</button>`}</div></td>
+      <td>${actions}</td>
     </tr>`;
   }).join("");
 }
@@ -262,16 +283,18 @@ function renderLens(state) {
   const record = state.records[Number($("#focus-record").value) || 0];
   const overridden = record && state.records.some((candidate) => candidate.name === record.name
     && candidate.type === record.type && candidate.views.internal.content);
-  const internal = record?.views.internal.content
+  // A name its provider serves answers the same thing on both sides, and the
+  // lens says so for the same reason the table does: the placeholder stored
+  // inside is the one answer the resolver never gives.
+  const owned = Boolean(record?.views.external.managed);
+  const internal = (owned ? record?.views.external.label : record?.views.internal.content)
     || (overridden ? t("record.overridden") : record?.views.external.content)
     || t("record.noAnswerDefined");
   $("#internal-answer").textContent = record ? internal : t("record.noneYet");
   $("#external-answer").textContent = record
     ? (record.views.external.label || record.views.external.content || t("record.noAnswerDefined"))
     : t("record.noneYet");
-  // Inside sees the record as DNS holds it, because that is what it inherits.
-  // Outside is where the service answers, so that is where it is named.
-  $("#internal-type").textContent = record?.type || "—";
+  $("#internal-type").textContent = record?.typeLabel || record?.type || "—";
   $("#external-type").textContent = record?.typeLabel || record?.type || "—";
   $("#internal-ttl").textContent = t("ttl.label", { value: record ? formatTtl(record.views.internal.ttl) : "—" });
   $("#external-ttl").textContent = t("ttl.label", { value: record ? formatTtl(record.views.external.ttl) : "—" });

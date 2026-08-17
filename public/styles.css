@@ -135,6 +135,20 @@ tr:last-child td { border-bottom: 0; }
 .record-identity b, .record-identity small { display: block; }
 .record-identity b { font: 600 12px var(--mono); }
 .record-identity small { margin-top: 4px; color: var(--muted); font: 9px var(--mono); }
+/*
+ * A row nothing here can change, set into the table rather than sitting on it.
+ * The table's own ground is white, so this reads as recessed at a glance and
+ * carries no action column to reach for -- the two together are the whole
+ * signal, since these rows have no button to grey out.
+ *
+ * `#edf4f5` is the sidebar's ground, reused rather than invented: it is already
+ * this design's colour for a surface you read but do not work on. The narrow
+ * selector is for the phone layout, where `table tbody td:first-child` paints
+ * its own background and would otherwise leave the name cell a shade lighter
+ * than the row it belongs to.
+ */
+table tbody tr.provider-owned td { background: #edf4f5; color: var(--muted); }
+.provider-owned .record-identity b { color: var(--muted); }
 /* A service name, not a DNS type -- so it does not read as one. */
 .record-identity small.service-type { color: var(--external); font-weight: 600; letter-spacing: 0.04em; }
 .record-answer { max-width: 190px; overflow: hidden; text-overflow: ellipsis; font: 11px var(--mono); white-space: nowrap; }
