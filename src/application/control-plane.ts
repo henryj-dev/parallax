@@ -91,6 +91,28 @@ function assertProviderManagedIntact(before: readonly DnsView[], after: readonly
  */
 export interface PreviewPlan extends ReconcilePlan {
   error?: string;
+  /**
+   * What the provider holds for this view, and which of it this control plane
+   * owns.
+   *
+   * The plan says what would change; this says who each record belongs to, and
+   * they are different questions. A record that produces no operation is either
+   * one of ours that already matches or somebody else's that happens to say the
+   * same thing -- identical in a plan, and the difference decides whether an
+   * operator may touch it. Ownership lives in a marker on the provider's copy,
+   * so nothing but a provider read can answer it, and the read has already
+   * happened here: this is the answer being carried instead of discarded.
+   */
+  actual?: ProviderOwnership[];
+}
+
+/** One record the provider holds, reduced to what identifies and claims it. */
+export interface ProviderOwnership {
+  readonly name: string;
+  readonly type: string;
+  readonly content: string;
+  /** True when it carries this control plane's ownership marker. */
+  readonly managed: boolean;
 }
 
 export const DEFAULT_HISTORY_PAGE_SIZE = 50;
@@ -654,7 +676,12 @@ export class ControlPlane {
       }
       try {
         const actual = await this.#provider.list(key);
-        views[view.name] = buildReconcilePlan(view.records, actual);
+        views[view.name] = {
+          ...buildReconcilePlan(view.records, actual),
+          actual: actual.map((record) => ({
+            name: record.name, type: record.type, content: record.content, managed: record.managed,
+          })),
+        };
       } catch (error) {
         // Asking for one view by name is asking about that view, so a failure
         // there is the answer to the question and belongs to the caller.

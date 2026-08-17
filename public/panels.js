@@ -76,6 +76,42 @@ export function fallbackPanel(state) {
 }
 
 /**
+ * Who each record belongs to, read off the last plan.
+ *
+ * Ownership is a marker on the provider's copy, so only a provider read can
+ * answer it -- and the plan is where that read already happened. The verdicts
+ * are deliberately four, because "no operation" hides two very different
+ * records: one of ours that already matches, and somebody else's that happens
+ * to say the same thing. An operator may rewrite the first and must not touch
+ * the second, and until now the table showed them identically.
+ *
+ * `""` means nobody has asked the provider yet. Not "unowned" -- the difference
+ * matters, because an empty answer here must never read as "safe to change".
+ *
+ * @param {{ views?: Record<string, { actual?: { name?: string, type?: string, content?: string, managed?: boolean }[] }> }} plan
+ * @returns {Map<string, string>} row key to `ours`, `theirs`, `absent` or `""`
+ */
+export function recordOwnership(records, plan, view = "external") {
+  const rows = Array.isArray(records) ? records : [];
+  const actual = plan?.views?.[view]?.actual;
+  // A view whose provider could not be read carries no list, which is not the
+  // same as a provider holding nothing.
+  if (!Array.isArray(actual)) return new Map();
+  const held = new Map(actual.map((entry) =>
+    [`${String(entry?.name ?? "")}\0${String(entry?.type ?? "")}\0${String(entry?.content ?? "")}`, entry?.managed === true]));
+  const verdicts = new Map();
+  for (const row of rows) {
+    const content = String(row?.views?.[view]?.content ?? "");
+    // A row with no answer on this side describes nothing here, so there is
+    // nothing at the provider for it to be.
+    if (!content) continue;
+    const owned = held.get(`${String(row?.name ?? "")}\0${String(row?.type ?? "")}\0${content}`);
+    verdicts.set(row.id, owned === undefined ? "absent" : owned ? "ours" : "theirs");
+  }
+  return verdicts;
+}
+
+/**
  * One row of the record table: what it says, and what it offers.
  *
  * Here for the reason this file exists. A record its provider owns has no edit

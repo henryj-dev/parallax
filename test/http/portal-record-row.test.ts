@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { recordRow } from "../../public/panels.js";
+import { recordOwnership, recordRow } from "../../public/panels.js";
 import { readRecords } from "../../public/store.js";
 
 /**
@@ -68,6 +68,61 @@ describe("a row the provider owns", () => {
 
   it("is never marked as inheriting, since both sides say the same thing", () => {
     assert.equal(rowFor("root").inside.inherited, false);
+  });
+});
+
+describe("who owns each record at the provider", () => {
+  const zone = {
+    views: [{
+      name: "external",
+      records: [
+        { id: "mine", name: "www", type: "A", content: "203.0.113.1", ttl: 300 },
+        { id: "theirs", name: "mail", type: "A", content: "203.0.113.2", ttl: 300 },
+        { id: "new", name: "api", type: "A", content: "203.0.113.3", ttl: 300 },
+        { id: "inside-only", name: "admin", type: "A", content: "", ttl: 300 },
+      ],
+    }],
+  };
+  const plan = {
+    views: {
+      external: {
+        actual: [
+          { name: "www", type: "A", content: "203.0.113.1", managed: true },
+          { name: "mail", type: "A", content: "203.0.113.2", managed: false },
+        ],
+      },
+    },
+  };
+
+  it("tells a record of ours from somebody else's that says the same thing", () => {
+    // The whole reason this exists. Both produce no operation, so a plan shows
+    // them identically -- and an operator may rewrite the first while touching
+    // the second breaks a binding this control plane did not make.
+    const owners = recordOwnership(readRecords(zone), plan);
+    assert.equal(owners.get("mine"), "ours");
+    assert.equal(owners.get("theirs"), "theirs");
+  });
+
+  it("says a record is not published rather than not ours", () => {
+    // It will be ours, once applied. Calling it "theirs" would be backwards.
+    assert.equal(recordOwnership(readRecords(zone), plan).get("new"), "absent");
+  });
+
+  it("says nothing at all until the provider has been read", () => {
+    // An empty verdict must never render as "not ours": that is an invitation to
+    // the exact edit the badge exists to prevent.
+    assert.equal(recordOwnership(readRecords(zone), null).size, 0);
+    assert.equal(recordOwnership(readRecords(zone), { views: {} }).size, 0);
+    // A view whose provider could not be read carries no list, which is not the
+    // same answer as a provider that holds nothing.
+    assert.equal(recordOwnership(readRecords(zone), { views: { external: { error: "provider could not be read" } } }).size, 0);
+    assert.equal(recordOwnership(readRecords(zone), { views: { external: { actual: [] } } }).get("mine"), "absent",
+      "a provider that answered and holds nothing is a different thing, and does have a verdict");
+  });
+
+  it("passes over a row that answers nothing on this side", () => {
+    // There is nothing at the provider for a row that describes nothing there.
+    assert.equal(recordOwnership(readRecords(zone), plan).has("inside-only"), false);
   });
 });
 

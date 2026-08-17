@@ -1122,6 +1122,48 @@ describe("ControlPlane", () => {
     assert.deepEqual(await provider.list("example.com/external"), []);
   });
 
+  it("reports who owns each record the provider holds, beside the plan", async () => {
+    // The plan says what would change; this says whose each record is, and the
+    // two are different questions. A record of ours that already matches and
+    // somebody else's that happens to say the same thing both produce no
+    // operation -- and only one of them may be edited here. The provider read
+    // that can tell them apart has already happened, so the answer is carried
+    // rather than thrown away and asked for again.
+    const { service, provider } = setup();
+    await service.createZone("example.com");
+    provider.seed("example.com/external", [
+      { id: "adopted", name: "mail", type: "A", content: "8.8.8.11", ttl: 300, providerId: "cf-2", managed: false },
+      { id: "ours", name: "www", type: "A", content: "8.8.8.10", ttl: 300, providerId: "cf-1", managed: true },
+    ]);
+    await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+    await service.upsertRecord("example.com", "external", "mail", { name: "mail", type: "A", content: "8.8.8.11", ttl: 300 });
+
+    const plan = await service.preview("example.com", "external");
+    assert.deepEqual(plan.views.external?.operations, [], "both records already say what the provider says");
+    assert.deepEqual(plan.views.external?.actual, [
+      { name: "mail", type: "A", content: "8.8.8.11", managed: false },
+      { name: "www", type: "A", content: "8.8.8.10", managed: true },
+    ]);
+  });
+
+  it("carries no ownership for a view whose provider could not be read", async () => {
+    // Absent, not empty. An empty list means the provider answered and holds
+    // nothing, which a reader may act on; a failed read means nobody knows, and
+    // the portal must not draw a verdict from it.
+    const provider = new SingleViewProvider("internal");
+    const state = new InMemoryZoneRepository();
+    const service = new ControlPlane(state, state, provider);
+    await service.createZone("example.com");
+    await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+
+    const plan = await service.preview("example.com");
+    assert.ok(plan.views.external?.error, "the external view could not be read");
+    assert.equal(plan.views.external?.actual, undefined);
+    // The view that answered carries its list, so the absence above is about
+    // that view rather than about the field never being populated at all.
+    assert.deepEqual(plan.views.internal?.actual, []);
+  });
+
   it("gives a list one verdict per zone, from the same routine one zone reports", async () => {
     // The sidebar carried a fixed `Not observed` on every row because there was
     // no way to ask for many zones at once, and the stylesheet's applied/pending

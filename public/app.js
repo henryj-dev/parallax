@@ -1,5 +1,5 @@
 import { createApiClient } from "./api-client.js";
-import { fallbackPanel, recordRow, syncPanel } from "./panels.js";
+import { fallbackPanel, recordOwnership, recordRow, syncPanel } from "./panels.js";
 import { createStore, isNonGlobalAddress, ERROR_SCOPES, HISTORY_PAGE_SIZE } from "./store.js";
 import { effectiveExternalTtl, isValidDnsOnlyTtl } from "./ttl.js";
 import {
@@ -235,9 +235,21 @@ function answerCell(answer) {
   return `<div class="record-answer${answer.inherited ? " inherited" : ""}">${escapeHtml(text)}${badge}</div>`;
 }
 
+/**
+ * Who owns the record at the provider, where the provider has been asked.
+ *
+ * Silent otherwise: an absent badge means nobody has looked, and dressing that
+ * up as "not ours" would invite exactly the edit the badge exists to prevent.
+ */
+function ownershipBadge(verdict) {
+  if (!verdict) return "";
+  return `<span class="owner-badge ${verdict}" title="${escapeHtml(t(`record.owner.${verdict}Hint`))}">${escapeHtml(t(`record.owner.${verdict}`))}</span>`;
+}
+
 function renderRecords(state) {
   $("#records-empty").hidden = state.records.length > 0;
   $(".table-wrap").hidden = state.records.length === 0;
+  const owners = recordOwnership(state.records, state.plan);
   $("#record-rows").innerHTML = state.records.map((record, index) => {
     // What the row is, and what it offers, is decided in `panels.js` where a
     // test can read it; this only writes it down. The stored DNS value goes on
@@ -253,7 +265,7 @@ function renderRecords(state) {
     return `<tr${row.locked ? ` class="provider-owned" title="${escapeHtml(t("record.providerOwnedHint"))}"` : ""}>
       <td><span class="record-identity"><b>${escapeHtml(displayName(record.name))}</b><small${row.locked ? ' class="service-type"' : ""}>${escapeHtml(row.typeLabel)}</small></span></td>
       <td data-label="${escapeHtml(t("record.internalAnswer"))}"${stored}>${answerCell(row.inside)}</td>
-      <td data-label="${escapeHtml(t("record.externalAnswer"))}"${stored}>${answerCell(row.outside)}</td>
+      <td data-label="${escapeHtml(t("record.externalAnswer"))}"${stored}>${answerCell(row.outside)}${ownershipBadge(owners.get(record.id))}</td>
       <td data-label="TTL"><span class="record-answer">${escapeHtml(formatTtl(record.views.internal.ttl))} / ${escapeHtml(formatTtl(record.views.external.ttl))}</span></td>
       <td>${actions}</td>
     </tr>`;

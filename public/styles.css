@@ -154,6 +154,14 @@ table tbody tr.provider-owned td { background: #edf4f5; color: var(--muted); }
 .record-answer { max-width: 190px; overflow: hidden; text-overflow: ellipsis; font: 11px var(--mono); white-space: nowrap; }
 .inherited { color: var(--muted); font-style: italic; }
 .proxy-badge { display: inline-block; margin-left: 6px; padding: 3px 5px; color: var(--external); background: #fff3e3; border-radius: 4px; font: 8px var(--mono); text-transform: uppercase; }
+/*
+ * Who owns the record at the provider. Outlined rather than filled, so it reads
+ * as provenance beside the answer instead of competing with the proxy badge,
+ * which is a property of the answer itself.
+ */
+.owner-badge { display: inline-block; margin-top: 5px; padding: 2px 5px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
+.owner-badge.ours { border-color: var(--internal); color: var(--internal); }
+.owner-badge.theirs { border-color: var(--amber); color: var(--external); }
 .row-actions { display: flex; justify-content: flex-end; gap: 4px; }
 .row-action { padding: 5px 7px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }
 .row-action:hover { background: var(--surface-blue); color: var(--blue); }

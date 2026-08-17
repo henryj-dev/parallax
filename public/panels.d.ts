@@ -72,3 +72,14 @@ export interface FallbackPanel {
 }
 
 export function fallbackPanel(state: unknown): FallbackPanel;
+
+/**
+ * Record id to `ours`, `theirs` or `absent`. A row missing from the map has no
+ * verdict: either it answers nothing on this side, or nobody has read the
+ * provider yet -- which must never be shown as unowned.
+ */
+export function recordOwnership(
+  records: readonly unknown[],
+  plan: unknown,
+  view?: string,
+): Map<string, string>;
