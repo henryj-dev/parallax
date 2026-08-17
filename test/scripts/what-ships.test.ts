@@ -64,12 +64,19 @@ describe("what a deployment greps for", () => {
     // counts: the builder copies everything, the image copies `public`.
     await writeFile(join(repo, "Dockerfile"),
       "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY public ./public\n");
+    // The chain the script follows to narrow a whole-tree stage: the build
+    // script names a tsconfig, the tsconfig names what it compiles.
+    await writeFile(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.build.json" } }));
+    await writeFile(join(repo, "tsconfig.build.json"), JSON.stringify({ include: ["src/**/*.ts"] }));
     await mkdir(join(repo, "public"), { recursive: true });
     await mkdir(join(repo, "src"), { recursive: true });
     await writeFile(join(repo, "public/app.js"), "one\n");
     await writeFile(join(repo, "src/index.ts"), "one\n");
     await git("add", "-A");
     await git("commit", "-qm", "base");
+    await writeFile(join(repo, "notes.md"), "docs\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "docs only");
     await writeFile(join(repo, "src/index.ts"), "two\n");
     await git("commit", "-qam", "source only");
     await writeFile(join(repo, "public/app.js"), "two\n");
@@ -79,7 +86,7 @@ describe("what a deployment greps for", () => {
   after(async () => { await rm(repo, { recursive: true, force: true }); });
 
   it("says `실리는 변경 없음` when nothing in the image changed", async () => {
-    const out = await run("HEAD~2..HEAD~1");
+    const out = await run("HEAD~3..HEAD~2");
     assert.match(out, /실리는 변경 없음/u, "the gate reads this as measured-and-clean");
     assert.doesNotMatch(out, /🔴 실립니다/u, "and must not also say the opposite");
   });
@@ -94,7 +101,7 @@ describe("what a deployment greps for", () => {
     // The gate tests for `실립니다` first and falls through to the other, so a
     // range that produced both would be approved-by-human when it should have
     // been clean, or the reverse -- depending only on the order of its ifs.
-    for (const range of ["HEAD~2..HEAD~1", "HEAD~1..HEAD", "HEAD~2..HEAD"]) {
+    for (const range of ["HEAD~3..HEAD~2", "HEAD~2..HEAD~1", "HEAD~1..HEAD", "HEAD~2..HEAD"]) {
       const out = await run(range);
       const ships = /실립니다/u.test(out);
       const clean = /실리는 변경 없음/u.test(out);
@@ -117,15 +124,72 @@ describe("what a deployment greps for", () => {
     // They cannot see this coming: how many consumers exist is a fact only this
     // side holds. So the current contract is pinned here rather than left to a
     // promise to remember.
-    assert.equal(await status("HEAD~2..HEAD~1"), 0, "clean range");
+    assert.equal(await status("HEAD~3..HEAD~2"), 0, "clean range");
     assert.equal(await status("HEAD~1..HEAD"), 0, "shipping range");
   });
 
-  it("counts only the last stage, so the builder's `COPY . .` does not ship everything", async () => {
-    // Without that rule every file would match and the first test above would
-    // fail -- but stated on its own, because it is the reason the answer is
-    // usable at all.
+  it("follows a stage to what feeds it, narrowed by what the build compiles", async () => {
+    // The final stage copies `dist` out of a builder, and the builder takes the
+    // whole tree. Skipping the stage answered "nothing ships" for a release that
+    // changed only sources -- silently, which is the direction that matters.
+    // Following it without narrowing would call every file shipped, which is the
+    // over-report that made skipping look right in the first place.
     const out = await run("HEAD~2..HEAD~1");
-    assert.match(out, /^이미지에 실리는 경로\(Dockerfile 에서 읽음\): public$/mu);
+    assert.match(out, /^이미지에 실리는 경로\(Dockerfile 에서 읽음\): .*\bsrc\b/mu, "the build's inputs");
+    assert.match(out, /^이미지에 실리는 경로\(Dockerfile 에서 읽음\): .*\bpublic\b/mu, "and the direct copy");
+    assert.doesNotMatch(out, /^이미지에 실리는 경로[^\n]*(^| )\.( |$)/mu, "not the whole tree");
+    // And the source-only commit is now on the shipping side of the answer.
+    assert.match(out, /실립니다/u);
+    assert.match(out, /src\/index\.ts/u);
+  });
+});
+
+/**
+ * The fallback, which is the half that had no fixture.
+ *
+ * When a stage takes the whole tree and the build cannot be read, the script
+ * says everything ships. That is deliberately an over-report -- but the first
+ * version of it matched nothing at all, so the safe answer it claimed to give
+ * was silently no answer. Nothing here exercised that path, because the other
+ * fixture's build chain always resolved.
+ */
+describe("a stage whose inputs cannot be narrowed", () => {
+  let repo: string;
+
+  async function git(...args: string[]): Promise<void> {
+    await execFileAsync("git", ["-C", repo, ...args], {
+      timeout: TIMEOUT_MS,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+      },
+    });
+  }
+
+  before(async () => {
+    repo = await mkdtemp(join(tmpdir(), "parallax-ships-wide-"));
+    await git("init", "-q", "--initial-branch=main");
+    await writeFile(join(repo, "Dockerfile"),
+      "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY public ./public\n");
+    // No build script to follow, so the whole tree is the honest answer.
+    await writeFile(join(repo, "package.json"), JSON.stringify({ name: "x" }));
+    await mkdir(join(repo, "public"), { recursive: true });
+    await writeFile(join(repo, "public/app.js"), "one\n");
+    await writeFile(join(repo, "notes.md"), "one\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "base");
+    await writeFile(join(repo, "notes.md"), "two\n");
+    await git("commit", "-qam", "docs only");
+  });
+
+  after(async () => { await rm(repo, { recursive: true, force: true }); });
+
+  it("calls everything shipped rather than nothing", async () => {
+    const { stdout, stderr } = await execFileAsync("bash", [SCRIPT, "HEAD~1..HEAD"], { cwd: repo, timeout: TIMEOUT_MS });
+    assert.match(stderr, /빌드 입력을 못 읽었습니다/u, "and says why it widened");
+    assert.match(stdout, /실립니다/u, "a file it cannot rule out is reported, not dropped");
+    assert.match(stdout, /notes\.md/u);
+    assert.doesNotMatch(stdout, /실리는 변경 없음/u);
   });
 });

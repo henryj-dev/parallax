@@ -25,18 +25,91 @@ root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 cd "$root"
 [[ -f Dockerfile ]] || { echo "❌ $root 에 Dockerfile 이 없습니다 — 여기서는 무엇이 실리는지 알 수 없습니다" >&2; exit 1; }
 
-# Sources named by a COPY in the **final** stage. Earlier stages copy the whole
-# tree in to build it, so reading every COPY would call every file shipped --
-# true of the builder, false of the image. `--from=` lines carry build output
-# rather than tracked paths, so they are not something a reader of a diff checks.
+# What reaches the image, read from the Dockerfile rather than written here.
+#
+# Two kinds of COPY land in the final stage, and only counting the first kind is
+# how this used to answer "nothing ships" for a release that changed `src/`:
+#
+#   COPY public ./public              -- a tracked path, straight in
+#   COPY --from=build /app/dist ./dist -- the output of a stage, built from tracked paths
+#
+# Skipping the second was deliberate once: earlier stages copy the whole tree in
+# to build it, so counting their COPYs called every file shipped. That rule
+# stopped an over-report and started an under-report, which is the quieter of the
+# two and the one that matters -- a deployment reading "nothing ships" decides
+# nothing needs a human.
+#
+# So a stage is followed instead of skipped: whatever that stage copies in is an
+# input to what it produces. Where a stage takes the whole tree (`COPY . .`), the
+# tree is narrowed by what the build actually compiles -- `package.json` names
+# the build command, the command names a tsconfig, the tsconfig names its inputs.
+# Every step reads the fact where it already lives. If that chain cannot be
+# followed the whole tree is used, which over-reports rather than under-reports.
+stage_sources() {
+  awk -v want="$1" '
+    /^FROM /   { stage = ""; for (i = 2; i <= NF; i++) if (tolower($i) == "as") stage = $(i + 1) }
+    /^COPY /   { if (stage != want) next
+                 if ($0 ~ /--from=/) next
+                 for (i = 2; i < NF; i++) if ($i !~ /^--/) print $i }
+  ' Dockerfile | sed 's|/$||'
+}
+
+# The paths a `tsc -p …` build compiles, from the tsconfig the build script names.
+#
+# Read as JSON rather than with a line pattern: a pretty-printed config and a
+# compact one carry the same fact, and a reader that only sees one of them
+# reports "could not tell" for a repository that told it plainly.
+build_inputs() {
+  node -e '
+    const fs = require("node:fs");
+    const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+    const build = pkg.scripts && pkg.scripts.build;
+    if (!build) process.exit(1);
+    const named = /-p\s+(\S+)/.exec(build);
+    if (!named) process.exit(1);
+    const config = JSON.parse(fs.readFileSync(named[1], "utf8").replace(/^\s*\/\/.*$/gm, ""));
+    const globs = config.include;
+    if (!Array.isArray(globs) || globs.length === 0) process.exit(1);
+    const roots = new Set(globs.map((glob) => glob.split("/*")[0].replace(/\/$/, "")).filter(Boolean));
+    if (roots.size === 0) process.exit(1);
+    process.stdout.write([...roots].join("\n") + "\n");
+  ' 2>/dev/null
+}
+
 ships=()
-while IFS= read -r path; do
-  [[ -n "$path" ]] && ships+=("$path")
-done < <(awk '
-  /^FROM /   { copies = "" }
-  /^COPY /   { if ($0 ~ /--from=/) next
-               for (i = 2; i < NF; i++) copies = copies $i "\n" }
-  END        { printf "%s", copies }' Dockerfile | sed 's|/$||' | sort -u)
+add_path() {
+  local candidate="$1"
+  [[ -n "$candidate" ]] || return 0
+  for existing in "${ships[@]:-}"; do [[ "$existing" == "$candidate" ]] && return 0; done
+  ships+=("$candidate")
+}
+
+while IFS= read -r line; do
+  case "$line" in
+    *--from=*)
+      stage="$(sed -n 's/.*--from=\([A-Za-z0-9_.-]*\).*/\1/p' <<< "$line")"
+      while IFS= read -r source; do
+        if [[ "$source" == "." ]]; then
+          if narrowed="$(build_inputs)" && [[ -n "$narrowed" ]]; then
+            while IFS= read -r input; do add_path "$input"; done <<< "$narrowed"
+          else
+            echo "⚠️ 스테이지 '$stage' 가 트리 전체를 가져가는데 빌드 입력을 못 읽었습니다 — 전부 실린다고 봅니다." >&2
+            add_path "."
+          fi
+        else
+          add_path "$source"
+        fi
+      done < <(stage_sources "$stage")
+      ;;
+    *)
+      for token in $line; do
+        case "$token" in COPY|--*|*/) continue;; esac
+        add_path "$token"
+      done
+      ;;
+  esac
+done < <(awk '/^FROM /{ copies = "" } /^COPY /{ copies = copies $0 "\n" } END { printf "%s", copies }' Dockerfile |
+  sed '/^$/d' | sed 's/\(.*\) [^ ]*$/\1/')
 
 # The control. A parse that finds nothing would report every change as harmless,
 # which is the one direction that matters -- so it has to find something, and it
@@ -66,7 +139,10 @@ while IFS= read -r file; do
   [[ -n "$file" ]] || continue
   hit=""
   for path in "${ships[@]}"; do
-    if [[ "$file" == "$path" || "$file" == "$path"/* ]]; then hit=1; break; fi
+    # `.` is the whole tree -- the fallback for a stage whose inputs could not be
+    # narrowed. Matching it literally matched nothing, so the over-report it was
+    # supposed to be was silently no report at all.
+    if [[ "$path" == "." || "$file" == "$path" || "$file" == "$path"/* ]]; then hit=1; break; fi
   done
   if [[ -n "$hit" ]]; then shipped+="  $file"$'\n'; else rest+="  $file"$'\n'; fi
 done <<< "$changed"
