@@ -76,6 +76,50 @@ async function setup() {
   return { api, settings, accessTokens };
 }
 
+describe("the override report over HTTP", () => {
+  /** A credential manager that holds bindings and no provider at all. */
+  function credentialsHolding(bindings: { zone: string; profile: string }[]) {
+    return { listZones: async () => bindings.map((binding) => ({ ...binding })) };
+  }
+
+  it("says why each zone is or is not covered, without reaching a provider", async () => {
+    // The route exists because the answer used to require a shell on the pod,
+    // and it must not need the credential to work: the day somebody asks is
+    // often the day the token is the broken thing.
+    const adapters = createInMemoryAdapters();
+    const control = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider);
+    await control.createZone("tinymail.app");
+    await control.createZone("tinyuniver.se");
+    await control.upsertRecord("tinyuniver.se", "internal", "inside", { name: "www", type: "A", content: "10.17.192.11", ttl: 300 });
+    const api = createApiHandler(
+      {
+        controlPlane: control,
+        credentials: credentialsHolding([
+          { zone: "tinymail.app", profile: "main" },
+          { zone: "tinyuniver.se", profile: "main" },
+        ]) as unknown as Parameters<typeof createApiHandler>[0]["credentials"],
+      },
+      security,
+    );
+
+    const response = await api(request("/api/v1/fallback/main/coverage"));
+    assert.equal(response.status, 200);
+    const body = await response.json() as { profile: string; zones: { zone: string; covered: boolean; reason: string }[] };
+    assert.equal(body.profile, "main");
+    assert.deepEqual(body.zones, [
+      // Bound, but nothing to answer for, so the listener claims no authority.
+      { zone: "tinymail.app", covered: false, reason: "empty", profile: "main" },
+      { zone: "tinyuniver.se", covered: true, reason: "covered", profile: "main" },
+    ]);
+  });
+
+  it("refuses a route that does not exist rather than guessing an action", async () => {
+    const { api } = await setup();
+    assert.equal((await api(request("/api/v1/fallback/main/nonsense"))).status, 404);
+    assert.equal((await api(request("/api/v1/fallback"))).status, 404);
+  });
+});
+
 describe("administration HTTP API", () => {
   it("reads and updates settings, and refuses an unusable value", async () => {
     const { api, settings } = await setup();

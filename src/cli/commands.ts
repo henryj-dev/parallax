@@ -1,6 +1,6 @@
 import { TOKEN_REFRESH_INTERVAL_MS, type AccessTokenService } from "../application/access-tokens.ts";
 import type { CloudflareCredentialManager } from "../application/cloudflare-credentials.ts";
-import { overridableZones, type FallbackDomainService } from "../application/fallback-domains.ts";
+import { fallbackCoverage, overridableZones, type FallbackDomainService } from "../application/fallback-domains.ts";
 import { NotFoundError, type ControlPlane } from "../application/control-plane.ts";
 import type { SettingsService } from "../application/settings.ts";
 import { DomainValidationError } from "../domain/dns.ts";
@@ -614,6 +614,26 @@ const COMMANDS: readonly Command[] = [
       dnsServer: splitList(input["dns-server"]),
       ...(optionalText(input.description) ? { description: String(input.description) } : {}),
     }, optionalText(input.policy)),
+  },
+  {
+    name: "fallback coverage",
+    summary: "Say, for every zone held here, whether this profile's overrides cover it and why not",
+    role: "admin",
+    options: [
+      { name: "profile", summary: "Stored credential profile to report against", required: true },
+    ],
+    // Reaches no provider on purpose. A zone missing from the overrides has
+    // several possible reasons and they need different repairs, and the day an
+    // operator asks is often the day the credential is the broken thing -- so
+    // this answers without a token, an account id or a permission.
+    run: async (context, input) => ({
+      profile: String(input.profile),
+      zones: fallbackCoverage(
+        await requireCredentials(context).listZones(),
+        await requireControlPlane(context.runtime).listZones(),
+        String(input.profile),
+      ),
+    }),
   },
   {
     name: "fallback preview",

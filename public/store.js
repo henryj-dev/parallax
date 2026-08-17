@@ -17,7 +17,7 @@ export const HISTORY_PAGE_SIZE = 5;
 export const REVISION_PAGE_SIZE = 50;
 
 /** Scopes a view can surface an inline error against. */
-export const ERROR_SCOPES = ["zone", "record", "credential", "profile", "settings", "token", "auth"];
+export const ERROR_SCOPES = ["zone", "record", "credential", "profile", "settings", "token", "auth", "fallback"];
 
 export function createStore(client) {
   const state = {
@@ -50,6 +50,11 @@ export function createStore(client) {
     selectedBinding: null,
     settings: null,
     tokens: [],
+    fallbackProfile: "",
+    fallbackCoverage: [],
+    fallbackEntries: [],
+    fallbackPlan: null,
+    fallbackPlanError: "",
     issuedToken: "",
     providerAccess: null,
 
@@ -450,6 +455,64 @@ export function createStore(client) {
     },
 
     // ---- provider settings, server settings, tokens -----------------------
+
+    /**
+     * The override report for one profile.
+     *
+     * Coverage and the plan are loaded separately and independently on purpose.
+     * Coverage reaches no provider, so it is the half that still answers when
+     * the token, the account id or the permission is the broken thing -- and
+     * that is precisely when somebody is asking why a zone is not covered. A
+     * plan that cannot be read leaves its reason on the state and the coverage
+     * table intact, rather than blanking the panel.
+     */
+    async loadFallback(profile) {
+      setError("fallback", null);
+      state.fallbackProfile = profile;
+      state.fallbackCoverage = [];
+      state.fallbackPlan = null;
+      state.fallbackEntries = [];
+      state.fallbackPlanError = "";
+      emitChange();
+      let ok = true;
+      try {
+        const coverage = await client.fallbackCoverage(profile);
+        state.fallbackCoverage = coverage?.zones ?? [];
+      } catch (error) {
+        handleUnauthorized(error);
+        setError("fallback", "fallback.coverageFailed", { error: error.message });
+        ok = false;
+      }
+      try {
+        const [entries, plan] = await Promise.all([client.fallbackList(profile), client.fallbackPreview(profile)]);
+        state.fallbackEntries = Array.isArray(entries) ? entries : entries?.domains ?? [];
+        state.fallbackPlan = plan ?? null;
+      } catch (error) {
+        handleUnauthorized(error);
+        state.fallbackPlanError = error.message;
+        ok = false;
+      }
+      emitChange();
+      return ok;
+    },
+
+    /** Writes the overrides for one profile, then reads the result back. */
+    async syncFallback(profile) {
+      setError("fallback", null);
+      try {
+        const result = await client.fallbackSync(profile);
+        const plan = result?.plan ?? {};
+        const changed = ["add", "update", "remove", "adopt"]
+          .reduce((total, key) => total + (Array.isArray(plan[key]) ? plan[key].length : 0), 0);
+        notice(changed > 0 ? "fallback.synced" : "fallback.alreadyInStep", { count: String(changed) });
+        await this.loadFallback(profile);
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        setError("fallback", "fallback.syncFailed", { error: error.message });
+        return false;
+      }
+    },
 
     async loadAdministration() {
       state.providerAccess = null;

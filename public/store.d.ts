@@ -105,6 +105,10 @@ export interface Store {
   restoreRevision(revision: number): Outcome;
 
   loadAdministration(): Outcome;
+  /** Reads the override report for one profile: coverage, live list and plan. */
+  loadFallback(profile: string): Outcome;
+  /** Makes the overrides match this profile's zones, then reads them back. */
+  syncFallback(profile: string): Outcome;
   selectProfile(name: string): void;
   selectBinding(zone: string): void;
   saveProfile(name: string, credential: { token?: string; accountId?: string }): Outcome;

@@ -13,6 +13,69 @@
  */
 
 /**
+ * The client-side resolver overrides for one profile: what covers what, what a
+ * sync would change, and whether syncing is even possible.
+ *
+ * Split in two because the two halves fail independently. Coverage is computed
+ * from state this control plane already holds and needs no provider at all, so
+ * it answers on the day the token or the permission is the broken thing -- which
+ * is exactly when somebody asks why a zone is missing from the overrides. The
+ * plan needs the provider, and when it cannot be read the panel still shows the
+ * half that explains the question.
+ *
+ * @param {{
+ *   fallbackProfile?: string,
+ *   fallbackCoverage?: { zone?: string, covered?: boolean, reason?: string, profile?: string, detail?: string }[],
+ *   fallbackEntries?: { suffix?: string, dnsServer?: string[] }[],
+ *   fallbackPlan?: {
+ *     add?: { suffix?: string }[], update?: { suffix?: string }[], adopt?: { suffix?: string }[],
+ *     remove?: { suffix?: string }[], conflict?: { suffix?: string, reason?: string }[],
+ *     unchanged?: number, untouched?: number,
+ *   } | null,
+ *   fallbackPlanError?: string,
+ *   settings?: { fallbackResolver?: string },
+ * }} state
+ */
+export function fallbackPanel(state) {
+  const rows = Array.isArray(state?.fallbackCoverage) ? state.fallbackCoverage : [];
+  const resolver = String(state?.settings?.fallbackResolver ?? "").trim();
+  const raw = state?.fallbackPlan;
+  const plan = raw && typeof raw === "object" ? raw : null;
+  const suffixes = (key) => (Array.isArray(plan?.[key]) ? plan[key] : []).map((entry) => String(entry?.suffix ?? ""));
+  const add = suffixes("add");
+  const update = suffixes("update");
+  const adopt = suffixes("adopt");
+  const remove = suffixes("remove");
+  const conflict = (Array.isArray(plan?.conflict) ? plan.conflict : [])
+    .map((entry) => ({ suffix: String(entry?.suffix ?? ""), reason: String(entry?.reason ?? "") }));
+  const pending = add.length + update.length + adopt.length + remove.length;
+  return {
+    profile: String(state?.fallbackProfile ?? ""),
+    resolver,
+    // The plan refuses without one, so the panel says so before offering a
+    // button that can only fail.
+    resolverMissing: resolver === "",
+    covered: rows.filter((row) => row?.covered).map((row) => String(row.zone)),
+    excluded: rows.filter((row) => !row?.covered).map((row) => ({
+      zone: String(row.zone),
+      reason: String(row.reason ?? ""),
+      ...(row.profile ? { profile: String(row.profile) } : {}),
+      ...(row.detail ? { detail: String(row.detail) } : {}),
+    })),
+    entries: (Array.isArray(state?.fallbackEntries) ? state.fallbackEntries : []).map((entry) => ({
+      suffix: String(entry?.suffix ?? ""),
+      dnsServer: Array.isArray(entry?.dnsServer) ? entry.dnsServer.map(String) : [],
+    })),
+    plan: plan ? { add, update, adopt, remove, conflict, unchanged: Number(plan.unchanged ?? 0), untouched: Number(plan.untouched ?? 0) } : null,
+    planError: String(state?.fallbackPlanError ?? ""),
+    pending,
+    /** Nothing to write, and the provider was read successfully enough to know. */
+    inStep: plan !== null && pending === 0,
+    syncable: plan !== null && pending > 0 && resolver !== "",
+  };
+}
+
+/**
  * One row of the record table: what it says, and what it offers.
  *
  * Here for the reason this file exists. A record its provider owns has no edit

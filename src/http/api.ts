@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { ConflictError, NotFoundError, ProviderManagedRecordError } from "../application/control-plane.ts";
 import { CredentialNotFoundError, CredentialTestError } from "../application/cloudflare-credentials.ts";
 import { ZoneLookupForbiddenError, ZoneNotFoundError } from "../adapters/cloudflare.ts";
-import { FallbackDomainForbiddenError } from "../adapters/cloudflare-fallback.ts";
+import { FallbackDomainForbiddenError, FallbackDomainUnavailableError } from "../adapters/cloudflare-fallback.ts";
 import { ProviderNotConfiguredError } from "../application/ports.ts";
 import { parseInvocation, UsageError } from "../cli/argv.ts";
 import {
@@ -203,6 +203,30 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
 
   if (area === "credentials") return credentialRoute(segments, method, request);
 
+  // The client-side resolver overrides, one profile at a time. Reachable over
+  // HTTP because the portal is where an operator is when they ask why a zone is
+  // not covered, and until now the only answer was a shell on the pod.
+  if (area === "fallback") {
+    const profile = segments[3];
+    if (!profile) throw new NotFoundError("route was not found");
+    const policy = url.searchParams.get("policy") ?? undefined;
+    const action = segments[4];
+    if (segments.length === 4 && method === "GET") {
+      return { command: "fallback list", input: { profile, ...(policy ? { policy } : {}) } };
+    }
+    // No provider call, so it answers when the credential is the broken thing.
+    if (segments.length === 5 && action === "coverage" && method === "GET") {
+      return { command: "fallback coverage", input: { profile } };
+    }
+    if (segments.length === 5 && action === "preview" && method === "GET") {
+      return { command: "fallback preview", input: { profile, ...(policy ? { policy } : {}) } };
+    }
+    if (segments.length === 5 && action === "sync" && method === "POST") {
+      return { command: "fallback sync", input: { profile, ...(policy ? { policy } : {}) } };
+    }
+    throw new NotFoundError("route was not found");
+  }
+
   if (area === "zones") {
     if (segments.length === 3 && method === "GET") {
       return { command: "zone list", input: readPageQuery(url) };
@@ -365,6 +389,10 @@ function errorResponse(error: unknown): Response {
   // The credential is valid and the request is well formed; the token simply
   // is not allowed here, which is a different thing to tell an operator.
   if (error instanceof FallbackDomainForbiddenError) return json({ error: "provider_forbidden", message: error.message }, 403);
+  // The provider was reached, or could not be, and said something an operator
+  // can act on. Every one of these messages is built from a status and codes and
+  // carries no secret, so it is repeated rather than replaced by "unexpected".
+  if (error instanceof FallbackDomainUnavailableError) return json({ error: "provider_unavailable", message: error.message }, 502);
   if (error instanceof ProviderNotConfiguredError) return json({ error: "provider_not_configured", message: error.message }, 409);
   if (error instanceof UnknownCommandError || error instanceof UsageError) {
     return json({ error: "unknown_command", message: error.message }, 400);

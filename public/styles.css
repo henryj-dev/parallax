@@ -158,6 +158,16 @@ table tbody tr.provider-owned td { background: #edf4f5; color: var(--muted); }
 .row-action { padding: 5px 7px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }
 .row-action:hover { background: var(--surface-blue); color: var(--blue); }
 .row-action.danger:hover { color: var(--danger); background: #fff0ef; }
+/* The override report: sections of suffixes, and a reason beside each exclusion. */
+.fallback-picker { display: grid; gap: 5px; max-width: 320px; margin-bottom: 14px; font-size: 11px; }
+.fallback-section { padding: 12px 0; border-top: 1px solid var(--line); }
+.fallback-section:first-child { border-top: 0; }
+.fallback-suffixes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.fallback-suffixes code, .fallback-reasons code { padding: 3px 6px; border-radius: 4px; background: var(--surface-blue); font: 10px var(--mono); }
+.fallback-reasons { margin: 7px 0 0; padding: 0; list-style: none; display: grid; gap: 7px; }
+.fallback-reasons li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; font-size: 11px; }
+.fallback-reasons li small { flex-basis: 100%; color: var(--muted); font: 10px var(--mono); }
+.fallback-conflict span { color: var(--external); font-weight: 650; }
 .activity-column { display: grid; gap: 18px; }
 .status-chip { padding: 5px 7px; border-radius: 5px; font: 9px var(--mono); text-transform: uppercase; }
 .status-chip.applied { color: var(--success); background: #e8f4ef; }

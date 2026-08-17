@@ -47,10 +47,61 @@ export function overridableZones(
   zones: readonly Zone[],
   profile: string,
 ): string[] {
-  const served = new Set(servedZones(zones).map((zone) => zone.name));
-  return bindings
-    .filter((binding) => binding.profile === profile && served.has(binding.zone))
-    .map((binding) => binding.zone);
+  return fallbackCoverage(bindings, zones, profile)
+    .filter((row) => row.covered)
+    .map((row) => row.zone);
+}
+
+/** Why a zone is or is not among the ones a profile's overrides cover. */
+export type CoverageReason = "covered" | "empty" | "invalid" | "otherProfile" | "unbound";
+
+export interface CoverageRow {
+  readonly zone: string;
+  readonly covered: boolean;
+  readonly reason: CoverageReason;
+  /** The profile this zone is bound to, where it is bound to one. */
+  readonly profile?: string;
+  /** Why the views could not be composed, for `invalid` only. */
+  readonly detail?: string;
+}
+
+/**
+ * Every zone this control plane holds, and whether this profile's overrides
+ * cover it -- with the reason when they do not.
+ *
+ * `overridableZones` answers what to write, which is all a sync needs and
+ * nothing an operator can act on: a zone simply absent from that list looks the
+ * same whether it is bound elsewhere, holds nothing to answer, or was never
+ * bound at all. That question cost a live investigation -- a zone visibly full
+ * of internal records was missing from the overrides and there was nowhere to
+ * read why -- so the rule reports its own exclusions rather than only its
+ * results, and the one list is derived from this one.
+ *
+ * Deliberately says nothing about the provider. Nothing here needs a token, an
+ * account id or a permission, so the answer is available on the worst day: when
+ * the credential is the thing that is wrong.
+ */
+export function fallbackCoverage(
+  bindings: readonly { readonly zone: string; readonly profile: string }[],
+  zones: readonly Zone[],
+  profile: string,
+): CoverageRow[] {
+  const invalid = new Map<string, string>();
+  const served = new Set(servedZones(zones, (zone, reason) => invalid.set(zone, reason)).map((zone) => zone.name));
+  const boundTo = new Map(bindings.map((binding) => [binding.zone, binding.profile]));
+  return zones
+    .map((zone): CoverageRow => {
+      const bound = boundTo.get(zone.name);
+      if (bound === undefined) return { zone: zone.name, covered: false, reason: "unbound" };
+      if (bound !== profile) return { zone: zone.name, covered: false, reason: "otherProfile", profile: bound };
+      const failure = invalid.get(zone.name);
+      if (failure !== undefined) {
+        return { zone: zone.name, covered: false, reason: "invalid", profile: bound, detail: failure };
+      }
+      if (!served.has(zone.name)) return { zone: zone.name, covered: false, reason: "empty", profile: bound };
+      return { zone: zone.name, covered: true, reason: "covered", profile: bound };
+    })
+    .sort((left, right) => left.zone.localeCompare(right.zone));
 }
 
 /** One suffix's place in the difference between the zones and the live list. */

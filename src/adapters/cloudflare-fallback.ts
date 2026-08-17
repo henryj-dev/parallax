@@ -23,6 +23,21 @@ export class FallbackDomainForbiddenError extends Error {
   override readonly name = "FallbackDomainForbiddenError";
 }
 
+/**
+ * Raised when the provider could not be read or written for any other reason:
+ * the request did not arrive, or it did and the answer was a refusal.
+ *
+ * Named so the message survives the trip to an operator. Every one of these is
+ * built here from a status, a set of provider error codes, or a transport
+ * failure already passed through `redact`, so none of them carries the token --
+ * and the alternative was the whole class arriving as "an unexpected error
+ * occurred", which is the least useful sentence available on the one screen that
+ * exists to explain why the overrides are not what somebody expected.
+ */
+export class FallbackDomainUnavailableError extends Error {
+  override readonly name = "FallbackDomainUnavailableError";
+}
+
 export interface CloudflareFallbackDomainsOptions {
   readonly token: string;
   readonly accountId: string;
@@ -75,7 +90,7 @@ export class CloudflareFallbackDomains {
       .map((domain) => domain.suffix.toLowerCase())
       .filter((suffix) => !written.some((domain) => domain.suffix.toLowerCase() === suffix));
     if (missing.length > 0) {
-      throw new Error(`Cloudflare accepted the fallback list but did not return ${missing.join(", ")}; the list may be incomplete`);
+      throw new FallbackDomainUnavailableError(`Cloudflare accepted the fallback list but did not return ${missing.join(", ")}; the list may be incomplete`);
     }
     return written;
   }
@@ -93,7 +108,7 @@ export class CloudflareFallbackDomains {
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
     } catch (error) {
-      throw new Error(`Cloudflare API transport failure: ${redact(error instanceof Error ? error.message : String(error), this.#token)}`);
+      throw new FallbackDomainUnavailableError(`Cloudflare API transport failure: ${redact(error instanceof Error ? error.message : String(error), this.#token)}`);
     }
     const payload = await readJson(response);
     if (response.status === 403 || response.status === 401) {
@@ -106,7 +121,7 @@ export class CloudflareFallbackDomains {
     if (!response.ok || payload.success !== true) {
       const errors = Array.isArray(payload.errors) ? payload.errors : [];
       const codes = errors.flatMap((error) => isObject(error) && (typeof error.code === "number" || typeof error.code === "string") ? [String(error.code)] : []);
-      throw new Error(`Cloudflare API request failed (HTTP ${response.status}${codes.length > 0 ? `; codes ${codes.join(",")}` : ""})`);
+      throw new FallbackDomainUnavailableError(`Cloudflare API request failed (HTTP ${response.status}${codes.length > 0 ? `; codes ${codes.join(",")}` : ""})`);
     }
     return payload;
   }

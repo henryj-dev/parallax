@@ -119,6 +119,16 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     testBinding: (zone, body) =>
       request(`/credentials/cloudflare/${encodeURIComponent(zone)}/test`, { method: "POST", ...(body ? { body } : {}) }),
 
+    /**
+     * The client-side resolver overrides. `coverage` reaches no provider, so it
+     * still answers when the credential is what is wrong -- which is the case an
+     * operator is most often looking at when they ask why a zone is missing.
+     */
+    fallbackCoverage: (profile) => request(`/fallback/${encodeURIComponent(profile)}/coverage`),
+    fallbackList: (profile) => request(`/fallback/${encodeURIComponent(profile)}`),
+    fallbackPreview: (profile) => request(`/fallback/${encodeURIComponent(profile)}/preview`),
+    fallbackSync: (profile) => request(`/fallback/${encodeURIComponent(profile)}/sync`, { method: "POST" }),
+
     getSettings: () => request("/settings"),
     saveSettings: (values) => request("/settings", { method: "PUT", body: values }),
 

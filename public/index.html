@@ -225,8 +225,20 @@
         <button class="provider-tab" id="tab-profiles" type="button" role="tab" aria-controls="panel-profiles" aria-selected="true" data-panel="profiles" data-i18n="credentials.profilesTab">Credential profiles</button>
         <button class="provider-tab" id="tab-bindings" type="button" role="tab" aria-controls="panel-bindings" aria-selected="false" data-panel="bindings" data-i18n="credentials.bindingsTab">Apex domains</button>
         <button class="provider-tab" id="tab-settings" type="button" role="tab" aria-controls="panel-settings" aria-selected="false" data-panel="settings" data-i18n="settings.tab">Server settings</button>
+        <button class="provider-tab" id="tab-fallback" type="button" role="tab" aria-controls="panel-fallback" aria-selected="false" data-panel="fallback" data-i18n="fallback.tab">Local domain fallback</button>
         <button class="provider-tab" id="tab-tokens" type="button" role="tab" aria-controls="panel-tokens" aria-selected="false" data-panel="tokens" data-i18n="tokens.tab">Access tokens</button>
       </div>
+
+      <section id="panel-fallback" class="provider-panel" role="tabpanel" aria-labelledby="tab-fallback" hidden>
+        <p data-i18n="fallback.body">Devices running the provider's client resolve these suffixes through this control plane instead of publicly. A zone is covered when it is bound to this profile and its internal view answers for something.</p>
+        <label class="fallback-picker"><span data-i18n="fallback.profile">Credential profile</span><select id="fallback-profile"></select></label>
+        <div id="fallback-report" aria-live="polite"><div class="skeleton plan-skeleton"></div></div>
+        <div class="form-error" id="fallback-form-error" role="alert" hidden></div>
+        <div class="dialog-actions">
+          <button class="button quiet" id="fallback-refresh-button" type="button" data-i18n="fallback.refresh">Refresh</button>
+          <button class="button primary" id="fallback-sync-button" type="button" data-i18n="fallback.sync">Apply to device settings</button>
+        </div>
+      </section>
 
       <section id="panel-profiles" class="provider-panel" role="tabpanel" aria-labelledby="tab-profiles">
         <div class="credential-layout">

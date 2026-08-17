@@ -1,5 +1,5 @@
 import { createApiClient } from "./api-client.js";
-import { recordRow, syncPanel } from "./panels.js";
+import { fallbackPanel, recordRow, syncPanel } from "./panels.js";
 import { createStore, isNonGlobalAddress, ERROR_SCOPES, HISTORY_PAGE_SIZE } from "./store.js";
 import { effectiveExternalTtl, isValidDnsOnlyTtl } from "./ttl.js";
 import {
@@ -134,6 +134,7 @@ const ERROR_TARGETS = {
   credential: "#credential-form-error",
   settings: "#settings-form-error",
   token: "#token-form-error",
+  fallback: "#fallback-form-error",
 };
 
 function renderErrors() {
@@ -159,6 +160,7 @@ function render(state) {
   if ($("#plan-dialog").open) renderPlan(state);
   if ($("#revisions-dialog").open) renderRevisions(state);
   if ($("#credential-dialog").open) renderAdministration(state);
+  if ($("#credential-dialog").open && !$("#panel-fallback").hidden) renderFallback(state);
   if ($("#record-dialog").open) renderRecordDialogHeading();
   $("#sign-out-button").hidden = !state.authRequired || !state.authenticated;
   syncRoleVisibility(state);
@@ -640,7 +642,75 @@ function reportSignInError() {
 
 function selectProviderPanel(panel) {
   for (const tab of $$(".provider-tab")) tab.setAttribute("aria-selected", String(tab.dataset.panel === panel));
-  for (const name of ["profiles", "bindings", "settings", "tokens"]) $(`#panel-${name}`).hidden = panel !== name;
+  for (const name of ["profiles", "bindings", "settings", "fallback", "tokens"]) $(`#panel-${name}`).hidden = panel !== name;
+  // Read on opening rather than with the rest of the administration state: it
+  // costs two provider calls, and most visits to this dialog are not about it.
+  if (panel === "fallback") void loadFallbackPanel();
+}
+
+/** Loads the report for whichever profile the picker is on, or the first one. */
+function loadFallbackPanel() {
+  const state = store.getState();
+  const chosen = $("#fallback-profile").value || state.fallbackProfile || state.profiles[0]?.name || "";
+  if (!chosen) {
+    renderFallback(state);
+    return Promise.resolve(false);
+  }
+  return store.loadFallback(chosen);
+}
+
+function renderFallback(state) {
+  const picker = $("#fallback-profile");
+  const previous = picker.value;
+  picker.innerHTML = state.profiles.length
+    ? state.profiles.map((profile) => `<option value="${escapeHtml(profile.name)}">${escapeHtml(profile.name)}</option>`).join("")
+    : `<option value="">${escapeHtml(t("credentials.profilesNone"))}</option>`;
+  const wanted = state.fallbackProfile || previous;
+  if (wanted && state.profiles.some((profile) => profile.name === wanted)) picker.value = wanted;
+
+  const panel = fallbackPanel(state);
+  $("#fallback-sync-button").disabled = !panel.syncable;
+  if (state.profiles.length === 0) {
+    $("#fallback-report").innerHTML = `<div class="mini-empty">${escapeHtml(t("credentials.profilesNone"))}</div>`;
+    return;
+  }
+
+  const list = (items) => items.map((item) => `<code>${escapeHtml(item)}</code>`).join(" ");
+  const section = (label, body) => `<div class="fallback-section"><span class="eyebrow">${escapeHtml(label)}</span>${body}</div>`;
+  const covered = panel.covered.length
+    ? section(t("fallback.covered"), `<div class="fallback-suffixes">${list(panel.covered)}</div>`)
+    : section(t("fallback.covered"), `<div class="mini-empty">${escapeHtml(t("fallback.coveredNone"))}</div>`);
+  // The half that answers the question this panel exists for: a zone missing
+  // from the overrides looks the same for four different reasons, and each one
+  // is repaired differently.
+  const excluded = panel.excluded.length === 0
+    ? ""
+    : section(t("fallback.excluded"), `<ul class="fallback-reasons">${panel.excluded.map((row) =>
+      `<li><code>${escapeHtml(row.zone)}</code> <span>${escapeHtml(t(`fallback.reason.${row.reason}`, { profile: row.profile ?? "" }))}</span>${
+        row.detail ? `<small>${escapeHtml(row.detail)}</small>` : ""}</li>`).join("")}</ul>`);
+
+  const planBody = panel.planError
+    ? `<div class="mini-empty">${escapeHtml(t("fallback.planFailed", { error: panel.planError }))}</div>`
+    : panel.inStep
+      ? `<div class="mini-empty">${escapeHtml(t("fallback.inStep"))}</div>`
+      : `<ul class="fallback-reasons">${[
+        ["add", panel.plan?.add ?? []], ["update", panel.plan?.update ?? []],
+        ["adopt", panel.plan?.adopt ?? []], ["remove", panel.plan?.remove ?? []],
+      ].filter(([, items]) => items.length > 0)
+        .map(([kind, items]) => `<li><span>${escapeHtml(t(`fallback.plan.${kind}`))}</span> ${list(items)}</li>`)
+        .join("")}${(panel.plan?.conflict ?? []).map((entry) =>
+          `<li class="fallback-conflict"><code>${escapeHtml(entry.suffix)}</code> <span>${escapeHtml(t("fallback.plan.conflict"))}</span><small>${escapeHtml(entry.reason)}</small></li>`).join("")}</ul>`;
+
+  const resolver = panel.resolverMissing
+    ? `<div class="mini-empty">${escapeHtml(t("fallback.resolverMissing"))}</div>`
+    : `<div class="fallback-suffixes"><code>${escapeHtml(panel.resolver)}</code></div>`;
+
+  $("#fallback-report").innerHTML = section(t("fallback.resolver"), resolver) + covered + excluded
+    + section(t("fallback.plan.title"), planBody)
+    + section(t("fallback.live"), panel.entries.length
+      ? `<div class="fallback-suffixes">${panel.entries.map((entry) =>
+        `<code>${escapeHtml(entry.suffix)}${entry.dnsServer.length ? ` → ${escapeHtml(entry.dnsServer.join(", "))}` : ""}</code>`).join(" ")}</div>`
+      : `<div class="mini-empty">${escapeHtml(t("fallback.liveNone"))}</div>`);
 }
 
 async function openProviderSettings() {
@@ -792,6 +862,15 @@ $("#credential-settings-button").addEventListener("click", () => void openProvid
 for (const tab of $$(".provider-tab")) {
   tab.addEventListener("click", () => selectProviderPanel(tab.dataset.panel));
 }
+$("#fallback-profile").addEventListener("change", () => void loadFallbackPanel());
+$("#fallback-refresh-button").addEventListener("click", () => void loadFallbackPanel());
+$("#fallback-sync-button").addEventListener("click", () => {
+  // Written to a setting the whole organization shares, so it is confirmed
+  // like the other writes that reach beyond this control plane.
+  const profile = $("#fallback-profile").value;
+  if (!profile || !globalThis.confirm(t("fallback.syncConfirm", { profile }))) return;
+  void store.syncFallback(profile);
+});
 $("#profile-list").addEventListener("click", (event) => {
   const pick = event.target.closest("[data-profile]");
   if (!pick) return;

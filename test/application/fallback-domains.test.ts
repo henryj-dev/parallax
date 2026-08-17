@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { CloudflareFallbackDomains, FallbackDomainForbiddenError, type FallbackDomain } from "../../src/adapters/cloudflare-fallback.ts";
 import { CredentialNotFoundError } from "../../src/application/cloudflare-credentials.ts";
-import { FallbackDomainService, overridableZones, type ProfileSecretReader } from "../../src/application/fallback-domains.ts";
-import type { Zone } from "../../src/domain/dns.ts";
+import { fallbackCoverage, FallbackDomainService, overridableZones, type ProfileSecretReader } from "../../src/application/fallback-domains.ts";
+import type { DesiredRecord, Zone } from "../../src/domain/dns.ts";
 import { ownershipComment } from "../../src/adapters/ownership.ts";
 
 /** The provider's list, and a record of every request made against it. */
@@ -315,8 +315,11 @@ describe("which zones get an override at all", () => {
   });
 
   it("includes it again once it has something to answer", () => {
+    // By name, not by the order the bindings happen to be stored in: the list
+    // is a set of suffixes to a plan, and an order that depends on insertion
+    // makes two runs over the same state look like different answers.
     const zones = [zone("tinyuniver.se", [record]), zone("tinymail.app", [record])];
-    assert.deepEqual(overridableZones(BINDINGS, zones, "main"), ["tinyuniver.se", "tinymail.app"]);
+    assert.deepEqual(overridableZones(BINDINGS, zones, "main"), ["tinymail.app", "tinyuniver.se"]);
   });
 
   it("keeps to the profile it was asked about", () => {
@@ -326,5 +329,70 @@ describe("which zones get an override at all", () => {
 
   it("leaves out a zone that is bound but not held here", () => {
     assert.deepEqual(overridableZones(BINDINGS, [zone("tinyuniver.se", [record])], "main"), ["tinyuniver.se"]);
+  });
+});
+
+describe("why a zone is or is not covered", () => {
+  const zone = (name: string, records: DesiredRecord[], external: DesiredRecord[] = []): Zone => ({
+    name,
+    revision: 1,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    views: [{ name: "internal", records }, ...(external.length > 0 ? [{ name: "external", records: external }] : [])],
+  });
+  const record = { id: "a", name: "www", type: "A" as const, content: "10.17.192.11", ttl: 60 };
+  const BINDINGS = [
+    { zone: "tinyuniver.se", profile: "main" },
+    { zone: "tinymail.app", profile: "main" },
+    { zone: "other.example", profile: "second" },
+  ];
+
+  it("names the reason for every zone this control plane holds", () => {
+    // The question that cost a live investigation: a zone full of internal
+    // records was missing from the overrides, and `overridableZones` could only
+    // say it was absent. Bound elsewhere, nothing to answer, and never bound
+    // look identical in a list of what to write, and an operator can act on
+    // each of them differently.
+    const rows = fallbackCoverage(BINDINGS, [
+      zone("tinyuniver.se", [record]),
+      zone("tinymail.app", []),
+      zone("other.example", [record]),
+      zone("stray.test", [record]),
+    ], "main");
+
+    assert.deepEqual(rows, [
+      { zone: "other.example", covered: false, reason: "otherProfile", profile: "second" },
+      { zone: "stray.test", covered: false, reason: "unbound" },
+      { zone: "tinymail.app", covered: false, reason: "empty", profile: "main" },
+      { zone: "tinyuniver.se", covered: true, reason: "covered", profile: "main" },
+    ]);
+  });
+
+  it("says when the views could not be composed, and what went wrong", () => {
+    // Different from empty, and worse: the desired state contradicts itself, so
+    // the listener answers for the zone at all. Reporting it as "nothing to
+    // answer" would send somebody looking for a missing record.
+    const clash = [
+      { id: "a", name: "www", type: "A" as const, content: "10.0.0.1", ttl: 60 },
+      { id: "a", name: "www", type: "A" as const, content: "10.0.0.1", ttl: 60 },
+    ];
+    const rows = fallbackCoverage(BINDINGS, [zone("tinyuniver.se", clash)], "main");
+    assert.equal(rows[0]?.reason, "invalid");
+    assert.equal(rows[0]?.covered, false);
+    assert.ok(rows[0]?.detail, "the composition failure is carried, not just its existence");
+  });
+
+  it("agrees with the list a sync writes, because that list is derived from it", () => {
+    const zones = [zone("tinyuniver.se", [record]), zone("tinymail.app", [record]), zone("stray.test", [record])];
+    const covered = fallbackCoverage(BINDINGS, zones, "main").filter((row) => row.covered).map((row) => row.zone);
+    assert.deepEqual(covered, overridableZones(BINDINGS, zones, "main"));
+  });
+
+  it("needs no provider, so it answers when the credential is the broken thing", () => {
+    // No token, no account id, no permission and no network: this is the report
+    // an operator reads on the day the provider call is what fails.
+    assert.deepEqual(fallbackCoverage([], [zone("tinyuniver.se", [record])], "main"), [
+      { zone: "tinyuniver.se", covered: false, reason: "unbound" },
+    ]);
   });
 });

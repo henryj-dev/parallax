@@ -37,3 +37,38 @@ export interface RecordRow {
 }
 
 export function recordRow(record: unknown, records: readonly unknown[]): RecordRow;
+
+/** A zone this profile's overrides do not cover, and why not. */
+export interface ExcludedZone {
+  zone: string;
+  /** `unbound`, `otherProfile`, `empty` or `invalid`. */
+  reason: string;
+  profile?: string;
+  detail?: string;
+}
+
+export interface FallbackPanel {
+  profile: string;
+  resolver: string;
+  /** No resolver is set, so a plan cannot be built and a sync can only fail. */
+  resolverMissing: boolean;
+  covered: string[];
+  excluded: ExcludedZone[];
+  entries: { suffix: string; dnsServer: string[] }[];
+  /** `null` when the provider could not be read; `planError` says why. */
+  plan: {
+    add: string[];
+    update: string[];
+    adopt: string[];
+    remove: string[];
+    conflict: { suffix: string; reason: string }[];
+    unchanged: number;
+    untouched: number;
+  } | null;
+  planError: string;
+  pending: number;
+  inStep: boolean;
+  syncable: boolean;
+}
+
+export function fallbackPanel(state: unknown): FallbackPanel;
