@@ -37,6 +37,14 @@ That is the only thing that makes drift checkable at all: with both checkouts
 present, `cmp` answers in one line. Editing them here to say they are copies
 would remove the property that lets anyone tell.
 
+`scripts/git-hooks/install.sh` is not in that set either, and the reason is the
+opposite one. stardust's grew a second hook -- `pre-push`, which refuses a
+correspondence document whose number is already taken. There are no
+correspondence documents here, and no `pre-push` file to install, so taking that
+version would `chmod` a path that does not exist and the installer would stop.
+The difference is **fit, not staleness**: leave it, and re-take it only if this
+repository ever grows the thing that hook guards.
+
 `.claude/settings.json` is **not** in that set, though this file used to claim it
 was. It cannot be: `symlinkDirectories` names this repository's own dependency
 directories, and stardust's copy names three of its own. Only the `hooks` block
