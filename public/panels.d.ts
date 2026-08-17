@@ -15,3 +15,25 @@ export interface SyncPanel {
 }
 
 export function syncPanel(state: unknown): SyncPanel;
+
+/** One side's answer, and which message stands in when there is none. */
+export interface RecordAnswerView {
+  text: string;
+  /** `""`, `"overridden"` or `"noAnswer"` -- the view translates it. */
+  absent: string;
+}
+
+export interface RecordRow {
+  /** `Worker`, `R2`, or the DNS type. */
+  typeLabel: string;
+  /** The provider owns this row: it offers nothing and says so on both sides. */
+  locked: boolean;
+  /** The DNS value as stored, for a row that shows something else. */
+  stored: string;
+  /** `["edit", "delete"]`, or empty where nothing here can change the record. */
+  actions: string[];
+  inside: RecordAnswerView & { inherited: boolean };
+  outside: RecordAnswerView & { proxied: boolean };
+}
+
+export function recordRow(record: unknown, records: readonly unknown[]): RecordRow;

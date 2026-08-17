@@ -1,5 +1,5 @@
 import { createApiClient } from "./api-client.js";
-import { syncPanel } from "./panels.js";
+import { recordRow, syncPanel } from "./panels.js";
 import { createStore, isNonGlobalAddress, ERROR_SCOPES, HISTORY_PAGE_SIZE } from "./store.js";
 import { effectiveExternalTtl, isValidDnsOnlyTtl } from "./ttl.js";
 import {
@@ -220,49 +220,32 @@ function renderWorkspace(state) {
   renderHistory(state);
 }
 
-/** The proxy badge belongs to the external record, which is the only side proxied. */
-function proxyBadge(record) {
-  return record.views.external.proxied ? `<span class="proxy-badge">${escapeHtml(t("record.proxied"))}</span>` : "";
+/** One side's answer, or the message that stands in for the absence of one. */
+function answerCell(answer) {
+  const text = answer.text || (answer.absent ? t(`record.${answer.absent}`) : "");
+  const badge = answer.proxied ? `<span class="proxy-badge">${escapeHtml(t("record.proxied"))}</span>` : "";
+  return `<div class="record-answer${answer.inherited ? " inherited" : ""}">${escapeHtml(text)}${badge}</div>`;
 }
 
 function renderRecords(state) {
   $("#records-empty").hidden = state.records.length > 0;
   $(".table-wrap").hidden = state.records.length === 0;
   $("#record-rows").innerHTML = state.records.map((record, index) => {
-    const overridden = state.records.some((candidate) => candidate.name === record.name
-      && candidate.type === record.type && candidate.views.internal.content);
-    const internal = record.views.internal.content || (overridden ? "" : record.views.external.content);
-    // A record its provider owns is shown the way the provider shows it: the
-    // service in the type column, and the worker or bucket as the answer on
-    // both sides. Reading the stored CNAME as a target is what invites the edit
-    // that breaks the binding -- and inside is where that reading was worst,
-    // because the placeholder shown there is the one address the resolver
-    // deliberately never answers: it relays the query to the public answer, so
-    // what a client gets inside is the service, exactly as it says here.
-    //
-    // No buttons at all rather than dead ones. Nothing on this row can be
-    // changed from this page, so an action that exists only to refuse is noise
-    // where the row already says what it is; the reason stays on the row, for
-    // anyone who hovers it wondering where the controls went.
-    const owned = Boolean(record.views.external.managed);
-    // What the provider serves, said the same way on both sides, with the
-    // stored DNS value on hover for whoever needs it.
-    const service = escapeHtml(record.views.external.label);
-    const stored = ` title="${escapeHtml(record.views.external.content)}"`;
-    const inside = owned
-      ? `<div class="record-answer"${stored}>${service}</div>`
-      : `<div class="record-answer ${record.views.internal.content ? "" : "inherited"}">${escapeHtml(internal || t(overridden ? "record.overridden" : "record.noAnswer"))}</div>`;
-    const outside = owned
-      ? `<div class="record-answer"${stored}>${service}${proxyBadge(record)}</div>`
-      : `<div class="record-answer">${escapeHtml(record.views.external.content || t("record.noAnswer"))}${proxyBadge(record)}</div>`;
-    const actions = owned
+    // What the row is, and what it offers, is decided in `panels.js` where a
+    // test can read it; this only writes it down. The stored DNS value goes on
+    // the answer cells as a title for a locked row, which is the one case where
+    // the text shown is not the value held.
+    const row = recordRow(record, state.records);
+    const stored = row.locked ? ` title="${escapeHtml(row.stored)}"` : "";
+    const button = (action, index) =>
+      `<button class="row-action${action === "delete" ? " danger" : ""}" type="button" data-${action}-record="${index}">${escapeHtml(t(`record.${action}`))}</button>`;
+    const actions = row.actions.length === 0
       ? ""
-      : `<div class="row-actions"><button class="row-action" type="button" data-edit-record="${index}">${escapeHtml(t("record.edit"))}</button>`
-        + `<button class="row-action danger" type="button" data-delete-record="${index}">${escapeHtml(t("record.delete"))}</button></div>`;
-    return `<tr${owned ? ` class="provider-owned" title="${escapeHtml(t("record.providerOwnedHint"))}"` : ""}>
-      <td><span class="record-identity"><b>${escapeHtml(displayName(record.name))}</b><small${owned ? ' class="service-type"' : ""}>${escapeHtml(record.typeLabel || record.type)}</small></span></td>
-      <td data-label="${escapeHtml(t("record.internalAnswer"))}">${inside}</td>
-      <td data-label="${escapeHtml(t("record.externalAnswer"))}">${outside}</td>
+      : `<div class="row-actions">${row.actions.map((action) => button(action, index)).join("")}</div>`;
+    return `<tr${row.locked ? ` class="provider-owned" title="${escapeHtml(t("record.providerOwnedHint"))}"` : ""}>
+      <td><span class="record-identity"><b>${escapeHtml(displayName(record.name))}</b><small${row.locked ? ' class="service-type"' : ""}>${escapeHtml(row.typeLabel)}</small></span></td>
+      <td data-label="${escapeHtml(t("record.internalAnswer"))}"${stored}>${answerCell(row.inside)}</td>
+      <td data-label="${escapeHtml(t("record.externalAnswer"))}"${stored}>${answerCell(row.outside)}</td>
       <td data-label="TTL"><span class="record-answer">${escapeHtml(formatTtl(record.views.internal.ttl))} / ${escapeHtml(formatTtl(record.views.external.ttl))}</span></td>
       <td>${actions}</td>
     </tr>`;
