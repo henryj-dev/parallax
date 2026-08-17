@@ -27,15 +27,21 @@ session left behind, for instance — `touch .git/claude-main-tree-rescue`
 
 ### Where these came from
 
-`scripts/claude-hooks/**`, `scripts/git-hooks/**`, `.claude/settings.json` and
-`.codex/hooks.json` are a **snapshot of stardust's**, taken at its commit
-`3e1e1ea7`, with the two guard scripts and their tests re-taken from `80bb6dbd`.
-stardust holds the canonical copy; this one is allowed to fall behind.
+`scripts/claude-hooks/**`, `scripts/git-hooks/**` and `.codex/hooks.json` are a
+**snapshot of stardust's**, taken at its commit `3e1e1ea7`, with the two guard
+scripts and their tests re-taken from `80bb6dbd`. stardust holds the canonical
+copy; this one is allowed to fall behind.
 
-They are kept **byte-identical on purpose** -- no local header, no local tweak.
+Those are kept **byte-identical on purpose** -- no local header, no local tweak.
 That is the only thing that makes drift checkable at all: with both checkouts
 present, `cmp` answers in one line. Editing them here to say they are copies
 would remove the property that lets anyone tell.
+
+`.claude/settings.json` is **not** in that set, though this file used to claim it
+was. It cannot be: `symlinkDirectories` names this repository's own dependency
+directories, and stardust's copy names three of its own. Only the `hooks` block
+and `worktree.baseRef` are meant to agree, and `cmp` will always report a
+difference here -- so compare those two keys, not the file.
 
 stardust's `.codex/config.toml` is deliberately **not** taken: it sets shell
 environment for that repository, and copying it here would put a second copy of

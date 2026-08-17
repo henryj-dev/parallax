@@ -7,7 +7,7 @@
 ⚠️ 이 검사는 소유자 기록 파일을 건드린다. 원본을 백업했다가 끝에 되돌린다 —
    안 되돌렸다가 실제로 «메인 트리가 워크트리로 등록되는» 잔재를 남긴 적이 있다.
 """
-import json, os, subprocess, sys
+import hashlib, json, os, subprocess, sys, tempfile
 
 COMMON = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
                         capture_output=True, text=True, check=True).stdout.strip()
@@ -18,7 +18,13 @@ MAIN = os.path.dirname(COMMON)
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUARD = os.path.join(HERE, "main-tree-guard.py")
 OWNERS = f"{COMMON}/claude-worktree-owners.json"
-WT = "/tmp/_wtguard"
+# 🔴 **레포마다 다른 경로여야 한다.** `/tmp/_wtguard` 하나를 공용으로 쓰던 동안, 이 검사를
+#    두 체크아웃에서 동시에 돌리면 뒤에 온 쪽이 그 경로를 못 만들어 **워크트리 케이스가 통째로
+#    무너졌다** — 2026-08-17 실측: 동시 실행에서 실패 22건·1건, 순차에서는 양쪽 0건.
+#    하필 무너지는 모양이 「DENY 케이스가 ALLOW 로 통과」라 **「가드가 안 막힌다」로 읽힌다.**
+#    가드 검사에서 이보다 나쁜 거짓 신호는 없다. 경로를 MAIN 으로 갈라 닫는다.
+WT = os.path.join(tempfile.gettempdir(),
+                  "_wtguard-" + hashlib.sha1(MAIN.encode()).hexdigest()[:8])
 
 _saved = open(OWNERS, "rb").read() if os.path.exists(OWNERS) else None
 

@@ -1,6 +1,6 @@
 {
   "worktree": {
-    "baseRef": "fresh",
+    "baseRef": "head",
     "symlinkDirectories": ["node_modules"]
   },
   "hooks": {
