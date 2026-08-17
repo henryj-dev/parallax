@@ -73,16 +73,30 @@ def main():
     except Exception:
         pass
 
-    # 기본 브랜치는 **묻는다.** 적어 두면 이식한 클론에서 메세지가 거짓말을 한다.
-    # 모르면 자리표시자를 남긴다 — `origin/main` 으로 찍으면 틀린 명령을 주게 된다.
-    rc, base = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
-    if rc or not base:
+    # 기준은 **묻는다.** 적어 두면 이식한 클론에서 메세지가 거짓말을 한다. 그리고 묻는
+    # 대상은 `origin/HEAD` 가 아니라 **지금 올라가 있는 브랜치**다 — 기본 브랜치로 적으면
+    # feature 브랜치를 쓰는 레포에서 「그 작업을 버리고 기본 브랜치로 push 하라」가 된다
+    # (2026-08-17 barycenter: 그 브랜치에만 177 커밋, origin 에 없음, 메세지는 `HEAD:main`).
+    # 업스트림이 없으면 로컬 팁에서 딴다. 모르면 자리표시자를 남긴다.
+    # push 대상은 로컬 이름이 아니라 `branch.<n>.merge` 의 원격 쪽 이름이다 — 다를 수 있고
+    # (`push -u origin feat:feat-remote`), 로컬 이름으로 적으면 원격에 갈라진 브랜치를 만든다.
+    # unborn HEAD 에서는 `symbolic-ref` 가 **성공하지만** 그 ref 는 아직 없으므로 따로 본다.
+    rc, _ = git("rev-parse", "--verify", "--quiet", "HEAD")
+    rc, branch = git("symbolic-ref", "--short", "HEAD") if not rc else (1, "")
+    branch = "" if rc else branch
+    if branch:
         rc, base = git("rev-parse", "--abbrev-ref", "@{u}")
-    base = "" if rc else base
-    branch = base.split("/", 1)[1] if "/" in base else ""
+        base = branch if rc or not base else base
+        rc, merge = git("config", "--get", f"branch.{branch}.merge")
+        if not rc and merge.startswith("refs/heads/"):
+            branch = merge[len("refs/heads/"):]
+    else:
+        rc, base = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+        base = "" if rc else base
+        branch = base.split("/", 1)[1] if "/" in base else ""
     print(DENY.format(rescue=rescue,
-                      base=base or "origin/<기본브랜치>",
-                      branch=branch or "<기본브랜치>"), file=sys.stderr)
+                      base=base or "origin/<기준브랜치>",
+                      branch=branch or "<대상브랜치>"), file=sys.stderr)
     return 1
 
 

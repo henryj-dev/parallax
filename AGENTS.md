@@ -29,8 +29,8 @@ session left behind, for instance — `touch .git/claude-main-tree-rescue`
 
 `scripts/claude-hooks/**`, `scripts/git-hooks/**`, `.claude/settings.json` and
 `.codex/hooks.json` are a **snapshot of stardust's**, taken at its commit
-`3e1e1ea7`. stardust holds the
-canonical copy; this one is allowed to fall behind.
+`3e1e1ea7`, with the two guard scripts and their tests re-taken from `80bb6dbd`.
+stardust holds the canonical copy; this one is allowed to fall behind.
 
 They are kept **byte-identical on purpose** -- no local header, no local tweak.
 That is the only thing that makes drift checkable at all: with both checkouts

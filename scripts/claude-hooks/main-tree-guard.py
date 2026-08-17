@@ -103,12 +103,46 @@ DENY = """메인 작업 트리는 읽기 전용입니다. 수정은 워크트리
 def deny_text(cwd, common):
     """거부 메세지를 **그 레포의 실제 값으로** 채운다.
 
-    기본 브랜치는 `origin/HEAD` → 메인의 업스트림 순으로 묻는다. 둘 다 없으면 자리표시자를
-    남긴다 — **모르는 것을 아는 척해 `origin/main` 으로 적으면 틀린 명령을 주게 된다.**
+    기준은 `origin/HEAD` 가 **아니라 메인 트리가 지금 올라가 있는 브랜치**다. 기본 브랜치로
+    적으면 feature 브랜치에서 작업하는 레포에서 메세지가 「그 작업을 버리고 기본 브랜치에서
+    새로 따서, 기본 브랜치로 push 하라」고 말한다 — 2026-08-17 barycenter 에서 실측했다:
+    메인이 `design/…` 에 있고 그 브랜치에만 177 커밋, origin 에는 아직 없는 상태인데
+    메세지는 `origin/main` 에서 따서 `HEAD:main` 으로 밀라고 인쇄했다. 브랜치 이름은 한 번도
+    나오지 않았다. **막는 것은 맞았고 시키는 것이 틀렸다** — 이쪽이 더 위험하다. 거부는
+    사람이 다시 생각하게 만들지만, 조언은 그대로 복사되기 때문이다.
+
+    push 대상은 그 브랜치, 분기·rebase 기준은 **그 브랜치의 업스트림**이다. 업스트림이
+    없으면(아직 안 밀어 본 브랜치) 로컬 팁에서 딴다 — 그 경우 `git fetch` 가 기준을 앞으로
+    옮기지 못하므로 뒤따르는 rebase 는 사실상 no-op 이다. 틀린 곳으로 보내는 것보다 낫다.
+
+    push 대상은 로컬 이름이 아니라 **`branch.<n>.merge` 가 가리키는 원격 쪽 이름**이다. 둘은
+    다를 수 있다(`git push -u origin feat:feat-remote`). 로컬 이름으로 적으면 추적하던 ref 를
+    갱신하는 대신 **원격에 갈라진 두 번째 브랜치를 만든다.**
+
+    detached HEAD 처럼 브랜치를 모를 때만 `origin/HEAD` 로 폴백하고, 그것도 없으면
+    자리표시자를 남긴다 — **모르는 것을 아는 척해 `origin/main` 으로 적으면 틀린 명령을 주게
+    된다.** 커밋이 하나도 없는 저장소(unborn HEAD)도 여기 속한다: `symbolic-ref` 는 그때도
+    **성공하므로** 이름을 그대로 믿으면 `-b <이름> trunk` 처럼 **존재하지 않는 ref** 를 기준으로
+    주게 된다(`fatal: invalid reference`). 그래서 HEAD 가 가리키는 커밋이 실재하는지 따로 본다.
+
+    ⚠️ 못 덮는 것 둘. (1) rebase·bisect 중이면 HEAD 가 «이유 있게» detached 라 기본 브랜치로
+    폴백한다 — 원래 브랜치는 `.git/rebase-merge/head-name` 에 있지만 읽지 않는다. 고치기 전보다
+    나쁘지는 않으나 맞지도 않다. (2) 이 문장은 그대로 복사해 셸에 붙이는 것인데 브랜치 이름을
+    따옴표 없이 끼운다 — `wip/a&b` 같은 이름은 셸이 쪼갠다. 로컬 이름을 새로 끌어들인 만큼
+    이쪽 노출은 늘었다. 둘 다 «조용히 틀리는» 자리이므로 여기 적어 둔다.
     """
-    base = (git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
-            or git(cwd, "rev-parse", "--abbrev-ref", "@{u}") or "")
-    branch = base.split("/", 1)[1] if "/" in base else ""
+    branch = ""
+    if git(cwd, "rev-parse", "--verify", "--quiet", "HEAD") is not None:
+        branch = git(cwd, "symbolic-ref", "--short", "HEAD") or ""
+    if branch:
+        # push 대상은 원격 쪽 이름. 추적이 없으면(아직 안 밀어 본 브랜치) 같은 이름으로 생긴다.
+        merge = git(cwd, "config", "--get", f"branch.{branch}.merge") or ""
+        base = git(cwd, "rev-parse", "--abbrev-ref", "@{u}") or branch
+        if merge.startswith("refs/heads/"):
+            branch = merge[len("refs/heads/"):]
+    else:
+        base = git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD") or ""
+        branch = base.split("/", 1)[1] if "/" in base else ""
     extra = ""
     try:
         with open(os.path.join(os.path.dirname(common), BOOTSTRAP), encoding="utf-8") as f:
@@ -118,8 +152,8 @@ def deny_text(cwd, common):
                 "   " + ln for ln in body.splitlines())
     except Exception:
         pass
-    return DENY.format(base=base or "origin/<기본브랜치>",
-                       branch=branch or "<기본브랜치>",
+    return DENY.format(base=base or "origin/<기준브랜치>",
+                       branch=branch or "<대상브랜치>",
                        rescue=os.path.join(common, RESCUE),
                        extra=extra)
 

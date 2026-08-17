@@ -172,6 +172,80 @@ try:
     fail += os.path.exists(RESCUE)
     print(f"{'✓' if not os.path.exists(RESCUE) else '✗'} 만료된 구제 파일은 치워진다")
 
+    # 거부 메세지가 **어느 브랜치를 가리키는가.** 위 케이스들은 ALLOW/DENY 만 재고,
+    # `call()` 은 이유의 첫 줄만 돌려주므로 base·push 대상 줄은 아무도 안 봤다. 그래서
+    # 이 저장소가 기본 브랜치에 있는 동안에는 틀린 값이 조용히 통과했다 — 2026-08-17
+    # barycenter 에서 드러났다(메인이 `design/…`, 그 브랜치에만 177 커밋, origin 에 없음,
+    # 그런데 메세지는 `origin/main` 에서 따서 `HEAD:main` 으로 밀라고 했다).
+    #
+    # 실제 저장소의 브랜치를 바꿀 수는 없으므로 `deny_text` 를 **격리 픽스처에 대고**
+    # 직접 부른다. cwd·common 을 인자로 받는 함수라 그것이 가능하다.
+    import importlib.util, tempfile, shutil
+    spec = importlib.util.spec_from_file_location("_mtg", GUARD)
+    mtg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtg)                  # `__main__` 이 아니므로 훅은 안 돈다
+
+    FIX = tempfile.mkdtemp(prefix="denytext-")
+    try:
+        def fixture(branch, upstream):
+            """브랜치가 `branch` 인 저장소 하나. `upstream` 이면 원격까지 세운다."""
+            r = tempfile.mkdtemp(prefix="repo-", dir=FIX)
+            subprocess.run(["git", "init", "-q", r], check=True)
+            for k, v in (("user.email", "t@t"), ("user.name", "t")):
+                subprocess.run(["git", "-C", r, "config", k, v], capture_output=True)
+            open(os.path.join(r, "A.md"), "w").write("v1\n")
+            for a in (("add", "A.md"), ("commit", "-qm", "init"), ("checkout", "-q", "-b", branch)):
+                subprocess.run(["git", "-C", r] + list(a), capture_output=True)
+            if upstream:
+                b = tempfile.mkdtemp(prefix="bare-", dir=FIX)
+                subprocess.run(["git", "init", "-q", "--bare", b], check=True)
+                subprocess.run(["git", "-C", r, "remote", "add", "origin", b], capture_output=True)
+                subprocess.run(["git", "-C", r, "push", "-q", "-u", "origin", branch],
+                               capture_output=True)
+                # 🔴 `origin/HEAD` 를 **함께** 세운다. 없으면 예전 로직도 자기 `@{u}` 폴백으로
+                # 같은 답을 내서 이 검사가 **공허해진다**(2026-08-17 실측: 옛/새 출력이 바이트
+                # 동일). 갈라지는 모양은 「업스트림과 origin/HEAD 가 함께 있는」 것뿐이고,
+                # 그것이 이 수정을 부른 barycenter 의 모양이다.
+                subprocess.run(["git", "-C", r, "push", "-q", "origin", "HEAD:refs/heads/trunk"],
+                               capture_output=True)
+                subprocess.run(["git", "-C", r, "remote", "set-head", "origin", "trunk"],
+                               capture_output=True)
+            return r, os.path.join(r, ".git")
+
+        def denies(branch, upstream):
+            r, common = fixture(branch, upstream)
+            return mtg.deny_text(r, common)
+
+        t = denies("design/feature-x", upstream=False)
+        ok = "HEAD:design/feature-x" in t and "-b <브랜치> design/feature-x" in t
+        fail += not ok
+        print(f"{'✓' if ok else '✗'} 업스트림 없는 feature 브랜치 — 그 브랜치를 기준·대상으로 준다")
+
+        t = denies("design/feature-y", upstream=True)
+        ok = ("origin/design/feature-y" in t and "HEAD:design/feature-y" in t
+              and "HEAD:trunk" not in t)      # origin/HEAD 가 있어도 끌려가지 않는다
+        fail += not ok
+        print(f"{'✓' if ok else '✗'} 업스트림·origin/HEAD 가 함께 있어도 그 브랜치를 준다")
+
+        # 변이 — 기준을 예전처럼 `origin/HEAD` 에서만 읽으면 그 브랜치를 놓치는가.
+        # 위 두 검사가 공허하지 않다는 증거다.
+        srcd = open(GUARD, encoding="utf-8").read()
+        mutd = srcd.replace('branch = git(cwd, "symbolic-ref", "--short", "HEAD") or ""',
+                            'branch = ""')
+        assert mutd != srcd, "변이가 안 심겼다 — 이 검사는 무의미하다"
+        MD = GUARD.replace(".py", "_mutd.py")
+        open(MD, "w", encoding="utf-8").write(mutd)
+        spec2 = importlib.util.spec_from_file_location("_mtgd", MD)
+        mtgd = importlib.util.module_from_spec(spec2)
+        spec2.loader.exec_module(mtgd)
+        r, common = fixture("design/feature-z", upstream=False)
+        got = "HEAD:design/feature-z" in mtgd.deny_text(r, common)
+        fail += got
+        print(f"{'✓' if not got else '✗'} 변이본은 feature 브랜치를 놓친다(기준 검사가 공허하지 않음)")
+        os.remove(MD)
+    finally:
+        shutil.rmtree(FIX, ignore_errors=True)
+
     # 변이 — 메인 판정을 무력화하면 차단이 사라져야 한다(검사가 공허하지 않다는 증거)
     src = open(GUARD, encoding="utf-8").read()
     mut = src.replace("return os.path.realpath(top) == os.path.realpath(guarded), common",
