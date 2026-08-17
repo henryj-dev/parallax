@@ -5,6 +5,11 @@ node_modules/
 node_modules
 /dist/
 
+# Worktrees live inside the repo, so the checkout would otherwise track itself.
+.claude/worktrees/
+# Which session holds the scheduler; a pid and a session id, true for one machine.
+.claude/scheduled_tasks.lock
+
 # Test and coverage output
 *.out
 coverage.*
