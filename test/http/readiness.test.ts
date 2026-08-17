@@ -267,3 +267,32 @@ describe("readiness", () => {
     assert.deepEqual(unservedTargets([], NOTHING_CONFIGURED, false), []);
   });
 });
+
+describe("reporting how old the snapshot is", () => {
+  // Freshness gates membership through `ready()`, and where one replica also
+  // carries DNS that is a blunt instrument: going unready withdraws a resolver
+  // that is still answering correctly. Reporting the number lets a deployment
+  // alert on it instead of being withdrawn by it.
+  it("says the age and the limit, and keeps saying it while ready", async () => {
+    let clock = 1_000;
+    const monitor = createReadinessMonitor(
+      () => Promise.resolve([zone("example.com", ["external"])]),
+      () => true,
+      false,
+      { now: () => clock, maxStalenessMs: 5_000 },
+    );
+    assert.deepEqual(monitor.staleness(), { ageMs: undefined, maxMs: 5_000 }, "before any read");
+
+    await monitor.refresh();
+    assert.deepEqual(monitor.staleness(), { ageMs: 0, maxMs: 5_000 });
+    assert.ok(monitor.ready());
+
+    clock += 3_000;
+    assert.deepEqual(monitor.staleness(), { ageMs: 3_000, maxMs: 5_000 }, "reported while still ready");
+    assert.ok(monitor.ready(), "three seconds is inside the window");
+
+    clock += 3_000;
+    assert.equal(monitor.staleness().ageMs, 6_000, "and keeps counting past the limit");
+    assert.ok(!monitor.ready(), "six seconds is outside it");
+  });
+});

@@ -15,6 +15,27 @@ describe("configuration", () => {
     });
   });
 
+  describe("how long a stale snapshot may still be called ready", () => {
+    // stardust's probe gates the endpoints of a service that also carries DNS,
+    // with one replica -- so going unready removes a resolver that is still
+    // answering correctly. How long that should take is a fact about their
+    // topology, and this is the lever for it.
+    it("stays at ten seconds when nothing says otherwise", () => {
+      assert.equal(readConfig({}).readinessMaxStalenessMs, undefined, "unset means the monitor's own default");
+    });
+
+    it("takes seconds, because that is what a probe is written in", () => {
+      assert.equal(readConfig({ PARALLAX_READINESS_MAX_STALENESS_SECONDS: "45" }).readinessMaxStalenessMs, 45_000);
+    });
+
+    it("refuses a value that is not a whole number of seconds in range", () => {
+      for (const bad of ["0", "-1", "1.5", "abc", "86401"]) {
+        assert.throws(() => readConfig({ PARALLAX_READINESS_MAX_STALENESS_SECONDS: bad }),
+          /between 1 and 86400/u, `accepted ${bad}`);
+      }
+    });
+  });
+
   describe("what the portal offers a visitor who has not signed in", () => {
     /** Enough of an identity provider for the setting to be allowed. */
     const IDENTITY = {

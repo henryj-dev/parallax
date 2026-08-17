@@ -65,6 +65,7 @@ bind, how to reach the store, and the keys that protect what is stored.
 | `PARALLAX_DNS_FORWARD_ALLOW` | Client CIDRs allowed to recurse. Defaults to loopback; required explicitly for forwarding on a non-loopback listener |
 | `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | Certificate and key for this process to end TLS itself; set both or neither |
 | `PARALLAX_HTTP_REDIRECT_PORT` | Port answering plain HTTP with a redirect to the stored `publicOrigin`; needs both TLS and that setting |
+| `PARALLAX_READINESS_MAX_STALENESS_SECONDS` | How old a desired-state read may be before readiness reports 503; defaults to 10. Raise it where a readiness probe gates endpoints that also carry DNS |
 | `PARALLAX_AUTH_TOKENS` | JSON array of `{"token","subject","role"}`; tokens must be canonical base64url encodings of 32 random bytes. Optional on loopback, **required to bind any other address** |
 
 File-backed deployments require the parent directory of each configured data
@@ -498,10 +499,24 @@ seconds**, so a store that is unreachable for longer reports 503 while every
 query is still answered correctly, out of a snapshot that is still right.
 
 ⚠️ **That decoupling only survives if nothing outside re-couples it.** Where a
-readiness probe gates the endpoints of the service that carries DNS, a ten-second
-store blip withdraws a resolver that is healthy and holding the right answers.
-On a deployment where this listener is the only resolver, check which way that is
-wired before deciding the probe is free.
+readiness probe gates the endpoints of the service that carries DNS, a store
+outage withdraws a resolver that is healthy and holding the right answers. On a
+deployment where this listener is the only resolver, check which way that is
+wired before deciding the probe is free -- and note that the probe's own
+`periodSeconds × failureThreshold` sets how long the outage has to last, which
+is usually longer than this window.
+
+```sh
+PARALLAX_READINESS_MAX_STALENESS_SECONDS=45     # default: 10
+```
+
+Raising it keeps a stale-but-correct snapshot serving for longer before the
+process reports itself unready. The age is reported to an authenticated caller
+of `/health/ready` as `desiredState` whether or not it is ready, so a deployment
+can alert on a snapshot going old rather than be withdrawn for it.
+
+⚠️ It is not a way to switch readiness off. The four startup refusals below stay
+fail-closed, because there "cannot answer" is true.
 
 Every path that stops the process is a **startup** path: an unusable stored
 setting, a non-loopback bind with no access token, a desired state that cannot be

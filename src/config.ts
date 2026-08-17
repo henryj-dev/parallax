@@ -34,6 +34,17 @@ export interface ParallaxConfig {
   oidc?: OidcSettings;
   /** What the portal offers a visitor who has not signed in. Defaults to the prompt. */
   portalSignIn: PortalSignIn;
+  /**
+   * How long a desired-state read may be stale before readiness reports 503.
+   *
+   * This is in the environment rather than the store because it is a fact about
+   * the topology, not about DNS: it only matters through whatever consumes the
+   * probe. Where a readiness probe gates the endpoints of a service that also
+   * carries DNS, and there is one replica, going unready takes the resolver out
+   * -- so how long a stale-but-correct snapshot should keep serving is a
+   * question only the deployment can answer.
+   */
+  readinessMaxStalenessMs?: number;
   /** Answers DNS for the internal view directly. Unset leaves the port unbound. */
   dns?: DnsListenerSettings;
 }
@@ -83,6 +94,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
   }
   const oidc = readOidc(environment);
   const portalSignIn = readPortalSignIn(environment, oidc !== undefined);
+  const readinessMaxStalenessMs = readStaleness(environment.PARALLAX_READINESS_MAX_STALENESS_SECONDS);
   const dns = readDnsListener(environment);
   const allowPlaintextPostgres = readOptIn(
     environment.PARALLAX_ALLOW_PLAINTEXT_POSTGRES,
@@ -107,6 +119,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     ...(httpRedirectPort !== undefined ? { httpRedirectPort } : {}),
     ...(oidc ? { oidc } : {}),
     portalSignIn,
+    ...(readinessMaxStalenessMs !== undefined ? { readinessMaxStalenessMs } : {}),
     ...(dns ? { dns } : {}),
   };
 }
@@ -211,6 +224,20 @@ function readOidc(environment: NodeJS.ProcessEnv): OidcSettings | undefined {
  * other, and the only symptom would be a login page somebody thought they had
  * removed.
  */
+/**
+ * Seconds, because the operator thinking about this is reading a probe's
+ * `periodSeconds` and `failureThreshold` beside it.
+ */
+function readStaleness(value: string | undefined): number | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 86_400) {
+    throw new Error("PARALLAX_READINESS_MAX_STALENESS_SECONDS must be an integer between 1 and 86400");
+  }
+  return seconds * 1000;
+}
+
 function readPortalSignIn(environment: NodeJS.ProcessEnv, hasIdentityProvider: boolean): PortalSignIn {
   const value = environment.PARALLAX_PORTAL_SIGN_IN?.trim();
   if (!value) return "prompt";

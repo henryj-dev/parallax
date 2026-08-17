@@ -44,6 +44,9 @@ const readiness = createReadinessMonitor(
   config.dns !== undefined,
   {
     configurationRevision: () => provider.configurationRevision(),
+    ...(config.readinessMaxStalenessMs !== undefined
+      ? { maxStalenessMs: config.readinessMaxStalenessMs }
+      : {}),
     forwardsEmptyInternalViews: (config.dns?.forwardTo.length ?? 0) > 0,
     onZones: (zones) => {
       if (!config.dns) return;
@@ -236,6 +239,9 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
             ? { port: config.dns.port, zones: dnsSnapshot.length, forwarding: config.dns.forwardTo.length > 0 }
             : "disabled",
           accessTokens: tokenReadiness,
+          // Reported even while ready, so a deployment can alert on a snapshot
+          // going old instead of waiting to be withdrawn for it.
+          desiredState: readiness.staleness(),
         }
         : { status: "ready", service: "parallax" }));
     } catch {

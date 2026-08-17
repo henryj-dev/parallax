@@ -4,6 +4,16 @@ import { servedZones } from "../dns/snapshot.ts";
 export interface ReadinessMonitor {
   /** Constant-time value safe to serve from a public health endpoint. */
   ready(): boolean;
+  /**
+   * How old the last successful read is, and how old it may get.
+   *
+   * Freshness decides membership through `ready()`, and membership is a blunt
+   * instrument where one replica also carries DNS: going unready removes a
+   * resolver that is still answering correctly from its last snapshot. So the
+   * number is reported as well, for a deployment that would rather alert on it
+   * than be withdrawn by it.
+   */
+  staleness(): { readonly ageMs: number | undefined; readonly maxMs: number };
   /** Recomputes readiness from zones a trusted background task already read. */
   update(zones: readonly Zone[]): void;
   /** Fails closed immediately and requests one trailing scan if one is active. */
@@ -95,6 +105,10 @@ export function createReadinessMonitor(
     return tracked;
   };
   return {
+    staleness: () => ({
+      ageMs: lastSuccessAt === undefined ? undefined : Math.max(0, now() - lastSuccessAt),
+      maxMs: maxStalenessMs,
+    }),
     ready: () => current
       && lastSuccessAt !== undefined
       && Math.max(0, now() - lastSuccessAt) <= maxStalenessMs
