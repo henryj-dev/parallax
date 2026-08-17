@@ -141,7 +141,23 @@ const EXAMPLE: ServedZone = {
 
 describe("DNS server", () => {
   const closers: (() => Promise<void>)[] = [];
-  after(async () => { for (const close of closers) await close().catch(() => undefined); });
+  /**
+   * A closer that throws is forgiven; one that never answers is not.
+   *
+   * `.catch()` forgives an error, which is a different thing from a failure
+   * that produces no error at all -- and this hook is where a socket that will
+   * not close stops the whole file without saying so. Bounded, the file fails
+   * and names the closer that would not finish.
+   */
+  after(async () => {
+    for (const [index, close] of closers.entries()) {
+      let timer: NodeJS.Timeout | undefined;
+      const stalled = new Promise<"stalled">((resolve) => { timer = setTimeout(() => resolve("stalled"), 5_000); });
+      const finished = await Promise.race([close().then(() => "closed" as const).catch(() => "closed" as const), stalled]);
+      clearTimeout(timer);
+      assert.notEqual(finished, "stalled", `closer ${index} did not finish; something here stays open`);
+    }
+  });
 
   async function start(
     options: Partial<Parameters<typeof createDnsServer>[0]> & { zones: () => readonly ServedZone[] },
