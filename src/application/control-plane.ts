@@ -803,7 +803,33 @@ export class ControlPlane {
   }
 
   async status(zoneName: string): Promise<{ zone: string; desiredRevision: number; statuses: ApplyStatus[] }> {
-    const zone = await this.getZone(zoneName);
+    return this.#statusFor(await this.getZone(zoneName));
+  }
+
+  /**
+   * One line per zone: how far it is applied overall.
+   *
+   * For a list, where asking each zone in turn is one request per row and the
+   * page would draw itself a row at a time. Every zone's verdict comes from the
+   * same routine one zone's own status page uses, rather than a second reading
+   * of the same rows -- two answers to "is this zone applied?" is exactly the
+   * kind of pair that drifts, and the disagreement would show as a dot that
+   * contradicts the panel beside it.
+   *
+   * Bounded by the same paging as the zone list, so it reads a page of zones,
+   * never every zone there is.
+   */
+  async statusOverview(page?: PageRequest): Promise<Paged<"zones", { zone: string; desiredRevision: number; state: string }>> {
+    const listed = await this.listZonePage(page);
+    const zones = await Promise.all(listed.zones.map(async (zone) => ({
+      zone: zone.name,
+      desiredRevision: zone.revision,
+      state: overallApplyState((await this.#statusFor(zone)).statuses),
+    })));
+    return { zones, limit: listed.limit, offset: listed.offset, hasMore: listed.hasMore };
+  }
+
+  async #statusFor(zone: Zone): Promise<{ zone: string; desiredRevision: number; statuses: ApplyStatus[] }> {
     const stored = await this.#statuses.list(zone.name);
     const effectiveViews = materializeProviderViews(zone.views);
     const statuses: ApplyStatus[] = stored.filter((status) =>
@@ -1233,6 +1259,20 @@ function describeAdopted(id: string, record: ProviderRecord): DesiredRecord {
     throw new DomainValidationError(error.issues.map((issue) =>
       `${record.name} ${record.type} ${record.content}: ${issue}`));
   }
+}
+
+/**
+ * One verdict for a zone from its views' statuses.
+ *
+ * A zone is only as caught up as its furthest-behind view, so one failure makes
+ * the zone failed and one pending makes it pending. `""` means there is nothing
+ * to reconcile -- a zone with no views has no status, and reporting that as
+ * `pending` would say it is behind when there is nothing to be behind on.
+ */
+export function overallApplyState(statuses: readonly ApplyStatus[]): string {
+  if (statuses.length === 0) return "";
+  if (statuses.some((status) => status.state === "failed")) return "failed";
+  return statuses.every((status) => status.state === "applied") ? "applied" : "pending";
 }
 
 /** Whether two records name the same service binding, absence included. */

@@ -192,9 +192,15 @@ function renderZoneList(state) {
   }
   list.innerHTML = zones.map((zone) => {
     const active = zone.name === zoneLabel(state);
+    // How far the zone is applied, from the server's own verdict. This row used
+    // to carry a fixed `Not observed` and a dot permanently classed `unknown`,
+    // so it said the same thing about a zone fully applied and a zone whose
+    // last apply failed -- while the stylesheet had carried the three states it
+    // never received since the day it was written.
+    const applied = ["applied", "pending", "failed"].includes(zone.state) ? zone.state : "";
     return `<button class="zone-item${active ? " active" : ""}" type="button" data-zone="${escapeHtml(zone.name)}" aria-current="${active ? "page" : "false"}">
-      <span class="dot unknown" aria-hidden="true"></span>
-      <span><b>${escapeHtml(zone.name)}</b><small>${escapeHtml(t("zones.notObserved"))}</small></span>
+      <span class="dot ${applied || "unknown"}" aria-hidden="true"></span>
+      <span><b>${escapeHtml(zone.name)}</b><small>${escapeHtml(applied ? t(`status.${applied}`) : t("zones.stateUnknown"))}</small></span>
       <span class="zone-rev">r${escapeHtml(zone.revision ?? "—")}</span>
     </button>`;
   }).join("");

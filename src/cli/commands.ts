@@ -362,10 +362,14 @@ const COMMANDS: readonly Command[] = [
   },
   {
     name: "status",
-    summary: "Show how far each view has been applied",
+    summary: "Show how far each view has been applied; without a zone, one line per zone",
     role: "viewer",
-    options: [ZONE],
-    run: ({ runtime }, input) => requireControlPlane(runtime).status(String(input.zone)),
+    // Optional like `history`'s, and for the same reason: a list wants one
+    // request, not one per row.
+    options: [{ ...ZONE, required: false }, ...PAGING],
+    run: ({ runtime }, input) => input.zone === undefined
+      ? requireControlPlane(runtime).statusOverview(page(input))
+      : requireControlPlane(runtime).status(String(input.zone)),
   },
   {
     name: "history",

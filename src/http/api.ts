@@ -185,6 +185,12 @@ async function route(runtime: CommandRuntime, request: Request, security: Securi
 async function matchRoute(segments: string[], method: string, url: URL, request: Request): Promise<RouteMatch> {
   const area = segments[2];
 
+  // One line per zone, for a list that would otherwise ask once per row. The
+  // per-zone page keeps its own route under the zone it describes.
+  if (area === "status" && segments.length === 3 && method === "GET") {
+    return { command: "status", input: readPageQuery(url) };
+  }
+
   if (area === "settings" && segments.length === 3) {
     if (method === "GET") return { command: "settings get", input: {} };
     if (method === "PUT") return { command: "settings set", input: { values: await parseJson(request) } };

@@ -176,6 +176,20 @@ export function createStore(client) {
         state.zonesError = "";
         state.connection = "online";
         state.authenticated = true;
+        // How far each zone is applied, read once for the whole list. Its own
+        // failure is not the list's: a zone list that draws is worth more than
+        // one that refuses because a dot beside it could not be decided, so the
+        // state is simply absent and the row says nothing rather than guessing.
+        try {
+          const overview = await client.statusOverview();
+          const states = new Map((overview?.zones ?? []).map((entry) => [entry.zone, entry.state]));
+          state.zones = state.zones.map((zone) => {
+            const applied = states.get(zone.name);
+            return applied ? { ...zone, state: applied } : zone;
+          });
+        } catch {
+          // Left unset, which the view draws as no verdict at all.
+        }
         emitChange();
         if (!preserveSelection && state.zones.length > 0) await this.selectZone(state.zones[0].name);
         return true;

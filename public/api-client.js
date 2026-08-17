@@ -93,6 +93,8 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     deleteZone: (zone, revision) => request(zonePath(zone), { method: "DELETE", headers: ifMatch(revision) }),
 
     zoneStatus: (zone) => request(`${zonePath(zone)}/status`),
+    /** One line per zone, so a list of zones costs one request and not one each. */
+    statusOverview: () => request("/status"),
     history: (zone, limit) => request(`${zonePath(zone)}/history?limit=${encodeURIComponent(limit)}`),
     preview: (zone, desired) => request(`${zonePath(zone)}/preview`, { method: "POST", body: desired }),
     apply: (zone, revision) => request(`${zonePath(zone)}/apply`, { method: "POST", headers: ifMatch(revision) }),

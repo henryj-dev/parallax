@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { inspect } from "node:util";
-import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE, NotFoundError, ProviderManagedRecordError } from "../../src/application/control-plane.ts";
+import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE, NotFoundError, overallApplyState, ProviderManagedRecordError } from "../../src/application/control-plane.ts";
 import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type DesiredChange, type ProviderAdapter, type ZoneDeletion } from "../../src/application/ports.ts";
 import type { DesiredRecord } from "../../src/domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../../src/domain/reconciliation.ts";
@@ -1120,6 +1120,53 @@ describe("ControlPlane", () => {
     await deleting;
     await assert.rejects(editing, NotFoundError);
     assert.deepEqual(await provider.list("example.com/external"), []);
+  });
+
+  it("gives a list one verdict per zone, from the same routine one zone reports", async () => {
+    // The sidebar carried a fixed `Not observed` on every row because there was
+    // no way to ask for many zones at once, and the stylesheet's applied/pending
+    // /failed dots were never set. This is what fills them -- and it comes from
+    // the same routine the per-zone page uses, because two readings of the same
+    // rows drift and the disagreement would be a dot contradicting the panel.
+    const { service, provider } = setup();
+    await service.createZone("behind.example");
+    await service.createZone("caught-up.example");
+    await service.createZone("empty.example");
+    for (const zone of ["behind.example", "caught-up.example"]) {
+      await service.upsertRecord(zone, "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+    }
+    await service.apply("caught-up.example");
+
+    const overview = await service.statusOverview();
+    const stateOf = (zone: string) => overview.zones.find((entry) => entry.zone === zone)?.state;
+    assert.equal(stateOf("caught-up.example"), "applied");
+    assert.equal(stateOf("behind.example"), "pending");
+    // Nothing to reconcile is not "behind": a zone with no views has no status,
+    // and calling that pending would report a lag against nothing.
+    assert.equal(stateOf("empty.example"), "");
+
+    // The same answer the zone's own status page gives, not a second opinion.
+    for (const zone of ["behind.example", "caught-up.example", "empty.example"]) {
+      const own = await service.status(zone);
+      assert.equal(stateOf(zone), overallApplyState(own.statuses), zone);
+    }
+
+    // An apply that the provider refuses reports the failure rather than
+    // throwing it, and the list has to carry the same verdict: a red dot is the
+    // only place this shows without opening the zone.
+    provider.failure = new Error("provider refused");
+    const failed = await service.apply("behind.example");
+    assert.equal(failed.statuses[0]?.state, "failed");
+    assert.equal((await service.statusOverview()).zones.find((entry) => entry.zone === "behind.example")?.state, "failed");
+  });
+
+  it("reads a page of zones rather than every zone there is", async () => {
+    const { service } = setup();
+    for (const name of ["a.example", "b.example", "c.example"]) await service.createZone(name);
+    const page = await service.statusOverview({ limit: 2, offset: 0 });
+    assert.equal(page.zones.length, 2);
+    assert.equal(page.hasMore, true);
+    assert.deepEqual(page.zones.map((entry) => entry.zone), ["a.example", "b.example"]);
   });
 
   it("does not let a slow provider for one zone block another zone", async () => {
