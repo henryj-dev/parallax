@@ -68,12 +68,38 @@ function rcodeOf(reply: Buffer | undefined): number {
   return received(reply).readUInt16BE(2) & 0x000f;
 }
 
+/**
+ * A port free for both transports, because the listener binds both.
+ *
+ * A TCP probe alone certifies the wrong thing: every caller here goes on to
+ * bind UDP, and the two have separate port spaces. A port this said was free
+ * could already be held by another UDP socket, and the bind that followed
+ * neither answered nor failed -- the test simply stopped, which is how it
+ * reached a timeout on a loaded machine and never on this one.
+ */
 async function freePort(host = "127.0.0.1"): Promise<number> {
   const probe = createServer();
   await new Promise<void>((resolve) => probe.listen(0, host, resolve));
   const port = (probe.address() as AddressInfo).port;
   await new Promise<void>((resolve) => probe.close(() => resolve()));
+  const datagram = createSocket(isIP(host) === 6 ? "udp6" : "udp4");
+  await bound(datagram, port, host);
+  await new Promise<void>((resolve) => datagram.close(resolve));
   return port;
+}
+
+/**
+ * Binds, and fails when it cannot.
+ *
+ * `bind` reports a taken port by emitting `error`, so a promise that only
+ * resolves from the callback waits for something that will never come. Every
+ * bind here used to be written that way.
+ */
+function bound(socket: ReturnType<typeof createSocket>, port: number, host: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    socket.once("error", reject);
+    socket.bind(port, host, () => { socket.removeListener("error", reject); resolve(); });
+  });
 }
 
 /**
@@ -320,7 +346,7 @@ describe("DNS server", () => {
   it("hands a name outside every zone to an upstream, and relays the bytes unchanged", async () => {
     const upstreamPort = await freePort();
     const upstream = createSocket("udp4");
-    await new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve));
+    await bound(upstream, upstreamPort, "127.0.0.1");
     upstream.on("message", (message, remote) => {
       // Answer with something this server could not have synthesized, so the
       // test can tell a relayed reply from a locally built one.
@@ -340,8 +366,8 @@ describe("DNS server", () => {
     const upstream = createSocket("udp4");
     const rogue = createSocket("udp4");
     await Promise.all([
-      new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve)),
-      new Promise<void>((resolve) => rogue.bind(0, "127.0.0.1", resolve)),
+      bound(upstream, upstreamPort, "127.0.0.1"),
+      bound(rogue, 0, "127.0.0.1"),
     ]);
     closers.push(async () => { upstream.close(); rogue.close(); });
     upstream.on("message", (message, remote) => {
@@ -375,7 +401,7 @@ describe("DNS server", () => {
   it("allows forwarding only for explicitly permitted client networks", async () => {
     const upstreamPort = await freePort();
     const upstream = createSocket("udp4");
-    await new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve));
+    await bound(upstream, upstreamPort, "127.0.0.1");
     let receivedQueries = 0;
     upstream.on("message", () => { receivedQueries += 1; });
     closers.push(async () => { upstream.close(); });
@@ -413,7 +439,7 @@ describe("DNS server", () => {
   it("bounds simultaneous upstream work and returns SERVFAIL at capacity", async () => {
     const upstreamPort = await freePort();
     const upstream = createSocket("udp4");
-    await new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve));
+    await bound(upstream, upstreamPort, "127.0.0.1");
     let firstMessage: { message: Buffer; port: number; address: string } | undefined;
     let signalFirst = (): void => {};
     const sawFirst = new Promise<void>((resolve) => { signalFirst = resolve; });
@@ -581,7 +607,7 @@ describe("DNS server", () => {
     const upstreamPort = await freePort();
     const overUdp: number[] = [];
     const udpUpstream = createSocket("udp4");
-    await new Promise<void>((resolve) => udpUpstream.bind(upstreamPort, "127.0.0.1", resolve));
+    await bound(udpUpstream, upstreamPort, "127.0.0.1");
     udpUpstream.on("message", (message, remote) => {
       overUdp.push(1);
       const truncated = Buffer.from(message.subarray(0, 12));
@@ -641,7 +667,7 @@ describe("DNS server", () => {
     async function withUpstream(zone: ServedZone) {
       const upstreamPort = await freePort();
       const upstream = createSocket("udp4");
-      await new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve));
+      await bound(upstream, upstreamPort, "127.0.0.1");
       const asked: string[] = [];
       upstream.on("message", (message, remote) => {
         asked.push(readName(message, 12).name);
@@ -745,7 +771,7 @@ describe("DNS server", () => {
       // answer SERVFAIL -- a client can retry that. Silence it cannot.
       const upstreamPort = await freePort();
       const upstream = createSocket("udp4");
-      await new Promise<void>((resolve) => upstream.bind(upstreamPort, "127.0.0.1", resolve));
+      await bound(upstream, upstreamPort, "127.0.0.1");
       const held: { message: Buffer; port: number; address: string }[] = [];
       upstream.on("message", (message, remote) => { held.push({ message, port: remote.port, address: remote.address }); });
       closers.push(async () => { upstream.close(); });
