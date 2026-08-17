@@ -10,6 +10,7 @@ import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "./config.ts";
 import { createDnsServer, type ServedZone } from "./dns/server.ts";
 import { servedZones } from "./dns/snapshot.ts";
 import { PORTAL_ASSETS } from "./http/portal-assets.ts";
+import { portalRedirect } from "./http/portal-entry.ts";
 import { createNodeHandler, requestOrigin } from "./http/api.ts";
 import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.ts";
 import { createReadinessMonitor } from "./http/readiness.ts";
@@ -271,6 +272,20 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
   const asset = staticFiles.get(pathname);
+  if (request.method === "GET" || request.method === "HEAD") {
+    const location = portalRedirect({
+      signIn: config.portalSignIn,
+      pathname,
+      isDocument: asset?.type.startsWith("text/html") ?? false,
+      authenticationRequired: securityConfig().enabled,
+      authenticated: isAuthenticated(request),
+    });
+    if (location) {
+      response.writeHead(302, { location, "cache-control": "no-store" });
+      response.end();
+      return;
+    }
+  }
   if (!asset || (request.method !== "GET" && request.method !== "HEAD")) {
     response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     response.end("Not found");

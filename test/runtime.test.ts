@@ -56,6 +56,7 @@ describe("runtime filesystem policy", () => {
         providerStateFile: join(sealed, "provider.json"),
         configurationFile: join(privateData, "configuration.json"),
         bootstrapTokens: [],
+        portalSignIn: "prompt",
       };
       const stored = new FileConfigurationStore(config.configurationFile);
       await stored.settings.write({ allowLocalProvider: true, revisionRetention: 7 });

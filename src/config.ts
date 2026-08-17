@@ -1,5 +1,6 @@
 import { isIP } from "node:net";
 import { isStrongBootstrapToken } from "./application/access-tokens.ts";
+import { isPortalSignIn, PORTAL_SIGN_IN, type PortalSignIn } from "./http/portal-entry.ts";
 import type { Role, TokenRecord } from "./security/http-authorization.ts";
 
 /**
@@ -31,6 +32,8 @@ export interface ParallaxConfig {
   httpRedirectPort?: number;
   /** Signs in through an identity provider. Unset leaves only access tokens. */
   oidc?: OidcSettings;
+  /** What the portal offers a visitor who has not signed in. Defaults to the prompt. */
+  portalSignIn: PortalSignIn;
   /** Answers DNS for the internal view directly. Unset leaves the port unbound. */
   dns?: DnsListenerSettings;
 }
@@ -79,6 +82,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     throw new Error("PARALLAX_HTTP_REDIRECT_PORT only makes sense with TLS configured on the main port");
   }
   const oidc = readOidc(environment);
+  const portalSignIn = readPortalSignIn(environment, oidc !== undefined);
   const dns = readDnsListener(environment);
   const allowPlaintextPostgres = readOptIn(
     environment.PARALLAX_ALLOW_PLAINTEXT_POSTGRES,
@@ -102,6 +106,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     ...(tls ? { tls } : {}),
     ...(httpRedirectPort !== undefined ? { httpRedirectPort } : {}),
     ...(oidc ? { oidc } : {}),
+    portalSignIn,
     ...(dns ? { dns } : {}),
   };
 }
@@ -196,6 +201,26 @@ function readOidc(environment: NodeJS.ProcessEnv): OidcSettings | undefined {
     scopes: environment.PARALLAX_OIDC_SCOPES?.trim() || "openid profile email",
     sessionMaxAgeSeconds: readSessionMaxAge(environment.PARALLAX_OIDC_SESSION_SECONDS),
   };
+}
+
+/**
+ * Refuses `idp` without an identity provider rather than falling back.
+ *
+ * The fallback would be the prompt -- the very screen this setting exists to
+ * take away -- so a deployment that asked for one thing would quietly get the
+ * other, and the only symptom would be a login page somebody thought they had
+ * removed.
+ */
+function readPortalSignIn(environment: NodeJS.ProcessEnv, hasIdentityProvider: boolean): PortalSignIn {
+  const value = environment.PARALLAX_PORTAL_SIGN_IN?.trim();
+  if (!value) return "prompt";
+  if (!isPortalSignIn(value)) {
+    throw new Error(`PARALLAX_PORTAL_SIGN_IN must be one of: ${PORTAL_SIGN_IN.join(", ")}`);
+  }
+  if (value === "idp" && !hasIdentityProvider) {
+    throw new Error("PARALLAX_PORTAL_SIGN_IN=idp sends every visitor to an identity provider; configure PARALLAX_OIDC_ISSUER and the rest of PARALLAX_OIDC_* first");
+  }
+  return value;
 }
 
 function environmentNameFor(field: string): string {

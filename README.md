@@ -214,6 +214,35 @@ Setting some but not all of the required five is refused at startup. A partly
 configured deployment meant to offer this, and starting anyway would leave a
 sign-in button that fails only when somebody presses it.
 
+#### Sending everyone to the provider
+
+```sh
+PARALLAX_PORTAL_SIGN_IN=idp     # default: prompt
+```
+
+With this, a browser that asks for the portal without a session is redirected
+straight to the provider rather than being shown the page and its token field.
+For a deployment where accounts are administered in the directory, an access
+token is a machine's credential and the field is an invitation to paste one into
+a browser.
+
+It changes what a *page* does and nothing else:
+
+| | |
+|---|---|
+| `GET /` with no session | `302` to `/auth/login?next=…` |
+| `GET /api/…` with no credential | `401` as before — a command-line client cannot sign in at a browser, and a redirect would read to it as success |
+| `GET /app.js` and the rest | served as before; the page that loads them has already been redirected |
+| Anyone holding a session or a token | unaffected |
+
+`idp` without the five settings above is refused at startup. Falling back would
+leave the prompt this setting exists to remove, and the only symptom would be a
+login page somebody thought they had taken away.
+
+**The way back in does not change.** `POST /api/v1/session` still exchanges a
+bearer token for a session cookie, so `PARALLAX_AUTH_TOKENS` remains what a
+deployment uses when the provider is the thing that is broken.
+
 **The role comes from the provider, not from here.** Parallax reads the
 `entitlements` claim the provider returns for this client and takes the highest
 of `admin`, `editor` and `viewer`. Keys it does not know are ignored. An account

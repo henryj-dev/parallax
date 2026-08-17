@@ -11,6 +11,37 @@ describe("configuration", () => {
       providerStateFile: "data/provider-state.json",
       configurationFile: "data/parallax-config.json",
       bootstrapTokens: [],
+      portalSignIn: "prompt",
+    });
+  });
+
+  describe("what the portal offers a visitor who has not signed in", () => {
+    /** Enough of an identity provider for the setting to be allowed. */
+    const IDENTITY = {
+      PARALLAX_OIDC_ISSUER: "https://idp.example.com",
+      PARALLAX_OIDC_CLIENT_ID: "parallax",
+      PARALLAX_OIDC_CLIENT_SECRET: "secret",
+      PARALLAX_OIDC_REDIRECT_URI: "https://dns.example.com/auth/callback",
+      PARALLAX_OIDC_SESSION_SECRET: "0".repeat(32),
+    };
+
+    it("sends them to the provider when asked to", () => {
+      assert.equal(readConfig({ ...IDENTITY, PARALLAX_PORTAL_SIGN_IN: "idp" }).portalSignIn, "idp");
+    });
+
+    it("refuses `idp` with no provider to send them to", () => {
+      // Falling back would leave the prompt this setting exists to remove, and
+      // the only symptom would be a login page somebody thought they had taken
+      // away.
+      assert.throws(() => readConfig({ PARALLAX_PORTAL_SIGN_IN: "idp" }), /PARALLAX_OIDC_ISSUER/u);
+    });
+
+    it("refuses a value it does not know rather than guessing which was meant", () => {
+      assert.throws(() => readConfig({ ...IDENTITY, PARALLAX_PORTAL_SIGN_IN: "oidc" }), /must be one of/u);
+    });
+
+    it("keeps the prompt when nothing is set, provider or not", () => {
+      assert.equal(readConfig(IDENTITY).portalSignIn, "prompt");
     });
   });
 
@@ -47,8 +78,11 @@ describe("configuration", () => {
       PARALLAX_CLOUDFLARE_ZONES: '{"example.com":{"zoneId":"z","token":"t"}}',
       PARALLAX_CREDENTIAL_FILE: "data/credentials.enc",
     });
+    // `portalSignIn` belongs with `oidc` rather than with these: it names which
+    // identity source this deployment uses, and editing it through the portal
+    // would be the one setting able to lock the editor out of the portal.
     assert.deepEqual(Object.keys(config).sort(), [
-      "bootstrapTokens", "configurationFile", "host", "port", "providerStateFile", "stateFile",
+      "bootstrapTokens", "configurationFile", "host", "port", "portalSignIn", "providerStateFile", "stateFile",
     ]);
   });
 
