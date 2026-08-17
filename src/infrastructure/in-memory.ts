@@ -1,6 +1,6 @@
 import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
-import { mergeApplyStatus, RevisionConflictError, type AccessTokenRepository, type AccessTokenRevocationResult, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type DesiredChange, type PageRequest, type ProviderAdapter, type RetentionPolicy, type SettingsRepository, type SettingsRepositoryUpdate, type StatusRepository, type StoredAccessToken, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
+import { mergeApplyStatus, RevisionConflictError, type AccessTokenRepository, type AccessTokenRevocationResult, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type DesiredChange, type PageRequest, type ProviderAdapter, type RetentionPolicy, type ServiceOwnedHostname, type SettingsRepository, type SettingsRepositoryUpdate, type StatusRepository, type StoredAccessToken, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 
 /** A serialized settings repository for embedded use and concurrency tests. */
 export class InMemorySettingsRepository implements SettingsRepository {
@@ -268,10 +268,12 @@ export class InMemoryStatusRepository implements StatusRepository {
 
 export class InMemoryProvider implements ProviderAdapter {
   readonly #records = new Map<string, ProviderRecord[]>();
+  readonly #owned = new Map<string, ServiceOwnedHostname[]>();
   readonly calls: Array<{ target: string; operation: ReconcileOperation }> = [];
   #nextId = 1;
   failure?: Error;
   listFailure?: Error;
+  serviceOwnershipFailure?: Error;
 
   async list(target: string): Promise<ProviderRecord[]> {
     if (this.listFailure) throw this.listFailure;
@@ -296,8 +298,22 @@ export class InMemoryProvider implements ProviderAdapter {
     this.#records.set(target, records);
   }
 
+  /**
+   * `undefined` until a target is seeded, which is the answer of a provider
+   * that cannot say who owns what -- the state most providers are in, and the
+   * one that must never be read as "no service owns any of these names".
+   */
+  async serviceOwnership(target: string): Promise<ServiceOwnedHostname[] | undefined> {
+    if (this.serviceOwnershipFailure) throw this.serviceOwnershipFailure;
+    return this.#owned.get(target)?.map((hostname) => ({ ...hostname }));
+  }
+
   seed(target: string, records: ProviderRecord[]): void {
     this.#records.set(target, records.map((record) => ({ ...record })));
+  }
+
+  seedServiceOwnership(target: string, hostnames: ServiceOwnedHostname[]): void {
+    this.#owned.set(target, hostnames.map((hostname) => ({ ...hostname })));
   }
 }
 

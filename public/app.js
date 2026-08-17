@@ -227,17 +227,23 @@ function renderRecords(state) {
     const overridden = state.records.some((candidate) => candidate.name === record.name
       && candidate.type === record.type && candidate.views.internal.content);
     const internal = record.views.internal.content || (overridden ? "" : record.views.external.content);
+    // A record its provider owns is shown the way the provider shows it: the
+    // service in the type column and the worker or bucket as the answer, with
+    // both buttons closed. Reading the stored CNAME as a target is what invites
+    // the edit that breaks the binding, and the edit cannot be made here
+    // anyway -- a button that only fails is worse than one that is not offered.
+    const owned = Boolean(record.views.external.managed);
+    const hint = escapeHtml(t("record.providerOwnedHint"));
     return `<tr>
-      <td><span class="record-identity"><b>${escapeHtml(displayName(record.name))}</b><small>${escapeHtml(record.type)}</small></span></td>
+      <td><span class="record-identity"><b>${escapeHtml(displayName(record.name))}</b><small${owned ? ' class="service-type"' : ""}>${escapeHtml(record.typeLabel || record.type)}</small></span></td>
       <td data-label="${escapeHtml(t("record.internalAnswer"))}"><div class="record-answer ${record.views.internal.content ? "" : "inherited"}">${escapeHtml(internal || t(overridden ? "record.overridden" : "record.noAnswer"))}</div></td>
-      <td data-label="${escapeHtml(t("record.externalAnswer"))}"><div class="record-answer">${escapeHtml(record.views.external.content || t("record.noAnswer"))}${record.views.external.proxied ? `<span class="proxy-badge">${escapeHtml(t("record.proxied"))}</span>` : ""}</div></td>
+      <td data-label="${escapeHtml(t("record.externalAnswer"))}"><div class="record-answer"${owned ? ` title="${escapeHtml(record.views.external.content)}"` : ""}>${escapeHtml(record.views.external.label || record.views.external.content || t("record.noAnswer"))}${record.views.external.proxied ? `<span class="proxy-badge">${escapeHtml(t("record.proxied"))}</span>` : ""}</div></td>
       <td data-label="TTL"><span class="record-answer">${escapeHtml(formatTtl(record.views.internal.ttl))} / ${escapeHtml(formatTtl(record.views.external.ttl))}</span></td>
-      <td><div class="row-actions"><button class="row-action" type="button" data-edit-record="${index}">${escapeHtml(t("record.edit"))}</button>${record.views.external.managed
-          // Deleting it here changes DNS without telling whatever created it,
-          // so the record comes back and what it belongs to breaks in between.
-          // Editing stays open: the internal answer is ours to set.
-          ? `<button class="row-action danger" type="button" disabled title="${escapeHtml(t("record.providerOwnedHint"))}">${escapeHtml(t("record.delete"))}</button>`
-          : `<button class="row-action danger" type="button" data-delete-record="${index}">${escapeHtml(t("record.delete"))}</button>`}</div></td>
+      <td><div class="row-actions">${owned
+          ? `<button class="row-action" type="button" disabled title="${hint}">${escapeHtml(t("record.view"))}</button>`
+            + `<button class="row-action danger" type="button" disabled title="${hint}">${escapeHtml(t("record.delete"))}</button>`
+          : `<button class="row-action" type="button" data-edit-record="${index}">${escapeHtml(t("record.edit"))}</button>`
+            + `<button class="row-action danger" type="button" data-delete-record="${index}">${escapeHtml(t("record.delete"))}</button>`}</div></td>
     </tr>`;
   }).join("");
 }
@@ -260,9 +266,13 @@ function renderLens(state) {
     || (overridden ? t("record.overridden") : record?.views.external.content)
     || t("record.noAnswerDefined");
   $("#internal-answer").textContent = record ? internal : t("record.noneYet");
-  $("#external-answer").textContent = record ? (record.views.external.content || t("record.noAnswerDefined")) : t("record.noneYet");
+  $("#external-answer").textContent = record
+    ? (record.views.external.label || record.views.external.content || t("record.noAnswerDefined"))
+    : t("record.noneYet");
+  // Inside sees the record as DNS holds it, because that is what it inherits.
+  // Outside is where the service answers, so that is where it is named.
   $("#internal-type").textContent = record?.type || "—";
-  $("#external-type").textContent = record?.type || "—";
+  $("#external-type").textContent = record?.typeLabel || record?.type || "—";
   $("#internal-ttl").textContent = t("ttl.label", { value: record ? formatTtl(record.views.internal.ttl) : "—" });
   $("#external-ttl").textContent = t("ttl.label", { value: record ? formatTtl(record.views.external.ttl) : "—" });
   $("#proxy-label").textContent = t(record?.views.external.proxied ? "record.proxiedLabel" : "record.dnsOnly");

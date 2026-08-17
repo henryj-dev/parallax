@@ -13,6 +13,8 @@ import {
   type AuditEntry,
   type DesiredRecord,
   type DnsView,
+  type ManagedByService,
+  type ProviderManagement,
   type Zone,
   type ZoneRevision,
 } from "../domain/dns.ts";
@@ -37,24 +39,48 @@ export class ProviderManagedRecordError extends Error {
  * and replacing the desired state wholesale all arrive here. A guard that only
  * watched the two obvious doors would be one `PUT /desired` away from useless.
  *
- * Only the external view is guarded. The internal view exists to answer these
- * names differently -- overriding a provider-served name with an address that
- * only makes sense inside is the reason it exists -- so the same record shape is
- * refused in one view and expected in the other.
+ * The internal view is closed for the same names, but only against being
+ * written. An override is a second answer for a name whose first answer this
+ * process cannot describe, and a name it cannot describe is one it should not
+ * be quietly answering differently either -- that is a split nobody can see
+ * from the provider's side and nobody can correct from this one. Removing an
+ * override is still allowed: it moves the name back to what the provider
+ * serves, which is the direction that cannot break anything.
  */
 function assertProviderManagedIntact(before: readonly DnsView[], after: readonly DnsView[]): void {
   const externalBefore = before.find((view) => view.name === "external");
   if (!externalBefore) return;
   const externalAfter = after.find((view) => view.name === "external");
+  const managed: Array<{ record: DesiredRecord; management: ProviderManagement }> = [];
   for (const record of externalBefore.records) {
     const management = providerManagement(record);
     if (!management) continue;
+    managed.push({ record, management });
     const survivor = externalAfter?.records.find((candidate) => candidate.id === record.id);
-    if (survivor && survivor.name === record.name && survivor.type === record.type && survivor.content === record.content) continue;
+    // The binding counts as part of the record here, though reconciliation
+    // ignores it. It is the whole reason this record cannot be edited, so a
+    // request that simply left it out would be the one edit that always
+    // worked -- and it would unlock every other edit after it.
+    if (survivor && survivor.name === record.name && survivor.type === record.type
+      && survivor.content === record.content && sameService(record.managedBy, survivor.managedBy)) continue;
     const what = survivor ? "changed" : "deleted";
     throw new ProviderManagedRecordError(
       `${record.type} ${record.name} cannot be ${what} here: ${management.reason}. Change it where it was created, and adopt the zone again`,
     );
+  }
+  if (managed.length === 0) return;
+  const internalBefore = before.find((view) => view.name === "internal")?.records ?? [];
+  const internalAfter = after.find((view) => view.name === "internal")?.records ?? [];
+  const answersFor = (records: readonly DesiredRecord[], record: DesiredRecord): DesiredRecord[] =>
+    records.filter((candidate) => candidate.name === record.name && candidate.type === record.type);
+  for (const { record, management } of managed) {
+    const was = answersFor(internalBefore, record);
+    for (const answer of answersFor(internalAfter, record)) {
+      if (was.some((candidate) => candidate.id === answer.id && candidate.content === answer.content)) continue;
+      throw new ProviderManagedRecordError(
+        `${record.type} ${record.name} cannot be answered differently inside: ${management.reason}. Change it where it was created, and adopt the zone again`,
+      );
+    }
   }
 }
 
@@ -487,15 +513,37 @@ export class ControlPlane {
       adopted.push(desired);
       target.records.push(desired);
     }
+    // Which of these names a provider service publishes for itself, asked of
+    // the services rather than of DNS, because a record does not say.
+    //
+    // Applied to every record in the view and not only the new ones: a name
+    // becomes a Worker custom domain, or stops being one, without its DNS
+    // record changing at all, and adoption is the one thing that catches up.
+    // Only a read that succeeded may unlock a record -- an ownership lookup
+    // that failed says nothing about who owns what, and treating silence as
+    // "nobody" would hand an operator the edit that breaks the binding.
+    const ownership = await this.#serviceOwnership(zone.name, view);
+    if (ownership.owned) {
+      for (const record of target.records) {
+        // Only the types a service can stand in front of. A name may hold a
+        // TXT beside its Worker custom domain, and that record is nobody's but
+        // the operator's -- matching on the name alone would lock it too.
+        const owner = canBeProxied(record.type) ? ownership.owned.get(record.name) : undefined;
+        if (sameService(record.managedBy, owner)) continue;
+        if (owner) record.managedBy = owner;
+        else delete record.managedBy;
+        if (!refreshed.includes(record) && !adopted.includes(record)) refreshed.push(record);
+      }
+    }
     if (adopted.length === 0 && refreshed.length === 0) {
-      return { zone, adopted, refreshed, warnings: [], seen: actual.length };
+      return { zone, adopted, refreshed, warnings: ownership.warnings, seen: actual.length };
     }
 
     if (view === "external") target.records = normalizeExternalRecords(target.records);
     ensureUniqueRecordKeys(target.records);
     materializeProviderViews(views);
     const updated = this.#nextRevision(zone, views);
-    const warnings = authorityWarnings(zone, updated, dryRun);
+    const warnings = [...ownership.warnings, ...authorityWarnings(zone, updated, dryRun)];
     // Everything above decided what would happen; nothing has been written yet.
     // A dry run stops here, which is the whole point: adopting is what turns a
     // forwarded zone into one this process is the authority for, so finding that
@@ -506,6 +554,36 @@ export class ControlPlane {
       { view, adopted: adopted.length, ...(refreshed.length > 0 ? { refreshed: refreshed.length } : {}) },
       new Set(views.map((candidate) => candidate.name)), expectedRevision);
     return { zone: updated, adopted, refreshed, warnings, seen: actual.length };
+  }
+
+  /**
+   * Asks the provider which names its own services publish.
+   *
+   * Never fails adoption. A provider that cannot answer -- one with no such
+   * services, a token without the permission, an account id nobody filled in --
+   * leaves every stored label exactly as it was and says so where the operator
+   * is already reading. The alternative, refusing to adopt, would make
+   * describing a zone depend on a lookup that has nothing to do with the
+   * records being described.
+   */
+  async #serviceOwnership(zoneName: string, view: string): Promise<{
+    owned?: Map<string, ManagedByService>;
+    warnings: string[];
+  }> {
+    if (!this.#provider.serviceOwnership) return { warnings: [] };
+    try {
+      const hostnames = await this.#provider.serviceOwnership(targetKey(zoneName, view));
+      if (!hostnames) return { warnings: [] };
+      const owned = new Map<string, ManagedByService>();
+      for (const hostname of hostnames) {
+        owned.set(hostname.name, { service: hostname.service, resource: hostname.resource });
+      }
+      return { owned, warnings: [] };
+    } catch (error) {
+      return {
+        warnings: [`which names Workers and R2 own could not be read, so records already marked as theirs keep that mark and no new ones gained it: ${error instanceof Error ? error.message : String(error)}`],
+      };
+    }
   }
 
   async listRevisions(zoneName: string, page?: PageRequest): Promise<Paged<"revisions", ZoneRevision>> {
@@ -1155,6 +1233,12 @@ function describeAdopted(id: string, record: ProviderRecord): DesiredRecord {
     throw new DomainValidationError(error.issues.map((issue) =>
       `${record.name} ${record.type} ${record.content}: ${issue}`));
   }
+}
+
+/** Whether two records name the same service binding, absence included. */
+function sameService(left: ManagedByService | undefined, right: ManagedByService | undefined): boolean {
+  if (!left || !right) return left === right;
+  return left.service === right.service && left.resource === right.resource;
 }
 
 /** Whether a desired record already says what a provider record says. */

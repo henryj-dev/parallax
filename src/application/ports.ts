@@ -1,4 +1,4 @@
-import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
+import type { AuditEntry, ManagingService, Zone, ZoneRevision } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 
 export class RevisionConflictError extends Error {
@@ -139,9 +139,32 @@ export interface ZoneRepository {
   audit(zone?: string, page?: PageRequest): Promise<AuditEntry[]>;
 }
 
+/** One hostname a provider service publishes, and the resource behind it. */
+export interface ServiceOwnedHostname {
+  /** Relative to the zone, `@` for the apex -- the same shape a record's name has. */
+  readonly name: string;
+  readonly service: ManagingService;
+  readonly resource: string;
+}
+
 export interface ProviderAdapter {
   list(target: string): Promise<ProviderRecord[]>;
   apply(target: string, operation: Exclude<ReconcileOperation, { kind: "conflict" }>): Promise<void>;
+  /**
+   * Which names a provider service publishes for itself, where the provider can
+   * say. A DNS record does not carry that -- Cloudflare's record API has no
+   * marker for it -- so it is asked of the services that hold the bindings.
+   *
+   * Optional, and asked only while adopting rather than on every list: it needs
+   * permissions reconciliation does not, and an apply that started failing
+   * because a token could not read Workers would be a cost paid on every run
+   * for something only adoption records.
+   *
+   * `undefined` means this provider cannot say, which is not the same answer as
+   * an empty list. An empty list is a provider reporting that its services own
+   * none of these names, and that unlocks records; silence must not.
+   */
+  serviceOwnership?(target: string): Promise<ServiceOwnedHostname[] | undefined>;
 }
 
 /** Coordinates provider reconciliation for a zone across control-plane instances. */

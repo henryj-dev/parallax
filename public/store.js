@@ -684,10 +684,29 @@ export function readRecords(zone) {
  */
 export function providerManagedReason(record) {
   const content = String(record?.content ?? "").trim();
+  if (managingService(record)) return "service";
   if (record?.type === "A" && content === "192.0.2.0") return "originless";
   if (record?.type === "AAAA" && isDiscardAddress(content)) return "originless";
   if (record?.type === "CNAME" && content.replace(/\.$/u, "").toLowerCase().endsWith(".r2.dev")) return "service";
   return "";
+}
+
+/**
+ * Mirrors `MANAGING_SERVICE_LABELS` in `src/domain/dns.ts`.
+ *
+ * A record a provider service publishes is stored as the CNAME it is, and that
+ * is not what it is. The table says `Worker` or `R2` and names the worker or
+ * bucket, as the provider's own table does, because reading the DNS value as a
+ * target is what invites the edit that breaks the binding.
+ */
+const SERVICE_LABELS = { worker: "Worker", r2: "R2" };
+
+/** The service binding on a record, or `undefined` when nothing claims it. */
+function managingService(record) {
+  const binding = record?.managedBy;
+  if (!binding || typeof binding !== "object") return undefined;
+  const label = SERVICE_LABELS[binding.service];
+  return label && binding.resource ? { label, resource: String(binding.resource) } : undefined;
 }
 
 /** `100::` however it is spelled. */
@@ -709,10 +728,16 @@ function isDiscardAddress(content) {
 function toRow(external, internal) {
   const source = external ?? internal;
   const proxied = Boolean(external?.proxied);
+  const service = external ? managingService(external) : undefined;
   return {
     id: source.id,
     name: source.name,
     type: source.type,
+    // What the row shows where it shows a type and an outside answer. The
+    // stored CNAME is still `type` and `content`, because that is what is
+    // saved and reconciled; these two are what the record means.
+    typeLabel: service ? service.label : source.type,
+    ...(service ? { managedBy: { ...external.managedBy } } : {}),
     views: {
       internal: {
         id: internal?.id ?? source.id,
@@ -727,6 +752,8 @@ function toRow(external, internal) {
         acknowledgeNonGlobalIp: Boolean(external?.acknowledgeNonGlobalIp),
         // Why the provider owns this record, or "" when nobody but us does.
         managed: external ? providerManagedReason(external) : "",
+        /** What the outside answer is, named as the thing that owns it. */
+        label: service ? service.resource : (external?.content ?? ""),
       },
     },
   };
@@ -768,6 +795,10 @@ export function desiredState(records) {
       ? {
         ...(["A", "AAAA", "CNAME"].includes(row.type) ? { proxied: row.views.external.proxied } : {}),
         ...(row.views.external.acknowledgeNonGlobalIp ? { acknowledgeNonGlobalIp: true } : {}),
+        // Sent back untouched. The server treats a missing binding as a
+        // changed record and refuses the save, which is what stops a page
+        // that forgot the field from quietly unlocking every locked row.
+        ...(row.managedBy ? { managedBy: row.managedBy } : {}),
       }
       : {}),
   });

@@ -55,6 +55,8 @@ export interface DesiredRecord {
   proxied?: boolean;
   /** Explicit operator acknowledgement required before publishing a non-global address externally. */
   acknowledgeNonGlobalIp?: boolean;
+  /** Set by adoption when a provider service claims this name; never by an operator. */
+  managedBy?: ManagedByService;
 }
 
 export interface DnsView {
@@ -357,6 +359,74 @@ function isBase64(value: string): boolean {
  * serves itself. Editing or deleting one through here changes DNS without
  * changing what created it, so the binding breaks and the record comes back.
  */
+/**
+ * A provider service that publishes a name it serves itself.
+ *
+ * Cloudflare's own table does not show these as the CNAME they are stored as.
+ * It shows `Worker` or `R2` and the name of the worker or bucket behind them,
+ * because that is what the record is: the DNS value is an implementation
+ * detail of a binding made somewhere else, and reading it as a target invites
+ * an operator to point it at something better, which is the one edit that
+ * breaks the binding without changing what made it.
+ *
+ * Nothing in a DNS record says which service made it -- the API's type list is
+ * the 21 real types and its response carries no marker -- so this is read from
+ * the service that owns the binding and stored on the record. Adoption is what
+ * writes it, and re-adopting is what corrects it.
+ */
+export const MANAGING_SERVICES = ["worker", "r2"] as const;
+
+export type ManagingService = (typeof MANAGING_SERVICES)[number];
+
+/** What the provider's own table shows in the type column for each service. */
+export const MANAGING_SERVICE_LABELS: Readonly<Record<ManagingService, string>> = { worker: "Worker", r2: "R2" };
+
+export interface ManagedByService {
+  readonly service: ManagingService;
+  /** The worker script or bucket this record stands for. */
+  readonly resource: string;
+}
+
+/**
+ * What a reader of the record means by its type: `Worker` and `R2` where a
+ * service owns the name, and the DNS type everywhere else.
+ */
+export function recordTypeLabel(record: Pick<DesiredRecord, "type"> & { readonly managedBy?: ManagedByService }): string {
+  return record.managedBy ? MANAGING_SERVICE_LABELS[record.managedBy.service] : record.type;
+}
+
+/** What the record points at, named as the thing that owns it where one does. */
+export function recordContentLabel(record: Pick<DesiredRecord, "content"> & { readonly managedBy?: ManagedByService }): string {
+  return record.managedBy ? record.managedBy.resource : record.content;
+}
+
+/** A worker script or bucket name, as the services that own them allow. */
+const SERVICE_RESOURCE = /^[a-z0-9][a-z0-9._-]{0,62}$/i;
+
+/**
+ * Reads a service binding off stored or adopted state.
+ *
+ * `undefined` means the record names no service; anything present but
+ * malformed is refused rather than dropped, because a dropped binding is a
+ * record that silently becomes editable.
+ */
+export function readManagedByService(value: unknown): ManagedByService | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new DomainValidationError(["managedBy must be an object"]);
+  }
+  const input = value as Record<string, unknown>;
+  const service = typeof input.service === "string" ? input.service.toLowerCase() : "";
+  if (!MANAGING_SERVICES.some((candidate) => candidate === service)) {
+    throw new DomainValidationError([`managedBy.service must be one of ${MANAGING_SERVICES.join(", ")}`]);
+  }
+  const resource = typeof input.resource === "string" ? input.resource.trim() : "";
+  if (!SERVICE_RESOURCE.test(resource)) {
+    throw new DomainValidationError(["managedBy.resource must be the name of a worker or bucket"]);
+  }
+  return { service: service as ManagingService, resource };
+}
+
 export interface ProviderManagement {
   /** Said back to whoever tried to change it. */
   readonly reason: string;
@@ -385,8 +455,26 @@ const ORIGINLESS_V4: readonly string[] = ["192.0.2.0"];
 /** Hostnames whose records a provider service owns, though the value still works. */
 const MANAGED_CNAME_SUFFIXES: readonly string[] = [".r2.dev"];
 
-export function providerManagement(record: { readonly type: RecordType; readonly content: string }): ProviderManagement | undefined {
+export function providerManagement(record: {
+  readonly type: RecordType;
+  readonly content: string;
+  readonly managedBy?: ManagedByService;
+}): ProviderManagement | undefined {
   const content = record.content.trim();
+  // Read rather than trusted, though `createDesiredRecord` has already refused
+  // anything else: this is also the portal's rule, and the two are compared
+  // against each other. A binding one of them can read and the other cannot is
+  // a row the page offers to edit and the server refuses to save.
+  if (record.managedBy && MANAGING_SERVICES.some((service) => service === record.managedBy?.service)
+    && record.managedBy.resource) {
+    // The name resolves and answers -- the service is the origin -- so the
+    // internal view can inherit it. What it cannot do is describe it, which is
+    // why the whole row is closed rather than only its external half.
+    return {
+      reason: `${MANAGING_SERVICE_LABELS[record.managedBy.service]} ${record.managedBy.resource} serves this name and owns this record`,
+      originless: false,
+    };
+  }
   if (record.type === "A" && isOriginlessV4(content)) {
     return { reason: "the provider serves this name itself and keeps a reserved placeholder address here", originless: true };
   }
@@ -474,6 +562,16 @@ export function createDesiredRecord(id: string, input: unknown): DesiredRecord {
   if (value.acknowledgeNonGlobalIp !== undefined && !["A", "AAAA"].includes(typeValue)) {
     issues.push("acknowledgeNonGlobalIp is supported only for A and AAAA records");
   }
+  // Read here rather than only where adoption writes it, because every stored
+  // record is rebuilt through this function: a field this dropped would be a
+  // lock that survives until the next restart and then quietly does not.
+  let managedBy: ManagedByService | undefined;
+  try {
+    managedBy = readManagedByService(value.managedBy);
+  } catch (error) {
+    if (!(error instanceof DomainValidationError)) throw error;
+    issues.push(...error.issues);
+  }
 
   if (issues.length > 0) throw new DomainValidationError(issues);
   if (typeValue === "CNAME") content = content.toLowerCase().replace(/\.$/, "");
@@ -487,6 +585,7 @@ export function createDesiredRecord(id: string, input: unknown): DesiredRecord {
   };
   if (value.proxied !== undefined) record.proxied = value.proxied as boolean;
   if (value.acknowledgeNonGlobalIp !== undefined) record.acknowledgeNonGlobalIp = value.acknowledgeNonGlobalIp as boolean;
+  if (managedBy) record.managedBy = managedBy;
   return record;
 }
 

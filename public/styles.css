@@ -135,6 +135,8 @@ tr:last-child td { border-bottom: 0; }
 .record-identity b, .record-identity small { display: block; }
 .record-identity b { font: 600 12px var(--mono); }
 .record-identity small { margin-top: 4px; color: var(--muted); font: 9px var(--mono); }
+/* A service name, not a DNS type -- so it does not read as one. */
+.record-identity small.service-type { color: var(--external); font-weight: 600; letter-spacing: 0.04em; }
 .record-answer { max-width: 190px; overflow: hidden; text-overflow: ellipsis; font: 11px var(--mono); white-space: nowrap; }
 .inherited { color: var(--muted); font-style: italic; }
 .proxy-badge { display: inline-block; margin-left: 6px; padding: 3px 5px; color: var(--external); background: #fff3e3; border-radius: 4px; font: 8px var(--mono); text-transform: uppercase; }

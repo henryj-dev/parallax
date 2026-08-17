@@ -240,4 +240,70 @@ describe("CloudflareProviderAdapter", () => {
     await assert.rejects(() => adapter.list("example.com/external"), /pagination exceeds/);
     assert.ok(signal instanceof AbortSignal);
   });
+
+  describe("which names Workers and R2 publish for themselves", () => {
+    const serviceFetch = (paths: string[]) => async (input: string | URL | Request): Promise<Response> => {
+      const path = String(input);
+      paths.push(path.replace("https://api.cloudflare.com/client/v4", ""));
+      if (path.includes("/workers/domains")) {
+        return Response.json({
+          success: true,
+          result: [
+            { id: "d1", hostname: "example.com", service: "tinyuniverse-dashboard", zone_id: "zone-1" },
+            { id: "d2", hostname: "contract-api.example.com", service: "tiny-contract-api", zone_id: "zone-1" },
+          ],
+        });
+      }
+      if (path.includes("/r2/buckets/")) {
+        const bucket = /\/r2\/buckets\/([^/]+)\//u.exec(path)?.[1];
+        return Response.json({
+          success: true,
+          result: {
+            domains: bucket === "tnuv-static"
+              ? [{ domain: "static-apps.example.com", enabled: true }, { domain: "cdn.elsewhere.test", enabled: true }]
+              : [{ domain: "static-toss.example.com", enabled: false }],
+          },
+        });
+      }
+      return Response.json({ success: true, result: { buckets: [{ name: "tnuv-static" }, { name: "appintoss" }] } });
+    };
+
+    it("names the worker and the bucket behind each hostname in this zone", async () => {
+      const paths: string[] = [];
+      const adapter = new CloudflareProviderAdapter({
+        token: "secret", zoneId: "zone-1", accountId: "acct-1",
+        ownershipSecret: OWNERSHIP_SECRET, fetch: serviceFetch(paths),
+      });
+
+      assert.deepEqual(await adapter.serviceOwnership("example.com/external"), [
+        { name: "@", service: "worker", resource: "tinyuniverse-dashboard" },
+        { name: "contract-api", service: "worker", resource: "tiny-contract-api" },
+        { name: "static-apps", service: "r2", resource: "tnuv-static" },
+        // Disabled, not removed: the bucket stopped serving the name, it did
+        // not hand the record back, so the record is still not ours to edit.
+        { name: "static-toss", service: "r2", resource: "appintoss" },
+      ]);
+      assert.ok(paths[0]?.includes("zone_id=zone-1"), "the Workers lookup is filtered to this zone");
+      assert.ok(!paths.some((path) => path.includes("cdn.elsewhere")), "a bucket domain in another zone is simply not ours");
+    });
+
+    it("says so instead of guessing when no account id was configured", async () => {
+      // The zone reconciles without one -- DNS is zone-scoped and these lookups
+      // are not -- so this has to fail loudly rather than report nothing owned,
+      // which is the answer that unlocks every row.
+      const adapter = new CloudflareProviderAdapter({
+        token: "secret", zoneId: "zone-1", ownershipSecret: OWNERSHIP_SECRET,
+        fetch: async () => Response.json({ success: true, result: [] }),
+      });
+      await assert.rejects(() => adapter.serviceOwnership("example.com/external"), /account id/u);
+    });
+
+    it("refuses a partial answer when an account holds more buckets than it will read", async () => {
+      const adapter = new CloudflareProviderAdapter({
+        token: "secret", zoneId: "zone-1", accountId: "acct-1", maxBuckets: 1,
+        ownershipSecret: OWNERSHIP_SECRET, fetch: serviceFetch([]),
+      });
+      await assert.rejects(() => adapter.serviceOwnership("example.com/external"), /cannot be read completely/u);
+    });
+  });
 });

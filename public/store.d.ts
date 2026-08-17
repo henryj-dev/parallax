@@ -38,6 +38,14 @@ export interface RecordViewValue {
   acknowledgeNonGlobalIp?: boolean;
   /** Why the provider owns this record, or "" when nobody but us does. */
   managed?: string;
+  /** The answer as the row shows it: the worker or bucket where one owns it. */
+  label?: string;
+}
+
+/** The service that publishes a name for itself, as the record records it. */
+export interface ManagedByService {
+  service: string;
+  resource: string;
 }
 
 /**
@@ -49,6 +57,10 @@ export interface RecordRow {
   id: string;
   name: string;
   type: string;
+  /** `Worker`, `R2`, or the DNS type where no service owns the name. */
+  typeLabel?: string;
+  /** Carried through an edit and sent back, so a save cannot drop the lock. */
+  managedBy?: ManagedByService;
   views: { internal: RecordViewValue; external: RecordViewValue };
 }
 

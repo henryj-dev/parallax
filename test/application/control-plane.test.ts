@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { inspect } from "node:util";
 import { ConflictError, ControlPlane, DEFAULT_HISTORY_PAGE_SIZE, NotFoundError, ProviderManagedRecordError } from "../../src/application/control-plane.ts";
 import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type DesiredChange, type ProviderAdapter, type ZoneDeletion } from "../../src/application/ports.ts";
 import type { DesiredRecord } from "../../src/domain/dns.ts";
@@ -283,16 +284,22 @@ describe("ControlPlane", () => {
     const base: Required<Omit<DesiredRecord, "id">> = {
       name: "www", type: "A", content: "8.8.8.10", ttl: 300,
       proxied: false, acknowledgeNonGlobalIp: false,
+      managedBy: { service: "worker", resource: "dashboard" },
     };
     const moved: Record<string, unknown> = {
       name: "web", type: "AAAA", content: "8.8.8.11", ttl: 600, proxied: true,
-      acknowledgeNonGlobalIp: true,
+      acknowledgeNonGlobalIp: true, managedBy: { service: "r2", resource: "assets" },
     };
     for (const field of Object.keys(base)) {
       const { service } = setup();
       await service.createZone("example.com");
-      await service.upsertRecord("example.com", "external", "web", base);
-      const after: Record<string, unknown> = { ...base, [field]: moved[field] };
+      // Every record starts without a service binding, because carrying one is
+      // what refuses the next edit -- so the binding is a field that arrives,
+      // and the other fields move on a record still free to move.
+      const before: Record<string, unknown> = { ...base };
+      delete before.managedBy;
+      await service.upsertRecord("example.com", "external", "web", before);
+      const after: Record<string, unknown> = { ...before, [field]: moved[field] };
       // AAAA needs an address of its own family; the point is the field moved.
       if (field === "type") { after.content = "2001:4860:4860::8888"; }
       await service.upsertRecord("example.com", "external", "web", after);
@@ -1181,15 +1188,130 @@ describe("ControlPlane", () => {
       assert.equal(zone.views.find((view) => view.name === "external")?.records.length, 2, "nothing was dropped");
     });
 
-    it("still allows the internal view to answer the same name differently", async () => {
-      // The point of the internal view. The record shape refused above is the
-      // record shape expected here, and the guard has to tell the two apart.
+    it("refuses to answer the same name differently inside", async () => {
+      // The internal view exists to answer a name differently, and it still
+      // does for every name this control plane can describe. Not for these:
+      // the outside answer is one nobody here can read or correct, so a second
+      // answer beside it is a split visible from neither side.
       const service = await withPlaceholder();
-      const updated = await service.upsertRecord("example.com", "internal", "apex-inside", {
-        name: "@", type: "AAAA", content: "fd00::1", ttl: 60, acknowledgeNonGlobalIp: true,
+      await assert.rejects(
+        service.upsertRecord("example.com", "internal", "apex-inside", {
+          name: "@", type: "AAAA", content: "fd00::1", ttl: 60, acknowledgeNonGlobalIp: true,
+        }),
+        (error: unknown) => error instanceof ProviderManagedRecordError && /answered differently inside/u.test(error.message),
+      );
+      const zone = await service.getZone("example.com");
+      const inside = zone.views.find((view) => view.name === "internal")?.records ?? [];
+      assert.ok(!inside.some((record) => record.content === "fd00::1"), "the override was refused");
+    });
+
+    it("still lets an override be taken away, which returns the name to the provider", async () => {
+      // Removing one only moves the name back to what the provider serves, so
+      // the direction that cannot break a binding stays open -- otherwise an
+      // override made before the lock existed could never be undone.
+      const service = await withPlaceholder();
+      const zone = await service.getZone("example.com");
+      const external = zone.views.find((view) => view.name === "external")?.records ?? [];
+      const inside = zone.views.find((view) => view.name === "internal")?.records ?? [];
+      const kept = inside.filter((record) => record.name !== "@");
+      const updated = await service.replaceDesiredState("example.com", {
+        views: [{ name: "internal", records: kept }, { name: "external", records: external }],
       });
-      const inside = updated.views.find((view) => view.name === "internal")?.records ?? [];
-      assert.ok(inside.some((record) => record.content === "fd00::1"), "the override was accepted");
+      assert.ok(updated.revision > zone.revision, "the replace was accepted");
+    });
+
+    it("learns from the services which names they publish, and locks those rows", async () => {
+      // The record is an ordinary proxied CNAME. Nothing in DNS says a Worker
+      // is behind it -- Cloudflare's record API has no field for that -- so the
+      // lock can only come from asking the service that holds the binding.
+      const { service, provider } = setup();
+      await service.createZone("example.com");
+      provider.seed("example.com/external", [
+        { id: "a", name: "contract-api", type: "CNAME", content: "origin.example.net", ttl: 1, proxied: true, providerId: "cf-1", managed: false },
+        { id: "b", name: "www", type: "A", content: "8.8.8.10", ttl: 300, providerId: "cf-2", managed: false },
+      ]);
+      provider.seedServiceOwnership("example.com/external", [
+        { name: "contract-api", service: "worker", resource: "tiny-contract-api" },
+      ]);
+      await service.adoptProviderRecords("example.com", "external", "operator");
+
+      const records = (await service.getZone("example.com")).views.find((view) => view.name === "external")?.records ?? [];
+      const api = records.find((record) => record.name === "contract-api");
+      assert.deepEqual(api?.managedBy, { service: "worker", resource: "tiny-contract-api" });
+      assert.equal(records.find((record) => record.name === "www")?.managedBy, undefined,
+        "a name no service claims stays the operator's");
+
+      await assert.rejects(
+        service.upsertRecord("example.com", "external", api?.id ?? "", { name: "contract-api", type: "CNAME", content: "elsewhere.example.net", ttl: 1, proxied: true }),
+        (error: unknown) => error instanceof ProviderManagedRecordError && /Worker tiny-contract-api/u.test(error.message),
+      );
+    });
+
+    it("gives the row back when the service stops publishing the name", async () => {
+      // The DNS record does not change when a custom domain is removed from a
+      // worker -- the binding does. Refusing to edit these is only honest if
+      // adopting again is the way out, so adoption has to be able to unlock.
+      const { service, provider } = setup();
+      await service.createZone("example.com");
+      provider.seed("example.com/external", [
+        { id: "a", name: "contract-api", type: "CNAME", content: "origin.example.net", ttl: 1, proxied: true, providerId: "cf-1", managed: false },
+      ]);
+      provider.seedServiceOwnership("example.com/external", [
+        { name: "contract-api", service: "worker", resource: "tiny-contract-api" },
+      ]);
+      await service.adoptProviderRecords("example.com", "external", "operator");
+
+      provider.seedServiceOwnership("example.com/external", []);
+      const result = await service.adoptProviderRecords("example.com", "external", "operator");
+      assert.equal(result.refreshed.length, 1, "the binding falling away is a refresh, not a new record");
+      const records = (await service.getZone("example.com")).views.find((view) => view.name === "external")?.records ?? [];
+      assert.equal(records[0]?.managedBy, undefined, "the row is the operator's again");
+    });
+
+    it("keeps every lock when the services cannot be reached, and says it did", async () => {
+      // Silence is not an answer. A lookup that failed says nothing about who
+      // owns what, and reading it as "nobody" would hand the operator exactly
+      // the edit that breaks the binding.
+      const { service, provider } = setup();
+      await service.createZone("example.com");
+      provider.seed("example.com/external", [
+        { id: "a", name: "contract-api", type: "CNAME", content: "origin.example.net", ttl: 1, proxied: true, providerId: "cf-1", managed: false },
+      ]);
+      provider.seedServiceOwnership("example.com/external", [
+        { name: "contract-api", service: "worker", resource: "tiny-contract-api" },
+      ]);
+      await service.adoptProviderRecords("example.com", "external", "operator");
+
+      provider.serviceOwnershipFailure = new Error("Cloudflare API request failed (HTTP 403)");
+      const result = await service.adoptProviderRecords("example.com", "external", "operator");
+      assert.ok(result.warnings.some((warning) => /HTTP 403/u.test(warning)), inspect(result.warnings));
+      const records = (await service.getZone("example.com")).views.find((view) => view.name === "external")?.records ?? [];
+      assert.deepEqual(records[0]?.managedBy, { service: "worker", resource: "tiny-contract-api" },
+        "the lock survived a lookup that could not answer");
+    });
+
+    it("refuses a save that simply leaves the binding out", async () => {
+      // Reconciliation ignores the binding, so nothing else would notice its
+      // absence -- and dropping a field would be the one edit that always
+      // worked, and the one that unlocks every edit after it.
+      const { service, provider } = setup();
+      await service.createZone("example.com");
+      provider.seed("example.com/external", [
+        { id: "a", name: "contract-api", type: "CNAME", content: "origin.example.net", ttl: 1, proxied: true, providerId: "cf-1", managed: false },
+      ]);
+      provider.seedServiceOwnership("example.com/external", [
+        { name: "contract-api", service: "worker", resource: "tiny-contract-api" },
+      ]);
+      await service.adoptProviderRecords("example.com", "external", "operator");
+      const stored = (await service.getZone("example.com")).views.find((view) => view.name === "external")?.records ?? [];
+
+      const stripped = stored.map(({ managedBy: _dropped, ...record }) => record);
+      await assert.rejects(
+        service.replaceDesiredState("example.com", { views: [{ name: "external", records: stripped }] }),
+        (error: unknown) => error instanceof ProviderManagedRecordError,
+      );
+      const after = (await service.getZone("example.com")).views.find((view) => view.name === "external")?.records ?? [];
+      assert.deepEqual(after[0]?.managedBy, { service: "worker", resource: "tiny-contract-api" });
     });
 
     it("still follows the provider when it changes one there", async () => {

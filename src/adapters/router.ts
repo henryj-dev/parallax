@@ -1,4 +1,4 @@
-import { ProviderNotConfiguredError, type ProviderAdapter } from "../application/ports.ts";
+import { ProviderNotConfiguredError, type ProviderAdapter, type ServiceOwnedHostname } from "../application/ports.ts";
 import type { ReconcileOperation } from "../domain/reconciliation.ts";
 
 export interface RoutingProviderAdapterOptions {
@@ -84,6 +84,16 @@ export class RoutingProviderAdapter implements ProviderAdapter {
   async apply(target: string, operation: Exclude<ReconcileOperation, { kind: "conflict" }>): Promise<void> {
     const route = this.#route(target);
     await route.adapter.apply(route.target, operation);
+  }
+
+  /**
+   * Answers only for a route whose adapter can say. Routing to one that cannot
+   * and reporting no owned names would be indistinguishable from a provider
+   * that owns none, which is what unlocks a record.
+   */
+  async serviceOwnership(target: string): Promise<ServiceOwnedHostname[] | undefined> {
+    const route = this.#route(target);
+    return route.adapter.serviceOwnership?.(route.target);
   }
 
   #representativeConfiguration(): string {

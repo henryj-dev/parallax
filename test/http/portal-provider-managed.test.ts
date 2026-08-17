@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { providerManagement, type RecordType } from "../../src/domain/dns.ts";
-import { providerManagedReason, readRecords } from "../../public/store.js";
+import { desiredState, providerManagedReason, readRecords } from "../../public/store.js";
 
 /**
  * The portal decides whether to offer a delete button, and the server decides
@@ -13,7 +13,13 @@ import { providerManagedReason, readRecords } from "../../public/store.js";
  * they include the spellings and near-misses that a second implementation gets
  * wrong first.
  */
-const CASES: readonly { type: RecordType; content: string; managed: boolean }[] = [
+const CASES: readonly { type: RecordType; content: string; managed: boolean; managedBy?: unknown }[] = [
+  { type: "CNAME", content: "origin.example.net", managed: true, managedBy: { service: "worker", resource: "tinyuniverse-dashboard" } },
+  { type: "CNAME", content: "public.r2.dev", managed: true, managedBy: { service: "r2", resource: "tnuv-static" } },
+  { type: "A", content: "8.8.8.10", managed: true, managedBy: { service: "worker", resource: "tiny-contract-api" } },
+  // A binding neither side can read is not a binding either side may act on.
+  { type: "CNAME", content: "origin.example.net", managed: false, managedBy: { service: "pages", resource: "site" } },
+  { type: "CNAME", content: "origin.example.net", managed: false, managedBy: { service: "worker" } },
   { type: "AAAA", content: "100::", managed: true },
   { type: "AAAA", content: "0100::", managed: true },
   { type: "AAAA", content: "100:0:0:0:0:0:0:0", managed: true },
@@ -34,8 +40,9 @@ const CASES: readonly { type: RecordType; content: string; managed: boolean }[] 
 describe("portal and domain agree on which records the provider owns", () => {
   it("classifies every case the same way on both sides", () => {
     for (const testCase of CASES) {
-      const server = providerManagement({ type: testCase.type, content: testCase.content }) !== undefined;
-      const portal = providerManagedReason({ type: testCase.type, content: testCase.content }) !== "";
+      const record = { type: testCase.type, content: testCase.content, managedBy: testCase.managedBy };
+      const server = providerManagement(record as Parameters<typeof providerManagement>[0]) !== undefined;
+      const portal = providerManagedReason(record) !== "";
       assert.equal(server, testCase.managed, `server: ${testCase.type} ${testCase.content}`);
       assert.equal(portal, testCase.managed, `portal: ${testCase.type} ${testCase.content}`);
     }
@@ -55,6 +62,54 @@ describe("portal and domain agree on which records the provider owns", () => {
     const web = rows.find((row) => row.id === "web");
     assert.equal(apex?.views.external.managed, "originless");
     assert.equal(web?.views.external.managed, "", "an ordinary record stays editable");
+  });
+
+  it("shows a service record as the provider shows it: the service, and what it serves", () => {
+    // The screenshot this came from: the type column says `R2` and the content
+    // column names the bucket. The CNAME is still underneath, for the tooltip
+    // and for what gets saved -- it is just not what the row is about.
+    const rows = readRecords({
+      views: [{
+        name: "external",
+        records: [
+          { id: "assets", name: "static-apps", type: "CNAME", content: "public.r2.dev", ttl: 1, proxied: true,
+            managedBy: { service: "r2", resource: "tnuv-static" } },
+          { id: "api", name: "contract-api", type: "CNAME", content: "origin.example.net", ttl: 1, proxied: true,
+            managedBy: { service: "worker", resource: "tiny-contract-api" } },
+          { id: "web", name: "www", type: "A", content: "8.8.8.10", ttl: 300 },
+        ],
+      }],
+    });
+    const bucket = rows.find((row) => row.id === "assets");
+    assert.equal(bucket?.typeLabel, "R2");
+    assert.equal(bucket?.views.external.label, "tnuv-static");
+    assert.equal(bucket?.views.external.content, "public.r2.dev", "what is stored is still stored");
+    assert.equal(bucket?.views.external.managed, "service", "and the row is closed");
+
+    const worker = rows.find((row) => row.id === "api");
+    assert.equal(worker?.typeLabel, "Worker");
+    assert.equal(worker?.views.external.label, "tiny-contract-api");
+
+    const plain = rows.find((row) => row.id === "web");
+    assert.equal(plain?.typeLabel, "A", "an ordinary record is still its type");
+    assert.equal(plain?.views.external.label, "8.8.8.10");
+    assert.equal(plain?.views.external.managed, "");
+  });
+
+  it("sends the binding back, so saving a page cannot unlock a row", () => {
+    // The server treats a record that arrives without its binding as changed
+    // and refuses the save. A page that dropped the field would therefore
+    // break every save -- or, if the server were laxer, quietly unlock the row.
+    const rows = readRecords({
+      views: [{
+        name: "external",
+        records: [{ id: "assets", name: "static-apps", type: "CNAME", content: "public.r2.dev", ttl: 1, proxied: true,
+          managedBy: { service: "r2", resource: "tnuv-static" } }],
+      }],
+    });
+    const sent = desiredState(rows) as { views: { name: string; records: { managedBy?: unknown }[] }[] };
+    const external = sent.views.find((view) => view.name === "external");
+    assert.deepEqual(external?.records[0]?.managedBy, { service: "r2", resource: "tnuv-static" });
   });
 
   it("leaves a record that exists only inside unmarked", () => {

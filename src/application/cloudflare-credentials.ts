@@ -46,6 +46,9 @@ export class CloudflareCredentialManager {
       zoneId: credential.zoneId,
       token: credential.token,
       ownershipSecret: options.ownershipSecret,
+      // Optional on a profile, and only the Worker and R2 lookups need it: a
+      // binding without one still reconciles, and says so while adopting.
+      ...(credential.accountId ? { accountId: credential.accountId } : {}),
     }));
     this.#resolveZoneId = options.resolveZoneId
       ?? ((zone, token) => resolveZoneId({ name: zone, token }));
