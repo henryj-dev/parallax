@@ -108,6 +108,26 @@ describe("who owns each record at the provider", () => {
     assert.equal(recordOwnership(readRecords(zone), plan).get("new"), "absent");
   });
 
+  it("does not call an edit against somebody else's record unpublished", () => {
+    // The case that made the first version of this lie. The value no longer
+    // matches what the provider holds, so there is no exact match -- but the
+    // provider does hold that name, and it is not ours, so applying reports a
+    // conflict and writes nothing. `not published` promised the opposite.
+    const edited = readRecords({
+      views: [{ name: "external", records: [{ id: "theirs", name: "mail", type: "A", content: "203.0.113.99", ttl: 300 }] }],
+    });
+    assert.equal(recordOwnership(edited, plan).get("theirs"), "contested");
+  });
+
+  it("calls an edit to our own record ours, because applying updates it", () => {
+    // Same shape, opposite answer, decided by who holds the name: an RRset this
+    // control plane owns is one it may rewrite.
+    const edited = readRecords({
+      views: [{ name: "external", records: [{ id: "mine", name: "www", type: "A", content: "203.0.113.98", ttl: 300 }] }],
+    });
+    assert.equal(recordOwnership(edited, plan).get("mine"), "ours");
+  });
+
   it("says nothing at all until the provider has been read", () => {
     // An empty verdict must never render as "not ours": that is an invitation to
     // the exact edit the badge exists to prevent.

@@ -97,16 +97,38 @@ export function recordOwnership(records, plan, view = "external") {
   // A view whose provider could not be read carries no list, which is not the
   // same as a provider holding nothing.
   if (!Array.isArray(actual)) return new Map();
-  const held = new Map(actual.map((entry) =>
-    [`${String(entry?.name ?? "")}\0${String(entry?.type ?? "")}\0${String(entry?.content ?? "")}`, entry?.managed === true]));
+  const key = (name, type) => `${String(name ?? "")}\0${String(type ?? "")}`;
+  const held = new Map();
+  const atName = new Map();
+  for (const entry of actual) {
+    const managed = entry?.managed === true;
+    held.set(`${key(entry?.name, entry?.type)}\0${String(entry?.content ?? "")}`, managed);
+    const group = atName.get(key(entry?.name, entry?.type)) ?? [];
+    group.push(managed);
+    atName.set(key(entry?.name, entry?.type), group);
+  }
   const verdicts = new Map();
   for (const row of rows) {
     const content = String(row?.views?.[view]?.content ?? "");
     // A row with no answer on this side describes nothing here, so there is
     // nothing at the provider for it to be.
     if (!content) continue;
-    const owned = held.get(`${String(row?.name ?? "")}\0${String(row?.type ?? "")}\0${content}`);
-    verdicts.set(row.id, owned === undefined ? "absent" : owned ? "ours" : "theirs");
+    const rowKey = key(row?.name, row?.type);
+    const exact = held.get(`${rowKey}\0${content}`);
+    if (exact !== undefined) {
+      verdicts.set(row.id, exact ? "ours" : "theirs");
+      continue;
+    }
+    // No exact match, which is not the same as nothing being there. The value
+    // was edited, or is new, and what applying would do depends entirely on who
+    // holds the name: reconciliation updates an RRset this control plane owns
+    // and refuses one it does not, reporting a conflict rather than a write.
+    // Reading "no exact match" as "not published" told an operator their edit
+    // would be created, when it would be refused -- the one case where the
+    // difference decides whether to go and change it at the provider instead.
+    const others = atName.get(rowKey);
+    if (!others) verdicts.set(row.id, "absent");
+    else verdicts.set(row.id, others.every((managed) => managed) ? "ours" : "contested");
   }
   return verdicts;
 }

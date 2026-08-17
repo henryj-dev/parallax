@@ -74,9 +74,13 @@ export interface FallbackPanel {
 export function fallbackPanel(state: unknown): FallbackPanel;
 
 /**
- * Record id to `ours`, `theirs` or `absent`. A row missing from the map has no
- * verdict: either it answers nothing on this side, or nobody has read the
- * provider yet -- which must never be shown as unowned.
+ * Record id to `ours`, `theirs`, `contested` or `absent`. A row missing from the
+ * map has no verdict: either it answers nothing on this side, or nobody has read
+ * the provider yet -- which must never be shown as unowned.
+ *
+ * `contested` is the row whose value does not match what the provider holds at
+ * that name, where what it holds is not ours: applying reports a conflict rather
+ * than writing, so it is neither ours nor merely unpublished.
  */
 export function recordOwnership(
   records: readonly unknown[],
