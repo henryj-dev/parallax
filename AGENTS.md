@@ -25,6 +25,23 @@ If something genuinely must happen in the main tree — rescuing work an ended
 session left behind, for instance — `touch .git/claude-main-tree-rescue`
 (expires after 30 minutes), **only after the user approves it**.
 
+### Where these came from
+
+`scripts/claude-hooks/**`, `scripts/git-hooks/**` and `.claude/settings.json` are
+a **snapshot of stardust's**, taken at its commit `3e1e1ea7`. stardust holds the
+canonical copy; this one is allowed to fall behind.
+
+They are kept **byte-identical on purpose** -- no local header, no local tweak.
+That is the only thing that makes drift checkable at all: with both checkouts
+present, `cmp` answers in one line. Editing them here to say they are copies
+would remove the property that lets anyone tell.
+
+⚠️ Nothing detects stardust moving ahead. This is a record, not a mechanism: if
+those hooks change there, this copy goes quietly stale, and the staleness lives
+in a different repository than the check would. A fix belongs here rather than
+upstream only if it is about this repository specifically -- otherwise it goes
+to stardust and comes back with the next snapshot.
+
 ### What this does not cover
 
 `git commit --no-verify` bypasses the git layer, and a clone that never ran
