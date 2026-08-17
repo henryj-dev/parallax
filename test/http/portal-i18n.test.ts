@@ -186,6 +186,38 @@ describe("portal store", () => {
     }
   });
 
+  it("carries what adopting could not read to whoever adopted", async () => {
+    // The count cannot say this. A zone whose service lookups were refused
+    // gains no `Worker` or `R2` label, and nothing else on the page explains
+    // the absence -- so an operator reads "adopted 7 of 7" and concludes the
+    // feature does not work. The CLI passed these through from the start; the
+    // portal dropped them, which is the half an operator actually looks at.
+    const store = createStore({
+      adopt: async () => ({
+        seen: 7,
+        adopted: [],
+        refreshed: [],
+        warnings: ["which names Workers and R2 own could not be read: Cloudflare API request failed (HTTP 403)"],
+      }),
+      getZone: async () => ({ name: "example.com", revision: 2, views: [] }),
+      listZones: async () => ({ zones: [{ name: "example.com", revision: 2 }] }),
+      status: async () => ({ zone: "example.com", revision: 2, views: {} }),
+      audit: async () => ({ entries: [] }),
+    });
+    const notices: StoreNotice[] = [];
+    store.onNotice((notice) => { notices.push(notice); });
+
+    await store.adopt();
+    assert.deepEqual(notices.map((notice) => notice.key).slice(0, 2), ["zone.adopted", "zone.adoptWarning"]);
+    const warning = notices[1]!;
+    assert.equal(warning.level, "warning");
+    for (const locale of Object.keys(messages)) {
+      const translated = createTranslator(locale)(warning.key, warning.values);
+      assert.notEqual(translated, warning.key, locale);
+      assert.match(translated, /HTTP 403/, locale);
+    }
+  });
+
   it("says nothing extra when a change costs nothing", async () => {
     const store = createStore({
       saveSettings: async () => ({ settings: { publicOrigin: "https://dns.example.com" } }),

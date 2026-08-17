@@ -318,6 +318,14 @@ export function createStore(client) {
       try {
         const result = await client.adopt(activeName(), state.status?.revision);
         notice("zone.adopted", { seen: String(result.seen), adopted: String(result.adopted.length) });
+        // Adoption reports things no count can carry: that this process just
+        // became the authority for a whole zone, or that it could not read
+        // which names Workers and R2 own -- in which case no row gained a
+        // label and nothing else on the page would say why. The page dropped
+        // them, so the CLI told an operator what the portal did not.
+        for (const warning of Array.isArray(result.warnings) ? result.warnings : []) {
+          notice("zone.adoptWarning", { warning: String(warning) }, "warning");
+        }
         await this.selectZone(activeName());
         return true;
       } catch (error) {
