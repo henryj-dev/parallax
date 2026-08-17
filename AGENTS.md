@@ -61,6 +61,18 @@ in a different repository than the check would. A fix belongs here rather than
 upstream only if it is about this repository specifically -- otherwise it goes
 to stardust and comes back with the next snapshot.
 
+### Rewriting history on `main` breaks something outside this repository
+
+stardust's release gate pins four commit shas from here: two ranges it runs
+`scripts/what-ships.sh` over, before trusting the answer, to prove the tool
+still speaks the two lines that gate greps for. A rebase or amend that moves
+those commits does not corrupt anything -- it makes their gate refuse every
+release, and the reason it prints is "our control could not read it", which
+points at the tool rather than at the rewrite.
+
+So: **tell them before rewriting `main`.** Nothing here can detect it, and this
+is the one dependency that lives entirely in another repository's file.
+
 ### What this does not cover
 
 `git commit --no-verify` bypasses the git layer, and a clone that never ran
