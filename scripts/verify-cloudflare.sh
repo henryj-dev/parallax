@@ -13,11 +13,11 @@
 # The token needs `Zone -> DNS -> Edit` for the records and `Zone -> Zone -> Read`,
 # which Parallax uses once to resolve the domain to its zone id.
 #
-# Not covered here: the two account-scoped lookups adoption uses to tell which
-# names Workers and R2 publish for themselves, which need an account id plus
-# `Account -> Workers Scripts -> Read` and `Account -> Workers R2 Storage -> Read`.
-# So the request shapes for those are what Cloudflare's schema documents, not what
-# a real account was observed to answer -- the gap this file exists to close.
+# Adoption also asks two account-scoped endpoints which names Workers and R2
+# publish for themselves. Those are checked only when `CF_ACCOUNT_ID` is set, and
+# the token then also needs `Account -> Workers Scripts -> Read` and
+# `Account -> Workers R2 Storage -> Read`. Read-only, and skipped loudly without
+# it, because the zone reconciles perfectly well while those go unread.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -205,6 +205,75 @@ STORED_TTL=$(curl -sf "$API/zones/${CF_ZONE}" | json 'v.views.find(x=>x.name==="
 curl -sf -X POST "$API/zones/${CF_ZONE}/apply?view=external" | json 'v.statuses[0].state' | grep -qx applied \
   || fail "proxied update did not apply"
 ok "proxied record normalized to Auto TTL and updated"
+
+echo "== which names Workers and R2 publish for themselves =="
+# The one part of the adapter no stand-in can settle. A DNS record does not say
+# which service created it -- Cloudflare's record API enumerates the 21 real
+# types and carries no marker -- so the labels come from the services that hold
+# the bindings, over two account-scoped endpoints this script otherwise never
+# touches. Read-only: it asks, compares, and writes nothing.
+if [ -z "${CF_ACCOUNT_ID:-}" ]; then
+  echo "  skipped: set CF_ACCOUNT_ID to check the Workers and R2 lookups (the token also needs Account -> Workers Scripts -> Read and Account -> Workers R2 Storage -> Read)" >&2
+else
+  cat > "$WORK/service-ownership.mjs" <<'NODE'
+import { pathToFileURL } from "node:url";
+
+// The script lives in a temporary directory, so the adapter is reached by the
+// path this run was given rather than by one relative to this file.
+const { CloudflareProviderAdapter } = await import(pathToFileURL(process.env.ADAPTER).href);
+
+const target = `${process.env.CF_ZONE}/external`;
+const adapter = new CloudflareProviderAdapter({
+  token: process.env.CF_API_TOKEN,
+  zoneId: process.env.CF_ZONE_ID,
+  accountId: process.env.CF_ACCOUNT_ID,
+  ownershipSecret: "verify-ownership-secret-that-is-at-least-32-bytes",
+  ...(process.env.CF_API_BASE ? { apiBaseUrl: process.env.CF_API_BASE } : {}),
+});
+
+const owned = await adapter.serviceOwnership(target);
+if (!Array.isArray(owned)) throw new Error(`serviceOwnership answered ${typeof owned}, not a list`);
+for (const entry of owned) {
+  if (!["worker", "r2"].includes(entry.service)) throw new Error(`unknown service ${entry.service}`);
+  if (!entry.resource) throw new Error(`${entry.service} claimed ${entry.name} with no resource name`);
+}
+
+// Every name a service claims must be a name this zone actually holds a proxied
+// address record for. This is what checks the relative-name mapping against real
+// hostnames: an apex must come back as `@`, and a bucket's domains in somebody
+// else's zone must not come back at all. A claim with no record behind it means
+// the mapping is wrong, and the label would attach to nothing -- or worse, to
+// the wrong row.
+const records = await adapter.list(target);
+const proxiable = new Set(records
+  .filter((record) => ["A", "AAAA", "CNAME"].includes(record.type))
+  .map((record) => record.name));
+const orphans = owned.filter((entry) => !proxiable.has(entry.name));
+if (orphans.length > 0) {
+  throw new Error(`claimed names with no address record in this zone: ${orphans.map((entry) => entry.name).join(", ")}`);
+}
+console.log(JSON.stringify({ owned, records: records.length }));
+NODE
+  # stderr kept out of the answer: it is JSON, and a warning printed into it
+  # would fail the parse rather than the check it belongs to.
+  if ! OWNERSHIP=$(ADAPTER="$ROOT/src/adapters/cloudflare.ts" \
+    CF_ZONE="$CF_ZONE" CF_ZONE_ID="$CF_ZONE_ID" CF_API_TOKEN="$CF_API_TOKEN" \
+    CF_ACCOUNT_ID="$CF_ACCOUNT_ID" CF_API_BASE="${CF_API_BASE:-}" \
+    node "$WORK/service-ownership.mjs" 2>"$WORK/ownership.err"); then
+    fail "the Workers and R2 lookups failed -- if the token was refused it needs Account -> Workers Scripts -> Read and Account -> Workers R2 Storage -> Read: $(tr '\n' ' ' < "$WORK/ownership.err")"
+  fi
+  COUNT=$(printf '%s' "$OWNERSHIP" | json 'v.owned.length')
+  if [ "${COUNT:-0}" = "0" ]; then
+    # Said out loud, like the empty-zone case above: a lookup that legitimately
+    # finds nothing passes every assertion here, and reading that as "the labels
+    # work" is the mistake this note exists to prevent.
+    echo "  note: no Workers custom domain and no R2 custom domain in ${CF_ZONE}, so the field names went unchecked" >&2
+    ok "the lookups answered (vacuously -- this zone has neither)"
+  else
+    echo "  found: $(printf '%s' "$OWNERSHIP" | json 'v.owned.map(o=>o.service+" "+o.resource+" at "+o.name).join(", ")')" >&2
+    ok "${COUNT} name(s) matched to the worker or bucket that publishes them"
+  fi
+fi
 
 curl -sf -X DELETE "$API/zones/${CF_ZONE}" | json 'v.removedProviderRecords.length' | grep -qv '^0$' \
   || fail "zone deletion did not withdraw the record it published"

@@ -986,6 +986,15 @@ whatever it is sent. `verify:cloudflare` writes to a live zone, so it refuses to
 all set; it confines itself to a `parallax-verify-*` name and asserts that
 records Parallax does not own are never scheduled for deletion.
 
+Set `CF_ACCOUNT_ID` as well to include the two account-scoped lookups that tell
+which names Workers and R2 publish for themselves. That part writes nothing: it
+asks the services, then requires every name they claim to be one the zone holds a
+proxied address record for -- which is what checks the hostname mapping against a
+real account, where an apex must come back as `@` and a bucket's domains in other
+zones must not come back at all. Without the variable it skips and says so, and a
+zone that has neither a Workers nor an R2 custom domain reports that the check
+proved nothing rather than passing quietly.
+
 ## Development workflow
 
 The project uses Node's stable built-in test runner. Keep changes in the TDD
