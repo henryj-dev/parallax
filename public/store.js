@@ -668,7 +668,7 @@ export function readRecords(zone) {
   const views = Array.isArray(zone?.views) ? zone.views : [];
   const internal = views.find((view) => view.name === "internal")?.records ?? [];
   const external = views.find((view) => view.name === "external")?.records ?? [];
-  const key = (record) => `${record.id} ${record.name} ${record.type}`;
+  const key = (record) => `${record.id}\0${record.name}\0${record.type}`;
   const remaining = new Map(internal.map((record) => [key(record), record]));
 
   const rows = external.map((record) => {
