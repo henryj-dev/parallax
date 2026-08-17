@@ -262,6 +262,14 @@ export function createStore(client) {
      */
     stageRecord(record, index = null) {
       setError("record", null);
+      // One side or the other has to answer. A row with neither is dropped by
+      // `desiredState` on both views, so saving it would report success and
+      // change nothing -- and the record would be gone from the table on the
+      // next load with no error ever shown.
+      if (!record.views.external.content && !record.views.internal.content) {
+        setError("record", "record.answerRequired");
+        return false;
+      }
       const duplicate = state.records.findIndex((item, position) => item.name === record.name
         && item.type === record.type && position !== index
         && ((item.views.external.content && item.views.external.content === record.views.external.content)

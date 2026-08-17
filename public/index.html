@@ -169,7 +169,16 @@
         </div>
         <div class="view-inputs external-inputs">
           <div class="view-input-heading"><span class="view-symbol">EX</span><span><b data-i18n="record.externalAnswer">External answer</b><small data-i18n="recordDialog.externalHelp">Published through the configured provider</small></span></div>
-          <label><span data-i18n="recordDialog.content">Content</span><input name="externalContent" type="text" placeholder="12.34.56.78" required data-validation-label="recordDialog.content" spellcheck="false"></label>
+          <!--
+            Not required. A name answered only inside is a thing this control
+            plane is for, the desired state has always accepted one, and the
+            attribute was the only thing standing in the way -- so the dialog
+            refused to create what the API, the CLI and the table all handled.
+            What is actually required is an answer on one side or the other, and
+            the store says so, because "neither" stages a row that saves as
+            nothing at all.
+          -->
+          <label><span data-i18n="recordDialog.content">Content</span><input name="externalContent" type="text" placeholder="12.34.56.78" data-validation-label="recordDialog.content" spellcheck="false"></label>
           <label class="check-label"><input name="proxied" type="checkbox"><span><b data-i18n="recordDialog.proxy">Cloudflare proxy</b><small data-i18n="recordDialog.proxyHelp">Available for supported address and CNAME records.</small></span></label>
           <label><span data-i18n="recordDialog.externalTtl">External TTL</span><input name="externalTtl" type="number" value="300" min="1" max="86400" step="1" required data-validation-label="recordDialog.externalTtl"><small id="external-ttl-help" data-i18n="recordDialog.ttlHelp">Use 1 for Auto, or 60–86400 seconds for DNS-only records.</small></label>
           <label class="check-label" id="non-global-warning" hidden><input name="acknowledgeNonGlobalIp" type="checkbox" data-validation-label="recordDialog.nonGlobal"><span><b data-i18n="recordDialog.nonGlobal">Confirm non-global address publication</b><small data-i18n="recordDialog.nonGlobalHelp">This address is private or reserved and may expose an invalid external DNS answer. Check only after reviewing the intent.</small></span></label>

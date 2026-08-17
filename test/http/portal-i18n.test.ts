@@ -218,6 +218,38 @@ describe("portal store", () => {
     }
   });
 
+  it("stages a record answered only inside, and refuses one answered nowhere", async () => {
+    // The dialog required an external answer, so the portal could not create a
+    // name answered only inside -- which the desired state, the CLI and the
+    // table have always handled. What is actually required is one answer or the
+    // other: a row with neither is dropped from both views by `desiredState`, so
+    // saving it would report success, change nothing, and lose the record with
+    // no error ever shown.
+    const store = createStore({});
+    const notices: StoreNotice[] = [];
+    store.onNotice((notice) => { notices.push(notice); });
+    const row = (internal: string, external: string) => ({
+      id: "inside", name: "only-inside", type: "A",
+      views: {
+        internal: { id: "inside", content: internal, ttl: 300 },
+        external: { id: "inside", content: external, ttl: 300 },
+      },
+    });
+
+    assert.equal(store.stageRecord(row("10.10.10.10", "")), true, "inside only is a record");
+    assert.equal(store.stageRecord(row("", "203.0.113.9")), true, "outside only still is too");
+    assert.equal(store.stageRecord(row("", "")), false, "neither is not");
+
+    const errors = store.getState().errors as Record<string, { key: string } | null>;
+    const refusal = errors.record;
+    assert.equal(refusal?.key, "record.answerRequired");
+    assert.ok(refusal);
+    for (const locale of Object.keys(messages)) {
+      const translated = createTranslator(locale)(refusal.key, {});
+      assert.notEqual(translated, refusal.key, locale);
+    }
+  });
+
   it("says nothing extra when a change costs nothing", async () => {
     const store = createStore({
       saveSettings: async () => ({ settings: { publicOrigin: "https://dns.example.com" } }),
