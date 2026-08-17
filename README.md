@@ -482,6 +482,33 @@ TCP uses a 10-second idle timeout with at most 1,024 connections. Upstream UDP
 sockets are connected, and a reply is accepted only when its source, QR/opcode,
 transaction id, and complete question match the query.
 
+⚠️ **The allow-list compares the address this socket sees.** Behind NAT -- a mesh,
+a gateway that forwards on behalf of its own clients -- the source of a query is
+the rewriting hop, not the host that asked. A CIDR here says which addresses may
+reach this listener and recurse, not which hosts. A deployment that needs the
+stronger claim has to make the network preserve the source, or refuse the
+forwarding path at the boundary instead of here.
+
+### Answering and being ready are not the same thing
+
+Once the listener is up, nothing about the store stops it answering: a failed
+refresh is logged and the last known-good snapshot keeps serving. Readiness is
+the opposite -- `/health/ready` needs a successful read within the last **10
+seconds**, so a store that is unreachable for longer reports 503 while every
+query is still answered correctly, out of a snapshot that is still right.
+
+⚠️ **That decoupling only survives if nothing outside re-couples it.** Where a
+readiness probe gates the endpoints of the service that carries DNS, a ten-second
+store blip withdraws a resolver that is healthy and holding the right answers.
+On a deployment where this listener is the only resolver, check which way that is
+wired before deciding the probe is free.
+
+Every path that stops the process is a **startup** path: an unusable stored
+setting, a non-loopback bind with no access token, a desired state that cannot be
+read at all, and a DNS port that cannot be bound. None of them can fire in a
+process that is already serving -- so the exposure is a restart, not an outage
+elsewhere.
+
 A change committed by this process is served as soon as it commits, because the
 repository the control plane writes through says so. The 5-second refresh stays
 for everything that cannot announce itself: a second instance sharing a
