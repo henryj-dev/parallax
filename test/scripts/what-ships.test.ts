@@ -47,6 +47,16 @@ describe("what a deployment greps for", () => {
     return stdout;
   }
 
+  /** Runs it and reports the exit code instead of throwing on a non-zero one. */
+  async function status(range: string): Promise<number> {
+    try {
+      await execFileAsync("bash", [SCRIPT, range], { cwd: repo, timeout: TIMEOUT_MS });
+      return 0;
+    } catch (error) {
+      return (error as { code?: number }).code ?? -1;
+    }
+  }
+
   before(async () => {
     repo = await mkdtemp(join(tmpdir(), "parallax-ships-"));
     await git("init", "-q", "--initial-branch=main");
@@ -90,6 +100,25 @@ describe("what a deployment greps for", () => {
       const clean = /실리는 변경 없음/u.test(out);
       assert.notEqual(ships, clean, `${range} answered both or neither`);
     }
+  });
+
+
+  it("exits 0 whether something ships or not, which is what its one consumer relies on", async () => {
+    // "Something ships" is an observation, not a failure, so both answers are a
+    // successful run and the wording carries the result. stardust measured that
+    // and built their gate on the strings alone.
+    //
+    // ⚠️ There is exactly one known consumer: stardust's release gate, which
+    // greps this output and treats a non-zero exit as "could not measure". If a
+    // second consumer ever wants exit codes to carry the answer, splitting them
+    // is a change to a published interface -- that gate has to be told, and the
+    // wording has to keep working, or their ④ stops producing a verdict at all.
+    //
+    // They cannot see this coming: how many consumers exist is a fact only this
+    // side holds. So the current contract is pinned here rather than left to a
+    // promise to remember.
+    assert.equal(await status("HEAD~2..HEAD~1"), 0, "clean range");
+    assert.equal(await status("HEAD~1..HEAD"), 0, "shipping range");
   });
 
   it("counts only the last stage, so the builder's `COPY . .` does not ship everything", async () => {
