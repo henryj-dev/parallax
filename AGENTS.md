@@ -27,14 +27,19 @@ session left behind, for instance — `touch .git/claude-main-tree-rescue`
 
 ### Where these came from
 
-`scripts/claude-hooks/**`, `scripts/git-hooks/**` and `.claude/settings.json` are
-a **snapshot of stardust's**, taken at its commit `3e1e1ea7`. stardust holds the
+`scripts/claude-hooks/**`, `scripts/git-hooks/**`, `.claude/settings.json` and
+`.codex/hooks.json` are a **snapshot of stardust's**, taken at its commit
+`3e1e1ea7`. stardust holds the
 canonical copy; this one is allowed to fall behind.
 
 They are kept **byte-identical on purpose** -- no local header, no local tweak.
 That is the only thing that makes drift checkable at all: with both checkouts
 present, `cmp` answers in one line. Editing them here to say they are copies
 would remove the property that lets anyone tell.
+
+stardust's `.codex/config.toml` is deliberately **not** taken: it sets shell
+environment for that repository, and copying it here would put a second copy of
+someone's credentials in a second place.
 
 ⚠️ Nothing detects stardust moving ahead. This is a record, not a mechanism: if
 those hooks change there, this copy goes quietly stale, and the staleness lives
