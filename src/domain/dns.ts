@@ -461,24 +461,35 @@ export function providerManagement(record: {
   readonly managedBy?: ManagedByService;
 }): ProviderManagement | undefined {
   const content = record.content.trim();
+  /**
+   * Whether the address here is one nobody can reach. Decided from the address
+   * and nothing else, and deliberately before the service binding is read.
+   *
+   * A Workers custom domain is stored as a proxied `AAAA` holding `100::` --
+   * measured, not assumed: Cloudflare's record API returns the placeholder,
+   * and the `Worker` label the dashboard shows comes from somewhere else
+   * entirely. So the two facts are independent and have to stay that way. The
+   * binding says who owns the record; the address says whether any view can
+   * usefully answer it. Reading them as one fact made a Worker label turn
+   * `originless` off, which is what tells the internal resolver to relay an
+   * address query to the public answer -- so labelling the apex would have
+   * started answering `100::` inside, to every client, for the three names a
+   * zone can least afford to lose.
+   */
+  const originless = (record.type === "A" && isOriginlessV4(content))
+    || (record.type === "AAAA" && isOriginlessV6(content));
   // Read rather than trusted, though `createDesiredRecord` has already refused
   // anything else: this is also the portal's rule, and the two are compared
   // against each other. A binding one of them can read and the other cannot is
   // a row the page offers to edit and the server refuses to save.
   if (record.managedBy && MANAGING_SERVICES.some((service) => service === record.managedBy?.service)
     && record.managedBy.resource) {
-    // The name resolves and answers -- the service is the origin -- so the
-    // internal view can inherit it. What it cannot do is describe it, which is
-    // why the whole row is closed rather than only its external half.
     return {
       reason: `${MANAGING_SERVICE_LABELS[record.managedBy.service]} ${record.managedBy.resource} serves this name and owns this record`,
-      originless: false,
+      originless,
     };
   }
-  if (record.type === "A" && isOriginlessV4(content)) {
-    return { reason: "the provider serves this name itself and keeps a reserved placeholder address here", originless: true };
-  }
-  if (record.type === "AAAA" && isOriginlessV6(content)) {
+  if (originless) {
     return { reason: "the provider serves this name itself and keeps a reserved placeholder address here", originless: true };
   }
   if (record.type === "CNAME") {

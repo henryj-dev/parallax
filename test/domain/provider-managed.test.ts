@@ -75,6 +75,28 @@ describe("provider-managed records", () => {
       "the same content with no binding is an ordinary record");
   });
 
+  it("keeps who owns a record separate from whether anyone can reach it", () => {
+    // Cloudflare stores a Workers custom domain as a proxied AAAA holding the
+    // placeholder -- so the label arriving must not make the address look
+    // reachable. `originless` is what tells the internal resolver to relay an
+    // address query, and turning it off for these names answers `100::` inside.
+    const apex = providerManagement({
+      type: "AAAA", content: "100::",
+      managedBy: { service: "worker", resource: "tinyuniverse-dashboard" },
+    });
+    assert.ok(apex);
+    assert.match(apex.reason, /Worker tinyuniverse-dashboard/u, "the owner is the service");
+    assert.equal(apex.originless, true, "and the address is still one nobody can reach");
+
+    // An R2 custom domain is a CNAME to a name that does resolve, so the same
+    // rule reaches the opposite answer -- from the value, not from the label.
+    const bucket = providerManagement({
+      type: "CNAME", content: "public.r2.dev",
+      managedBy: { service: "r2", resource: "tnuv-static" },
+    });
+    assert.equal(bucket?.originless, false);
+  });
+
   it("shows a service record as the service, and everything else as its type", () => {
     const bucket = { id: "assets", name: "static", type: "CNAME" as const, content: "public.r2.dev", ttl: 1,
       managedBy: { service: "r2" as const, resource: "tnuv-static" } };

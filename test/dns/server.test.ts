@@ -724,6 +724,25 @@ describe("DNS server", () => {
       assert.deepEqual(asked, ["example.com"]);
     });
 
+    it("still relays once the record says which worker publishes the name", async () => {
+      // The label and the address are two facts, and adoption learns the first
+      // without changing the second: Cloudflare stores a Workers custom domain
+      // as this exact placeholder, so a name that gained a `Worker` label is
+      // still a name no view can answer usefully. Reading the binding as "the
+      // service is the origin, so the address is fine" made labelling the apex
+      // answer `100::` inside, to every client, for the most important name in
+      // the zone -- and nothing in the portal or the plan would have shown it.
+      const { port, asked } = await withUpstream({
+        ...WORKERS,
+        records: WORKERS.records.map((record) => (record.type === "AAAA"
+          ? { ...record, managedBy: { service: "worker" as const, resource: "tinyuniverse-dashboard" } }
+          : record)),
+      });
+      const reply = received(await ask(port, buildQuery("example.com", TYPE.AAAA)));
+      assert.equal(reply.subarray(-2).toString("hex"), "c0de", "the answer still came from the upstream");
+      assert.deepEqual(asked, ["example.com"]);
+    });
+
     it("still answers the same name's mail and text itself", async () => {
       // Relaying the whole name would throw away every override that is not an
       // address, which is most of what an internal view is for.
