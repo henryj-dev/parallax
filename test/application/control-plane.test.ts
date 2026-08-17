@@ -1247,6 +1247,38 @@ describe("ControlPlane", () => {
       );
     });
 
+    it("labels a zone that was already adopted without proposing a single write", async () => {
+      // The situation every existing deployment is in: a zone adopted before
+      // any of this existed, whose records already match the provider exactly.
+      // Learning who owns them must be bookkeeping and nothing more -- if a
+      // label reached the reconcile plan, upgrading would rewrite live records
+      // at the provider for no reason, and the apex would be among them.
+      const { service, provider } = setup();
+      await service.createZone("example.com");
+      provider.seed("example.com/external", [
+        { id: "a", name: "@", type: "AAAA", content: "100::", ttl: 1, proxied: true, providerId: "cf-1", managed: false },
+        { id: "b", name: "static-apps", type: "CNAME", content: "public.r2.dev", ttl: 1, proxied: true, providerId: "cf-2", managed: false },
+      ]);
+      // Adopted the way it would have been before the services were consulted.
+      await service.adoptProviderRecords("example.com", "external", "operator");
+      assert.equal((await service.preview("example.com", "external")).views.external?.operations.length, 0,
+        "the zone starts settled, which is what makes the next assertion mean something");
+
+      provider.seedServiceOwnership("example.com/external", [
+        { name: "@", service: "worker", resource: "tinyuniverse-dashboard" },
+        { name: "static-apps", service: "r2", resource: "tnuv-static" },
+      ]);
+      const result = await service.adoptProviderRecords("example.com", "external", "operator");
+      assert.equal(result.adopted.length, 0, "nothing new was described");
+      assert.equal(result.refreshed.length, 2, "both records learned who owns them");
+
+      const preview = await service.preview("example.com", "external");
+      assert.deepEqual(preview.views.external?.operations, [], "and the provider is asked to do nothing");
+      const before = provider.calls.length;
+      await service.apply("example.com", "external");
+      assert.equal(provider.calls.length, before, "applying wrote nothing either");
+    });
+
     it("gives the row back when the service stops publishing the name", async () => {
       // The DNS record does not change when a custom domain is removed from a
       // worker -- the binding does. Refusing to edit these is only honest if
