@@ -95,6 +95,9 @@ export function usage(commandName?: string): string {
     "",
     "commands:",
     ...listCommands().map((command) => `  ${command.name.padEnd(width)}  ${command.summary}`),
+    // Answered before a runtime exists, so it is not one of the commands above
+    // -- but a listing that leaves it out is a listing somebody trusts.
+    `  ${"config check".padEnd(width)}  Report what would stop this process from starting, without starting it`,
     "",
     "Run `parallax help <command>` for its options.",
     "Add --json to print machine-readable output.",

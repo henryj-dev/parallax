@@ -243,6 +243,26 @@ login page somebody thought they had taken away.
 bearer token for a session cookie, so `PARALLAX_AUTH_TOKENS` remains what a
 deployment uses when the provider is the thing that is broken.
 
+#### Asking before the rollout
+
+```sh
+parallax config check          # add --json for a machine to read
+environment=ok portalSignIn=idp identityProvider=configured dns=0.0.0.0:5353 forward=2 …
+```
+
+Startup validation is fail-closed: a setting this process cannot honour stops it
+rather than quietly doing something else. Where this pod is a resolver's only
+upstream, that refusal is not one pod -- it is name resolution for everything
+behind it, found at the moment the pod it replaced is already gone.
+
+`config check` gives the same reading a minute earlier. It reads the environment
+only: it opens no store, binds no port, and exits `78` with the message the
+server would have printed. It reports names and shapes, never values, because a
+preflight's output goes wherever a deployment's output goes.
+
+⚠️ It cannot answer for the store. A stored setting this process cannot act on
+also fails startup closed, and that is not what this looks at.
+
 **The role comes from the provider, not from here.** Parallax reads the
 `entitlements` claim the provider returns for this client and takes the highest
 of `admin`, `editor` and `viewer`. Keys it does not know are ignored. An account

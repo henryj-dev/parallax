@@ -7,6 +7,7 @@ import {
 } from "../../src/cli/commands.ts";
 import { ConflictError, NotFoundError } from "../../src/application/control-plane.ts";
 import { readConfig } from "../../src/config.ts";
+import { checkConfig } from "../../src/cli/config-check.ts";
 import { DomainValidationError } from "../../src/domain/dns.ts";
 import {
   createMigrationRuntime,
@@ -21,6 +22,24 @@ const argv = process.argv.slice(2);
 if (argv.length === 0 || argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h") {
   process.stdout.write(`${usage(argv.slice(1).join(" ") || undefined)}\n`);
   process.exit(0);
+}
+
+// Answered before anything is built, because that is the point: it reports
+// what would stop the serving process from starting, without starting it and
+// without opening the store. A deployment that only finds out at rollout finds
+// out when the pod it replaced is already gone.
+if (argv[0] === "config" && argv[1] === "check") {
+  try {
+    const checked = checkConfig();
+    const wantsJsonHere = argv.includes("--json");
+    process.stdout.write(wantsJsonHere
+      ? `${JSON.stringify(checked, null, 2)}\n`
+      : `${Object.entries(checked).map(([key, value]) => `${key}=${String(value)}`).join(" ")}\n`);
+    process.exit(0);
+  } catch (error) {
+    process.stderr.write(`parallax: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(78);
+  }
 }
 
 // `--json` is a presentation choice, not a command option, so it is removed
