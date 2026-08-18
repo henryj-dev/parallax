@@ -129,6 +129,24 @@ ships=()
 # Every file this answer was read out of. A change to one of them is not a
 # change to classify -- it is a change to what the classification means.
 derived_from=("Dockerfile")
+# And the one that decides what those paths actually contain, which this tool
+# does not read at all.
+#
+# `.dockerignore` is applied to the build context before any COPY runs, so a
+# path listed above ships whatever survives it. Adding `public/vendor/` to it
+# takes those files out of the image while every path in the list, and every
+# file in the range, stays exactly where it was -- and the answer came out
+# `✅ 실리는 변경 없음` with `.dockerignore` filed under what does not ship. That is
+# the same wrong answer the two configs used to get, in the same quiet
+# direction: not "could not classify" but "classified as harmless".
+#
+# It is listed separately from the files above because the honest sentence
+# differs. Those were opened; this one was not. Narrowing the list by its
+# patterns would be the other half of the job and is deliberately not done here
+# -- a pattern parsed wrong would drop a path from the list, which is the quiet
+# direction again. Not narrowing over-reports, and over-reporting is the side
+# this tool takes everywhere else.
+decides_context=(".dockerignore")
 add_path() {
   local candidate="$1"
   [[ -n "$candidate" ]] || return 0
@@ -201,12 +219,25 @@ changed="$(git -c core.quotepath=false diff --name-only "$range")"
 # exists rather than adding a third verdict nothing greps for. It says what the
 # warning was already asking for -- that a human decides -- in the words that
 # reach the thing which has to stop.
+#
+# Each one carries the sentence it is reported with. A file this tool opened and
+# one it never looked at are both reasons the classification does not hold, but
+# they are not the same reason, and this line is read at the place a release
+# stopped -- a wrong reason there sends the next person to the wrong file.
 moved=()
+moved_why=()
+note_moved() {
+  local source="$1" why="$2" already
+  grep -qx "$source" <<< "$changed" || return 0
+  for already in ${moved[@]+"${moved[@]}"}; do [[ "$already" == "$source" ]] && return 0; done
+  moved+=("$source")
+  moved_why+=("$why")
+}
 for source in "${derived_from[@]}"; do
-  grep -qx "$source" <<< "$changed" || continue
-  duplicate=""
-  for already in ${moved[@]+"${moved[@]}"}; do [[ "$already" == "$source" ]] && duplicate=1; done
-  [[ -n "$duplicate" ]] || moved+=("$source")
+  note_moved "$source" "이 답을 읽어 낸 파일입니다: 무엇이 어떻게 실리는지를 정합니다"
+done
+for source in ${decides_context[@]+"${decides_context[@]}"}; do
+  note_moved "$source" "이 도구가 안 읽는 파일입니다: 위 목록의 경로가 실제로 무엇을 담는지를 정합니다"
 done
 if (( ${#moved[@]} > 0 )); then
   echo "⚠️ 이 범위 안에서 ${moved[*]} 이(가) 바뀌었습니다 — 무엇이 실리는지가 범위 내내 같지 않습니다."
@@ -219,10 +250,16 @@ rest=""
 while IFS= read -r file; do
   [[ -n "$file" ]] || continue
   hit=""
+  why=""
   # A file the answer came from is decided before the list is consulted: the list
   # is what that file decides, so its absence from the list says nothing.
-  for source in ${moved[@]+"${moved[@]}"}; do
-    [[ "$file" == "$source" ]] && { hit="basis"; break; }
+  #
+  # Indexed rather than `for … in "${!moved[@]}"`: this runs under `set -u` on
+  # bash 3.2, where expanding an empty array's indices is an unbound variable.
+  index=0
+  while (( index < ${#moved[@]} )); do
+    [[ "$file" == "${moved[$index]}" ]] && { hit="basis"; why="${moved_why[$index]}"; break; }
+    index=$(( index + 1 ))
   done
   if [[ -z "$hit" ]]; then
     for path in "${ships[@]}"; do
@@ -233,7 +270,7 @@ while IFS= read -r file; do
     done
   fi
   case "$hit" in
-    basis) shipped+="  $file — 이 답을 읽어 낸 파일입니다: 무엇이 어떻게 실리는지를 정합니다"$'\n' ;;
+    basis) shipped+="  $file — $why"$'\n' ;;
     "")    rest+="  $file"$'\n' ;;
     *)     shipped+="  $file"$'\n' ;;
   esac

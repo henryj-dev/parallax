@@ -533,5 +533,126 @@ describe("when the Dockerfile itself moved", () => {
     assert.match(shipping, /Dockerfile/u, "on the shipping side");
     assert.doesNotMatch(quiet, /Dockerfile/u, "and not also on the quiet one");
     assert.doesNotMatch(stdout, /실리는 변경 없음/u);
+    // Each basis file carries its own reason now, paired with it by index. A
+    // file that was opened keeps saying so; pinning it here is what catches the
+    // pairing slipping when a third kind is added.
+    assert.match(shipping, /Dockerfile — 이 답을 읽어 낸 파일입니다/u);
+  });
+});
+
+/**
+ * The file that decides what those paths actually contain.
+ *
+ * `.dockerignore` is applied to the build context before any COPY runs, so it
+ * decides what a listed path ships -- and this tool never opens it. A commit
+ * that adds `public/vendor/` to it takes those files out of the image while
+ * every path in the list, and every file in the range, stays where it was: the
+ * answer came out `✅ 실리는 변경 없음`, with `.dockerignore` under what does not
+ * ship. Not "could not classify" but "classified as harmless", which is the
+ * same quiet direction the two configs were wrong in.
+ *
+ * stardust's cross-check layer stops on this file, and 170 §2 is the rule that
+ * their layer catching it is not a reason for this one to be wrong -- their (A)
+ * fixture rests on this gap on purpose, so closing it is what turns their check
+ * red and tells them to move it.
+ */
+describe("when the file that decides the build context moved", () => {
+  let repo: string;
+
+  async function git(...args: string[]): Promise<void> {
+    await execFileAsync("git", ["-C", repo, ...args], {
+      timeout: TIMEOUT_MS,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+      },
+    });
+  }
+
+  async function run(range: string): Promise<string> {
+    const { stdout } = await execFileAsync("bash", [SCRIPT, range], { cwd: repo, timeout: TIMEOUT_MS });
+    return stdout;
+  }
+
+  before(async () => {
+    repo = await mkdtemp(join(tmpdir(), "parallax-ships-context-"));
+    await git("init", "-q", "--initial-branch=main");
+    await writeFile(join(repo, "Dockerfile"),
+      "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY public ./public\n");
+    await writeFile(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.build.json" } }));
+    await writeFile(join(repo, "tsconfig.build.json"), JSON.stringify({ include: ["src/**/*.ts"] }));
+    await writeFile(join(repo, ".dockerignore"), "node_modules/\ndist/\n");
+    await mkdir(join(repo, "src"), { recursive: true });
+    await mkdir(join(repo, "public/vendor"), { recursive: true });
+    await writeFile(join(repo, "src/index.ts"), "one\n");
+    await writeFile(join(repo, "public/app.js"), "one\n");
+    await writeFile(join(repo, "public/vendor/lib.js"), "one\n");
+    await writeFile(join(repo, "notes.md"), "one\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "base");
+    await writeFile(join(repo, "notes.md"), "two\n");
+    await git("commit", "-qam", "docs only");
+    // Nothing under a listed path moved, and `public` is still in the list --
+    // but half of what it used to carry no longer reaches the image.
+    await writeFile(join(repo, ".dockerignore"), "node_modules/\ndist/\npublic/vendor/\n");
+    await git("commit", "-qam", "what the context carries changed");
+    // Both kinds of basis file in one range. Without this the reasons are
+    // paired by index against a list that never has two entries, so reading the
+    // first one every time is indistinguishable from reading the right one --
+    // the pairing was pinned by two assertions that were both measuring index 0.
+    await writeFile(join(repo, "tsconfig.build.json"), JSON.stringify({ include: ["src/**/*.ts", "cmd/**/*.ts"] }));
+    await writeFile(join(repo, ".dockerignore"), "node_modules/\ndist/\n");
+    await git("commit", "-qam", "both kinds at once");
+  });
+
+  after(async () => { await rm(repo, { recursive: true, force: true }); });
+
+  it("says so when the file that decides the context moved", async () => {
+    const out = await run("HEAD~2..HEAD~1");
+    assert.match(out, /\.dockerignore.*바뀌었습니다/u, "names the file, not just 'something'");
+    assert.match(out, /범위 내내 같지 않습니다/u);
+  });
+
+  it("counts it as shipping instead of filing it under what does not", async () => {
+    // The verdict is the whole point: with this file on the quiet side the one
+    // consumer read `✅ 실리는 변경 없음` for a range that drops files out of the
+    // image, and approved it without a human.
+    const out = await run("HEAD~2..HEAD~1");
+    const { shipping, quiet } = sides(out);
+    assert.match(shipping, /🔴 실립니다/u);
+    assert.match(shipping, /\.dockerignore/u, "on the shipping side");
+    assert.doesNotMatch(quiet, /\.dockerignore/u, "and not also on the quiet one");
+    assert.doesNotMatch(out, /실리는 변경 없음/u, "the verdict a machine reads moves with it");
+  });
+
+  it("does not claim to have read a file it never opened", async () => {
+    // This line is read where a release stopped. The other basis files were
+    // opened and this one was not, so borrowing their sentence would send the
+    // next person looking for the parse that produced the list -- there is
+    // none, and the honest reason is the one that gets them to the patterns.
+    const out = await run("HEAD~2..HEAD~1");
+    const { shipping } = sides(out);
+    assert.match(shipping, /\.dockerignore — 이 도구가 안 읽는 파일입니다/u);
+    assert.doesNotMatch(shipping, /\.dockerignore — 이 답을 읽어 낸 파일입니다/u);
+  });
+
+  it("gives each kind its own reason when both move in one range", async () => {
+    // The reasons are paired with the files by index, and every other fixture
+    // moves exactly one basis file -- so printing `moved_why[0]` every time
+    // passed all of them. Measured: with that substitution the suite stayed
+    // green until this range existed. A range that moves both is the only place
+    // the pairing is observable at all.
+    const out = await run("HEAD~1..HEAD");
+    const { shipping } = sides(out);
+    assert.match(shipping, /tsconfig\.build\.json — 이 답을 읽어 낸 파일입니다/u, "the one it opened");
+    assert.match(shipping, /\.dockerignore — 이 도구가 안 읽는 파일입니다/u, "and the one it did not");
+  });
+
+  it("stays quiet on a range that moved none of them", async () => {
+    // The control: a file reported on every range is a file reported on none.
+    const out = await run("HEAD~3..HEAD~2");
+    assert.doesNotMatch(out, /범위 내내 같지 않습니다/u);
+    assert.match(out, /실리는 변경 없음/u, "and the verdict is still reachable");
   });
 });
