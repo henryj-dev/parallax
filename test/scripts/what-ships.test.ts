@@ -193,3 +193,67 @@ describe("a stage whose inputs cannot be narrowed", () => {
     assert.doesNotMatch(stdout, /실리는 변경 없음/u);
   });
 });
+
+/**
+ * A change to a file the answer was read out of.
+ *
+ * stardust noticed that `tsconfig.build.json` decides what compiles into the
+ * image, and that the narrowing reads it -- so a range that moves it moves the
+ * meaning of the classification, exactly as a range that moves the Dockerfile
+ * does. The warning covered only the Dockerfile, because when it was written
+ * that was the only file the answer came from. Adding the narrowing added two
+ * more sources and left the warning behind.
+ */
+describe("when the list itself moved", () => {
+  let repo: string;
+
+  async function git(...args: string[]): Promise<void> {
+    await execFileAsync("git", ["-C", repo, ...args], {
+      timeout: TIMEOUT_MS,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+      },
+    });
+  }
+
+  async function run(range: string): Promise<string> {
+    const { stdout } = await execFileAsync("bash", [SCRIPT, range], { cwd: repo, timeout: TIMEOUT_MS });
+    return stdout;
+  }
+
+  before(async () => {
+    repo = await mkdtemp(join(tmpdir(), "parallax-ships-moved-"));
+    await git("init", "-q", "--initial-branch=main");
+    await writeFile(join(repo, "Dockerfile"),
+      "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY public ./public\n");
+    await writeFile(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.build.json" } }));
+    await writeFile(join(repo, "tsconfig.build.json"), JSON.stringify({ include: ["src/**/*.ts"] }));
+    await mkdir(join(repo, "src"), { recursive: true });
+    await mkdir(join(repo, "public"), { recursive: true });
+    await writeFile(join(repo, "src/index.ts"), "one\n");
+    await writeFile(join(repo, "public/app.js"), "one\n");
+    await writeFile(join(repo, "notes.md"), "one\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "base");
+    await writeFile(join(repo, "notes.md"), "two\n");
+    await git("commit", "-qam", "docs only");
+    await writeFile(join(repo, "tsconfig.build.json"), JSON.stringify({ include: ["src/**/*.ts", "cmd/**/*.ts"] }));
+    await git("commit", "-qam", "what compiles changed");
+  });
+
+  after(async () => { await rm(repo, { recursive: true, force: true }); });
+
+  it("says so when the file that decides what compiles moved", async () => {
+    const out = await run("HEAD~1..HEAD");
+    assert.match(out, /tsconfig\.build\.json.*바뀌었습니다/u, "names the file, not just 'something'");
+    assert.match(out, /범위 내내 같지 않습니다/u);
+  });
+
+  it("stays quiet on a range that moved none of them", async () => {
+    // The control: a warning on every range is a warning on none.
+    const out = await run("HEAD~2..HEAD~1");
+    assert.doesNotMatch(out, /범위 내내 같지 않습니다/u);
+  });
+});

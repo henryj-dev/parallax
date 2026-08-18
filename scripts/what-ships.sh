@@ -62,21 +62,28 @@ stage_sources() {
 build_inputs() {
   node -e '
     const fs = require("node:fs");
-    const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+    const read = [];
+    const load = (file) => { read.push(file); return JSON.parse(fs.readFileSync(file, "utf8").replace(/^\s*\/\/.*$/gm, "")); };
+    const pkg = load("package.json");
     const build = pkg.scripts && pkg.scripts.build;
     if (!build) process.exit(1);
     const named = /-p\s+(\S+)/.exec(build);
     if (!named) process.exit(1);
-    const config = JSON.parse(fs.readFileSync(named[1], "utf8").replace(/^\s*\/\/.*$/gm, ""));
+    const config = load(named[1]);
     const globs = config.include;
     if (!Array.isArray(globs) || globs.length === 0) process.exit(1);
     const roots = new Set(globs.map((glob) => glob.split("/*")[0].replace(/\/$/, "")).filter(Boolean));
     if (roots.size === 0) process.exit(1);
-    process.stdout.write([...roots].join("\n") + "\n");
+    // Which files this answer was read out of, so a change to one of them can
+    // be reported as "the list itself moved" rather than classified against it.
+    process.stdout.write([...roots].map((r) => "root:" + r).concat(read.map((f) => "from:" + f)).join("\n") + "\n");
   ' 2>/dev/null
 }
 
 ships=()
+# Every file this answer was read out of. A change to one of them is not a
+# change to classify -- it is a change to what the classification means.
+derived_from=("Dockerfile")
 add_path() {
   local candidate="$1"
   [[ -n "$candidate" ]] || return 0
@@ -91,7 +98,12 @@ while IFS= read -r line; do
       while IFS= read -r source; do
         if [[ "$source" == "." ]]; then
           if narrowed="$(build_inputs)" && [[ -n "$narrowed" ]]; then
-            while IFS= read -r input; do add_path "$input"; done <<< "$narrowed"
+            while IFS= read -r input; do
+              case "$input" in
+                root:*) add_path "${input#root:}" ;;
+                from:*) derived_from+=("${input#from:}") ;;
+              esac
+            done <<< "$narrowed"
           else
             echo "⚠️ 스테이지 '$stage' 가 트리 전체를 가져가는데 빌드 입력을 못 읽었습니다 — 전부 실린다고 봅니다." >&2
             add_path "."
@@ -127,9 +139,13 @@ changed="$(git -c core.quotepath=false diff --name-only "$range")"
 # The list above is read from the Dockerfile as it is now, and applied to a range
 # that may predate it. If the Dockerfile moved inside that range, what ships was
 # not the same at both ends and this classification is only true of one.
-if grep -qx "Dockerfile" <<< "$changed"; then
-  echo "⚠️ 이 범위 안에서 Dockerfile 이 바뀌었습니다 — 무엇이 실리는지가 범위 내내 같지 않습니다."
-  echo "   아래 분류는 **지금의** Dockerfile 기준입니다. 사람이 읽어야 합니다."
+moved=()
+for source in "${derived_from[@]}"; do
+  grep -qx "$source" <<< "$changed" && moved+=("$source")
+done
+if (( ${#moved[@]} > 0 )); then
+  echo "⚠️ 이 범위 안에서 ${moved[*]} 이(가) 바뀌었습니다 — 무엇이 실리는지가 범위 내내 같지 않습니다."
+  echo "   아래 분류는 **지금의** 그 파일들 기준입니다. 사람이 읽어야 합니다."
   echo
 fi
 
