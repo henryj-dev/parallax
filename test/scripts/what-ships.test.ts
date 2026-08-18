@@ -204,6 +204,78 @@ describe("a stage whose inputs cannot be narrowed", () => {
     assert.match(stdout, /notes\.md/u);
     assert.doesNotMatch(stdout, /실리는 변경 없음/u);
   });
+
+  /**
+   * The reason has to be beside the file, not only on stderr.
+   *
+   * `c2fb95d` fixed this once for the files the answer was read out of: the one
+   * consumer greps stdout for the two verdicts, so a reason aimed past them
+   * reaches nobody. The widening kept the old shape, and here the gap is wider
+   * than a missing note -- the verdict is not an over-reported classification,
+   * it is the absence of one, and a human reading a bare `🔴 실립니다 notes.md`
+   * goes looking for how a docs file reaches the image.
+   */
+  it("says beside the file that this is a failure to classify, not a classification", async () => {
+    const { stdout } = await execFileAsync("bash", [SCRIPT, "HEAD~1..HEAD"], { cwd: repo, timeout: TIMEOUT_MS });
+    const { shipping, quiet } = sides(stdout);
+    assert.match(shipping, /notes\.md — .*분류가 아니라 분류 실패입니다/u);
+    assert.doesNotMatch(quiet, /notes\.md/u);
+  });
+});
+
+/**
+ * The control for the sentence above, one layer over: a final stage that really
+ * does `COPY . .`.
+ *
+ * That puts `.` on the list too, and everything shipping is then the answer
+ * rather than the failure to reach one. Keying the sentence on `.` instead of on
+ * the widening would print "could not read the build inputs" for a Dockerfile
+ * that was read perfectly well -- a wrong reason at the place a release stopped,
+ * which is the thing this repository keeps splitting sentences to avoid.
+ */
+describe("a final stage that copies the tree on purpose", () => {
+  let repo: string;
+
+  async function git(...args: string[]): Promise<void> {
+    await execFileAsync("git", ["-C", repo, ...args], {
+      timeout: TIMEOUT_MS,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+      },
+    });
+  }
+
+  before(async () => {
+    repo = await mkdtemp(join(tmpdir(), "parallax-ships-wide-on-purpose-"));
+    await git("init", "-q", "--initial-branch=main");
+    // The chain is readable here -- the tree is on the list because the image
+    // asks for it, not because the narrowing failed.
+    await writeFile(join(repo, "Dockerfile"),
+      "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY . .\nCOPY public ./public\n");
+    await writeFile(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.build.json" } }));
+    await writeFile(join(repo, "tsconfig.build.json"), JSON.stringify({ include: ["src/**/*.ts"] }));
+    await mkdir(join(repo, "src"), { recursive: true });
+    await mkdir(join(repo, "public"), { recursive: true });
+    await writeFile(join(repo, "src/index.ts"), "one\n");
+    await writeFile(join(repo, "public/app.js"), "one\n");
+    await writeFile(join(repo, "notes.md"), "one\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "base");
+    await writeFile(join(repo, "notes.md"), "two\n");
+    await git("commit", "-qam", "docs only");
+  });
+
+  after(async () => { await rm(repo, { recursive: true, force: true }); });
+
+  it("reports it as shipping without claiming the build inputs were unreadable", async () => {
+    const { stdout, stderr } = await execFileAsync("bash", [SCRIPT, "HEAD~1..HEAD"], { cwd: repo, timeout: TIMEOUT_MS });
+    assert.doesNotMatch(stderr, /빌드 입력을 못 읽었습니다/u, "the chain was readable");
+    const { shipping } = sides(stdout);
+    assert.match(shipping, /notes\.md/u);
+    assert.doesNotMatch(shipping, /분류 실패/u);
+  });
 });
 
 /**

@@ -147,6 +147,21 @@ derived_from=("Dockerfile")
 # direction again. Not narrowing over-reports, and over-reporting is the side
 # this tool takes everywhere else.
 decides_context=(".dockerignore")
+# And the sentence for a range this tool did not classify at all.
+#
+# When a whole-tree stage cannot be narrowed the list widens to `.`, every file
+# lands on the shipping side, and until now the only thing that said why went to
+# stderr. That is the shape `c2fb95d` already fixed once for the files above: the
+# one consumer greps stdout for the two verdicts, so a reason aimed past them
+# reaches nobody -- and here it is worse than a missing note, because the verdict
+# is not an over-report of a classification, it is the absence of one. A human
+# reading `🔴 실립니다 tsconfig.test.json` with nothing beside it goes looking for
+# how that file reaches the image. It does not; the chain to the build broke.
+#
+# Empty unless the fallback fired. A final stage that genuinely does `COPY . .`
+# also puts `.` on the list, and for that one "everything ships" is the answer
+# rather than the failure to reach one -- so it keeps the bare line.
+widened_why=""
 add_path() {
   local candidate="$1"
   [[ -n "$candidate" ]] || return 0
@@ -169,6 +184,7 @@ while IFS= read -r line; do
             done <<< "$narrowed"
           else
             echo "⚠️ 스테이지 '$stage' 가 트리 전체를 가져가는데 빌드 입력을 못 읽었습니다 — 전부 실린다고 봅니다." >&2
+            widened_why="빌드 입력을 못 읽어 트리 전체를 실린다고 봤습니다: 이 줄은 분류가 아니라 분류 실패입니다"
             add_path "."
           fi
         else
@@ -266,7 +282,11 @@ while IFS= read -r file; do
       # `.` is the whole tree -- the fallback for a stage whose inputs could not be
       # narrowed. Matching it literally matched nothing, so the over-report it was
       # supposed to be was silently no report at all.
-      if [[ "$path" == "." || "$file" == "$path" || "$file" == "$path"/* ]]; then hit=1; break; fi
+      if [[ "$path" == "." ]]; then
+        if [[ -n "$widened_why" ]]; then hit="basis"; why="$widened_why"; else hit=1; fi
+        break
+      fi
+      if [[ "$file" == "$path" || "$file" == "$path"/* ]]; then hit=1; break; fi
     done
   fi
   case "$hit" in
