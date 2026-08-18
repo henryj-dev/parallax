@@ -207,13 +207,20 @@ describe("this repository's own chain", () => {
    * range has to exist for the question to be asked, and it is built here so
    * that no commit of this repository's is pinned by it.
    */
-  it("puts a change to the test config on the quiet side", async () => {
+  it("puts both paths their gate pins on the quiet side", async () => {
     const clone = await mkdtemp(join(tmpdir(), "parallax-ships-self-"));
     try {
       await execFileAsync("git", ["clone", "-q", root, clone], { timeout: TIMEOUT_MS });
-      const config = join(clone, "tsconfig.test.json");
-      await writeFile(config, (await readFile(config, "utf8")) + "\n");
-      await execFileAsync("git", ["-C", clone, "commit", "-qam", "touch the test config"], {
+      // The second one is `security-audits/`, which their (G) fixture pins for
+      // the opposite reason: it records why that candidate was *not* usable on
+      // their side, and the record is only worth anything while this side still
+      // calls it quiet.
+      const touched = ["tsconfig.test.json", "security-audits/2026-08-15-security-audit.md"];
+      for (const name of touched) {
+        const file = join(clone, name);
+        await writeFile(file, (await readFile(file, "utf8")) + "\n");
+      }
+      await execFileAsync("git", ["-C", clone, "commit", "-qam", "touch both pinned paths"], {
         timeout: TIMEOUT_MS,
         env: {
           ...process.env,
@@ -223,8 +230,10 @@ describe("this repository's own chain", () => {
       });
       const { stdout } = await execFileAsync("bash", [SCRIPT, "HEAD~1..HEAD"], { cwd: clone, timeout: TIMEOUT_MS });
       const { shipping, quiet } = sides(stdout);
-      assert.match(quiet, /tsconfig\.test\.json/u);
-      assert.doesNotMatch(shipping, /tsconfig\.test\.json/u);
+      for (const name of touched) {
+        assert.ok(quiet.includes(name), `${name} left the quiet side:\n${stdout}`);
+        assert.ok(!shipping.includes(name), `${name} moved to the shipping side:\n${stdout}`);
+      }
       assert.match(stdout, /실리는 변경 없음/u);
     } finally {
       await rm(clone, { recursive: true, force: true });
