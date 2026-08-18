@@ -257,3 +257,182 @@ describe("when the list itself moved", () => {
     assert.doesNotMatch(out, /범위 내내 같지 않습니다/u);
   });
 });
+
+/**
+ * The file the config the build names is itself reading.
+ *
+ * Collecting the sources while the answer is read out of them kept the warning
+ * from falling behind the files it opens -- but it only opened one link. This
+ * repository's `tsconfig.build.json` extends `tsconfig.json`, so the options
+ * that decide the shape of `dist` live in a file the tool never looked at: a
+ * range that moved it was classified as harmless rather than reported, which is
+ * the quiet direction and the one that matters. stardust found this by running
+ * the fixed warning once per filename.
+ */
+describe("a config that reads another config", () => {
+  let repo: string;
+
+  async function git(...args: string[]): Promise<void> {
+    await execFileAsync("git", ["-C", repo, ...args], {
+      timeout: TIMEOUT_MS,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+      },
+    });
+  }
+
+  async function run(range: string): Promise<string> {
+    const { stdout } = await execFileAsync("bash", [SCRIPT, range], { cwd: repo, timeout: TIMEOUT_MS });
+    return stdout;
+  }
+
+  before(async () => {
+    repo = await mkdtemp(join(tmpdir(), "parallax-ships-extends-"));
+    await git("init", "-q", "--initial-branch=main");
+    await writeFile(join(repo, "Dockerfile"),
+      "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY public ./public\n");
+    await writeFile(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.build.json" } }));
+    // The shape this repository has: the build points at a config whose
+    // compilerOptions are inherited from the one beside it.
+    await writeFile(join(repo, "tsconfig.build.json"),
+      JSON.stringify({ extends: "./tsconfig.json", compilerOptions: { outDir: "dist" }, include: ["src/**/*.ts"] }));
+    await writeFile(join(repo, "tsconfig.json"), JSON.stringify({ compilerOptions: { target: "ES2024" } }));
+    await mkdir(join(repo, "src"), { recursive: true });
+    await mkdir(join(repo, "public"), { recursive: true });
+    await writeFile(join(repo, "src/index.ts"), "one\n");
+    await writeFile(join(repo, "public/app.js"), "one\n");
+    await writeFile(join(repo, "notes.md"), "one\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "base");
+    await writeFile(join(repo, "notes.md"), "two\n");
+    await git("commit", "-qam", "docs only");
+    // Nothing under a shipping path moved -- but every compiled file comes out
+    // different, and the paths this tool lists cannot show that.
+    await writeFile(join(repo, "tsconfig.json"), JSON.stringify({ compilerOptions: { target: "ES2015" } }));
+    await git("commit", "-qam", "what the compiler emits changed");
+  });
+
+  after(async () => { await rm(repo, { recursive: true, force: true }); });
+
+  it("says so when the config that the named one extends moved", async () => {
+    const out = await run("HEAD~1..HEAD");
+    assert.match(out, /tsconfig\.json.*바뀌었습니다/u, "the parent is a file the answer came from too");
+    assert.match(out, /범위 내내 같지 않습니다/u);
+  });
+
+  it("stays quiet on a range that moved neither of them", async () => {
+    // The control again, for the link that was just added: a chain that reports
+    // every range would have replaced a blind spot with a blindfold.
+    const out = await run("HEAD~2..HEAD~1");
+    assert.doesNotMatch(out, /범위 내내 같지 않습니다/u);
+  });
+});
+
+/**
+ * The other half of following the chain: reading it, not just recording it.
+ *
+ * A child that leaves `include` to its parent used to stop the narrowing dead,
+ * and the whole tree was reported instead -- safe, but it called every docs
+ * commit a shipping one. Walking to the parent answers it properly, and the
+ * same walk is what makes the warning above see that file at all.
+ */
+describe("an include that lives in the parent config", () => {
+  let repo: string;
+
+  async function git(...args: string[]): Promise<void> {
+    await execFileAsync("git", ["-C", repo, ...args], {
+      timeout: TIMEOUT_MS,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+      },
+    });
+  }
+
+  before(async () => {
+    repo = await mkdtemp(join(tmpdir(), "parallax-ships-inherit-"));
+    await git("init", "-q", "--initial-branch=main");
+    await writeFile(join(repo, "Dockerfile"),
+      "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY public ./public\n");
+    await writeFile(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.build.json" } }));
+    await writeFile(join(repo, "tsconfig.build.json"),
+      JSON.stringify({ extends: "./tsconfig.json", compilerOptions: { outDir: "dist" } }));
+    await writeFile(join(repo, "tsconfig.json"), JSON.stringify({ include: ["src/**/*.ts"] }));
+    await mkdir(join(repo, "src"), { recursive: true });
+    await mkdir(join(repo, "public"), { recursive: true });
+    await writeFile(join(repo, "src/index.ts"), "one\n");
+    await writeFile(join(repo, "public/app.js"), "one\n");
+    await writeFile(join(repo, "notes.md"), "one\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "base");
+    await writeFile(join(repo, "notes.md"), "two\n");
+    await git("commit", "-qam", "docs only");
+  });
+
+  after(async () => { await rm(repo, { recursive: true, force: true }); });
+
+  it("narrows by what the parent compiles instead of widening to everything", async () => {
+    const { stdout, stderr } = await execFileAsync("bash", [SCRIPT, "HEAD~1..HEAD"], { cwd: repo, timeout: TIMEOUT_MS });
+    assert.doesNotMatch(stderr, /빌드 입력을 못 읽었습니다/u, "the chain resolves, so nothing had to be widened");
+    assert.match(stdout, /^이미지에 실리는 경로\(Dockerfile 에서 읽음\): .*\bsrc\b/mu, "the parent's inputs");
+    assert.doesNotMatch(stdout, /^이미지에 실리는 경로[^\n]*(^| )\.( |$)/mu, "not the whole tree");
+    assert.match(stdout, /실리는 변경 없음/u, "and a docs commit is not a release");
+  });
+});
+
+/**
+ * A link that cannot be followed.
+ *
+ * The chain is walked, not guessed at: a parent that is not there, or one named
+ * by a package that is not installed, leaves the tool unable to say what
+ * compiles. The rule that already governs the rest of this chain applies --
+ * report everything rather than nothing, loudly.
+ */
+describe("a parent config that cannot be read", () => {
+  let repo: string;
+
+  async function git(...args: string[]): Promise<void> {
+    await execFileAsync("git", ["-C", repo, ...args], {
+      timeout: TIMEOUT_MS,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+      },
+    });
+  }
+
+  before(async () => {
+    repo = await mkdtemp(join(tmpdir(), "parallax-ships-broken-"));
+    await git("init", "-q", "--initial-branch=main");
+    await writeFile(join(repo, "Dockerfile"),
+      "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY public ./public\n");
+    await writeFile(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.build.json" } }));
+    // An include is right there, and it is still not the answer: what the
+    // missing parent would have said cannot be known.
+    await writeFile(join(repo, "tsconfig.build.json"),
+      JSON.stringify({ extends: "@tsconfig/absent/tsconfig.json", include: ["src/**/*.ts"] }));
+    await mkdir(join(repo, "src"), { recursive: true });
+    await mkdir(join(repo, "public"), { recursive: true });
+    await writeFile(join(repo, "src/index.ts"), "one\n");
+    await writeFile(join(repo, "public/app.js"), "one\n");
+    await writeFile(join(repo, "notes.md"), "one\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "base");
+    await writeFile(join(repo, "notes.md"), "two\n");
+    await git("commit", "-qam", "docs only");
+  });
+
+  after(async () => { await rm(repo, { recursive: true, force: true }); });
+
+  it("calls everything shipped rather than trusting the half it could read", async () => {
+    const { stdout, stderr } = await execFileAsync("bash", [SCRIPT, "HEAD~1..HEAD"], { cwd: repo, timeout: TIMEOUT_MS });
+    assert.match(stderr, /빌드 입력을 못 읽었습니다/u, "and says why it widened");
+    assert.match(stdout, /실립니다/u);
+    assert.match(stdout, /notes\.md/u);
+    assert.doesNotMatch(stdout, /실리는 변경 없음/u);
+  });
+});

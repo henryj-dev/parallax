@@ -59,20 +59,65 @@ stage_sources() {
 # Read as JSON rather than with a line pattern: a pretty-printed config and a
 # compact one carry the same fact, and a reader that only sees one of them
 # reports "could not tell" for a repository that told it plainly.
+#
+# A tsconfig can name a parent, and this repository's does -- `tsconfig.build.json`
+# extends `tsconfig.json`, which is where the options that shape `dist` actually
+# live. Reading only the file the build names reads one link of a chain, and it
+# cannot even tell that the child's `include` is the last word: the parent is
+# where that would have come from had the child left it out. So the chain is
+# walked to the end, the nearest `include` wins the way tsc merges them, and
+# every file on the way counts as a file the answer was read out of. A link that
+# cannot be followed is not guessed at -- the whole tree is used, which
+# over-reports rather than under-reports.
 build_inputs() {
   node -e '
     const fs = require("node:fs");
+    const path = require("node:path");
     const read = [];
     const load = (file) => { read.push(file); return JSON.parse(fs.readFileSync(file, "utf8").replace(/^\s*\/\/.*$/gm, "")); };
+    // Where a parent named by a child lives: beside it, or in a package. tsc
+    // lets the .json be left off, so a name that is not a file is tried again
+    // with it before it is called unreadable.
+    const locate = (spec, child) => {
+      const dir = path.dirname(child);
+      let file = spec.startsWith(".") || path.isAbsolute(spec)
+        ? path.resolve(dir, spec)
+        : require.resolve(spec, { paths: [path.resolve(dir)] });
+      if (!fs.existsSync(file)) file += ".json";
+      if (!fs.existsSync(file)) throw new Error("unreadable: " + spec);
+      return path.relative(process.cwd(), file);
+    };
+    // A config compiles what it says it compiles, or else what its parents say.
+    // A later parent beats an earlier one and the child beats both, which is the
+    // order tsc reads them in. Every config on the way is recorded by load.
+    const seen = new Set();
+    const compiles = (file) => {
+      if (seen.has(file)) throw new Error("cycle: " + file);
+      seen.add(file);
+      const config = load(file);
+      let inherited;
+      for (const parent of config.extends === undefined ? [] : [].concat(config.extends)) {
+        const found = compiles(locate(parent, file));
+        if (found) inherited = found;
+      }
+      const own = Array.isArray(config.include) && config.include.length > 0 ? config.include : undefined;
+      return own ? { globs: own, base: path.dirname(file) } : inherited;
+    };
     const pkg = load("package.json");
     const build = pkg.scripts && pkg.scripts.build;
     if (!build) process.exit(1);
     const named = /-p\s+(\S+)/.exec(build);
     if (!named) process.exit(1);
-    const config = load(named[1]);
-    const globs = config.include;
-    if (!Array.isArray(globs) || globs.length === 0) process.exit(1);
-    const roots = new Set(globs.map((glob) => glob.split("/*")[0].replace(/\/$/, "")).filter(Boolean));
+    let compiled;
+    try { compiled = compiles(named[1]); } catch { process.exit(1); }
+    if (!compiled) process.exit(1);
+    // A relative path in a config is relative to that config, so a glob
+    // inherited from a parent elsewhere is rooted where the parent sits.
+    const roots = new Set(compiled.globs
+      .map((glob) => glob.split("/*")[0].replace(/\/$/, ""))
+      .filter(Boolean)
+      .map((root) => path.relative(process.cwd(), path.resolve(compiled.base, root)))
+      .filter((root) => root && !root.startsWith("..")));
     if (roots.size === 0) process.exit(1);
     // Which files this answer was read out of, so a change to one of them can
     // be reported as "the list itself moved" rather than classified against it.
