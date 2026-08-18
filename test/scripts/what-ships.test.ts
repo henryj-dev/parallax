@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -153,6 +153,82 @@ describe("what a deployment greps for", () => {
     // And the source-only commit is now on the shipping side of the answer.
     assert.match(out, /실립니다/u);
     assert.match(out, /src\/index\.ts/u);
+  });
+});
+
+/**
+ * The one case every other test here deliberately does not cover: this
+ * repository.
+ *
+ * Building each case as its own repository is what keeps these tests off this
+ * repository's history, and that is right -- but it means all of them prove the
+ * mechanism and none of them prove the mechanism reaches anything real. If
+ * `tsconfig.build.json` stopped naming a parent this tool could find, the
+ * narrowing here would fail, the list would widen to `.`, and every answer this
+ * repository gives would become "everything ships". That direction is the safe
+ * one, so no gate would stop and nothing would say the tool had gone blind.
+ *
+ * It is also the state that would silently move a fixture in another
+ * repository: stardust's release gate now pins `tsconfig.test.json` on the
+ * quiet side, and it is quiet only because the walk toward parents never
+ * reaches a sibling. Widened, it reads `🔴 실립니다` like everything else.
+ *
+ * `HEAD..HEAD` asks for no commits, so this depends on HEAD existing and on
+ * nothing else -- the list is printed before the range is consulted.
+ */
+describe("this repository's own chain", () => {
+  const root = join(import.meta.dirname, "../..");
+
+  it("is narrowed, not widened to the whole tree", async () => {
+    const { stdout, stderr } = await execFileAsync("bash", [SCRIPT, "HEAD..HEAD"], { cwd: root, timeout: TIMEOUT_MS });
+    assert.doesNotMatch(stderr, /빌드 입력을 못 읽었습니다/u, "the build chain here is readable");
+    const [list = ""] = stdout.split("\n");
+    assert.match(list, /실리는 경로/u);
+    assert.doesNotMatch(list, /(^|\s)\.(\s|$)/u, `widened to the whole tree: ${list}`);
+    for (const path of ["src", "cmd", "public", "migrations"]) {
+      assert.match(list, new RegExp(`(^|\\s)${path}(\\s|$)`, "u"), `${path} missing from ${list}`);
+    }
+  });
+
+  /**
+   * And the classification another repository's fixture rests on.
+   *
+   * stardust moved its gate's fixtures onto `tsconfig.test.json` because this
+   * tool calls it quiet, and it is quiet for a reason that is a property of this
+   * repository rather than of the tool: `tsconfig.build.json` and
+   * `tsconfig.test.json` are both children of `tsconfig.json`, and the walk goes
+   * toward parents, so a sibling is unreachable. Make the test config a link in
+   * the build chain and it becomes a file the answer was read out of, which is
+   * the shipping side.
+   *
+   * Measured against a clone rather than asserted from the list line: the list
+   * is roots, and a file the answer came from never appears there whichever side
+   * it lands on -- so reading it there would pass no matter what changed. The
+   * range has to exist for the question to be asked, and it is built here so
+   * that no commit of this repository's is pinned by it.
+   */
+  it("puts a change to the test config on the quiet side", async () => {
+    const clone = await mkdtemp(join(tmpdir(), "parallax-ships-self-"));
+    try {
+      await execFileAsync("git", ["clone", "-q", root, clone], { timeout: TIMEOUT_MS });
+      const config = join(clone, "tsconfig.test.json");
+      await writeFile(config, (await readFile(config, "utf8")) + "\n");
+      await execFileAsync("git", ["-C", clone, "commit", "-qam", "touch the test config"], {
+        timeout: TIMEOUT_MS,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+          GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+        },
+      });
+      const { stdout } = await execFileAsync("bash", [SCRIPT, "HEAD~1..HEAD"], { cwd: clone, timeout: TIMEOUT_MS });
+      const { shipping, quiet } = sides(stdout);
+      assert.match(quiet, /tsconfig\.test\.json/u);
+      assert.doesNotMatch(shipping, /tsconfig\.test\.json/u);
+      assert.match(stdout, /실리는 변경 없음/u);
+    } finally {
+      await rm(clone, { recursive: true, force: true });
+    }
   });
 });
 
