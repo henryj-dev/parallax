@@ -11,12 +11,18 @@ feeds a deploy mirror, so whatever slips in ships.
 Workflow: `EnterWorktree` → work and commit there →
 `git fetch origin && git rebase origin/main && git push origin HEAD:<branch>`
 
+**That push is what "done with a work cycle" means here — there is no separate
+merge step.** A worktree left with commits but no push has not landed on main
+yet; the cycle isn't finished until `HEAD` is on `origin/main`.
+
 Outside Claude:
 `git worktree add .claude/worktrees/<name> -b <branch> origin/main`
 
 The main tree fast-forwards on its own when a session starts and ends, so you
-never have to update it by hand. What still passes here: `Read`, `Grep`, and
-`git status|log|diff|pull|fetch`.
+never have to update it by hand — but that's a safety net, not something to
+wait on. The user can pull the main tree directly, any time; `pull`/`fetch`
+are always allowed there regardless of what else is going on. What still
+passes here: `Read`, `Grep`, and `git status|log|diff|pull|fetch`.
 
 New worktrees need `node_modules` and `.env` — see
 `.claude/worktree-bootstrap.md`, which the refusal message prints for you.
