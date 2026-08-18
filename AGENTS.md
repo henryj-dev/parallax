@@ -34,9 +34,19 @@ session left behind, for instance — `touch .git/claude-main-tree-rescue`
 ### Where these came from
 
 `scripts/claude-hooks/**`, `scripts/git-hooks/**` and `.codex/hooks.json` are a
-**snapshot of stardust's**, taken at its commit `3e1e1ea7`, with the two guard
-scripts and their tests re-taken from `80bb6dbd`. stardust holds the canonical
-copy; this one is allowed to fall behind.
+**snapshot of stardust's**. It was first taken at its commit `3e1e1ea7` and has
+been re-taken since; **measured 2026-08-18, every file in that set except
+`install.sh` is byte-identical to stardust's** — `cmp` on all ten, against a
+checkout at `0fadb45d`. The last commit there to touch any of them is
+`33a6863f`, so that is the baseline the set actually sits on. stardust holds the
+canonical copy; this one is allowed to fall behind, and today it does not.
+
+⚠️ **This paragraph said `80bb6dbd` for two of those files, and that was wrong
+one commit after it was written.** `66959a3` wrote the sentence; `409d2c2` took
+`test-main-tree-guard.py` again from `33a6863f` — and edited this very file
+without touching the number. So the record was a commit behind the thing it
+recorded, in the one document whose whole job is to be the record. A per-file
+baseline is what made that possible, so there is one commit here now.
 
 Those are kept **byte-identical on purpose** -- no local header, no local tweak.
 That is the only thing that makes drift checkable at all: with both checkouts
@@ -67,6 +77,16 @@ in a different repository than the check would. A fix belongs here rather than
 upstream only if it is about this repository specifically -- otherwise it goes
 to stardust and comes back with the next snapshot.
 
+That is still true, and the cost of it has now been paid in both directions.
+stardust asked the same question from their end, measured against `3e1e1ea7`,
+and read the three commits since as this copy having fallen behind -- it had
+not. They used the baseline this paragraph handed them, and the letter that
+handed it over quoted only the `3e1e1ea7` half of a sentence that already had
+two. **The check was never the hard part: ten `cmp` runs against a stardust
+checkout, no tooling at all.** What is missing is an occasion to run it, and
+until there is one, the honest form of this record is a measurement with a date
+on it rather than a commit number with a story about it.
+
 ### Rewriting history on `main` breaks something outside this repository
 
 stardust's release gate pins four commit shas from here: two ranges it runs
@@ -76,8 +96,31 @@ those commits does not corrupt anything -- it makes their gate refuse every
 release, and the reason it prints is "our control could not read it", which
 points at the tool rather than at the rewrite.
 
-So: **tell them before rewriting `main`.** Nothing here can detect it, and this
-is the one dependency that lives entirely in another repository's file.
+So: **tell them before rewriting `main`.** Nothing here can detect it, because
+the dependency lives entirely in another repository's file — and it is no longer
+the only one of those, see below.
+
+### Their gate also rests on two classifications from here
+
+stardust's release gate moved its own fixtures onto paths in this repository,
+and what those fixtures pin is what `scripts/what-ships.sh` answers for them:
+
+| path | the answer their fixture needs | why it holds here |
+|---|---|---|
+| `tsconfig.test.json` | does not ship | it and `tsconfig.build.json` are both children of `tsconfig.json`, and the walk goes toward parents -- a sibling is unreachable |
+| `security-audits/*.md` | does not ship | no `COPY` reaches it |
+
+Both are measured in `test/scripts/what-ships.test.ts` rather than left to this
+table, because a paragraph is what went stale above. Two things flip the first
+without anything in their repository moving: making the test config a link in
+the build chain, and **breaking that chain at all** -- a chain the tool cannot
+follow widens the list to the whole tree, and then every path here reads
+`🔴 실립니다`, that one included.
+
+⚠️ The second is the quiet one, and quiet *because* it is the safe direction for
+us. Widening over-reports, so no release is wrongly approved and nothing here
+stops -- while their fixture goes red looking exactly like a fixture that is
+working. That is why the narrowing has its own control now.
 
 ### What this does not cover
 
