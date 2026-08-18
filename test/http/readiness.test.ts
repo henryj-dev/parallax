@@ -296,3 +296,27 @@ describe("reporting how old the snapshot is", () => {
     assert.ok(!monitor.ready(), "six seconds is outside it");
   });
 });
+
+describe("the window it was handed", () => {
+  /**
+   * A guard nothing reached.
+   *
+   * `readConfig` rejects a bad value before it can arrive here, so from the
+   * environment this throw is unreachable -- and coverage said so: the two lines
+   * were the only ones in this file with no fixture. It still guards the direct
+   * caller, which is how the tests and any future wiring construct the monitor,
+   * so the answer is a fixture rather than deleting it.
+   *
+   * This is the mechanical half of "ask whether anything reaches that line
+   * before trusting a mutation of it".
+   */
+  it("refuses a window that cannot mean anything", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(
+        () => createReadinessMonitor(() => Promise.resolve([]), () => true, false, { maxStalenessMs: bad }),
+        /positive/u,
+        `accepted ${String(bad)}`,
+      );
+    }
+  });
+});
