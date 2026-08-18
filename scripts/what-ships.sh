@@ -182,15 +182,35 @@ changed="$(git -c core.quotepath=false diff --name-only "$range")"
 [[ -n "$changed" ]] || { echo "변경 없음"; exit 0; }
 
 # The list above is read from the Dockerfile as it is now, and applied to a range
-# that may predate it. If the Dockerfile moved inside that range, what ships was
-# not the same at both ends and this classification is only true of one.
+# that may predate it. If one of the files the answer was read out of moved
+# inside that range, what ships was not the same at both ends and this
+# classification is only true of one end.
+#
+# Those files are counted on the shipping side rather than classified against the
+# list. Saying so in a warning alone left the verdict line reading
+# `✅ 실리는 변경 없음` with the file listed under "does not ship" -- and the verdict
+# line is the part a machine reads. The one consumer of this output greps for the
+# two verdicts, so a warning aimed past them reached nobody, and the range where
+# it fires is exactly the range where the verdict is least trustworthy.
+#
+# It was not merely unclassified, either. A `target` in `tsconfig.json` changes
+# every file in `dist`, so "does not ship" was wrong -- and wrong in the quiet
+# direction, which is the one that matters.
+#
+# Counting them as shipping keeps the answer inside the interface that already
+# exists rather than adding a third verdict nothing greps for. It says what the
+# warning was already asking for -- that a human decides -- in the words that
+# reach the thing which has to stop.
 moved=()
 for source in "${derived_from[@]}"; do
-  grep -qx "$source" <<< "$changed" && moved+=("$source")
+  grep -qx "$source" <<< "$changed" || continue
+  duplicate=""
+  for already in ${moved[@]+"${moved[@]}"}; do [[ "$already" == "$source" ]] && duplicate=1; done
+  [[ -n "$duplicate" ]] || moved+=("$source")
 done
 if (( ${#moved[@]} > 0 )); then
   echo "⚠️ 이 범위 안에서 ${moved[*]} 이(가) 바뀌었습니다 — 무엇이 실리는지가 범위 내내 같지 않습니다."
-  echo "   아래 분류는 **지금의** 그 파일들 기준입니다. 사람이 읽어야 합니다."
+  echo "   그 파일들은 아래에서 **실리는 쪽**으로 셉니다. 나머지 분류는 **지금의** 그 파일들 기준입니다 — 사람이 읽어야 합니다."
   echo
 fi
 
@@ -199,13 +219,24 @@ rest=""
 while IFS= read -r file; do
   [[ -n "$file" ]] || continue
   hit=""
-  for path in "${ships[@]}"; do
-    # `.` is the whole tree -- the fallback for a stage whose inputs could not be
-    # narrowed. Matching it literally matched nothing, so the over-report it was
-    # supposed to be was silently no report at all.
-    if [[ "$path" == "." || "$file" == "$path" || "$file" == "$path"/* ]]; then hit=1; break; fi
+  # A file the answer came from is decided before the list is consulted: the list
+  # is what that file decides, so its absence from the list says nothing.
+  for source in ${moved[@]+"${moved[@]}"}; do
+    [[ "$file" == "$source" ]] && { hit="basis"; break; }
   done
-  if [[ -n "$hit" ]]; then shipped+="  $file"$'\n'; else rest+="  $file"$'\n'; fi
+  if [[ -z "$hit" ]]; then
+    for path in "${ships[@]}"; do
+      # `.` is the whole tree -- the fallback for a stage whose inputs could not be
+      # narrowed. Matching it literally matched nothing, so the over-report it was
+      # supposed to be was silently no report at all.
+      if [[ "$path" == "." || "$file" == "$path" || "$file" == "$path"/* ]]; then hit=1; break; fi
+    done
+  fi
+  case "$hit" in
+    basis) shipped+="  $file — 이 답을 읽어 낸 파일입니다: 무엇이 어떻게 실리는지를 정합니다"$'\n' ;;
+    "")    rest+="  $file"$'\n' ;;
+    *)     shipped+="  $file"$'\n' ;;
+  esac
 done <<< "$changed"
 
 if [[ -n "$shipped" ]]; then
@@ -216,4 +247,5 @@ else
 fi
 echo
 echo "실리지 않습니다"
-printf '%s' "${rest:-  (없음)$'\n'}"
+printf '%s' "${rest:-  (없음)
+}"

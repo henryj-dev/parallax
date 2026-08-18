@@ -11,6 +11,18 @@ const SCRIPT = join(import.meta.dirname, "../../scripts/what-ships.sh");
 const TIMEOUT_MS = 60_000;
 
 /**
+ * The two lists, split at the header between them.
+ *
+ * Asserting a filename against the whole output cannot tell "reported as
+ * shipping" from "reported as not shipping" -- both print the name. Which side
+ * of this line it lands on is the answer.
+ */
+function sides(out: string): { shipping: string; quiet: string } {
+  const parts = out.split(/^실리지 않습니다$/mu);
+  return { shipping: parts[0] ?? out, quiet: parts[1] ?? "" };
+}
+
+/**
  * Two lines of this script's output are a machine interface.
  *
  * A deployment's gate runs it and greps stdout for `실립니다` and for
@@ -251,10 +263,29 @@ describe("when the list itself moved", () => {
     assert.match(out, /범위 내내 같지 않습니다/u);
   });
 
+  it("counts it as shipping instead of filing it under what does not", async () => {
+    // The warning alone reached nobody that acts. stardust's gate greps the two
+    // verdict lines and nothing else, so with this file under "does not ship"
+    // the verdict stayed `✅ 실리는 변경 없음` -- a range whose classification the
+    // tool had just disclaimed was read as measured-and-clean, by the one reader
+    // there is. They asked whether that was deliberate; it was a column left
+    // behind.
+    //
+    // And "unclassifiable" understates it: what this file says decides what
+    // compiles, so a change to it does change the image.
+    const out = await run("HEAD~1..HEAD");
+    const { shipping, quiet } = sides(out);
+    assert.match(shipping, /🔴 실립니다/u);
+    assert.match(shipping, /tsconfig\.build\.json/u, "on the shipping side");
+    assert.doesNotMatch(quiet, /tsconfig\.build\.json/u, "and not also on the quiet one");
+    assert.doesNotMatch(out, /실리는 변경 없음/u, "the verdict a machine reads moves with it");
+  });
+
   it("stays quiet on a range that moved none of them", async () => {
     // The control: a warning on every range is a warning on none.
     const out = await run("HEAD~2..HEAD~1");
     assert.doesNotMatch(out, /범위 내내 같지 않습니다/u);
+    assert.match(out, /실리는 변경 없음/u, "and the verdict is still reachable");
   });
 });
 
@@ -322,11 +353,24 @@ describe("a config that reads another config", () => {
     assert.match(out, /범위 내내 같지 않습니다/u);
   });
 
+  it("counts the parent as shipping — a `target` changes every emitted file", async () => {
+    // The fixture's last commit moves `target` from ES2024 to ES2015. Nothing
+    // under a listed path moved and every file in `dist` comes out different,
+    // which is the case where "does not ship" is not a hedge but a wrong answer.
+    const out = await run("HEAD~1..HEAD");
+    const { shipping, quiet } = sides(out);
+    assert.match(shipping, /🔴 실립니다/u);
+    assert.match(shipping, /tsconfig\.json/u, "on the shipping side");
+    assert.doesNotMatch(quiet, /tsconfig\.json/u, "and not also on the quiet one");
+    assert.doesNotMatch(out, /실리는 변경 없음/u);
+  });
+
   it("stays quiet on a range that moved neither of them", async () => {
     // The control again, for the link that was just added: a chain that reports
     // every range would have replaced a blind spot with a blindfold.
     const out = await run("HEAD~2..HEAD~1");
     assert.doesNotMatch(out, /범위 내내 같지 않습니다/u);
+    assert.match(out, /실리는 변경 없음/u, "and the verdict is still reachable");
   });
 });
 
@@ -433,6 +477,61 @@ describe("a parent config that cannot be read", () => {
     assert.match(stderr, /빌드 입력을 못 읽었습니다/u, "and says why it widened");
     assert.match(stdout, /실립니다/u);
     assert.match(stdout, /notes\.md/u);
+    assert.doesNotMatch(stdout, /실리는 변경 없음/u);
+  });
+});
+
+/**
+ * The first file the answer was ever read out of.
+ *
+ * The Dockerfile has been on the warned list since the warning existed, and it
+ * went into "does not ship" all the same -- the same column the two configs sat
+ * in, just never measured, because the one consumer stops before running this
+ * tool when the Dockerfile moves. Its gate is not the reason this is right, so
+ * it is not left resting on it.
+ */
+describe("when the Dockerfile itself moved", () => {
+  let repo: string;
+
+  async function git(...args: string[]): Promise<void> {
+    await execFileAsync("git", ["-C", repo, ...args], {
+      timeout: TIMEOUT_MS,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+      },
+    });
+  }
+
+  before(async () => {
+    repo = await mkdtemp(join(tmpdir(), "parallax-ships-dockerfile-"));
+    await git("init", "-q", "--initial-branch=main");
+    await writeFile(join(repo, "Dockerfile"),
+      "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY public ./public\n");
+    await writeFile(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.build.json" } }));
+    await writeFile(join(repo, "tsconfig.build.json"), JSON.stringify({ include: ["src/**/*.ts"] }));
+    await mkdir(join(repo, "src"), { recursive: true });
+    await mkdir(join(repo, "public"), { recursive: true });
+    await writeFile(join(repo, "src/index.ts"), "one\n");
+    await writeFile(join(repo, "public/app.js"), "one\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "base");
+    // A path added to the image. Nothing else in the range moved.
+    await writeFile(join(repo, "Dockerfile"),
+      "FROM node AS build\nCOPY . .\nRUN true\n\nFROM node\nCOPY --from=build /app/dist ./dist\nCOPY public ./public\nCOPY migrations ./migrations\n");
+    await git("commit", "-qam", "what reaches the image changed");
+  });
+
+  after(async () => { await rm(repo, { recursive: true, force: true }); });
+
+  it("counts it as shipping, not as a file that stayed behind", async () => {
+    const { stdout } = await execFileAsync("bash", [SCRIPT, "HEAD~1..HEAD"], { cwd: repo, timeout: TIMEOUT_MS });
+    const { shipping, quiet } = sides(stdout);
+    assert.match(stdout, /Dockerfile.*바뀌었습니다/u);
+    assert.match(shipping, /🔴 실립니다/u);
+    assert.match(shipping, /Dockerfile/u, "on the shipping side");
+    assert.doesNotMatch(quiet, /Dockerfile/u, "and not also on the quiet one");
     assert.doesNotMatch(stdout, /실리는 변경 없음/u);
   });
 });
