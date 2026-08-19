@@ -239,6 +239,36 @@ describe("this repository's own chain", () => {
       await rm(clone, { recursive: true, force: true });
     }
   });
+
+  /**
+   * The list 177 actually measured, on this repository's Dockerfile.
+   *
+   * Breaking the chain here produces `package.json pnpm-lock.yaml . public
+   * migrations`, not `.`. Same reason as the synthetic fixture above: the
+   * final stage already copied those paths, and `add_path(".")` adds. The
+   * extra bypass named a line this Dockerfile cannot print.
+   */
+  it("still has other paths beside `.` when this repository's own chain breaks", async () => {
+    const clone = await mkdtemp(join(tmpdir(), "parallax-ships-widen-self-"));
+    try {
+      await execFileAsync("git", ["clone", "-q", root, clone], { timeout: TIMEOUT_MS });
+      const build = join(clone, "tsconfig.build.json");
+      const data = JSON.parse(await readFile(build, "utf8")) as { extends?: string };
+      data.extends = "./no-such-parent.json";
+      await writeFile(build, JSON.stringify(data));
+      const { stdout, stderr } = await execFileAsync("bash", [SCRIPT, "HEAD..HEAD"], {
+        cwd: clone,
+        timeout: TIMEOUT_MS,
+      });
+      assert.match(stderr, /빌드 입력을 못 읽었습니다/u);
+      const [list = ""] = stdout.split("\n");
+      assert.match(list, /(^|\s)\.(\s|$)/u, `widened: ${list}`);
+      assert.match(list, /(^|\s)public(\s|$)/u, `public still listed: ${list}`);
+      assert.doesNotMatch(list, /: \.$/u, ` . does not stand alone: ${list}`);
+    } finally {
+      await rm(clone, { recursive: true, force: true });
+    }
+  });
 });
 
 /**
@@ -305,6 +335,27 @@ describe("a stage whose inputs cannot be narrowed", () => {
     const { shipping, quiet } = sides(stdout);
     assert.match(shipping, /notes\.md — .*분류가 아니라 분류 실패입니다/u);
     assert.doesNotMatch(quiet, /notes\.md/u);
+  });
+
+  /**
+   * 176 §5 offered a second signal for a stdout-only consumer: if `.` stands
+   * alone on the list line, the run failed to classify. It does not fire, and
+   * this tool cannot produce the output that sentence named.
+   *
+   * `add_path(".")` appends to a list that already holds the other COPY
+   * targets of the final stage. This fixture is the smallest such stage
+   * (`COPY --from=build …` plus `COPY public`), and the list is `. public`.
+   * The control a few lines later refuses to print a list that lacks
+   * `public`, so a list of only `.` is not a shape this tool emits — it is a
+   * shape it exits 1 rather than print. The signal that does fire is the
+   * sentence on the verdict line, above.
+   */
+  it("puts `.` on the list beside the other COPY targets, not alone", async () => {
+    const { stdout } = await execFileAsync("bash", [SCRIPT, "HEAD~1..HEAD"], { cwd: repo, timeout: TIMEOUT_MS });
+    const [list = ""] = stdout.split("\n");
+    assert.match(list, /(^|\s)\.(\s|$)/u, "widened, so . is on the list");
+    assert.match(list, /(^|\s)public(\s|$)/u, "and public is still there — the control requires it");
+    assert.doesNotMatch(list, /: \.$/u, "so . does not stand alone");
   });
 });
 
