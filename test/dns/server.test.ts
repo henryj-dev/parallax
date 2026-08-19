@@ -336,6 +336,18 @@ describe("DNS server", () => {
     assert.equal(readAnswers(reply).length, 2);
   });
 
+  it("answers an apex SOA query from the zone serial", async () => {
+    const { port } = await start({ zones: () => [EXAMPLE] });
+    const reply = received(await ask(port, buildQuery("example.com", TYPE.SOA)));
+    assert.equal(rcodeOf(reply), RCODE.NOERROR);
+    const answers = readAnswers(reply);
+    assert.equal(answers.length, 1);
+    assert.equal(answers[0]?.type, TYPE.SOA);
+    const serialOffset = (answers[0]?.data.length ?? 0) - 20;
+    assert.ok(serialOffset >= 0);
+    assert.equal(answers[0]?.data.readUInt32BE(serialOffset), EXAMPLE.serial);
+  });
+
   it("tells apart a name with no records of this type from a name that does not exist", async () => {
     // A resolver treats these differently, and caches them differently. Both
     // carry the SOA so it knows how long it may remember the absence.

@@ -16,7 +16,7 @@ import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.t
 import { createReadinessMonitor } from "./http/readiness.ts";
 import { redirectLocation } from "./http/redirect.ts";
 import { createRuntime } from "./runtime.ts";
-import { authenticate, type SecurityConfig } from "./security/http-authorization.ts";
+import { authenticate, withIdentityProvider, type SecurityConfig } from "./security/http-authorization.ts";
 
 const config = readConfig();
 
@@ -58,7 +58,12 @@ const readiness = createReadinessMonitor(
   },
 );
 
-if (!accessTokens.security().enabled && !isLoopbackHost(config.host)) {
+const securityConfig = (): SecurityConfig => {
+  const tokens = accessTokens.security();
+  return config.oidc ? withIdentityProvider(tokens, config.oidc.sessionSecret) : tokens;
+};
+
+if (!securityConfig().enabled && !isLoopbackHost(config.host)) {
   console.error("parallax: refusing to serve a non-loopback address with no access token. Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.");
   process.exit(1);
 }
@@ -103,14 +108,6 @@ const nodeHandlerOptions = {
   get trustForwardedHeaders() { return settingsService.current().trustForwardedHeaders; },
   terminatesTls: config.tls !== undefined,
 };
-
-// The identity session is a second way to be a principal, so the security layer
-// is told the secret that signs it. With no provider configured the field stays
-// absent and nothing but a token authenticates.
-const securityConfig = (): SecurityConfig => ({
-  ...accessTokens.security(),
-  ...(config.oidc ? { identitySessionSecret: config.oidc.sessionSecret } : {}),
-});
 
 const handleApi = createNodeHandler(runtime, securityConfig, nodeHandlerOptions);
 

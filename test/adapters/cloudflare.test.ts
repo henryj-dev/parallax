@@ -27,6 +27,48 @@ describe("CloudflareProviderAdapter", () => {
     ]);
   });
 
+  it("lists a supported type that arrived as data rather than content", async () => {
+    const fetch = async (): Promise<Response> => Response.json({
+      success: true,
+      result: [
+        { id: "https-1", name: "_https.example.com", type: "HTTPS", data: "1 . alpn=h2", ttl: 300 },
+      ],
+      result_info: { page: 1, total_pages: 1 },
+    });
+    const adapter = new CloudflareProviderAdapter({ token: "secret", zoneId: "zone-1", fetch, ownershipSecret: OWNERSHIP_SECRET });
+    assert.deepEqual(await adapter.list("example.com/external"), [
+      { id: "https-1", providerId: "https-1", managed: false, name: "_https", type: "HTTPS", content: "1 . alpn=h2", ttl: 300 },
+    ]);
+  });
+
+  it("refuses to skip a supported type that has no usable RDATA", async () => {
+    const fetch = async (): Promise<Response> => Response.json({
+      success: true,
+      result: [
+        { id: "https-1", name: "_https.example.com", type: "HTTPS", ttl: 300 },
+      ],
+      result_info: { page: 1, total_pages: 1 },
+    });
+    const adapter = new CloudflareProviderAdapter({ token: "secret", zoneId: "zone-1", fetch, ownershipSecret: OWNERSHIP_SECRET });
+    await assert.rejects(() => adapter.list("example.com/external"), /no usable RDATA/);
+  });
+
+  it("compares provider hostnames after trailing-dot and case differences", async () => {
+    const fetch = async (): Promise<Response> => Response.json({
+      success: true,
+      result: [
+        { id: "ns", name: "example.com", type: "NS", content: "NS1.Example.NET.", ttl: 300 },
+        { id: "mx", name: "example.com", type: "MX", content: "Mail.Example.NET.", priority: 10, ttl: 300 },
+      ],
+      result_info: { page: 1, total_pages: 1 },
+    });
+    const adapter = new CloudflareProviderAdapter({ token: "secret", zoneId: "zone-1", fetch, ownershipSecret: OWNERSHIP_SECRET });
+    assert.deepEqual((await adapter.list("example.com/external")).map((record) => record.content), [
+      "ns1.example.net",
+      "10 mail.example.net",
+    ]);
+  });
+
   it("drops proxied from types Cloudflare cannot proxy, which it reports anyway", async () => {
     // Cloudflare answers with `proxied` on every record, including TXT and MX.
     // Carrying that through would describe a record this control plane refuses.

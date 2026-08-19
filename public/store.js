@@ -19,6 +19,14 @@ export const REVISION_PAGE_SIZE = 50;
 /** Scopes a view can surface an inline error against. */
 export const ERROR_SCOPES = ["zone", "record", "credential", "profile", "settings", "token", "auth", "fallback"];
 
+export function editorControlsVisible(state) {
+  return !state.authRequired || state.role === "admin" || state.role === "editor";
+}
+
+export function adminControlsVisible(state) {
+  return !state.authRequired || state.role === "admin";
+}
+
 export function createStore(client) {
   const state = {
     connection: "connecting",
@@ -32,7 +40,9 @@ export function createStore(client) {
     dirty: false,
     loadingZone: false,
     status: null,
+    statusError: "",
     history: [],
+    historyError: "",
 
     plan: null,
     planError: "",
@@ -210,27 +220,39 @@ export function createStore(client) {
       state.planError = "";
       state.previewRevision = null;
       state.loadingZone = true;
+      state.statusError = "";
+      state.historyError = "";
       emitChange();
 
       try {
-        const [detail, status, history] = await Promise.all([
+        const [detail, statusResult, historyResult] = await Promise.all([
           client.getZone(name),
-          client.zoneStatus(name).catch(() => null),
-          client.history(name, HISTORY_PAGE_SIZE).catch(() => ({ entries: [] })),
+          client.zoneStatus(name).then(
+            (status) => ({ status, error: "" }),
+            (error) => ({ status: null, error: error.message }),
+          ),
+          client.history(name, HISTORY_PAGE_SIZE).then(
+            (history) => ({ history, error: "" }),
+            (error) => ({ history: null, error: error.message }),
+          ),
         ]);
         // A slower answer for a zone the user has since left must not win.
         if (activeName() !== name) return true;
         state.activeZone = detail;
         state.records = readRecords(detail);
-        state.status = status;
-        state.history = history?.entries ?? [];
+        state.status = statusResult.status;
+        state.statusError = statusResult.error;
+        state.history = historyResult.history?.entries ?? [];
+        state.historyError = historyResult.error;
         return true;
       } catch (error) {
         if (activeName() !== name) return true;
         handleUnauthorized(error);
         state.records = [];
         state.status = null;
+        state.statusError = "";
         state.history = [];
+        state.historyError = "";
         notice("zone.detailsFailed", { error: error.message }, "error");
         return false;
       } finally {
@@ -343,7 +365,7 @@ export function createStore(client) {
     async adopt() {
       setError("zone", null);
       try {
-        const result = await client.adopt(activeName(), state.status?.revision);
+        const result = await client.adopt(activeName(), state.activeZone?.revision);
         notice("zone.adopted", { seen: String(result.seen), adopted: String(result.adopted.length) });
         // Adoption reports things no count can carry: that this process just
         // became the authority for a whole zone, or that it could not read

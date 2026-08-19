@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createIdentityHandler } from "../../src/http/identity-routes.ts";
-import { authenticate, IDENTITY_COOKIE } from "../../src/security/http-authorization.ts";
+import { authenticate, IDENTITY_COOKIE, withIdentityProvider } from "../../src/security/http-authorization.ts";
 import { readIdentity, type OidcConfig } from "../../src/security/oidc.ts";
 import { readSession, signSession } from "../../src/security/session-token.ts";
 
@@ -150,6 +150,38 @@ describe("identity sign-in", () => {
         return true;
       },
     );
+  });
+
+  it("does not treat an identity-provider config as an unauthenticated administrator", () => {
+    const config = withIdentityProvider({ enabled: false, tokens: [] }, SECRET);
+    assert.equal(config.enabled, true);
+    const principal = authenticate(new Request("https://parallax.example/api/v1/zones"), config);
+    assert.equal(principal, undefined);
+  });
+
+  it("refuses identity logout over GET, and still clears on a same-origin POST", async () => {
+    const handler = createIdentityHandler({ settings: SETTINGS, fetchImpl: provider({ sub: "u", entitlements: ["viewer"] }) });
+    const get = await handler(new Request("https://parallax.example/auth/logout"));
+    assert.equal(get?.status, 405);
+
+    const crossSite = await handler(new Request("https://parallax.example/auth/logout", {
+      method: "POST",
+      headers: { origin: "https://evil.example" },
+    }));
+    assert.equal(crossSite?.status, 403);
+
+    const session = signSession({ subject: "user-1", role: "editor", expiresAt: Math.floor(Date.now() / 1000) + 60 }, SECRET);
+    const cleared = await handler(new Request("https://parallax.example/auth/logout", {
+      method: "POST",
+      headers: {
+        origin: "https://parallax.example",
+        cookie: `${IDENTITY_COOKIE}=${encodeURIComponent(session)}`,
+      },
+    }));
+    assert.equal(cleared?.status, 302);
+    const cookieHeader = (cleared as Response).headers.getSetCookie().join("\n");
+    assert.match(cookieHeader, new RegExp(`${IDENTITY_COOKIE}=`));
+    assert.match(cookieHeader, /Max-Age=0/);
   });
 
   it("sends the browser only to a path on this origin", async () => {

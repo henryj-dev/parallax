@@ -23,6 +23,8 @@ describe("DNS desired state validation", () => {
 
   it("canonicalizes host-like values and rejects proxy fields on TXT", () => {
     assert.equal(createDesiredRecord("alias", { name: "www", type: "CNAME", content: "Example.COM.", ttl: 60 }).content, "example.com");
+    assert.equal(createDesiredRecord("ns", { name: "@", type: "NS", content: "NS1.Example.NET.", ttl: 60 }).content, "ns1.example.net");
+    assert.equal(createDesiredRecord("mx", { name: "@", type: "MX", content: "10 Mail.Example.NET.", ttl: 60 }).content, "10 mail.example.net");
     assert.equal(createDesiredRecord("v6", { name: "@", type: "AAAA", content: "2001:0db8:0:0:0:0:0:1", ttl: 60 }).content, "2001:db8::1");
     assert.throws(() => createDesiredRecord("txt", { name: "@", type: "TXT", content: "ok", ttl: 60, proxied: false }), /proxied/);
   });

@@ -1,4 +1,5 @@
 import { BlockList, isIP } from "node:net";
+import { encodeRdata } from "../dns/rdata.ts";
 
 /**
  * Every record type Parallax will hold in a desired state.
@@ -202,7 +203,12 @@ export function zoneFileContentIssue(type: string, content: string): string | un
   if (/[\u0000-\u001f\u007f]/u.test(content)) {
     return `${type || "record"} content must not contain control characters`;
   }
-  if (type !== "TXT" && /[;()]/u.test(content)) {
+  // Quoted character-strings are data. CAA values legitimately carry `;`
+  // (`0 issue "ca.example.net; account=123"`); checking the raw presentation
+  // rejected those while still catching an unquoted `;` that starts a zone-file
+  // comment.
+  const unquoted = content.replace(/"(?:[^"\\]|\\.)*"/gu, '""');
+  if (type !== "TXT" && /[;()]/u.test(unquoted)) {
     return `${type || "record"} content must not contain zone-file structural characters`;
   }
   if (type !== "TXT" && /(?:^|\s)\$[a-z][a-z0-9_-]*/iu.test(content)) {
@@ -234,7 +240,9 @@ function validateRecordContent(type: string, content: string): string | undefine
         ? undefined : "TXT content must contain between 1 and 4096 characters";
     case "MX":
       // `10 mail.example.com` -- preference first, exactly as a zone file has it.
-      return fields.length === 2 && isUnsigned(fields[0], 16) && isValidHostname(fields[1] as string)
+      // `.` is the RFC 7505 null MX, the same exception SRV and SVCB already allow.
+      return fields.length === 2 && isUnsigned(fields[0], 16)
+        && (fields[1] === "." || isValidHostname(fields[1] as string))
         ? undefined : "MX content must be a preference and a hostname, as in `10 mail.example.com`";
     case "SRV":
       return fields.length === 4 && isUnsigned(fields[0], 16) && isUnsigned(fields[1], 16)
@@ -584,9 +592,15 @@ export function createDesiredRecord(id: string, input: unknown): DesiredRecord {
     issues.push(...error.issues);
   }
 
+  if (RECORD_TYPES.some((candidate) => candidate === typeValue) && !contentIssue) {
+    content = canonicalizeRecordContent(typeValue, content);
+    try {
+      encodeRdata(typeValue as RecordType, content);
+    } catch (error) {
+      issues.push(error instanceof Error ? error.message : `${typeValue} content cannot be encoded`);
+    }
+  }
   if (issues.length > 0) throw new DomainValidationError(issues);
-  if (typeValue === "CNAME") content = content.toLowerCase().replace(/\.$/, "");
-  if (typeValue === "AAAA") content = new URL(`http://[${content}]/`).hostname.slice(1, -1);
   const record: DesiredRecord = {
     id: recordId,
     name,
@@ -675,4 +689,38 @@ function isValidRecordName(name: string): boolean {
 function isValidHostname(value: string): boolean {
   const hostname = value.toLowerCase().replace(/\.$/, "");
   return hostname.length > 0 && hostname.length <= 253 && hostname.split(".").every(isValidLabel);
+}
+
+function canonicalizeHostname(value: string): string {
+  if (value === ".") return ".";
+  return value.toLowerCase().replace(/\.$/, "");
+}
+
+/**
+ * One spelling of a record's presentation content, used on write and when
+ * reading a provider record, so trailing-dot and case differences cannot
+ * look like drift.
+ */
+export function canonicalizeRecordContent(type: string, content: string): string {
+  if (type === "AAAA" && isIP(content) === 6) {
+    try {
+      return new URL(`http://[${content}]/`).hostname.slice(1, -1);
+    } catch {
+      return content;
+    }
+  }
+  if (type === "CNAME" || type === "DNAME" || type === "NS" || type === "PTR") {
+    return canonicalizeHostname(content);
+  }
+  const fields = content.split(/\s+/u).filter((field) => field.length > 0);
+  if (type === "MX" && fields.length === 2) {
+    return `${fields[0]} ${canonicalizeHostname(fields[1] as string)}`;
+  }
+  if (type === "SRV" && fields.length === 4) {
+    return `${fields[0]} ${fields[1]} ${fields[2]} ${canonicalizeHostname(fields[3] as string)}`;
+  }
+  if ((type === "SVCB" || type === "HTTPS") && fields.length >= 2) {
+    return [fields[0], canonicalizeHostname(fields[1] as string), ...fields.slice(2)].join(" ");
+  }
+  return content;
 }

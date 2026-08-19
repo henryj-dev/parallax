@@ -5,9 +5,10 @@ export interface SyncPanelView {
 }
 
 export interface SyncPanel {
-  /** `empty` when the zone holds nothing to reconcile; `status` otherwise. */
-  kind: "empty" | "status";
+  /** `empty` when the zone holds nothing to reconcile; `error` when status could not be read; `status` otherwise. */
+  kind: "empty" | "status" | "error";
   overall: string;
+  error?: string;
   views: { internal: SyncPanelView; external: SyncPanelView };
   percent: number;
   desired: number;

@@ -34,4 +34,27 @@ describe("portal API client", () => {
     await assert.rejects(client.listZones(), (error) =>
       error instanceof ApiError && error.status === 502 && /did not advance/u.test(error.message));
   });
+
+  it("walks every status page the same way it walks zone pages", async () => {
+    const paths = [];
+    const client = createApiClient({
+      root: "https://portal.example/api/v1",
+      fetchImpl: async (input) => {
+        const url = new URL(String(input));
+        paths.push(`${url.pathname}${url.search}`);
+        const offset = Number(url.searchParams.get("offset"));
+        return Response.json(offset === 0
+          ? { zones: [{ zone: "a.example", state: "applied" }], limit: 500, offset: 0, hasMore: true }
+          : { zones: [{ zone: "b.example", state: "pending" }], limit: 500, offset: 1, hasMore: false });
+      },
+    });
+
+    assert.deepEqual(await client.statusOverview(), {
+      zones: [{ zone: "a.example", state: "applied" }, { zone: "b.example", state: "pending" }],
+    });
+    assert.deepEqual(paths, [
+      "/api/v1/status?limit=500&offset=0",
+      "/api/v1/status?limit=500&offset=1",
+    ]);
+  });
 });

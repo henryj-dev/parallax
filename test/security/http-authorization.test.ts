@@ -96,8 +96,14 @@ describe("HTTP role authorization", () => {
     assert.equal(authorize(editor, request("/api/v1/zones/example.com/views/external/records/root", "DELETE")), true);
     assert.equal(authorize(editor, request("/api/v1/zones/example.com/preview", "POST")), true);
     assert.equal(authorize(editor, request("/api/v1/zones/example.com/apply", "POST")), true);
+    assert.equal(authorize(editor, request("/api/v1/zones/example.com/adopt", "POST")), true);
     assert.equal(authorize(editor, request("/api/v1/zones/example.com/revisions/2/restore", "POST")), true);
     assert.equal(authorize(editor, request("/api/v1/zones/example.com", "DELETE")), false);
+  });
+
+  it("keeps zone adopt off the viewer path", () => {
+    const viewer = { role: "viewer", subject: "read-only" } as const;
+    assert.equal(authorize(viewer, request("/api/v1/zones/example.com/adopt", "POST")), false);
   });
 
   it("reserves zone deletion and credential paths for admins", () => {

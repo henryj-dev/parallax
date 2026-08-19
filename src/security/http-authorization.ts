@@ -92,6 +92,15 @@ export function authenticate(request: Request, config: SecurityConfig): Principa
   return authenticateWithPreparedTokens(request, prepareConfig(config));
 }
 
+/**
+ * An identity provider is a second way to be a principal. Once it is
+ * configured, unauthenticated callers are not treated as the
+ * `authentication-disabled` administrator — they have to present a session.
+ */
+export function withIdentityProvider(config: SecurityConfig, identitySessionSecret: string): SecurityConfig {
+  return { ...config, enabled: true, identitySessionSecret };
+}
+
 /** Returns whether the principal may invoke the request's route and method. */
 export function authorize(principal: Principal, request: Request): boolean {
   if (principal.role === "admin") return true;
@@ -128,6 +137,7 @@ export function authorize(principal: Principal, request: Request): boolean {
 
   if (segments.length === 5 && segments[4] === "preview" && method === "POST") return true;
   if (segments.length === 5 && segments[4] === "apply" && method === "POST") return true;
+  if (segments.length === 5 && segments[4] === "adopt" && method === "POST") return true;
   if (segments.length === 7 && segments[4] === "revisions" && segments[6] === "restore" && method === "POST") return true;
 
   // Individual record mutations are desired-state editing, not zone deletion.
@@ -344,7 +354,7 @@ function isUnsafeMethod(method: string): boolean {
  * either one is proof the request did not come from another site. `Sec-Fetch-Site`
  * is the fallback for clients that omit `Origin` on same-origin requests.
  */
-function hasSameOrigin(request: Request): boolean {
+export function hasSameOrigin(request: Request): boolean {
   if (request.headers.get("sec-fetch-site") === "same-origin") return true;
   const origin = request.headers.get("origin");
   if (!origin) return false;

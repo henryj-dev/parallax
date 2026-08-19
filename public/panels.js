@@ -199,12 +199,24 @@ export function recordRow(record, records) {
  *   status?: { desiredRevision?: number, statuses?: { view?: string, state?: string, appliedRevision?: number, error?: string }[] },
  *   activeZone?: { revision?: number },
  *   records?: unknown[],
+ *   statusError?: string,
  * }} state
  */
 export function syncPanel(state) {
+  const desired = Number(state?.status?.desiredRevision ?? state?.activeZone?.revision ?? 0);
+  if (state?.statusError) {
+    return {
+      kind: "error",
+      error: String(state.statusError),
+      overall: "failed",
+      views: { internal: { state: "", appliedRevision: 0, error: "" }, external: { state: "", appliedRevision: 0, error: "" } },
+      percent: 0,
+      desired,
+      applied: 0,
+    };
+  }
   const statuses = Array.isArray(state?.status?.statuses) ? state.status.statuses : [];
   const records = Array.isArray(state?.records) ? state.records : [];
-  const desired = Number(state?.status?.desiredRevision ?? state?.activeZone?.revision ?? 0);
 
   // A zone holding no records has no target to reconcile, so nothing ever writes
   // a status for it. Reading that absence as "pending" says the system has not

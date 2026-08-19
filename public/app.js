@@ -1,6 +1,6 @@
 import { createApiClient } from "./api-client.js";
 import { fallbackPanel, recordOwnership, recordRow, syncPanel } from "./panels.js";
-import { createStore, isNonGlobalAddress, ERROR_SCOPES, HISTORY_PAGE_SIZE } from "./store.js";
+import { createStore, isNonGlobalAddress, ERROR_SCOPES, HISTORY_PAGE_SIZE, editorControlsVisible, adminControlsVisible } from "./store.js";
 import { effectiveExternalTtl, isValidDnsOnlyTtl } from "./ttl.js";
 import {
   createSemanticMessage,
@@ -306,6 +306,20 @@ function renderLens(state) {
 
 function renderSync(state) {
   const panel = syncPanel(state);
+  if (panel.kind === "error") {
+    for (const prefix of ["internal", "external"]) {
+      const label = $(`#${prefix}-sync`);
+      label.className = "target-status failed";
+      label.textContent = t("status.failed");
+      $(`#${prefix}-sync-detail`).textContent = "";
+    }
+    const chip = $("#sync-overall");
+    chip.className = "status-chip failed";
+    chip.textContent = t("status.loadFailed", { error: panel.error });
+    $("#revision-progress").style.width = "0%";
+    $("#revision-caption").textContent = t("status.loadFailed", { error: panel.error });
+    return;
+  }
   if (panel.kind === "empty") return renderNothingToSync();
   for (const prefix of ["internal", "external"]) {
     const view = panel.views[prefix];
@@ -350,8 +364,15 @@ function changeCounts(entry, t) {
 }
 
 function renderHistory(state) {
+  if (state.historyError) {
+    $("#history-empty").hidden = false;
+    $("#history-empty").textContent = t("history.loadFailed", { error: state.historyError });
+    $("#history-list").innerHTML = "";
+    return;
+  }
   const entries = state.history.slice(0, HISTORY_PAGE_SIZE);
   $("#history-empty").hidden = entries.length > 0;
+  $("#history-empty").textContent = t("history.none");
   $("#history-list").innerHTML = entries.map((entry) => `<li><b>${escapeHtml(localizeAuditAction(entry.action, t))}</b><time>${escapeHtml(formatDate(entry.at))}</time><small>${escapeHtml(entry.actor || t("history.system"))}${entry.revision ? ` · ${escapeHtml(t("history.revision", { revision: entry.revision }))}` : ""}${changeCounts(entry, t)}</small></li>`).join("");
 }
 
@@ -508,6 +529,7 @@ function fillSettingsForm(state) {
   form.elements.publicOrigin.value = state.settings.publicOrigin ?? "";
   form.elements.revisionRetention.value = String(state.settings.revisionRetention ?? 0);
   form.elements.auditRetentionDays.value = String(state.settings.auditRetentionDays ?? 0);
+  form.elements.fallbackResolver.value = state.settings.fallbackResolver ?? "";
 }
 
 // ---- record dialog --------------------------------------------------------
@@ -629,7 +651,16 @@ function readRecordForm(form) {
  * says "this exists for you", and it does not.
  */
 function syncRoleVisibility(state) {
-  $("#credential-settings-button").hidden = state.authRequired && state.role !== "admin";
+  const canEdit = editorControlsVisible(state);
+  const canAdmin = adminControlsVisible(state);
+  $("#credential-settings-button").hidden = !canAdmin;
+  for (const id of ["#adopt-button", "#apply-button", "#preview-button", "#add-record-button"]) {
+    $(id).hidden = !canEdit;
+  }
+  $("#delete-zone-button").hidden = !canAdmin;
+  $("#add-zone-button").hidden = !canEdit;
+  const welcomeCreate = $('[data-action="open-create"]');
+  if (welcomeCreate) welcomeCreate.hidden = !canEdit;
 }
 
 function openAuthDialog() {
@@ -971,6 +1002,7 @@ $("#settings-form").addEventListener("submit", async (event) => {
     publicOrigin: String(form.elements.publicOrigin.value).trim(),
     revisionRetention: Number(form.elements.revisionRetention.value),
     auditRetentionDays: Number(form.elements.auditRetentionDays.value),
+    fallbackResolver: String(form.elements.fallbackResolver.value).trim(),
   });
   fillSettingsForm(store.getState());
   $("#save-settings-button").disabled = false;

@@ -287,6 +287,13 @@ function answerFromZone(
 ) {
   const name = query.question.name;
   const soa = soaRecord(zone, negativeTtl);
+  // SOA is synthesized, not stored. A query that asks for it at the apex must
+  // get it in the answer section — authority-only is how we talk about
+  // negatives, and `dig SOA` / a secondary asking for the zone's SOA is not a
+  // negative.
+  if (name === zone.name && query.question.type === TYPE.SOA) {
+    return { query, rcode: RCODE.NOERROR, authoritative: true, answers: [soa] };
+  }
   let atName: ServedZone["records"] = zone.records.filter((record) => absolute(record.name, zone.name) === name);
 
   if (atName.length === 0) {

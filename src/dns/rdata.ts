@@ -95,13 +95,22 @@ function encodeIpv4(value: string): Buffer {
 
 function encodeIpv6(value: string): Buffer {
   if (isIP(value) !== 6) throw new WireFormatError(`${value} is not an IPv6 address`);
-  // Expanded here rather than by a parser: the groups are already the answer,
-  // and `::` is the only thing that has to be counted out.
-  const [head, tail] = value.split("::") as [string, string | undefined];
+  // `isIP` accepts a dotted IPv4 tail (`::ffff:192.0.2.1`). Those four decimals
+  // are two hex groups, not one, and parsing them as hex wrote the wrong 16
+  // bytes. Same expansion the listener already uses for client CIDRs.
+  let text = value.toLowerCase();
+  const embedded = /(?:^|:)(\d+\.\d+\.\d+\.\d+)$/u.exec(text)?.[1];
+  if (embedded) {
+    const octets = embedded.split(".").map(Number);
+    const replacement = `${((octets[0] ?? 0) << 8 | (octets[1] ?? 0)).toString(16)}:${((octets[2] ?? 0) << 8 | (octets[3] ?? 0)).toString(16)}`;
+    text = `${text.slice(0, -embedded.length)}${replacement}`;
+  }
+  const [head, tail] = text.split("::") as [string, string | undefined];
   const left = head === "" ? [] : head.split(":");
   const right = tail === undefined || tail === "" ? [] : tail.split(":");
   const middle = new Array(8 - left.length - right.length).fill("0");
   const groups = tail === undefined ? left : [...left, ...middle, ...right];
+  if (groups.length !== 8) throw new WireFormatError(`${value} is not an IPv6 address`);
   const out = Buffer.alloc(16);
   groups.forEach((group, index) => out.writeUInt16BE(Number.parseInt(group || "0", 16), index * 2));
   return out;

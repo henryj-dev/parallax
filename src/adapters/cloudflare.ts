@@ -1,6 +1,6 @@
 import { ProviderConstraintError } from "../application/ports.ts";
 import type { ProviderAdapter, ServiceOwnedHostname } from "../application/ports.ts";
-import { RECORD_TYPES, canBeProxied, effectiveExternalTtl, type DesiredRecord, type ManagingService, type RecordType } from "../domain/dns.ts";
+import { RECORD_TYPES, canBeProxied, canonicalizeRecordContent, effectiveExternalTtl, type DesiredRecord, type ManagingService, type RecordType } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
 import { MAX_RECORD_ID_LENGTH, MAX_MARKER_LENGTH, ownershipComment, readOwnershipComment } from "./ownership.ts";
 
@@ -73,7 +73,15 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
       const records = Array.isArray(payload.result) ? payload.result : [];
       for (const value of records) {
         const record = asCloudflareRecord(value);
-        if (!record || !isSupportedType(record.type)) continue;
+        if (!record) {
+          const type = isObject(value) && typeof value.type === "string" ? value.type : "";
+          if (isSupportedType(type)) {
+            const id = isObject(value) && typeof value.id === "string" ? value.id : type;
+            throw new Error(`Cloudflare record ${id} (${type}) has no usable RDATA`);
+          }
+          continue;
+        }
+        if (!isSupportedType(record.type)) continue;
         const name = relativeName(record.name, zone);
         if (name === undefined) continue;
         const ownership = readOwnershipComment(record.comment, this.#ownershipSecret, target);
@@ -84,7 +92,7 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
           managed,
           name,
           type: record.type,
-          content: joinPriority(record.type, normalizeContent(record.type, record.content), record.priority),
+          content: normalizeContent(record.type, joinPriority(record.type, record.content, record.priority)),
           ttl: effectiveExternalTtl(record as Pick<DesiredRecord, "type" | "ttl" | "proxied">),
         };
         // Cloudflare reports `proxied` on every type, including the ones it
@@ -347,8 +355,8 @@ function relativeName(name: string, zone: string): string | undefined {
 }
 
 function normalizeContent(type: RecordType, content: string): string {
-  if (type === "CNAME") return content.toLowerCase().replace(/\.$/, "");
-  return type === "TXT" ? readTxtPresentation(content) : content;
+  if (type === "TXT") return readTxtPresentation(content);
+  return canonicalizeRecordContent(type, content);
 }
 
 /**
@@ -389,8 +397,14 @@ function readTxtPresentation(content: string): string {
 
 function asCloudflareRecord(value: unknown): CloudflareRecord | undefined {
   if (!isObject(value)) return undefined;
-  if (typeof value.id !== "string" || typeof value.name !== "string" || typeof value.type !== "string" || typeof value.content !== "string" || typeof value.ttl !== "number") return undefined;
-  const record: CloudflareRecord = { id: value.id, name: value.name, type: value.type, content: value.content, ttl: value.ttl };
+  if (typeof value.id !== "string" || typeof value.name !== "string" || typeof value.type !== "string" || typeof value.ttl !== "number") return undefined;
+  const content = typeof value.content === "string" && value.content.length > 0
+    ? value.content
+    : typeof value.data === "string" && value.data.length > 0
+      ? value.data
+      : undefined;
+  if (content === undefined) return undefined;
+  const record: CloudflareRecord = { id: value.id, name: value.name, type: value.type, content, ttl: value.ttl };
   if (typeof value.priority === "number") record.priority = value.priority;
   if (typeof value.proxied === "boolean") record.proxied = value.proxied;
   if (typeof value.comment === "string") record.comment = value.comment;
@@ -410,7 +424,8 @@ function isSupportedType(value: string): value is RecordType {
  * already start with one. The writer always splits, which both forms accept.
  */
 function hasSeparatePriority(type: string): boolean {
-  return type === "MX" || type === "SRV" || type === "URI";
+  return type === "MX" || type === "SRV" || type === "URI"
+    || type === "HTTPS" || type === "SVCB" || type === "NAPTR";
 }
 
 /**
@@ -430,9 +445,14 @@ const COMPLETE_FIELDS: Readonly<Record<string, number>> = { MX: 2, SRV: 4, URI: 
 function joinPriority(type: string, content: string, priority: number | undefined): string {
   if (!hasSeparatePriority(type) || priority === undefined) return content;
   const complete = COMPLETE_FIELDS[type];
-  if (complete === undefined) return content;
-  const fields = content.trim().split(/\s+/u).filter((field) => field !== "").length;
-  return fields === complete - 1 ? `${priority} ${content}` : content;
+  if (complete !== undefined) {
+    const fields = content.trim().split(/\s+/u).filter((field) => field !== "").length;
+    return fields === complete - 1 ? `${priority} ${content}` : content;
+  }
+  const trimmed = content.trim();
+  return trimmed === String(priority) || trimmed.startsWith(`${priority} `)
+    ? content
+    : `${priority} ${content}`;
 }
 
 /** Splits the leading priority back out, for the field Cloudflare expects it in. */

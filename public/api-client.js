@@ -70,6 +70,19 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     }
   }
 
+  async function listAllStatus() {
+    const zones = [];
+    let offset = 0;
+    for (;;) {
+      const page = await request(`/status?limit=500&offset=${offset}`);
+      if (!page || !Array.isArray(page.zones)) throw new ApiError("invalid status page", 502);
+      zones.push(...page.zones);
+      if (!page.hasMore) return { zones };
+      if (page.zones.length === 0) throw new ApiError("status pagination did not advance", 502);
+      offset += page.zones.length;
+    }
+  }
+
   return {
     /** Outside the API root: reports whether this deployment requires a token. */
     async authenticationMode() {
@@ -93,8 +106,8 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     deleteZone: (zone, revision) => request(zonePath(zone), { method: "DELETE", headers: ifMatch(revision) }),
 
     zoneStatus: (zone) => request(`${zonePath(zone)}/status`),
-    /** One line per zone, so a list of zones costs one request and not one each. */
-    statusOverview: () => request("/status"),
+    /** One line per zone, walked the same way as the zone list so a second page is not silently dropped. */
+    statusOverview: listAllStatus,
     history: (zone, limit) => request(`${zonePath(zone)}/history?limit=${encodeURIComponent(limit)}`),
     preview: (zone, desired) => request(`${zonePath(zone)}/preview`, { method: "POST", body: desired }),
     apply: (zone, revision) => request(`${zonePath(zone)}/apply`, { method: "POST", headers: ifMatch(revision) }),

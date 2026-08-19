@@ -12,6 +12,9 @@
  * command the view cannot reach is not finished.
  */
 
+export function editorControlsVisible(state: { authRequired?: boolean; role?: string | null }): boolean;
+export function adminControlsVisible(state: { authRequired?: boolean; role?: string | null }): boolean;
+
 export interface StoreNotice {
   readonly key: string;
   readonly values: Record<string, string>;
@@ -70,6 +73,9 @@ export interface StoreState extends Record<string, unknown> {
   bindings: { zone: string; [key: string]: unknown }[];
   tokens: { id: string; [key: string]: unknown }[];
   dirty: boolean;
+  statusError?: string;
+  historyError?: string;
+  history?: { action?: string; at?: string; actor?: string; revision?: number }[];
 }
 
 export interface Store {

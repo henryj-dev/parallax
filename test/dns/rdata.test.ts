@@ -60,6 +60,20 @@ describe("RDATA encoding", () => {
     }
   });
 
+  it("encodes an IPv4-mapped AAAA the same as its hex form", () => {
+    const dotted = encodeRdata("AAAA", "::ffff:192.0.2.1");
+    const hexForm = encodeRdata("AAAA", "::ffff:c000:0201");
+    assert.equal(dotted.toString("hex"), hexForm.toString("hex"));
+    assert.equal(dotted.toString("hex"), "00000000000000000000ffffc0000201");
+  });
+
+  it("encodes a dotted IPv4 tail in an HTTPS ipv6hint", () => {
+    const dotted = encodeRdata("HTTPS", "1 . ipv6hint=::ffff:192.0.2.1");
+    const hexForm = encodeRdata("HTTPS", "1 . ipv6hint=::ffff:c000:0201");
+    assert.equal(dotted.toString("hex"), hexForm.toString("hex"));
+    assert.doesNotMatch(dotted.toString("hex"), /00000000000000000000000000000000$/u);
+  });
+
   it("splits a TXT value longer than one character-string, as every provider does", () => {
     // A 420-byte DKIM key is the ordinary case, not the exotic one: it goes on
     // the wire as two strings and means one value.

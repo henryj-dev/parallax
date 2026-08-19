@@ -1,5 +1,5 @@
 import type { OidcSettings } from "../config.ts";
-import { IDENTITY_COOKIE } from "../security/http-authorization.ts";
+import { hasSameOrigin, IDENTITY_COOKIE } from "../security/http-authorization.ts";
 import { beginAuthorization, endSessionUrl, exchangeCode, readIdentity, OidcError, type OidcConfig } from "../security/oidc.ts";
 import { randomUrlSafe, signSession } from "../security/session-token.ts";
 
@@ -45,8 +45,19 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
     const route = url.pathname.replace(/\/+$/u, "");
     if (route === `${IDENTITY_PREFIX}/login` && request.method === "GET") return startLogin(url);
     if (route === `${IDENTITY_PREFIX}/callback` && request.method === "GET") return finishLogin(request, url);
-    if (route === `${IDENTITY_PREFIX}/logout` && (request.method === "POST" || request.method === "GET")) {
-      return logout(request, url);
+    if (route === `${IDENTITY_PREFIX}/logout`) {
+      if (request.method === "GET") {
+        return new Response(null, { status: 405, headers: { allow: "POST", "cache-control": "no-store" } });
+      }
+      if (request.method === "POST") {
+        if (!hasSameOrigin(request)) {
+          return Response.json(
+            { error: "forbidden", message: "same-origin required" },
+            { status: 403, headers: { "cache-control": "no-store" } },
+          );
+        }
+        return logout(request, url);
+      }
     }
     return undefined;
   };

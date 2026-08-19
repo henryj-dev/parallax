@@ -96,4 +96,27 @@ describe("record types", () => {
       name: "@", type: "TXT", content: "first\nsecond", ttl: 300,
     }), DomainValidationError);
   });
+
+  it("rejects presentation the wire encoder would refuse, and accepts CAA with ';' and a null MX", () => {
+    assert.throws(
+      () => createDesiredRecord("probe", { name: "@", type: "SVCB", content: "0 . alpn=h2", ttl: 300 }),
+      DomainValidationError,
+    );
+    assert.throws(
+      () => createDesiredRecord("probe", {
+        name: "@", type: "NAPTR",
+        content: '100 10 "s" "SIP+D2U" "" _sip._udp.example.com leftover',
+        ttl: 300,
+      }),
+      DomainValidationError,
+    );
+    assert.equal(
+      createDesiredRecord("caa", { name: "@", type: "CAA", content: '0 issue "ca.example.net; account=123"', ttl: 300 }).content,
+      '0 issue "ca.example.net; account=123"',
+    );
+    assert.equal(
+      createDesiredRecord("null-mx", { name: "@", type: "MX", content: "0 .", ttl: 300 }).content,
+      "0 .",
+    );
+  });
 });
