@@ -35,11 +35,27 @@ session left behind, for instance — `touch .git/claude-main-tree-rescue`
 
 `scripts/claude-hooks/**`, `scripts/git-hooks/**` and `.codex/hooks.json` are a
 **snapshot of stardust's**. It was first taken at its commit `3e1e1ea7` and has
-been re-taken since; **measured 2026-08-18, every file in that set except
-`install.sh` is byte-identical to stardust's** — `cmp` on all ten, against a
-checkout at `0fadb45d`. The last commit there to touch any of them is
-`33a6863f`, so that is the baseline the set actually sits on. stardust holds the
-canonical copy; this one is allowed to fall behind, and today it does not.
+been re-taken since. stardust holds the canonical copy; this one is allowed to
+fall behind.
+
+**Measured 2026-08-19** against this tree (`8b5adf4`) and a stardust checkout
+at `44b72518`. The walk is the **union** of both sides' paths under those
+globs — a file that exists on only one side is a difference, the same way a
+byte-unequal file is. The 2026-08-18 measurement walked the files this side
+has and reported ten `cmp` plus `install.sh`. That was the intersection. The
+range was written as `scripts/git-hooks/**`, so "all ten identical" read as
+an answer about everything that glob covers.
+
+| | count | |
+|---|---|---|
+| both sides, byte-identical | 10 | the seven under `scripts/claude-hooks/**`, `pre-commit`, `test-pre-commit.py`, `.codex/hooks.json` |
+| both sides, different | 1 | `scripts/git-hooks/install.sh` — fit, below |
+| only there | 2 | `scripts/git-hooks/pre-push`, `scripts/git-hooks/test-pre-push.py` (`00ee877e`) |
+| only here | 0 | |
+
+The last commit there to touch any of the identical ten is `33a6863f`. The
+two that exist only there arrived at `00ee877e`. Today the identical ten have
+not drifted.
 
 ⚠️ **This paragraph said `80bb6dbd` for two of those files, and that was wrong
 one commit after it was written.** `66959a3` wrote the sentence; `409d2c2` took
@@ -53,13 +69,18 @@ That is the only thing that makes drift checkable at all: with both checkouts
 present, `cmp` answers in one line. Editing them here to say they are copies
 would remove the property that lets anyone tell.
 
-`scripts/git-hooks/install.sh` is not in that set either, and the reason is the
-opposite one. stardust's grew a second hook -- `pre-push`, which refuses a
+`scripts/git-hooks/install.sh` is not in the identical set, and the reason is
+the opposite one. stardust's grew a second hook -- `pre-push`, which refuses a
 correspondence document whose number is already taken. There are no
-correspondence documents here, and no `pre-push` file to install, so taking that
-version would `chmod` a path that does not exist and the installer would stop.
-The difference is **fit, not staleness**: leave it, and re-take it only if this
-repository ever grows the thing that hook guards.
+correspondence documents here, and no `pre-push` file to install, so taking
+that installer would `chmod` a path that does not exist and the installer
+would stop. The difference is **fit, not staleness**: leave it, and re-take it
+only if this repository ever grows the thing that hook guards.
+
+The two files that exist only there are the same decision, not a second one.
+Taking `pre-push` itself would be a third copy of a hook whose job does not
+exist here. A walk of this side cannot see them — they are not different, they
+are absent, and `cmp` has nothing to compare.
 
 `.claude/settings.json` is **not** in that set, though this file used to claim it
 was. It cannot be: `symlinkDirectories` names this repository's own dependency
@@ -82,10 +103,10 @@ stardust asked the same question from their end, measured against `3e1e1ea7`,
 and read the three commits since as this copy having fallen behind -- it had
 not. They used the baseline this paragraph handed them, and the letter that
 handed it over quoted only the `3e1e1ea7` half of a sentence that already had
-two. **The check was never the hard part: ten `cmp` runs against a stardust
-checkout, no tooling at all.** What is missing is an occasion to run it, and
-until there is one, the honest form of this record is a measurement with a date
-on it rather than a commit number with a story about it.
+two. **The check was never the hard part: walk both trees, `cmp` the
+intersection, list each remainder.** What is missing is an occasion to run it,
+and until there is one, the honest form of this record is a measurement with a
+date on it rather than a commit number with a story about it.
 
 ### Rewriting history on `main` breaks something outside this repository
 
