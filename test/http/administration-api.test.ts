@@ -118,6 +118,39 @@ describe("the override report over HTTP", () => {
     assert.equal((await api(request("/api/v1/fallback/main/nonsense"))).status, 404);
     assert.equal((await api(request("/api/v1/fallback"))).status, 404);
   });
+
+  it("sets and deletes one override suffix over HTTP", async () => {
+    const calls: Array<{ method: string; suffix: string }> = [];
+    const domains = {
+      set: async (profile: string, entry: { suffix: string; dnsServer?: readonly string[] }) => {
+        calls.push({ method: "set", suffix: entry.suffix });
+        assert.equal(profile, "main");
+        assert.deepEqual(entry.dnsServer, ["10.17.192.11"]);
+        return { domains: [entry], outcome: "added" as const };
+      },
+      remove: async (profile: string, suffix: string) => {
+        calls.push({ method: "remove", suffix });
+        assert.equal(profile, "main");
+        return { domains: [], outcome: "removed" as const };
+      },
+    };
+    const api = createApiHandler({
+      controlPlane: new ControlPlane(createInMemoryAdapters().zones, createInMemoryAdapters().statuses, createInMemoryAdapters().provider),
+      fallbackDomains: domains as unknown as Parameters<typeof createApiHandler>[0]["fallbackDomains"],
+    }, security);
+
+    const set = await api(request("/api/v1/fallback/main/domains/tinyuniver.se", "PUT", { dnsServer: ["10.17.192.11"] }));
+    assert.equal(set.status, 200);
+    const setBody = await set.json() as { outcome: string };
+    assert.equal(setBody.outcome, "added");
+
+    const removed = await api(request("/api/v1/fallback/main/domains/tinyuniver.se", "DELETE"));
+    assert.equal(removed.status, 200);
+    assert.deepEqual(calls, [
+      { method: "set", suffix: "tinyuniver.se" },
+      { method: "remove", suffix: "tinyuniver.se" },
+    ]);
+  });
 });
 
 describe("administration HTTP API", () => {

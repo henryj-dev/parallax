@@ -83,6 +83,20 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     }
   }
 
+  async function listAllKeyed(path, key, label) {
+    const items = [];
+    let offset = 0;
+    for (;;) {
+      const join = path.includes("?") ? "&" : "?";
+      const page = await request(`${path}${join}limit=500&offset=${offset}`);
+      if (!page || !Array.isArray(page[key])) throw new ApiError(`invalid ${label} page`, 502);
+      items.push(...page[key]);
+      if (!page.hasMore) return { ...page, [key]: items };
+      if (page[key].length === 0) throw new ApiError(`${label} pagination did not advance`, 502);
+      offset += page[key].length;
+    }
+  }
+
   return {
     /** Outside the API root: reports whether this deployment requires a token. */
     async authenticationMode() {
@@ -97,24 +111,46 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     readSession: () => request("/session"),
     createSession: (token) => request("/session", { method: "POST", body: { token } }),
     deleteSession: () => request("/session", { method: "DELETE" }),
+    /**
+     * Ends the identity-provider session. Outside the API root, and a navigation
+     * rather than a JSON call: the response is a redirect to the provider so it
+     * can drop its own session too. `manual` keeps the Set-Cookie on this origin
+     * readable; the browser is sent on only when a location is present.
+     */
+    async endIdentitySession() {
+      const response = await fetchImpl("/auth/logout", {
+        method: "POST",
+        credentials: "same-origin",
+        redirect: "manual",
+      });
+      const location = response.headers.get("location");
+      if (location && typeof globalThis.location?.assign === "function" && response.status >= 300 && response.status < 400) {
+        globalThis.location.assign(location);
+      }
+    },
 
     listZones: listAllZones,
     getZone: (zone) => request(zonePath(zone)),
     createZone: (name) => request("/zones", { method: "POST", body: { name } }),
     replaceDesired: (zone, desired, revision) =>
       request(zonePath(zone), { method: "PUT", body: desired, headers: ifMatch(revision) }),
-    deleteZone: (zone, revision) => request(zonePath(zone), { method: "DELETE", headers: ifMatch(revision) }),
+    /** @param {string} zone @param {number | string | undefined} revision @param {{ abandonProviderRecords?: boolean }} [options] */
+    deleteZone: (zone, revision, options = {}) =>
+      request(
+        `${zonePath(zone)}${options.abandonProviderRecords ? "?abandonProviderRecords=true" : ""}`,
+        { method: "DELETE", headers: ifMatch(revision) },
+      ),
 
     zoneStatus: (zone) => request(`${zonePath(zone)}/status`),
     /** One line per zone, walked the same way as the zone list so a second page is not silently dropped. */
     statusOverview: listAllStatus,
-    history: (zone, limit) => request(`${zonePath(zone)}/history?limit=${encodeURIComponent(limit)}`),
+    history: (zone) => listAllKeyed(`${zonePath(zone)}/history`, "entries", "history"),
     preview: (zone, desired) => request(`${zonePath(zone)}/preview`, { method: "POST", body: desired }),
     apply: (zone, revision) => request(`${zonePath(zone)}/apply`, { method: "POST", headers: ifMatch(revision) }),
     adopt: (zone, revision) =>
       request(`${zonePath(zone)}/adopt?view=external`, { method: "POST", headers: ifMatch(revision) }),
 
-    listRevisions: (zone, limit) => request(`${zonePath(zone)}/revisions?limit=${encodeURIComponent(limit)}`),
+    listRevisions: (zone) => listAllKeyed(`${zonePath(zone)}/revisions`, "revisions", "revision"),
     getRevision: (zone, revision) => request(`${zonePath(zone)}/revisions/${encodeURIComponent(revision)}`),
     restoreRevision: (zone, revision, expected) =>
       request(`${zonePath(zone)}/revisions/${encodeURIComponent(revision)}/restore`, {

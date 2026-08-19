@@ -400,15 +400,65 @@ function asCloudflareRecord(value: unknown): CloudflareRecord | undefined {
   if (typeof value.id !== "string" || typeof value.name !== "string" || typeof value.type !== "string" || typeof value.ttl !== "number") return undefined;
   const content = typeof value.content === "string" && value.content.length > 0
     ? value.content
-    : typeof value.data === "string" && value.data.length > 0
-      ? value.data
-      : undefined;
+    : presentationFromData(value.type, value.data);
   if (content === undefined) return undefined;
   const record: CloudflareRecord = { id: value.id, name: value.name, type: value.type, content, ttl: value.ttl };
   if (typeof value.priority === "number") record.priority = value.priority;
   if (typeof value.proxied === "boolean") record.proxied = value.proxied;
   if (typeof value.comment === "string") record.comment = value.comment;
   return record;
+}
+
+/**
+ * Cloudflare's structured `data` field as presentation content.
+ *
+ * HTTPS/SVCB/NAPTR often arrive with an object and an empty `content`. The
+ * desired state stores one string, so this is the only place that has to know
+ * the object's fields, and it must fail rather than skip when it cannot.
+ */
+function presentationFromData(type: string, data: unknown): string | undefined {
+  if (typeof data === "string" && data.length > 0) return data;
+  if (!isObject(data)) return undefined;
+  switch (type) {
+    case "HTTPS":
+    case "SVCB": {
+      const priority = data.priority;
+      const target = data.target;
+      if (typeof priority !== "number" || typeof target !== "string" || target.length === 0) return undefined;
+      const rest = typeof data.value === "string" && data.value.length > 0 ? ` ${data.value}` : "";
+      return `${priority} ${target}${rest}`;
+    }
+    case "NAPTR": {
+      const order = data.order;
+      const preference = data.preference;
+      const replacement = data.replacement;
+      if (typeof order !== "number" || typeof preference !== "number" || typeof replacement !== "string") return undefined;
+      const flags = typeof data.flags === "string" ? data.flags : "";
+      const service = typeof data.service === "string" ? data.service : "";
+      const regexp = typeof data.regex === "string" ? data.regex : typeof data.regexp === "string" ? data.regexp : "";
+      return `${order} ${preference} "${flags}" "${service}" "${regexp}" ${replacement}`;
+    }
+    case "MX": {
+      const target = data.target;
+      if (typeof target !== "string" || target.length === 0) return undefined;
+      return typeof data.priority === "number" ? `${data.priority} ${target}` : target;
+    }
+    case "SRV": {
+      if (typeof data.priority !== "number" || typeof data.weight !== "number"
+        || typeof data.port !== "number" || typeof data.target !== "string") return undefined;
+      return `${data.priority} ${data.weight} ${data.port} ${data.target}`;
+    }
+    case "CAA": {
+      if (typeof data.flags !== "number" || typeof data.tag !== "string" || typeof data.value !== "string") return undefined;
+      return `${data.flags} ${data.tag} "${data.value}"`;
+    }
+    case "URI": {
+      if (typeof data.priority !== "number" || typeof data.weight !== "number" || typeof data.target !== "string") return undefined;
+      return `${data.priority} ${data.weight} "${data.target}"`;
+    }
+    default:
+      return typeof data.content === "string" && data.content.length > 0 ? data.content : undefined;
+  }
 }
 
 function isSupportedType(value: string): value is RecordType {

@@ -1,6 +1,6 @@
 import { createApiClient } from "./api-client.js";
 import { fallbackPanel, recordOwnership, recordRow, syncPanel } from "./panels.js";
-import { createStore, isNonGlobalAddress, ERROR_SCOPES, HISTORY_PAGE_SIZE, editorControlsVisible, adminControlsVisible } from "./store.js";
+import { createStore, isNonGlobalAddress, ERROR_SCOPES, editorControlsVisible, adminControlsVisible } from "./store.js";
 import { effectiveExternalTtl, isValidDnsOnlyTtl } from "./ttl.js";
 import {
   createSemanticMessage,
@@ -370,7 +370,7 @@ function renderHistory(state) {
     $("#history-list").innerHTML = "";
     return;
   }
-  const entries = state.history.slice(0, HISTORY_PAGE_SIZE);
+  const entries = state.history;
   $("#history-empty").hidden = entries.length > 0;
   $("#history-empty").textContent = t("history.none");
   $("#history-list").innerHTML = entries.map((entry) => `<li><b>${escapeHtml(localizeAuditAction(entry.action, t))}</b><time>${escapeHtml(formatDate(entry.at))}</time><small>${escapeHtml(entry.actor || t("history.system"))}${entry.revision ? ` · ${escapeHtml(t("history.revision", { revision: entry.revision }))}` : ""}${changeCounts(entry, t)}</small></li>`).join("");

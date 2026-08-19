@@ -191,6 +191,10 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
     return { command: "status", input: readPageQuery(url) };
   }
 
+  if (area === "history" && segments.length === 3 && method === "GET") {
+    return { command: "history", input: readPageQuery(url) };
+  }
+
   if (area === "settings" && segments.length === 3) {
     if (method === "GET") return { command: "settings get", input: {} };
     if (method === "PUT") return { command: "settings set", input: { values: await parseJson(request) } };
@@ -229,6 +233,27 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
     }
     if (segments.length === 5 && action === "sync" && method === "POST") {
       return { command: "fallback sync", input: { profile, ...(policy ? { policy } : {}) } };
+    }
+    if (segments.length === 6 && action === "domains" && segments[5]) {
+      const suffix = segments[5];
+      if (method === "PUT") {
+        const body = await parseJson(request);
+        const dnsServer = body["dns-server"] ?? body.dnsServer;
+        const dnsServerText = Array.isArray(dnsServer) ? dnsServer.filter((part) => typeof part === "string").join(",") : dnsServer;
+        return {
+          command: "fallback set",
+          input: {
+            profile,
+            suffix,
+            ...(typeof dnsServerText === "string" ? { "dns-server": dnsServerText } : {}),
+            ...(typeof body.description === "string" ? { description: body.description } : {}),
+            ...(policy ? { policy } : {}),
+          },
+        };
+      }
+      if (method === "DELETE") {
+        return { command: "fallback delete", input: { profile, suffix, ...(policy ? { policy } : {}) } };
+      }
     }
     throw new NotFoundError("route was not found");
   }
@@ -272,7 +297,12 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
       return { command: "apply", input: { zone, view: readViewQuery(url), expectedRevision }, revisioned: true };
     }
     if (action === "adopt" && segments.length === 5 && method === "POST") {
-      return { command: "zone adopt", input: { zone, view: readViewQuery(url), expectedRevision }, revisioned: true };
+      const dryRun = readBooleanQuery(url, "dryRun");
+      return {
+        command: "zone adopt",
+        input: { zone, view: readViewQuery(url), expectedRevision, ...(dryRun === undefined ? {} : { dryRun }) },
+        revisioned: true,
+      };
     }
     if (action === "status" && segments.length === 5 && method === "GET") {
       return { command: "status", input: { zone } };

@@ -105,4 +105,61 @@ describe("portal mapping", () => {
     assert.equal(panel.kind, "error");
     assert.notEqual(panel.overall, "pending");
   });
+
+  it("sends abandonProviderRecords when deleting a zone", async () => {
+    const seen = [];
+    const client = createApiClient({
+      fetchImpl: async (input, init = {}) => {
+        const url = String(input);
+        seen.push({ url, method: init.method ?? "GET" });
+        if ((init.method ?? "GET") === "DELETE" && url.includes("/zones/example.com")) {
+          return Response.json({ removedProviderRecords: [] });
+        }
+        return Response.json({ zones: [] });
+      },
+    });
+    const store = createStore(client);
+    store.getState().activeZone = { name: "example.com", revision: 4 };
+    await store.deleteActiveZone();
+    const deleted = seen.find((call) => call.method === "DELETE");
+    assert.ok(deleted);
+    assert.match(deleted.url, /abandonProviderRecords=true/);
+  });
+
+  it("opens sign-in when administration load is unauthorized", async () => {
+    const intents = [];
+    const client = createApiClient({
+      fetchImpl: async (input) => {
+        const url = String(input);
+        if (url.includes("/credentials/")) return Response.json({ profiles: [], credentials: [] });
+        if (url.includes("/settings") || url.includes("/tokens")) {
+          return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+        }
+        return Response.json({});
+      },
+    });
+    const store = createStore(client);
+    store.onIntent((event) => intents.push(event.type));
+    await store.loadAdministration();
+    assert.ok(intents.includes("auth-required"));
+    assert.equal(store.getState().authenticated, false);
+  });
+
+  it("posts same-origin identity logout as well as deleting the token session", async () => {
+    const seen = [];
+    const client = createApiClient({
+      fetchImpl: async (input, init = {}) => {
+        seen.push({ url: String(input), method: init.method ?? "GET", redirect: init.redirect });
+        return new Response(null, { status: 204 });
+      },
+    });
+    const store = createStore(client);
+    await store.signOut();
+    const identity = seen.find((call) => call.url.includes("/auth/logout"));
+    assert.ok(identity, "sign-out must POST /auth/logout");
+    assert.equal(identity.method, "POST");
+    assert.equal(identity.redirect, "manual");
+    const session = seen.find((call) => call.url.includes("/session") && call.method === "DELETE");
+    assert.ok(session, "sign-out must still clear the token session");
+  });
 });

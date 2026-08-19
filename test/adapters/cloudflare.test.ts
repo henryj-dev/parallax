@@ -41,6 +41,20 @@ describe("CloudflareProviderAdapter", () => {
     ]);
   });
 
+  it("lists a supported type whose RDATA arrived only as a data object", async () => {
+    const fetch = async (): Promise<Response> => Response.json({
+      success: true,
+      result: [
+        { id: "https-1", name: "_https.example.com", type: "HTTPS", data: { priority: 1, target: ".", value: "alpn=h2" }, ttl: 300 },
+      ],
+      result_info: { page: 1, total_pages: 1 },
+    });
+    const adapter = new CloudflareProviderAdapter({ token: "secret", zoneId: "zone-1", fetch, ownershipSecret: OWNERSHIP_SECRET });
+    assert.deepEqual(await adapter.list("example.com/external"), [
+      { id: "https-1", providerId: "https-1", managed: false, name: "_https", type: "HTTPS", content: "1 . alpn=h2", ttl: 300 },
+    ]);
+  });
+
   it("refuses to skip a supported type that has no usable RDATA", async () => {
     const fetch = async (): Promise<Response> => Response.json({
       success: true,

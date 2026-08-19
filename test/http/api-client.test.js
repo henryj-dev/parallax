@@ -57,4 +57,43 @@ describe("portal API client", () => {
       "/api/v1/status?limit=500&offset=1",
     ]);
   });
+
+  it("walks every history and revision page instead of stopping at one", async () => {
+    const paths = [];
+    const client = createApiClient({
+      root: "https://portal.example/api/v1",
+      fetchImpl: async (input) => {
+        const url = new URL(String(input));
+        paths.push(`${url.pathname}${url.search}`);
+        const offset = Number(url.searchParams.get("offset"));
+        if (url.pathname.endsWith("/history")) {
+          return Response.json(offset === 0
+            ? { entries: [{ action: "zone.created" }], limit: 500, offset: 0, hasMore: true }
+            : { entries: [{ action: "record.upserted" }], limit: 500, offset: 1, hasMore: false });
+        }
+        return Response.json(offset === 0
+          ? { revisions: [{ revision: 1 }], limit: 500, offset: 0, hasMore: true }
+          : { revisions: [{ revision: 2 }], limit: 500, offset: 1, hasMore: false });
+      },
+    });
+
+    assert.deepEqual(await client.history("example.com"), {
+      entries: [{ action: "zone.created" }, { action: "record.upserted" }],
+      limit: 500,
+      offset: 1,
+      hasMore: false,
+    });
+    assert.deepEqual(await client.listRevisions("example.com"), {
+      revisions: [{ revision: 1 }, { revision: 2 }],
+      limit: 500,
+      offset: 1,
+      hasMore: false,
+    });
+    assert.deepEqual(paths, [
+      "/api/v1/zones/example.com/history?limit=500&offset=0",
+      "/api/v1/zones/example.com/history?limit=500&offset=1",
+      "/api/v1/zones/example.com/revisions?limit=500&offset=0",
+      "/api/v1/zones/example.com/revisions?limit=500&offset=1",
+    ]);
+  });
 });

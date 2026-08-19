@@ -96,6 +96,37 @@ describe("HTTP API", () => {
     assert.deepEqual(body.adopted.map((record) => record.id), ["www-a"]);
   });
 
+  it("dry-runs adoption over HTTP and leaves the zone unchanged", async () => {
+    const adapters = createInMemoryAdapters();
+    const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
+    assert.equal((await api(request("/api/v1/zones", "POST", { name: "example.com" }))).status, 201);
+    adapters.provider.seed("example.com/external", [
+      { id: "a", name: "www", type: "A", content: "203.0.113.1", ttl: 300, providerId: "cf-1", managed: false },
+    ]);
+
+    const preview = await api(request("/api/v1/zones/example.com/adopt?view=external&dryRun=true", "POST", {}));
+    assert.equal(preview.status, 200);
+    const body = await preview.json() as { adopted: { id: string }[]; seen: number };
+    assert.equal(body.seen, 1);
+    assert.deepEqual(body.adopted.map((record) => record.id), ["www-a"]);
+
+    const zone = await (await api(request("/api/v1/zones/example.com"))).json() as {
+      revision: number;
+      views: Array<{ name: string; records?: unknown[] }>;
+    };
+    assert.equal(zone.revision, 1);
+    assert.equal((zone.views ?? []).flatMap((view) => view.records ?? []).length, 0);
+  });
+
+  it("reads the audit trail without a zone", async () => {
+    const api = setup();
+    assert.equal((await api(request("/api/v1/zones", "POST", { name: "one.example" }))).status, 201);
+    assert.equal((await api(request("/api/v1/zones", "POST", { name: "two.example" }))).status, 201);
+    const page = await (await api(request("/api/v1/history"))).json() as { entries: Array<{ action: string; zone?: string }> };
+    assert.ok(page.entries.some((entry) => entry.action === "zone.created"));
+    assert.ok(page.entries.length >= 2);
+  });
+
   it("reports malformed percent-encoding in a path as a client error", async () => {
     const api = setup();
     const response = await api(request("/api/v1/zones/%zz"));

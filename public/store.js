@@ -163,6 +163,11 @@ export function createStore(client) {
 
     async signOut() {
       try {
+        await client.endIdentitySession();
+      } catch {
+        // Token-only deployments have no identity route; the session delete below still ends it.
+      }
+      try {
         await client.deleteSession();
       } catch {
         // The cookie is cleared either way; a failed sign-out still ends it here.
@@ -231,7 +236,7 @@ export function createStore(client) {
             (status) => ({ status, error: "" }),
             (error) => ({ status: null, error: error.message }),
           ),
-          client.history(name, HISTORY_PAGE_SIZE).then(
+          client.history(name).then(
             (history) => ({ history, error: "" }),
             (error) => ({ history: null, error: error.message }),
           ),
@@ -280,7 +285,7 @@ export function createStore(client) {
       const name = activeName();
       if (!name) return false;
       try {
-        const result = await client.deleteZone(name, activeRevision());
+        const result = await client.deleteZone(name, activeRevision(), { abandonProviderRecords: true });
         state.activeZone = null;
         state.records = [];
         const withdrawn = result?.removedProviderRecords?.length ?? 0;
@@ -439,7 +444,7 @@ export function createStore(client) {
       state.revisionsError = "";
       emitChange();
       try {
-        const payload = await client.listRevisions(activeName(), REVISION_PAGE_SIZE);
+        const payload = await client.listRevisions(activeName());
         state.revisions = payload?.revisions ?? [];
       } catch (error) {
         handleUnauthorized(error);
@@ -566,6 +571,7 @@ export function createStore(client) {
         emitChange();
         return true;
       } catch (error) {
+        if (handleUnauthorized(error)) return false;
         state.profiles = [];
         state.bindings = [];
         state.providerAccess = error instanceof ApiError && error.status === 403
