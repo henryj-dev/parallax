@@ -1,14 +1,9 @@
 # Working in this repository
 
-## The main tree is read-only — every change happens in a worktree
+## 에이전트는 워크트리, 사람은 메인에서 작업
 
-`Edit`/`Write` and tree-changing git commands are **always refused** in the main
-working tree, including in a solo session. Several sessions and tools (Claude,
-codex, a person at a shell) share this checkout, so an edit made here mixes
-someone else's unfinished work into your commit — and this repository's origin
-feeds a deploy mirror, so whatever slips in ships.
-
-Workflow: `EnterWorktree` → work and commit there →
+에이전트의 `Edit`/`Write`/트리 변경 git 명령은 메인에서 **항상 거부**된다. 사람은 메인에서
+수정·커밋·push 할 수 있다. 에이전트 작업 흐름: `EnterWorktree` → 작업·커밋 →
 `git fetch origin && git rebase origin/main && git push origin HEAD:<branch>`
 
 **That push is what "done with a work cycle" means here — there is no separate
@@ -18,13 +13,15 @@ yet; the cycle isn't finished until `HEAD` is on `origin/main`.
 Outside Claude:
 `git worktree add .claude/worktrees/<name> -b <branch> origin/main`
 
-The main tree fast-forwards on its own when a session starts and ends, so you
-never have to update it by hand — but that's a safety net, not something to
-wait on. The user can pull the main tree directly, any time; `pull`/`fetch`
-are always allowed there regardless of what else is going on. What still
-passes here: `Read`, `Grep`, and `git status|log|diff|pull|fetch`.
+The main tree fast-forwards on its own when a session starts and ends, and only
+when it is clean. A person leaving uncommitted work on main makes auto-ff skip
+— that is the cost of allowing human commits there. The user can pull the main
+tree directly, any time; `pull`/`fetch` are always allowed there regardless of
+what else is going on. What still passes here for an agent: `Read`, `Grep`, and
+`git status|log|diff|pull|fetch`.
 
-New worktrees need `node_modules` and `.env` — see
+This repository's origin feeds a deploy mirror, so whatever an agent slips onto
+main ships. New worktrees need `node_modules` and `.env` — see
 `.claude/worktree-bootstrap.md`, which the refusal message prints for you.
 
 If something genuinely must happen in the main tree — rescuing work an ended
@@ -38,8 +35,8 @@ session left behind, for instance — `touch .git/claude-main-tree-rescue`
 been re-taken since. stardust holds the canonical copy; this one is allowed to
 fall behind.
 
-**Measured 2026-08-19** against this tree (`8b5adf4`) and a stardust checkout
-at `44b72518`. The walk is the **union** of both sides' paths under those
+**Measured 2026-08-19** against this re-take and a stardust checkout at
+`a74ebf4c`. The walk is the **union** of both sides' paths under those
 globs — a file that exists on only one side is a difference, the same way a
 byte-unequal file is. The 2026-08-18 measurement walked the files this side
 has and reported ten `cmp` plus `install.sh`. That was the intersection. The
@@ -53,9 +50,12 @@ an answer about everything that glob covers.
 | only there | 2 | `scripts/git-hooks/pre-push`, `scripts/git-hooks/test-pre-push.py` (`00ee877e`) |
 | only here | 0 | |
 
-The last commit there to touch any of the identical ten is `33a6863f`. The
-two that exist only there arrived at `00ee877e`. Today the identical ten have
-not drifted.
+The last commit there to touch any of the identical ten is `bdd4420b` — the
+2026-08-19 change that lets a person commit on main and still refuses an
+agent. The two that exist only there arrived at `00ee877e`. Today's identical
+ten match after this re-take; before it, `pre-commit` and
+`test-pre-commit.py` had already drifted while the previous paragraph still
+said they had not.
 
 ⚠️ **This paragraph said `80bb6dbd` for two of those files, and that was wrong
 one commit after it was written.** `66959a3` wrote the sentence; `409d2c2` took
@@ -144,6 +144,9 @@ stops -- while their fixture goes red looking exactly like a fixture that is
 working. That is why the narrowing has its own control now.
 
 ### What this does not cover
+
+The git layer only refuses an agent harness. A person at a shell can commit on
+main. A harness not on the env list is treated as a person.
 
 `git commit --no-verify` bypasses the git layer, and a clone that never ran
 `bash scripts/git-hooks/install.sh` has no git layer at all. All three layers
