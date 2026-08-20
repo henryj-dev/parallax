@@ -40,8 +40,8 @@ fall behind.
 owner-record locking were re-taken from stardust. Repository-specific settings,
 bootstrap, installer, and the intentionally absent correspondence pre-push hook remain fit.
 
-**Measured 2026-08-19** against this re-take and a stardust checkout at
-`a74ebf4c`. The walk is the **union** of both sides' paths under those
+**Measured 2026-08-20** against this re-take and stardust `094e404b`.
+The walk is the **union** of both sides' paths under those
 globs — a file that exists on only one side is a difference, the same way a
 byte-unequal file is. The 2026-08-18 measurement walked the files this side
 has and reported ten `cmp` plus `install.sh`. That was the intersection. The
@@ -50,7 +50,7 @@ an answer about everything that glob covers.
 
 | | count | |
 |---|---|---|
-| both sides, byte-identical | 10 | the seven under `scripts/claude-hooks/**`, `pre-commit`, `test-pre-commit.py`, `.codex/hooks.json` |
+| both sides, byte-identical | 12 | the nine under `scripts/claude-hooks/**`, `pre-commit`, `test-pre-commit.py`, `.codex/hooks.json` |
 | both sides, different | 1 | `scripts/git-hooks/install.sh` — fit, below |
 | only there | 2 | `scripts/git-hooks/pre-push`, `scripts/git-hooks/test-pre-push.py` (`00ee877e`) |
 | only here | 0 | |
