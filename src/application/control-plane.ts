@@ -661,7 +661,7 @@ export class ControlPlane {
     const zone = await this.getZone(zoneName);
     const candidateViews = desiredInput === undefined ? zone.views : parseDesiredViews(desiredInput);
     validateExternalView(candidateViews);
-    const effectiveViews = reconcilableViews(materializeProviderViews(candidateViews));
+    const effectiveViews = await this.#reconciliationViews(zone, candidateViews);
     const selected = viewName ? [findView(effectiveViews, validateViewName(viewName))] : effectiveViews;
     const views: Record<string, PreviewPlan> = {};
     let firstFailure: unknown;
@@ -780,14 +780,7 @@ export class ControlPlane {
     const zone = await this.getZone(zoneName);
     this.#assertExpectedRevision(zone, expectedRevision);
     validateExternalView(zone.views);
-    const storedStatuses = await this.#statuses.list(zone.name);
-    const removedPendingViews = storedStatuses
-      .filter((status) => isProviderView(status.view)
-        && !zone.views.some((view) => view.name === status.view)
-        && status.desiredRevision === zone.revision
-        && status.state !== "applied")
-      .map((status) => ({ name: status.view, records: [] as DesiredRecord[] }));
-    const availableViews = mergeRemovedViews(reconcilableViews(materializeProviderViews(zone.views)), removedPendingViews);
+    const availableViews = await this.#reconciliationViews(zone, zone.views);
     const selected = viewName ? [findView(availableViews, validateViewName(viewName))] : availableViews;
     const results: ApplyStatus[] = [];
     for (const view of selected) {
@@ -897,6 +890,32 @@ export class ControlPlane {
       }
     }
     return { zone: zone.name, revision: zone.revision, statuses: results };
+  }
+
+  /**
+   * The provider targets both preview and apply would reconcile.
+   *
+   * A candidate can remove a view before it is saved, while a saved removal is
+   * represented by a pending status after the view has disappeared from the
+   * desired state. Both cases need an empty target so managed provider records
+   * appear as deletes. Keeping that rule here prevents preview from promising
+   * fewer operations than the subsequent apply performs.
+   */
+  async #reconciliationViews(zone: Zone, candidateViews: Zone["views"]): Promise<Zone["views"]> {
+    const current = reconcilableViews(materializeProviderViews(candidateViews));
+    const candidateNames = new Set(current.map((view) => view.name));
+    const removedFromCandidate = [...providerViewNames(zone.views)]
+      .filter((view) => !candidateNames.has(view));
+    const pendingRemoved = (await this.#statuses.list(zone.name))
+      .filter((status) => isProviderView(status.view)
+        && !candidateNames.has(status.view)
+        && status.desiredRevision === zone.revision
+        && status.state !== "applied")
+      .map((status) => status.view);
+    const removed = [...new Set([...removedFromCandidate, ...pendingRemoved])]
+      .sort()
+      .map((name) => ({ name, records: [] as DesiredRecord[] }));
+    return mergeRemovedViews(current, removed);
   }
 
   async status(zoneName: string): Promise<{ zone: string; desiredRevision: number; statuses: ApplyStatus[] }> {

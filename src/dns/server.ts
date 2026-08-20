@@ -33,6 +33,8 @@ export interface DnsServerOptions {
   readonly forwardTo?: readonly string[];
   /** Client CIDRs allowed to use recursion. Defaults to loopback only. */
   readonly forwardAllow?: readonly string[];
+  /** Client CIDRs allowed to request AXFR over TCP. Defaults to deny all. */
+  readonly transferAllow?: readonly string[];
   readonly negativeTtl?: number;
   readonly forwardTimeoutMs?: number;
   readonly maxConcurrentForwards?: number;
@@ -89,6 +91,7 @@ export function createDnsServer(options: DnsServerOptions): {
   const forwardTo = options.forwardTo ?? [];
   const forwardTimeoutMs = options.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS;
   const forwardAllow = compileCidrs(options.forwardAllow ?? DEFAULT_FORWARD_ALLOW);
+  const transferAllow = compileCidrs(options.transferAllow ?? []);
   const maxConcurrentForwards = positiveInteger(options.maxConcurrentForwards ?? DEFAULT_MAX_CONCURRENT_FORWARDS, "maxConcurrentForwards");
   const tcpIdleTimeoutMs = positiveInteger(options.tcpIdleTimeoutMs ?? DEFAULT_TCP_IDLE_TIMEOUT_MS, "tcpIdleTimeoutMs");
   const maxTcpConnections = positiveInteger(options.maxTcpConnections ?? DEFAULT_MAX_TCP_CONNECTIONS, "maxTcpConnections");
@@ -127,6 +130,10 @@ export function createDnsServer(options: DnsServerOptions): {
       return forwarded ?? writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: false }, Number.MAX_SAFE_INTEGER);
     };
 
+    if (query.question.type === TYPE.AXFR
+      && (!overTcp || !cidrsContain(transferAllow, clientAddress))) {
+      return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
+    }
     const zone = matchZone(options.zones(), query.question.name);
     if (!zone) {
       if (forwardTo.length === 0) {

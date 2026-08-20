@@ -55,7 +55,7 @@ export interface FallbackPanel {
   resolverMissing: boolean;
   covered: string[];
   excluded: ExcludedZone[];
-  entries: { suffix: string; dnsServer: string[] }[];
+  entries: { suffix: string; dnsServer: string[]; owned: boolean; actions: string[] }[];
   /** `null` when the provider could not be read; `planError` says why. */
   plan: {
     add: string[];

@@ -399,6 +399,7 @@ if (config.dns) {
     zones: () => dnsSnapshot,
     forwardTo: dnsConfig.forwardTo,
     forwardAllow: dnsConfig.forwardAllow,
+    transferAllow: dnsConfig.transferAllow,
     ...(dnsConfig.notifyTo ? { notifyTo: dnsConfig.notifyTo } : {}),
     onUnservable: (record) => {
       // Stored content the domain accepted and the wire cannot carry. The

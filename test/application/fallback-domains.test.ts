@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { CloudflareFallbackDomains, FallbackDomainForbiddenError, type FallbackDomain } from "../../src/adapters/cloudflare-fallback.ts";
 import { CredentialNotFoundError } from "../../src/application/cloudflare-credentials.ts";
-import { fallbackCoverage, FallbackDomainService, overridableZones, type ProfileSecretReader } from "../../src/application/fallback-domains.ts";
+import { fallbackCoverage, FallbackDomainOwnershipError, FallbackDomainService, overridableZones, type ProfileSecretReader } from "../../src/application/fallback-domains.ts";
 import type { DesiredRecord, Zone } from "../../src/domain/dns.ts";
 import { ownershipComment } from "../../src/adapters/ownership.ts";
 
@@ -29,12 +29,18 @@ function stubProvider(initial: FallbackDomain[]) {
     }));
     return new Response(JSON.stringify({ success: true, errors: [], result }), { status: 200 });
   };
-  return { calls, fetch, stored: () => stored };
+  return { calls, fetch, stored: () => stored, replaceStored: (next: FallbackDomain[]) => { stored = [...next]; } };
 }
 
 const DEFAULTS: FallbackDomain[] = [
   { suffix: "localhost" }, { suffix: "internal" }, { suffix: "lan" },
 ];
+const OWNERSHIP_SECRET = "a-secret-long-enough-to-sign-with-000000000000";
+const owned = (suffix: string, dnsServer = ["10.17.192.70"]): FallbackDomain => ({
+  suffix,
+  dnsServer,
+  description: ownershipComment(`fallback/${suffix}`, "entry", OWNERSHIP_SECRET),
+});
 
 function serviceOver(provider: ReturnType<typeof stubProvider>, secrets?: ProfileSecretReader) {
   return new FallbackDomainService({
@@ -43,6 +49,7 @@ function serviceOver(provider: ReturnType<typeof stubProvider>, secrets?: Profil
         ? { name, accountId: "acct-1", token: "tok-secret" }
         : undefined,
     },
+    ownershipSecret: OWNERSHIP_SECRET,
     createClient: (options) => new CloudflareFallbackDomains({ ...options, fetch: provider.fetch }),
   });
 }
@@ -78,7 +85,7 @@ describe("fallback domains", () => {
   });
 
   it("replaces an entry rather than adding a second one for the same suffix", async () => {
-    const provider = stubProvider([...DEFAULTS, { suffix: "tinyuniver.se", dnsServer: ["10.17.239.78"] }]);
+    const provider = stubProvider([...DEFAULTS, owned("tinyuniver.se", ["10.17.239.78"])]);
     const change = await serviceOver(provider).set("main", { suffix: "TinyUniver.SE.", dnsServer: ["10.17.192.70"] });
     assert.equal(change.outcome, "updated");
     const matching = change.domains.filter((domain) => domain.suffix.toLowerCase().startsWith("tinyuniver"));
@@ -87,14 +94,14 @@ describe("fallback domains", () => {
   });
 
   it("writes nothing when the entry is already what was asked for", async () => {
-    const provider = stubProvider([...DEFAULTS, { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] }]);
+    const provider = stubProvider([...DEFAULTS, owned("tinyuniver.se")]);
     const change = await serviceOver(provider).set("main", { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] });
     assert.equal(change.outcome, "unchanged");
     assert.deepEqual(provider.calls.map((call) => call.method), ["GET"], "no write at all");
   });
 
   it("removes one suffix and leaves the rest", async () => {
-    const provider = stubProvider([...DEFAULTS, { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] }]);
+    const provider = stubProvider([...DEFAULTS, owned("tinyuniver.se")]);
     const change = await serviceOver(provider).remove("main", "tinyuniver.se");
     assert.equal(change.outcome, "removed");
     assert.deepEqual(change.domains.map((domain) => domain.suffix), ["localhost", "internal", "lan"]);
@@ -105,6 +112,52 @@ describe("fallback domains", () => {
     const change = await serviceOver(provider).remove("main", "absent.example");
     assert.equal(change.outcome, "unchanged");
     assert.deepEqual(provider.calls.map((call) => call.method), ["GET"]);
+  });
+
+  it("signs a newly managed suffix and reports ownership without claiming defaults", async () => {
+    const provider = stubProvider(DEFAULTS);
+    await serviceOver(provider).set("main", { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] });
+    const domains = await serviceOver(provider).list("main");
+    assert.deepEqual(domains.map((entry) => [entry.suffix, entry.owned]), [
+      ["localhost", false], ["internal", false], ["lan", false], ["tinyuniver.se", true],
+    ]);
+  });
+
+  it("refuses to replace an unsigned matching suffix and never writes the provider list", async () => {
+    const provider = stubProvider([...DEFAULTS, { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] }]);
+    await assert.rejects(
+      serviceOver(provider).set("main", { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] }),
+      (error: unknown) => error instanceof FallbackDomainOwnershipError,
+    );
+    assert.deepEqual(provider.calls.map((call) => call.method), ["GET"]);
+    assert.deepEqual(provider.stored().map((entry) => entry.suffix), ["localhost", "internal", "lan", "tinyuniver.se"]);
+  });
+
+  it("refuses to remove unsigned defaults, foreign markers, and a marker moved to another suffix", async () => {
+    const cases: FallbackDomain[] = [
+      { suffix: "localhost" },
+      { suffix: "foreign.example", dnsServer: ["10.0.0.2"], description: ownershipComment("fallback/foreign.example", "entry", "someone-elses-secret-000000000000000") },
+      { suffix: "moved.example", dnsServer: ["10.0.0.3"], description: ownershipComment("fallback/original.example", "entry", OWNERSHIP_SECRET) },
+    ];
+    for (const entry of cases) {
+      const provider = stubProvider([entry, { suffix: "lan" }]);
+      await assert.rejects(serviceOver(provider).remove("main", entry.suffix), FallbackDomainOwnershipError);
+      assert.deepEqual(provider.calls.map((call) => call.method), ["GET"], entry.suffix);
+      assert.deepEqual(provider.stored(), [entry, { suffix: "lan" }], entry.suffix);
+    }
+  });
+
+  it("does not delete a foreign duplicate beside an owned suffix", async () => {
+    const provider = stubProvider([owned("tinyuniver.se"), { suffix: "tinyuniver.se", dnsServer: ["10.0.0.9"] }]);
+    await assert.rejects(serviceOver(provider).remove("main", "tinyuniver.se"), FallbackDomainOwnershipError);
+    assert.deepEqual(provider.calls.map((call) => call.method), ["GET"]);
+    assert.equal(provider.stored().length, 2);
+  });
+
+  it("preserves a requested description beside its ownership marker", async () => {
+    const provider = stubProvider(DEFAULTS);
+    await serviceOver(provider).set("main", { suffix: "tinyuniver.se", description: "Office resolver" });
+    assert.match(provider.stored().at(-1)?.description ?? "", /^Office resolver parallax-managed:v3:/u);
   });
 
   it("addresses a named device profile when one is given", async () => {
@@ -132,6 +185,7 @@ describe("fallback domains", () => {
     // own failure so it is not read as "the list is wrong".
     const service = new FallbackDomainService({
       secrets: { getProfileSecret: async (name) => ({ name, accountId: "acct-1", token: "tok-secret" }) },
+      ownershipSecret: OWNERSHIP_SECRET,
       createClient: (options) => new CloudflareFallbackDomains({
         ...options,
         fetch: async () => new Response(JSON.stringify({ success: false, errors: [{ code: 10000 }] }), { status: 403 }),
@@ -146,6 +200,7 @@ describe("fallback domains", () => {
     // that worked, and the list it manages is one nobody reads again by hand.
     const service = new FallbackDomainService({
       secrets: { getProfileSecret: async (name) => ({ name, accountId: "acct-1", token: "tok-secret" }) },
+      ownershipSecret: OWNERSHIP_SECRET,
       createClient: (options) => new CloudflareFallbackDomains({
         ...options,
         fetch: async (_input, init) => new Response(JSON.stringify({
@@ -254,10 +309,69 @@ describe("keeping the overrides in step with the zones", () => {
     assert.equal(plan.add.length + plan.remove.length, 0);
   });
 
+  it("refuses when an entry changes ownership between planning and writing", async () => {
+    const provider = stubProvider([...OTHERS, owned("tinyuniver.se", ["10.17.239.78"])]);
+    let reads = 0;
+    const service = new FallbackDomainService({
+      secrets: { getProfileSecret: async (name) => ({ name, accountId: "acct-1", token: "tok-secret" }) },
+      ownershipSecret: OWNERSHIP_SECRET,
+      createClient: (options) => new CloudflareFallbackDomains({
+        ...options,
+        fetch: async (input, init) => {
+          if ((init?.method ?? "GET") === "GET" && ++reads === 2) {
+            provider.replaceStored([...OTHERS, {
+              suffix: "tinyuniver.se",
+              dnsServer: ["10.0.0.9"],
+              description: ownershipComment("fallback/tinyuniver.se", "entry", "someone-elses-secret-000000000000000"),
+            }]);
+          }
+          return provider.fetch(input, init);
+        },
+      }),
+    });
+    await assert.rejects(
+      service.sync("main", ["tinyuniver.se"], "10.17.192.70"),
+      FallbackDomainOwnershipError,
+    );
+    assert.equal(provider.calls.filter((call) => call.method === "PUT").length, 0);
+  });
+
+  it("does not adopt an entry carrying another control plane's marker", async () => {
+    const foreign = {
+      suffix: "tinyuniver.se",
+      dnsServer: ["10.17.192.70"],
+      description: ownershipComment("fallback/tinyuniver.se", "entry", "someone-elses-secret-000000000000000"),
+    };
+    const { service } = syncing([...OTHERS, foreign]);
+    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    assert.deepEqual(plan.adopt, []);
+    assert.deepEqual(plan.conflict.map((entry) => entry.suffix), ["tinyuniver.se"]);
+  });
+
   it("removes its own entry for a zone it no longer holds", async () => {
     const { service } = syncing([...OTHERS, { suffix: "gone.example", dnsServer: ["10.17.192.70"], description: marker("gone.example") }]);
     const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
     assert.deepEqual(plan.remove.map((entry) => entry.suffix), ["gone.example"]);
+  });
+
+  it("refuses when a removal target changes ownership before writing", async () => {
+    const provider = stubProvider([...OTHERS, owned("gone.example")]);
+    let reads = 0;
+    const service = new FallbackDomainService({
+      secrets: { getProfileSecret: async (name) => ({ name, accountId: "acct-1", token: "tok-secret" }) },
+      ownershipSecret: OWNERSHIP_SECRET,
+      createClient: (options) => new CloudflareFallbackDomains({
+        ...options,
+        fetch: async (input, init) => {
+          if ((init?.method ?? "GET") === "GET" && ++reads === 2) {
+            provider.replaceStored([...OTHERS, { suffix: "gone.example", dnsServer: ["10.17.192.70"] }]);
+          }
+          return provider.fetch(input, init);
+        },
+      }),
+    });
+    await assert.rejects(service.sync("main", [], "10.17.192.70"), FallbackDomainOwnershipError);
+    assert.equal(provider.calls.filter((call) => call.method === "PUT").length, 0);
   });
 
   it("does not accept a marker minted for another suffix", async () => {

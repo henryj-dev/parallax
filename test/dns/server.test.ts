@@ -330,8 +330,37 @@ describe("DNS server", () => {
     assert.equal(answers.some((record) => record.type === TYPE.CNAME), true);
   });
 
-  it("answers an AXFR of a served apex with that zone's records", async () => {
+  it("denies AXFR by default", async () => {
     const { port } = await start({ zones: () => [EXAMPLE] });
+    assert.equal(rcodeOf(await askOverTcp(port, buildQuery("example.com", TYPE.AXFR))), RCODE.REFUSED);
+  });
+
+  it("denies AXFR over UDP even for an allowed client", async () => {
+    const { port } = await start({ zones: () => [EXAMPLE], transferAllow: ["127.0.0.0/8"] });
+    assert.equal(rcodeOf(await ask(port, buildQuery("example.com", TYPE.AXFR))), RCODE.REFUSED);
+  });
+
+  it("denies AXFR from a client outside the transfer allowlist", async () => {
+    const { port } = await start({ zones: () => [EXAMPLE], transferAllow: ["10.0.0.0/8"] });
+    assert.equal(rcodeOf(await askOverTcp(port, buildQuery("example.com", TYPE.AXFR))), RCODE.REFUSED);
+  });
+
+  it("never forwards AXFR around the transfer policy", async () => {
+    const { socket: upstream, port: upstreamPort } = await upstreamOn();
+    let receivedQueries = 0;
+    upstream.on("message", () => { receivedQueries += 1; });
+    closers.push(async () => { upstream.close(); });
+    const { port } = await start({
+      zones: () => [EXAMPLE],
+      forwardTo: [`127.0.0.1#${upstreamPort}`],
+      forwardAllow: ["127.0.0.0/8"],
+    });
+    assert.equal(rcodeOf(await askOverTcp(port, buildQuery("outside.example", TYPE.AXFR))), RCODE.REFUSED);
+    assert.equal(receivedQueries, 0);
+  });
+
+  it("answers an allowed TCP AXFR of a served apex with that zone's records", async () => {
+    const { port } = await start({ zones: () => [EXAMPLE], transferAllow: ["127.0.0.0/8"] });
     const reply = await askOverTcp(port, buildQuery("example.com", TYPE.AXFR));
     const answers = readAnswers(reply);
     assert.equal(answers[0]?.type, TYPE.SOA);

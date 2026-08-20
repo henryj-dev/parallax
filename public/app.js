@@ -763,7 +763,7 @@ function renderFallback(state) {
     + section(t("fallback.live"), panel.entries.length
       ? `<div class="fallback-suffixes">${panel.entries.map((entry) =>
         `<span class="fallback-live-entry"><code>${escapeHtml(entry.suffix)}${entry.dnsServer.length ? ` → ${escapeHtml(entry.dnsServer.join(", "))}` : ""}</code>${
-          canEditFallback
+          canEditFallback && entry.actions.includes("delete")
             ? `<button class="button quiet" type="button" data-delete-suffix="${escapeHtml(entry.suffix)}">${escapeHtml(t("fallback.delete"))}</button>`
             : ""
         }</span>`).join(" ")}</div>`

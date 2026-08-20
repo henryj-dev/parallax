@@ -31,6 +31,15 @@ export interface FallbackDomainChange {
   readonly outcome: "added" | "updated" | "removed" | "unchanged";
 }
 
+export interface FallbackDomainState extends FallbackDomain {
+  /** True only when the marker is valid for this exact suffix and control plane. */
+  readonly owned: boolean;
+}
+
+export class FallbackDomainOwnershipError extends Error {
+  override readonly name = "FallbackDomainOwnershipError";
+}
+
 /**
  * The zones one credential profile should have overrides for.
  *
@@ -133,8 +142,11 @@ export class FallbackDomainService {
       ?? ((input) => new CloudflareFallbackDomains(input));
   }
 
-  async list(profile: string, policyId?: string): Promise<FallbackDomain[]> {
-    return (await this.#client(profile, policyId)).list();
+  async list(profile: string, policyId?: string): Promise<FallbackDomainState[]> {
+    return (await (await this.#client(profile, policyId)).list()).map((entry) => ({
+      ...entry,
+      owned: this.#owns(entry),
+    }));
   }
 
   /**
@@ -149,14 +161,20 @@ export class FallbackDomainService {
   async set(profile: string, entry: FallbackDomain, policyId?: string): Promise<FallbackDomainChange> {
     const suffix = normalizeSuffix(entry.suffix);
     if (!suffix) throw new Error("a fallback domain needs a suffix");
+    this.#requireOwnershipSecret();
     const client = await this.#client(profile, policyId);
     const current = await client.list();
     const desired: FallbackDomain = {
       suffix,
       ...(entry.dnsServer && entry.dnsServer.length > 0 ? { dnsServer: entry.dnsServer } : {}),
-      ...(entry.description ? { description: entry.description } : {}),
+      description: [entry.description?.trim(), ownershipComment(`fallback/${suffix}`, "entry", this.#ownershipSecret)]
+        .filter(Boolean)
+        .join(" "),
     };
     const index = current.findIndex((domain) => normalizeSuffix(domain.suffix) === suffix);
+    if (index >= 0 && !this.#owns(current[index] as FallbackDomain)) {
+      throw new FallbackDomainOwnershipError(`fallback domain ${suffix} is not owned by this control plane`);
+    }
     if (index >= 0 && sameEntry(current[index] as FallbackDomain, desired)) {
       return { domains: current, outcome: "unchanged" };
     }
@@ -168,9 +186,14 @@ export class FallbackDomainService {
 
   async remove(profile: string, suffix: string, policyId?: string): Promise<FallbackDomainChange> {
     const wanted = normalizeSuffix(suffix);
+    this.#requireOwnershipSecret();
     const client = await this.#client(profile, policyId);
     const current = await client.list();
-    const next = current.filter((domain) => normalizeSuffix(domain.suffix) !== wanted);
+    const matching = current.filter((domain) => normalizeSuffix(domain.suffix) === wanted);
+    if (matching.some((domain) => !this.#owns(domain))) {
+      throw new FallbackDomainOwnershipError(`fallback domain ${wanted} is not owned by this control plane`);
+    }
+    const next = current.filter((domain) => normalizeSuffix(domain.suffix) !== wanted || !this.#owns(domain));
     // Saying "removed" about a list that never held it would read as confirmation
     // that the override is gone, when it may be spelled differently and still live.
     if (next.length === current.length) return { domains: current, outcome: "unchanged" };
@@ -217,7 +240,7 @@ export class FallbackDomainService {
           // whose entry it is, so the next sync can maintain it instead of
           // reporting it forever. Anything else is somebody's decision, not ours.
           const desired = this.#entry(suffix, resolver);
-          if (sameServers(entry, desired)) adopt.push(desired);
+          if (!this.#hasOwnershipMarker(entry) && sameServers(entry, desired)) adopt.push(desired);
           else {
             conflict.push({ suffix, reason: "an entry for this suffix sends it somewhere else, and Parallax did not create it" });
           }
@@ -251,11 +274,33 @@ export class FallbackDomainService {
     const client = await this.#client(profile, policyId);
     const current = await client.list();
     const removing = new Set(plan.remove.map((entry) => normalizeSuffix(entry.suffix)));
-    const replacing = new Map([...plan.update, ...plan.adopt].map((entry) => [normalizeSuffix(entry.suffix), entry]));
+    const updates = new Map(plan.update.map((entry) => [normalizeSuffix(entry.suffix), entry]));
+    const adoptions = new Map(plan.adopt.map((entry) => [normalizeSuffix(entry.suffix), entry]));
+    const additions = new Map(plan.add.map((entry) => [normalizeSuffix(entry.suffix), entry]));
+    for (const suffix of removing) {
+      const matches = current.filter((entry) => normalizeSuffix(entry.suffix) === suffix);
+      if (matches.length === 0 || matches.some((entry) => !this.#owns(entry))) {
+        throw new FallbackDomainOwnershipError(`fallback domain ${suffix} changed ownership before removal`);
+      }
+    }
+    for (const entry of current) {
+      const suffix = normalizeSuffix(entry.suffix);
+      if (updates.has(suffix) && !this.#owns(entry)) {
+        throw new FallbackDomainOwnershipError(`fallback domain ${suffix} changed ownership before sync`);
+      }
+      const adoption = adoptions.get(suffix);
+      if (adoption && (this.#hasOwnershipMarker(entry) || !sameServers(entry, adoption))) {
+        throw new FallbackDomainOwnershipError(`fallback domain ${suffix} changed before adoption`);
+      }
+      if (additions.has(suffix)) {
+        throw new FallbackDomainOwnershipError(`fallback domain ${suffix} appeared before sync`);
+      }
+    }
+    const replacing = new Map([...updates, ...adoptions]);
     const next = current
       .filter((entry) => !(this.#owns(entry) && removing.has(normalizeSuffix(entry.suffix))))
       .map((entry) => replacing.get(normalizeSuffix(entry.suffix)) ?? entry);
-    return { plan, domains: await client.replace([...next, ...plan.add]) };
+    return { plan, domains: await client.replace([...next, ...additions.values()]) };
   }
 
   #entry(suffix: string, resolver: string): FallbackDomain {
@@ -273,6 +318,16 @@ export class FallbackDomainService {
   #owns(entry: FallbackDomain): boolean {
     if (!this.#ownershipSecret) return false;
     return readOwnershipComment(entry.description, this.#ownershipSecret, `fallback/${normalizeSuffix(entry.suffix)}`) !== undefined;
+  }
+
+  #hasOwnershipMarker(entry: FallbackDomain): boolean {
+    return /(?:^|\s)parallax-managed:v[23]:/u.test(entry.description ?? "");
+  }
+
+  #requireOwnershipSecret(): void {
+    if (!this.#ownershipSecret) {
+      throw new Error("PARALLAX_OWNERSHIP_SECRET is required to manage fallback domains safely");
+    }
   }
 
   async #client(profile: string, policyId?: string): Promise<CloudflareFallbackDomains> {

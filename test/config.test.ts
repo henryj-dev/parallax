@@ -205,6 +205,7 @@ describe("configuration", () => {
       port: 5353,
       forwardTo: [],
       forwardAllow: ["127.0.0.0/8", "::1/128"],
+      transferAllow: [],
     });
   });
 
@@ -269,6 +270,22 @@ describe("configuration", () => {
     assert.throws(
       () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_ALLOW: "not-an-address" }),
       /invalid address/,
+    );
+  });
+
+  it("denies zone transfers by default and validates their separate allowlist", () => {
+    assert.deepEqual(readConfig({ PARALLAX_DNS_PORT: "53" }).dns?.transferAllow, []);
+    assert.deepEqual(readConfig({
+      PARALLAX_DNS_PORT: "53",
+      PARALLAX_DNS_TRANSFER_ALLOW: "10.0.0.2/32, 2001:db8::/48",
+    }).dns?.transferAllow, ["10.0.0.2/32", "2001:db8::/48"]);
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_TRANSFER_ALLOW: "10.0.0.0/99" }),
+      /PARALLAX_DNS_TRANSFER_ALLOW contains an invalid prefix/,
+    );
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_TRANSFER_ALLOW: "not-an-address" }),
+      /PARALLAX_DNS_TRANSFER_ALLOW contains an invalid address/,
     );
   });
 });

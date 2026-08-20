@@ -67,6 +67,8 @@ export interface DnsListenerSettings {
   readonly forwardTo: readonly string[];
   /** Client networks allowed to use those upstreams. */
   readonly forwardAllow: readonly string[];
+  /** Client networks allowed to transfer a complete zone over TCP. Empty denies all transfers. */
+  readonly transferAllow: readonly string[];
   /** Hosts that receive NOTIFY when a served zone's serial rises. `host` or `host:port`. */
   readonly notifyTo?: readonly string[];
 }
@@ -152,7 +154,14 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
   if (forwardTo.length > 0 && !isLoopbackHost(host) && !explicitForwardAllow) {
     throw new Error("PARALLAX_DNS_FORWARD_ALLOW must explicitly name the client CIDRs allowed to recurse when the DNS listener is not loopback");
   }
-  const forwardAllow = readDnsClientCidrs(explicitForwardAllow || "127.0.0.0/8,::1/128");
+  const forwardAllow = readDnsClientCidrs(
+    explicitForwardAllow || "127.0.0.0/8,::1/128",
+    "PARALLAX_DNS_FORWARD_ALLOW",
+  );
+  const transferAllow = readDnsClientCidrs(
+    environment.PARALLAX_DNS_TRANSFER_ALLOW ?? "",
+    "PARALLAX_DNS_TRANSFER_ALLOW",
+  );
   const notifyTo = (environment.PARALLAX_DNS_NOTIFY_TO ?? "")
     .split(",")
     .map((destination) => destination.trim())
@@ -162,25 +171,26 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     port: readPort(port, "PARALLAX_DNS_PORT"),
     forwardTo,
     forwardAllow,
+    transferAllow,
     ...(notifyTo.length > 0 ? { notifyTo } : {}),
   };
 }
 
-function readDnsClientCidrs(source: string): string[] {
+function readDnsClientCidrs(source: string, setting: string): string[] {
   return source.split(",").map((entry) => entry.trim()).filter(Boolean).map((entry) => {
     const slash = entry.lastIndexOf("/");
     const address = slash < 0 ? entry : entry.slice(0, slash);
     const family = isIP(address);
-    if (family === 0) throw new Error(`PARALLAX_DNS_FORWARD_ALLOW contains an invalid address: ${entry}`);
+    if (family === 0) throw new Error(`${setting} contains an invalid address: ${entry}`);
     if (slash >= 0) {
       const prefixText = entry.slice(slash + 1);
       if (!/^\d{1,3}$/u.test(prefixText)) {
-        throw new Error(`PARALLAX_DNS_FORWARD_ALLOW contains an invalid prefix: ${entry}`);
+        throw new Error(`${setting} contains an invalid prefix: ${entry}`);
       }
       const prefix = Number(prefixText);
       const bits = family === 4 ? 32 : 128;
       if (!Number.isInteger(prefix) || prefix < 0 || prefix > bits) {
-        throw new Error(`PARALLAX_DNS_FORWARD_ALLOW contains an invalid prefix: ${entry}`);
+        throw new Error(`${setting} contains an invalid prefix: ${entry}`);
       }
     }
     return entry;

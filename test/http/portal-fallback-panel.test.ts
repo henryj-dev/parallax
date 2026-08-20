@@ -93,4 +93,17 @@ describe("the override panel", () => {
     assert.equal(panel.syncable, false);
     assert.equal(panel.inStep, false);
   });
+
+  it("exposes deletion only for entries the server says this control plane owns", () => {
+    const panel = fallbackPanel({
+      fallbackEntries: [
+        { suffix: "localhost" },
+        { suffix: "lan", owned: false },
+        { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"], owned: true },
+      ],
+    });
+    assert.deepEqual(panel.entries.map((entry) => [entry.suffix, entry.owned, entry.actions]), [
+      ["localhost", false, []], ["lan", false, []], ["tinyuniver.se", true, ["delete"]],
+    ]);
+  });
 });

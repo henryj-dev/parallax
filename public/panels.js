@@ -26,7 +26,7 @@
  * @param {{
  *   fallbackProfile?: string,
  *   fallbackCoverage?: { zone?: string, covered?: boolean, reason?: string, profile?: string, detail?: string }[],
- *   fallbackEntries?: { suffix?: string, dnsServer?: string[] }[],
+ *   fallbackEntries?: { suffix?: string, dnsServer?: string[], owned?: boolean }[],
  *   fallbackPlan?: {
  *     add?: { suffix?: string }[], update?: { suffix?: string }[], adopt?: { suffix?: string }[],
  *     remove?: { suffix?: string }[], conflict?: { suffix?: string, reason?: string }[],
@@ -65,6 +65,8 @@ export function fallbackPanel(state) {
     entries: (Array.isArray(state?.fallbackEntries) ? state.fallbackEntries : []).map((entry) => ({
       suffix: String(entry?.suffix ?? ""),
       dnsServer: Array.isArray(entry?.dnsServer) ? entry.dnsServer.map(String) : [],
+      owned: entry?.owned === true,
+      actions: entry?.owned === true ? ["delete"] : [],
     })),
     plan: plan ? { add, update, adopt, remove, conflict, unchanged: Number(plan.unchanged ?? 0), untouched: Number(plan.untouched ?? 0) } : null,
     planError: String(state?.fallbackPlanError ?? ""),

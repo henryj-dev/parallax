@@ -1006,9 +1006,28 @@ describe("ControlPlane", () => {
     await service.upsertRecord("example.com", "external", "root", { name: "@", type: "A", content: "8.8.8.1", ttl: 60 });
     await service.apply("example.com");
     assert.equal((await provider.list("example.com/external")).length, 1);
+
+    provider.calls.length = 0;
+    const before = await service.getZone("example.com");
+    const unsaved = await service.preview("example.com", undefined, { views: [] });
+    assert.deepEqual(Object.fromEntries(Object.entries(unsaved.views).map(([view, plan]) => [view, plan.summary.delete])), {
+      external: 1,
+      internal: 1,
+    });
+    assert.deepEqual(await service.getZone("example.com"), before, "preview must not persist its candidate or advance the revision");
+
     await service.replaceDesiredState("example.com", { views: [] });
     assert.equal((await service.status("example.com")).statuses[0]?.state, "pending");
+    const saved = await service.preview("example.com");
+    assert.deepEqual(saved.views, unsaved.views, "the saved tombstones must produce the plan shown before save");
+
+    const planned = Object.entries(saved.views).flatMap(([view, plan]) => plan.operations
+      .filter((operation) => operation.kind !== "conflict")
+      .map((operation) => ({ target: `example.com/${view}`, operation })));
     await service.apply("example.com");
+    assert.deepEqual(provider.calls, planned, "apply must execute exactly the operations preview counted");
+    assert.equal(provider.calls.length, Object.values(saved.views)
+      .reduce((count, plan) => count + plan.summary.create + plan.summary.update + plan.summary.delete, 0));
     assert.equal((await provider.list("example.com/external")).length, 0);
   });
 
@@ -1027,6 +1046,9 @@ describe("ControlPlane", () => {
     const pending = (await service.status("example.com")).statuses.find((status) => status.view === "external");
     assert.equal(pending?.desiredRevision, edited.revision);
     assert.equal(pending?.state, "pending");
+    const preview = await service.preview("example.com");
+    assert.equal(preview.views.external?.summary.delete, 1,
+      "an unrelated edit must carry the unfinished removal into preview");
 
     await service.apply("example.com");
     assert.deepEqual(await provider.list("example.com/external"), []);

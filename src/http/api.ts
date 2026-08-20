@@ -3,6 +3,7 @@ import { ConflictError, NotFoundError, ProviderManagedRecordError } from "../app
 import { CredentialNotFoundError, CredentialTestError } from "../application/cloudflare-credentials.ts";
 import { ZoneLookupForbiddenError, ZoneNotFoundError } from "../adapters/cloudflare.ts";
 import { FallbackDomainForbiddenError, FallbackDomainUnavailableError } from "../adapters/cloudflare-fallback.ts";
+import { FallbackDomainOwnershipError } from "../application/fallback-domains.ts";
 import { ProviderNotConfiguredError } from "../application/ports.ts";
 import { parseInvocation, UsageError } from "../cli/argv.ts";
 import {
@@ -434,6 +435,7 @@ function errorResponse(error: unknown): Response {
   if (error instanceof ZoneLookupForbiddenError) return json({ error: "zone_lookup_forbidden", message: error.message }, 403);
   if (error instanceof ZoneNotFoundError) return json({ error: "zone_not_found", message: error.message }, 404);
   if (error instanceof ConflictError) return json({ error: "conflict", message: error.message }, 409);
+  if (error instanceof FallbackDomainOwnershipError) return json({ error: "conflict", message: error.message }, 409);
   // Not a validation failure: the record is well formed and the caller may
   // read it. It is refused because something else owns it.
   if (error instanceof ProviderManagedRecordError) return json({ error: "provider_managed", message: error.message }, 409);

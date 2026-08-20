@@ -5,6 +5,7 @@ import { ControlPlane } from "../../src/application/control-plane.ts";
 import { SettingsService } from "../../src/application/settings.ts";
 import type { AccessTokenRepository, SettingsRepository, StoredAccessToken } from "../../src/application/ports.ts";
 import { createApiHandler } from "../../src/http/api.ts";
+import { FallbackDomainOwnershipError } from "../../src/application/fallback-domains.ts";
 import { createInMemoryAdapters } from "../../src/infrastructure/in-memory.ts";
 
 const security = {
@@ -150,6 +151,24 @@ describe("the override report over HTTP", () => {
       { method: "set", suffix: "tinyuniver.se" },
       { method: "remove", suffix: "tinyuniver.se" },
     ]);
+  });
+
+  it("reports an ownership refusal as a conflict over HTTP", async () => {
+    const domains = {
+      set: async () => { throw new FallbackDomainOwnershipError("fallback domain lan is not owned by this control plane"); },
+    };
+    const adapters = createInMemoryAdapters();
+    const api = createApiHandler({
+      controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider),
+      fallbackDomains: domains as unknown as Parameters<typeof createApiHandler>[0]["fallbackDomains"],
+    }, security);
+
+    const response = await api(request("/api/v1/fallback/main/domains/lan", "PUT", { dnsServer: ["10.17.192.11"] }));
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      error: "conflict",
+      message: "fallback domain lan is not owned by this control plane",
+    });
   });
 });
 
