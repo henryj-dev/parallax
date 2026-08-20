@@ -364,6 +364,8 @@ function changeCounts(entry, t) {
 }
 
 function renderHistory(state) {
+  $("#history-zone-button").hidden = !state.activeZone;
+  $("#history-global-button").hidden = false;
   if (state.historyError) {
     $("#history-empty").hidden = false;
     $("#history-empty").textContent = t("history.loadFailed", { error: state.historyError });
@@ -372,7 +374,7 @@ function renderHistory(state) {
   }
   const entries = state.history;
   $("#history-empty").hidden = entries.length > 0;
-  $("#history-empty").textContent = t("history.none");
+  $("#history-empty").textContent = t(state.historyScope === "global" ? "history.noneGlobal" : "history.none");
   $("#history-list").innerHTML = entries.map((entry) => `<li><b>${escapeHtml(localizeAuditAction(entry.action, t))}</b><time>${escapeHtml(formatDate(entry.at))}</time><small>${escapeHtml(entry.actor || t("history.system"))}${entry.revision ? ` · ${escapeHtml(t("history.revision", { revision: entry.revision }))}` : ""}${changeCounts(entry, t)}</small></li>`).join("");
 }
 
@@ -719,6 +721,8 @@ function renderFallback(state) {
 
   const panel = fallbackPanel(state);
   $("#fallback-sync-button").disabled = !panel.syncable;
+  const canEditFallback = adminControlsVisible(state);
+  $("#fallback-suffix-form").hidden = !canEditFallback;
   if (state.profiles.length === 0) {
     $("#fallback-report").innerHTML = `<div class="mini-empty">${escapeHtml(t("credentials.profilesNone"))}</div>`;
     return;
@@ -758,7 +762,11 @@ function renderFallback(state) {
     + section(t("fallback.plan.title"), planBody)
     + section(t("fallback.live"), panel.entries.length
       ? `<div class="fallback-suffixes">${panel.entries.map((entry) =>
-        `<code>${escapeHtml(entry.suffix)}${entry.dnsServer.length ? ` → ${escapeHtml(entry.dnsServer.join(", "))}` : ""}</code>`).join(" ")}</div>`
+        `<span class="fallback-live-entry"><code>${escapeHtml(entry.suffix)}${entry.dnsServer.length ? ` → ${escapeHtml(entry.dnsServer.join(", "))}` : ""}</code>${
+          canEditFallback
+            ? `<button class="button quiet" type="button" data-delete-suffix="${escapeHtml(entry.suffix)}">${escapeHtml(t("fallback.delete"))}</button>`
+            : ""
+        }</span>`).join(" ")}</div>`
       : `<div class="mini-empty">${escapeHtml(t("fallback.liveNone"))}</div>`);
 }
 
@@ -911,8 +919,29 @@ $("#credential-settings-button").addEventListener("click", () => void openProvid
 for (const tab of $$(".provider-tab")) {
   tab.addEventListener("click", () => selectProviderPanel(tab.dataset.panel));
 }
+$("#history-global-button").addEventListener("click", () => { void store.loadGlobalHistory(); });
+$("#history-zone-button").addEventListener("click", () => {
+  const name = store.getState().activeZone?.name;
+  if (name) void store.selectZone(name);
+});
 $("#fallback-profile").addEventListener("change", () => void loadFallbackPanel());
 $("#fallback-refresh-button").addEventListener("click", () => void loadFallbackPanel());
+$("#fallback-suffix-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const profile = $("#fallback-profile").value;
+  const suffix = $("#fallback-suffix").value.trim();
+  const dnsServer = $("#fallback-dns-server").value.trim();
+  if (!profile || !suffix) return;
+  void store.setFallbackSuffix(profile, suffix, dnsServer);
+});
+$("#fallback-report").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-delete-suffix]");
+  if (!button) return;
+  const profile = $("#fallback-profile").value;
+  const suffix = button.dataset.deleteSuffix;
+  if (!profile || !suffix || !globalThis.confirm(t("fallback.deleteConfirm", { suffix }))) return;
+  void store.deleteFallbackSuffix(profile, suffix);
+});
 $("#fallback-sync-button").addEventListener("click", () => {
   // Written to a setting the whole organization shares, so it is confirmed
   // like the other writes that reach beyond this control plane.

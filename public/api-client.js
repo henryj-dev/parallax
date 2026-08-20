@@ -145,6 +145,8 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     /** One line per zone, walked the same way as the zone list so a second page is not silently dropped. */
     statusOverview: listAllStatus,
     history: (zone) => listAllKeyed(`${zonePath(zone)}/history`, "entries", "history"),
+    /** Newest first, every zone, walked the same way as a per-zone page. */
+    globalHistory: () => listAllKeyed("/history", "entries", "history"),
     preview: (zone, desired) => request(`${zonePath(zone)}/preview`, { method: "POST", body: desired }),
     apply: (zone, revision) => request(`${zonePath(zone)}/apply`, { method: "POST", headers: ifMatch(revision) }),
     adopt: (zone, revision) =>
@@ -179,6 +181,13 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     fallbackList: (profile) => request(`/fallback/${encodeURIComponent(profile)}`),
     fallbackPreview: (profile) => request(`/fallback/${encodeURIComponent(profile)}/preview`),
     fallbackSync: (profile) => request(`/fallback/${encodeURIComponent(profile)}/sync`, { method: "POST" }),
+    setFallbackSuffix: (profile, suffix, dnsServer) =>
+      request(`/fallback/${encodeURIComponent(profile)}/domains/${encodeURIComponent(suffix)}`, {
+        method: "PUT",
+        body: { dnsServer },
+      }),
+    deleteFallbackSuffix: (profile, suffix) =>
+      request(`/fallback/${encodeURIComponent(profile)}/domains/${encodeURIComponent(suffix)}`, { method: "DELETE" }),
 
     getSettings: () => request("/settings"),
     saveSettings: (values) => request("/settings", { method: "PUT", body: values }),

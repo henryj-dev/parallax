@@ -15,8 +15,9 @@ import { createNodeHandler, requestOrigin } from "./http/api.ts";
 import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.ts";
 import { createReadinessMonitor } from "./http/readiness.ts";
 import { redirectLocation } from "./http/redirect.ts";
-import { createRuntime } from "./runtime.ts";
+import { createRuntime, type ParallaxRuntime } from "./runtime.ts";
 import { authenticate, withIdentityProvider, type SecurityConfig } from "./security/http-authorization.ts";
+import { shutdownProcess } from "./shutdown.ts";
 
 const config = readConfig();
 
@@ -28,13 +29,18 @@ const DNS_REFRESH_MS = 5_000;
 
 /** What the listener is answering from, and what readiness reports about it. */
 let dnsSnapshot: ServedZone[] = [];
+/** Serials of the last snapshot NOTIFY has already seen. */
+let previousDnsSerials = new Map<string, number>();
+let dnsServer: ReturnType<typeof createDnsServer> | undefined;
+let redirector: ReturnType<typeof createServer> | undefined;
 
-let runtime;
+let runtime: ParallaxRuntime;
 try {
   runtime = await createRuntime(config);
 } catch (error) {
   console.error(`parallax: ${error instanceof Error ? error.message : "startup failed"}`);
   process.exit(1);
+  throw error;
 }
 
 const { controlPlane, settings: settingsService, accessTokens, credentials, provider } = runtime;
@@ -53,7 +59,12 @@ const readiness = createReadinessMonitor(
       const next = servedZones(zones, (zone, reason) => {
         console.error(`parallax: not answering for ${zone}, its internal view could not be composed: ${reason}`);
       });
+      const previous = previousDnsSerials;
+      previousDnsSerials = new Map(next.map((zone) => [zone.name, zone.serial]));
       dnsSnapshot = next;
+      void dnsServer?.notifyChanged(previous, next).catch((error: unknown) => {
+        console.error(`parallax: NOTIFY failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      });
     },
   },
 );
@@ -349,7 +360,7 @@ server.keepAliveTimeout = 10_000;
  * untrusted input and must never choose the redirect destination.
  */
 if (config.httpRedirectPort !== undefined) {
-  const redirector = createServer((request, response) => {
+  redirector = createServer((request, response) => {
     setSecurityHeaders(response);
     const origin = settingsService.current().publicOrigin;
     if (!origin) {
@@ -384,10 +395,11 @@ if (config.httpRedirectPort !== undefined) {
  */
 if (config.dns) {
   const dnsConfig = config.dns;
-  const dns = createDnsServer({
+  dnsServer = createDnsServer({
     zones: () => dnsSnapshot,
     forwardTo: dnsConfig.forwardTo,
     forwardAllow: dnsConfig.forwardAllow,
+    ...(dnsConfig.notifyTo ? { notifyTo: dnsConfig.notifyTo } : {}),
     onUnservable: (record) => {
       // Stored content the domain accepted and the wire cannot carry. The
       // query was answered SERVFAIL, so this line is the only place it is said.
@@ -395,7 +407,7 @@ if (config.dns) {
     },
   });
   try {
-    await dns.listen(dnsConfig.port, dnsConfig.host);
+    await dnsServer.listen(dnsConfig.port, dnsConfig.host);
     console.log(`parallax: dns://${dnsConfig.host}:${dnsConfig.port} answering for ${dnsSnapshot.length} zone(s)`);
     if (dnsConfig.forwardTo.length === 0) {
       console.warn("parallax: no DNS upstream is configured, so names outside every managed zone are answered REFUSED. Set PARALLAX_DNS_FORWARD_TO if clients use this as their resolver.");
@@ -421,3 +433,19 @@ server.listen(config.port, config.host, () => {
     console.warn("parallax: DATABASE_URL does not request TLS; zone data and audit history cross the network in cleartext. Append ?sslmode=verify-full unless PostgreSQL is reached over a trusted local socket.");
   }
 });
+
+let shuttingDown = false;
+async function stop(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await shutdownProcess({
+    dns: dnsServer,
+    http: server,
+    redirect: redirector,
+    runtime,
+    timers: [desiredStateTimer],
+  });
+  process.exit(0);
+}
+process.on("SIGTERM", () => { void stop(); });
+process.on("SIGINT", () => { void stop(); });

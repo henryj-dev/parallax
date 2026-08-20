@@ -215,6 +215,14 @@ describe("configuration", () => {
     assert.equal(readConfig({ PARALLAX_DNS_PORT: "53", HOST: "10.0.0.5", PARALLAX_DNS_HOST: "0.0.0.0" }).dns?.host, "0.0.0.0");
   });
 
+  it("reads NOTIFY destinations only when they are named", () => {
+    assert.equal(readConfig({ PARALLAX_DNS_PORT: "53" }).dns?.notifyTo, undefined);
+    assert.deepEqual(
+      readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_NOTIFY_TO: " 127.0.0.1:5300 , 10.0.0.2 " }).dns?.notifyTo,
+      ["127.0.0.1:5300", "10.0.0.2"],
+    );
+  });
+
   it("reads the upstreams it relays to, and refuses one it could not reach", () => {
     assert.deepEqual(
       readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_TO: " 10.0.0.1 , 10.0.0.2#5353 ," }).dns?.forwardTo,

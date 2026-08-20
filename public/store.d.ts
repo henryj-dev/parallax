@@ -76,6 +76,8 @@ export interface StoreState extends Record<string, unknown> {
   statusError?: string;
   historyError?: string;
   history?: { action?: string; at?: string; actor?: string; revision?: number }[];
+  historyScope?: string;
+  activeZone?: { name?: string; revision?: number; [key: string]: unknown } | null;
 }
 
 export interface Store {
@@ -115,6 +117,12 @@ export interface Store {
   loadFallback(profile: string): Outcome;
   /** Makes the overrides match this profile's zones, then reads them back. */
   syncFallback(profile: string): Outcome;
+  /** Points one suffix at a resolver over the existing fallback HTTP route. */
+  setFallbackSuffix(profile: string, suffix: string, dnsServer: string): Outcome;
+  /** Removes one suffix over the existing fallback HTTP route. */
+  deleteFallbackSuffix(profile: string, suffix: string): Outcome;
+  /** Loads zoneless history from GET /api/v1/history, walking every page. */
+  loadGlobalHistory(): Outcome;
   selectProfile(name: string): void;
   selectBinding(zone: string): void;
   saveProfile(name: string, credential: { token?: string; accountId?: string }): Outcome;

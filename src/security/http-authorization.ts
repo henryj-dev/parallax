@@ -125,6 +125,9 @@ export function authorize(principal: Principal, request: Request): boolean {
   if ((method === "GET" || method === "HEAD") && !previewsProvider) return true;
   if (principal.role !== "editor") return false;
   if (previewsProvider) return method === "GET" || method === "HEAD" || method === "POST";
+  if (segments[0] === "api" && segments[1] === "v1" && segments[2] === "apply" && segments.length === 3) {
+    return method === "POST";
+  }
 
   if (segments[0] !== "api" || segments[1] !== "v1" || segments[2] !== "zones") return false;
 
@@ -137,6 +140,7 @@ export function authorize(principal: Principal, request: Request): boolean {
 
   if (segments.length === 5 && segments[4] === "preview" && method === "POST") return true;
   if (segments.length === 5 && segments[4] === "apply" && method === "POST") return true;
+  if (segments.length === 5 && segments[4] === "import" && method === "POST") return true;
   if (segments.length === 5 && segments[4] === "adopt" && method === "POST") return true;
   if (segments.length === 7 && segments[4] === "revisions" && segments[6] === "restore" && method === "POST") return true;
 

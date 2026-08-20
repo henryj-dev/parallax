@@ -145,6 +145,55 @@ describe("portal mapping", () => {
     assert.equal(store.getState().authenticated, false);
   });
 
+  it("sets and deletes one fallback suffix over the existing HTTP routes", async () => {
+    const seen = [];
+    const client = createApiClient({
+      fetchImpl: async (input, init = {}) => {
+        const url = String(input);
+        seen.push({ url, method: init.method ?? "GET", body: init.body });
+        if (url.includes("/fallback/main/coverage")) return Response.json({ zones: [] });
+        if (url.includes("/fallback/main/preview")) return Response.json({ add: [], update: [], remove: [], adopt: [], conflict: [] });
+        if (url.includes("/fallback/main") && !url.includes("/domains/")) return Response.json({ domains: [] });
+        return Response.json({ outcome: "added", domains: [] });
+      },
+    });
+    const store = createStore(client);
+    store.getState().profiles = [{ name: "main" }];
+    assert.equal(await store.setFallbackSuffix("main", "example.com", "10.17.192.11"), true);
+    const put = seen.find((call) => call.method === "PUT");
+    assert.ok(put, "set must PUT the suffix");
+    assert.match(put.url, /\/fallback\/main\/domains\/example.com$/);
+    assert.equal(JSON.parse(String(put.body)).dnsServer, "10.17.192.11");
+
+    seen.length = 0;
+    assert.equal(await store.deleteFallbackSuffix("main", "example.com"), true);
+    const deleted = seen.find((call) => call.method === "DELETE");
+    assert.ok(deleted, "delete must DELETE the suffix");
+    assert.match(deleted.url, /\/fallback\/main\/domains\/example.com$/);
+  });
+
+  it("loads zoneless history from GET /api/v1/history walking hasMore", async () => {
+    const paths = [];
+    const client = createApiClient({
+      fetchImpl: async (input) => {
+        const url = new URL(String(input), "https://portal.example");
+        paths.push(`${url.pathname}${url.search}`);
+        const offset = Number(url.searchParams.get("offset"));
+        return Response.json(offset === 0
+          ? { entries: [{ action: "zone.created" }], limit: 500, offset: 0, hasMore: true }
+          : { entries: [{ action: "record.upserted" }], limit: 500, offset: 1, hasMore: false });
+      },
+    });
+    const store = createStore(client);
+    assert.equal(await store.loadGlobalHistory(), true);
+    assert.deepEqual(store.getState().history.map((entry) => entry.action), ["zone.created", "record.upserted"]);
+    assert.equal(store.getState().historyScope, "global");
+    assert.deepEqual(paths, [
+      "/api/v1/history?limit=500&offset=0",
+      "/api/v1/history?limit=500&offset=1",
+    ]);
+  });
+
   it("posts same-origin identity logout as well as deleting the token session", async () => {
     const seen = [];
     const client = createApiClient({

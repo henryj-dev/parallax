@@ -96,4 +96,47 @@ describe("portal API client", () => {
       "/api/v1/zones/example.com/revisions?limit=500&offset=1",
     ]);
   });
+
+  it("sets and deletes a fallback suffix on the existing HTTP routes", async () => {
+    const calls = [];
+    const client = createApiClient({
+      root: "https://portal.example/api/v1",
+      fetchImpl: async (input, init = {}) => {
+        calls.push({ url: String(input), method: init.method ?? "GET", body: init.body });
+        return Response.json({ outcome: "added" });
+      },
+    });
+    await client.setFallbackSuffix("main", "example.com", "10.17.192.11");
+    await client.deleteFallbackSuffix("main", "example.com");
+    assert.equal(calls[0]?.method, "PUT");
+    assert.equal(calls[0]?.url, "https://portal.example/api/v1/fallback/main/domains/example.com");
+    assert.equal(JSON.parse(String(calls[0]?.body)).dnsServer, "10.17.192.11");
+    assert.equal(calls[1]?.method, "DELETE");
+    assert.equal(calls[1]?.url, "https://portal.example/api/v1/fallback/main/domains/example.com");
+  });
+
+  it("walks zoneless history pages from GET /history", async () => {
+    const paths = [];
+    const client = createApiClient({
+      root: "https://portal.example/api/v1",
+      fetchImpl: async (input) => {
+        const url = new URL(String(input));
+        paths.push(`${url.pathname}${url.search}`);
+        const offset = Number(url.searchParams.get("offset"));
+        return Response.json(offset === 0
+          ? { entries: [{ action: "zone.created" }], limit: 500, offset: 0, hasMore: true }
+          : { entries: [{ action: "desired.replaced" }], limit: 500, offset: 1, hasMore: false });
+      },
+    });
+    assert.deepEqual(await client.globalHistory(), {
+      entries: [{ action: "zone.created" }, { action: "desired.replaced" }],
+      limit: 500,
+      offset: 1,
+      hasMore: false,
+    });
+    assert.deepEqual(paths, [
+      "/api/v1/history?limit=500&offset=0",
+      "/api/v1/history?limit=500&offset=1",
+    ]);
+  });
 });

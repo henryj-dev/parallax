@@ -10,6 +10,7 @@ import {
   type UnservableRecord,
 } from "../../src/dns/server.ts";
 import { RCODE, TYPE, readName } from "../../src/dns/wire.ts";
+import { shutdownProcess } from "../../src/shutdown.ts";
 
 function encodeName(name: string): Buffer {
   if (name === "") return Buffer.of(0);
@@ -304,6 +305,75 @@ describe("DNS server", () => {
     assert.equal(readAnswers(received(await ask(port, buildQuery("www.example.com"), 2_000, "::1"))).length, 2);
     assert.equal(readAnswers(await askOverTcp(port, buildQuery("www.example.com"), false, "::1")).length, 2);
     assert.deepEqual(resolutions, ["localhost"], "the bind hostname is resolved once for both transports");
+  });
+
+  it("answers on the other family when the bind host is unspecified", async () => {
+    const { port } = await start({ zones: () => [EXAMPLE] }, "0.0.0.0");
+    const overV6 = received(await ask(port, buildQuery("www.example.com"), 2_000, "::1"));
+    assert.equal(readAnswers(overV6).length, 2);
+  });
+
+  it("substitutes a name below a stored DNAME instead of NXDOMAIN", async () => {
+    const { port } = await start({
+      zones: () => [{
+        name: "example.com",
+        serial: 1,
+        records: [
+          { name: "old", type: "DNAME", content: "new.example.net", ttl: 300 },
+        ],
+      }],
+    });
+    const reply = received(await ask(port, buildQuery("www.old.example.com")));
+    assert.equal(rcodeOf(reply), RCODE.NOERROR);
+    const answers = readAnswers(reply);
+    assert.equal(answers.some((record) => record.type === TYPE.DNAME), true);
+    assert.equal(answers.some((record) => record.type === TYPE.CNAME), true);
+  });
+
+  it("answers an AXFR of a served apex with that zone's records", async () => {
+    const { port } = await start({ zones: () => [EXAMPLE] });
+    const reply = await askOverTcp(port, buildQuery("example.com", TYPE.AXFR));
+    const answers = readAnswers(reply);
+    assert.equal(answers[0]?.type, TYPE.SOA);
+    assert.equal(answers.at(-1)?.type, TYPE.SOA);
+    assert.ok(answers.some((record) => record.type === TYPE.A && record.name === "www.example.com"));
+    assert.ok(answers.some((record) => record.type === TYPE.MX));
+  });
+
+  it("emits NOTIFY when a served zone's serial rises", async () => {
+    const sent: Array<{ packet: Buffer; address: string; port: number }> = [];
+    const zone = { ...EXAMPLE, serial: 12 };
+    const { server } = await start({
+      zones: () => [zone],
+      notifyTo: ["127.0.0.1:5300"],
+      sendNotify: async (packet, address, port) => { sent.push({ packet, address, port }); },
+    });
+    await server.notifyChanged(new Map(), [{ ...zone, serial: 12 }]);
+    assert.equal(sent.length, 0, "the first snapshot is not a change");
+    await server.notifyChanged(new Map([["example.com", 12]]), [{ ...zone, serial: 13 }]);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0]?.address, "127.0.0.1");
+    assert.equal(sent[0]?.port, 5300);
+    assert.equal(sent[0]?.packet.readUInt16BE(2), 0x2000);
+  });
+
+  it("closes so a subsequent bind on the same ports can succeed", async () => {
+    const { port, server } = await start({ zones: () => [EXAMPLE] });
+    const http = createServer((socket) => socket.end());
+    const httpPort = await freePort();
+    await new Promise<void>((resolve) => http.listen(httpPort, "127.0.0.1", resolve));
+    const runtime = { close: async () => undefined };
+    await shutdownProcess({ dns: server, http, runtime, timers: [] });
+    const rebound = createDnsServer({ zones: () => [EXAMPLE] });
+    await rebound.listen(port, "127.0.0.1");
+    closers.push(() => rebound.close());
+    const probe = createServer();
+    await new Promise<void>((resolve, reject) => {
+      probe.once("error", reject);
+      probe.listen(httpPort, "127.0.0.1", resolve);
+    });
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    assert.equal(readAnswers(received(await ask(port, buildQuery("www.example.com")))).length, 2);
   });
 
   it("bounds and coalesces stalled upstream hostname resolutions", async () => {

@@ -43,6 +43,7 @@ export function createStore(client) {
     statusError: "",
     history: [],
     historyError: "",
+    historyScope: "zone",
 
     plan: null,
     planError: "",
@@ -227,6 +228,7 @@ export function createStore(client) {
       state.loadingZone = true;
       state.statusError = "";
       state.historyError = "";
+      state.historyScope = "zone";
       emitChange();
 
       try {
@@ -535,6 +537,60 @@ export function createStore(client) {
       }
       emitChange();
       return ok;
+    },
+
+    /** Points one suffix at a resolver, leaving every other entry alone. */
+    async setFallbackSuffix(profile, suffix, dnsServer) {
+      setError("fallback", null);
+      try {
+        const result = await client.setFallbackSuffix(profile, suffix, dnsServer);
+        const outcome = result?.outcome ?? "added";
+        notice(
+          outcome === "unchanged" ? "fallback.unchanged"
+            : outcome === "updated" ? "fallback.updated" : "fallback.added",
+          { suffix },
+        );
+        await this.loadFallback(profile);
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        setError("fallback", "fallback.setFailed", { error: error.message });
+        return false;
+      }
+    },
+
+    /** Removes one suffix from the override list. */
+    async deleteFallbackSuffix(profile, suffix) {
+      setError("fallback", null);
+      try {
+        const result = await client.deleteFallbackSuffix(profile, suffix);
+        notice(result?.outcome === "unchanged" ? "fallback.unchanged" : "fallback.removed", { suffix });
+        await this.loadFallback(profile);
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        setError("fallback", "fallback.deleteFailed", { error: error.message });
+        return false;
+      }
+    },
+
+    /** Newest first across every zone, not only the one currently open. */
+    async loadGlobalHistory() {
+      state.historyError = "";
+      state.historyScope = "global";
+      emitChange();
+      try {
+        const history = await client.globalHistory();
+        state.history = history?.entries ?? [];
+        emitChange();
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        state.history = [];
+        state.historyError = error.message;
+        emitChange();
+        return false;
+      }
     },
 
     /** Writes the overrides for one profile, then reads the result back. */

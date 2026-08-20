@@ -96,6 +96,8 @@ describe("HTTP role authorization", () => {
     assert.equal(authorize(editor, request("/api/v1/zones/example.com/views/external/records/root", "DELETE")), true);
     assert.equal(authorize(editor, request("/api/v1/zones/example.com/preview", "POST")), true);
     assert.equal(authorize(editor, request("/api/v1/zones/example.com/apply", "POST")), true);
+    assert.equal(authorize(editor, request("/api/v1/apply", "POST")), true);
+    assert.equal(authorize(editor, request("/api/v1/zones/example.com/import", "POST")), true);
     assert.equal(authorize(editor, request("/api/v1/zones/example.com/adopt", "POST")), true);
     assert.equal(authorize(editor, request("/api/v1/zones/example.com/revisions/2/restore", "POST")), true);
     assert.equal(authorize(editor, request("/api/v1/zones/example.com", "DELETE")), false);

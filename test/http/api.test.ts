@@ -118,6 +118,32 @@ describe("HTTP API", () => {
     assert.equal((zone.views ?? []).flatMap((view) => view.records ?? []).length, 0);
   });
 
+  it("applies every pending zone from the overview over HTTP", async () => {
+    const adapters = createInMemoryAdapters();
+    const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
+    assert.equal((await api(request("/api/v1/zones", "POST", { name: "pending.example" }))).status, 201);
+    assert.equal((await api(request("/api/v1/zones/pending.example/views/external/records/web", "PUT", {
+      name: "www", type: "A", content: "8.8.8.8", ttl: 300,
+    }))).status, 200);
+    const response = await api(request("/api/v1/apply", "POST", {}));
+    assert.equal(response.status, 200);
+    const body = await response.json() as { applied: string[]; skipped: string[]; failed: unknown[] };
+    assert.deepEqual(body.applied, ["pending.example"]);
+  });
+
+  it("exports and imports a presentation-format zone file over HTTP", async () => {
+    const api = setup();
+    assert.equal((await api(request("/api/v1/zones", "POST", { name: "example.com" }))).status, 201);
+    const imported = await api(request("/api/v1/zones/example.com/import", "POST", {
+      text: "$ORIGIN example.com.\n@ 60 IN A 8.8.8.8\n",
+    }));
+    assert.equal(imported.status, 200);
+    const exported = await api(request("/api/v1/zones/example.com/export"));
+    assert.equal(exported.status, 200);
+    const body = await exported.json() as { text: string };
+    assert.match(body.text, /IN A 8\.8\.8\.8/);
+  });
+
   it("reads the audit trail without a zone", async () => {
     const api = setup();
     assert.equal((await api(request("/api/v1/zones", "POST", { name: "one.example" }))).status, 201);

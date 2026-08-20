@@ -361,6 +361,45 @@ const COMMANDS: readonly Command[] = [
     ),
   },
   {
+    name: "apply pending",
+    summary: "Apply every pending zone from the status overview, reporting failures without stopping",
+    role: "editor",
+    options: [],
+    run: ({ runtime, actor }) => requireControlPlane(runtime).applyPending(actor),
+  },
+  {
+    name: "zone export",
+    summary: "Write a view as a presentation-format zone file",
+    role: "viewer",
+    options: [ZONE, VIEW],
+    run: async ({ runtime }, input) => ({
+      zone: String(input.zone),
+      view: input.view === undefined ? "external" : String(input.view),
+      text: await requireControlPlane(runtime).exportZoneFile(
+        String(input.zone),
+        input.view === undefined ? "external" : String(input.view),
+      ),
+    }),
+  },
+  {
+    name: "zone import",
+    summary: "Replace one view from a presentation-format zone file",
+    role: "editor",
+    options: [
+      ZONE,
+      VIEW,
+      EXPECTED,
+      { name: "text", summary: "Zone file contents", required: true },
+    ],
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).importZoneFile(
+      String(input.zone),
+      input.view === undefined ? "external" : String(input.view),
+      String(input.text),
+      actor,
+      expectedRevisionOf(input),
+    ),
+  },
+  {
     name: "status",
     summary: "Show how far each view has been applied; without a zone, one line per zone",
     role: "viewer",

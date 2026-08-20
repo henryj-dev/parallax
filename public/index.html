@@ -133,7 +133,12 @@
               </section>
 
               <section class="panel history-panel" aria-labelledby="history-title">
-                <div class="section-heading"><div><span class="eyebrow" data-i18n="history.eyebrow">Audit trail</span><h2 id="history-title" data-i18n="history.title">Recent changes</h2></div></div>
+                <div class="section-heading"><div><span class="eyebrow" data-i18n="history.eyebrow">Audit trail</span><h2 id="history-title" data-i18n="history.title">Recent changes</h2></div>
+                  <div class="dialog-actions">
+                    <button class="button quiet" id="history-zone-button" type="button" data-i18n="history.thisZone">This zone</button>
+                    <button class="button quiet" id="history-global-button" type="button" data-i18n="history.all">All zones</button>
+                  </div>
+                </div>
                 <ol id="history-list" class="history-list"><li class="history-loading skeleton"></li><li class="history-loading skeleton"></li></ol>
                 <div id="history-empty" class="mini-empty" hidden data-i18n="history.none">No changes have been recorded for this zone.</div>
               </section>
@@ -234,6 +239,11 @@
         <label class="fallback-picker"><span data-i18n="fallback.profile">Credential profile</span><select id="fallback-profile"></select></label>
         <div id="fallback-report" aria-live="polite"><div class="skeleton plan-skeleton"></div></div>
         <div class="form-error" id="fallback-form-error" role="alert" hidden></div>
+        <form id="fallback-suffix-form" class="fallback-suffix-form" hidden>
+          <label><span data-i18n="fallback.suffix">Suffix</span><input id="fallback-suffix" name="suffix" type="text" autocomplete="off" spellcheck="false" required></label>
+          <label><span data-i18n="fallback.dnsServer">Resolver addresses</span><input id="fallback-dns-server" name="dnsServer" type="text" autocomplete="off" spellcheck="false"></label>
+          <button class="button" id="fallback-set-button" type="submit" data-i18n="fallback.set">Add suffix</button>
+        </form>
         <div class="dialog-actions">
           <button class="button quiet" id="fallback-refresh-button" type="button" data-i18n="fallback.refresh">Refresh</button>
           <button class="button primary" id="fallback-sync-button" type="button" data-i18n="fallback.sync">Apply to device settings</button>

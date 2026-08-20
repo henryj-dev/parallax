@@ -69,10 +69,11 @@ export async function withFileLock<T>(
       handle = await open(lockPath, "wx", 0o600);
     } catch (error) {
       if (!isNodeError(error, "EEXIST")) throw error;
-      // Never reclaim a lock automatically. Two would-be reclaimers cannot
-      // atomically prove that the pathname still names the stale inode they
-      // inspected; one can otherwise unlink a replacement lock held by a live
-      // writer and defeat the very serialization this file protects.
+      // A lock whose recorded pid is gone on this host is not a live writer.
+      // The inode is re-checked after the pid probe so a replacement lock is
+      // not unlinked. A lock without a pid, or one held by a live process, is
+      // left until the waiter times out.
+      if (await reclaimDeadLock(lockPath)) continue;
       if (Date.now() >= deadline) {
         throw new Error(`timed out acquiring file lock for ${path}; if no writer is active, remove stale lock ${lockPath}`);
       }
@@ -97,4 +98,42 @@ export async function withFileLock<T>(
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error && error.code === code;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isNodeError(error, "ESRCH");
+  }
+}
+
+/** Unlinks a lock only when this host recorded it and that pid is gone. */
+async function reclaimDeadLock(lockPath: string): Promise<boolean> {
+  let handle;
+  try {
+    handle = await open(lockPath, "r");
+  } catch (error) {
+    return isNodeError(error, "ENOENT");
+  }
+  try {
+    const inspected = await handle.stat();
+    let owner: LockOwner;
+    try {
+      owner = JSON.parse((await handle.readFile("utf8")).trim()) as LockOwner;
+    } catch {
+      return false;
+    }
+    if (owner.hostname !== hostname() || typeof owner.pid !== "number" || pidAlive(owner.pid)) return false;
+    const current = await lstat(lockPath);
+    if (current.ino !== inspected.ino || current.dev !== inspected.dev) return false;
+    await unlink(lockPath);
+    return true;
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return true;
+    return false;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 }

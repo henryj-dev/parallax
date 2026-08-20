@@ -1202,6 +1202,56 @@ describe("ControlPlane", () => {
     assert.equal((await service.statusOverview()).zones.find((entry) => entry.zone === "behind.example")?.state, "failed");
   });
 
+  it("applies pending zones from the overview and reports a failed zone without dropping the rest", async () => {
+    const { service, provider } = setup();
+    await service.createZone("applied.example");
+    await service.createZone("pending.example");
+    await service.createZone("failed.example");
+    await service.createZone("empty.example");
+    for (const zone of ["applied.example", "pending.example", "failed.example"]) {
+      await service.upsertRecord(zone, "external", "web", { name: "www", type: "A", content: "8.8.8.8", ttl: 300 });
+    }
+    await service.apply("applied.example");
+    provider.failure = new Error("provider refused");
+    await service.apply("failed.example");
+    provider.failure = undefined;
+
+    const result = await service.applyPending("alice");
+    assert.deepEqual(result.applied, ["pending.example"]);
+    assert.ok(result.failed.some((row) => row.zone === "failed.example"), inspect(result.failed));
+    assert.ok(result.skipped.includes("applied.example"));
+    assert.ok(result.skipped.includes("empty.example"));
+    assert.equal((await service.status("pending.example")).statuses.find((status) => status.view === "external")?.state, "applied");
+  });
+
+  it("round-trips a presentation-format zone file through desired state", async () => {
+    const { service } = setup();
+    await service.createZone("example.com");
+    const text = [
+      "$ORIGIN example.com.",
+      "$TTL 300",
+      "@ 60 IN A 8.8.8.8",
+      "  60 IN TXT \"v=spf1 -all\"",
+      "www 120 IN A 8.8.8.9",
+      "mail 300 IN MX 10 mail.example.net.",
+    ].join("\n");
+    const imported = await service.importZoneFile("example.com", "external", text, "alice");
+    const records = imported.views.find((view) => view.name === "external")?.records ?? [];
+    assert.deepEqual(records.map((record) => `${record.name} ${record.type} ${record.content}`).sort(), [
+      "@ A 8.8.8.8",
+      "@ TXT v=spf1 -all",
+      "mail MX 10 mail.example.net",
+      "www A 8.8.8.9",
+    ]);
+    const exported = await service.exportZoneFile("example.com", "external");
+    const again = await service.importZoneFile("example.com", "external", exported, "alice");
+    assert.deepEqual(
+      (again.views.find((view) => view.name === "external")?.records ?? [])
+        .map((record) => `${record.name} ${record.type} ${record.content} ${record.ttl}`).sort(),
+      records.map((record) => `${record.name} ${record.type} ${record.content} ${record.ttl}`).sort(),
+    );
+  });
+
   it("reads a page of zones rather than every zone there is", async () => {
     const { service } = setup();
     for (const name of ["a.example", "b.example", "c.example"]) await service.createZone(name);

@@ -191,6 +191,10 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
     return { command: "status", input: readPageQuery(url) };
   }
 
+  if (area === "apply" && segments.length === 3 && method === "POST") {
+    return { command: "apply pending", input: {} };
+  }
+
   if (area === "history" && segments.length === 3 && method === "GET") {
     return { command: "history", input: readPageQuery(url) };
   }
@@ -295,6 +299,17 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
     }
     if (action === "apply" && segments.length === 5 && method === "POST") {
       return { command: "apply", input: { zone, view: readViewQuery(url), expectedRevision }, revisioned: true };
+    }
+    if (action === "export" && segments.length === 5 && method === "GET") {
+      return { command: "zone export", input: { zone, view: readViewQuery(url) } };
+    }
+    if (action === "import" && segments.length === 5 && method === "POST") {
+      const body = await parseJson(request);
+      return {
+        command: "zone import",
+        input: { zone, view: readViewQuery(url) ?? (typeof body.view === "string" ? body.view : undefined), text: readString(body, "text"), expectedRevision },
+        revisioned: true,
+      };
     }
     if (action === "adopt" && segments.length === 5 && method === "POST") {
       const dryRun = readBooleanQuery(url, "dryRun");

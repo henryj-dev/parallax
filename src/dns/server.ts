@@ -6,7 +6,7 @@ import { providerManagement, type RecordType } from "../domain/dns.ts";
 import { encodeRdata, encodeSoa, rrType } from "./rdata.ts";
 import {
   CLASS_IN, MIN_UDP_PAYLOAD, RCODE, TYPE, WireFormatError,
-  isResponseToQuery, readQuery, writeReply, type ParsedQuery, type ResourceRecord,
+  isResponseToQuery, readQuery, writeName, writeReply, type ParsedQuery, type ResourceRecord,
 } from "./wire.ts";
 
 /** One zone's answers, as the control plane computed them. */
@@ -51,6 +51,10 @@ export interface DnsServerOptions {
    * to be told about, not a record to quietly leave out.
    */
   readonly onUnservable?: (record: UnservableRecord) => void;
+  /** Hosts that receive NOTIFY when a served zone's serial rises. `host` or `host:port`. */
+  readonly notifyTo?: readonly string[];
+  /** Injected by tests that capture NOTIFY instead of sending UDP. */
+  readonly sendNotify?: (packet: Buffer, address: string, port: number) => Promise<void>;
 }
 
 export interface ResolvedDnsAddress {
@@ -79,6 +83,7 @@ const DEFAULT_RATE_LIMIT_BURST = 200;
 export function createDnsServer(options: DnsServerOptions): {
   listen(port: number, host: string): Promise<void>;
   close(): Promise<void>;
+  notifyChanged(previous: ReadonlyMap<string, number>, next: readonly ServedZone[]): Promise<void>;
 } {
   const negativeTtl = options.negativeTtl ?? DEFAULT_NEGATIVE_TTL;
   const forwardTo = options.forwardTo ?? [];
@@ -94,8 +99,8 @@ export function createDnsServer(options: DnsServerOptions): {
   );
   const resolveHost = options.resolveHost ?? resolveDnsAddress;
   const resolveForwardHost = createTimedDnsResolver(resolveHost);
-  let udp: Socket | undefined;
-  let tcp: Server | undefined;
+  const udpSockets: Socket[] = [];
+  const tcpServers: Server[] = [];
   const tcpSockets = new Set<TcpSocket>();
   let activeForwards = 0;
 
@@ -159,89 +164,148 @@ export function createDnsServer(options: DnsServerOptions): {
   const shutdown = async (): Promise<void> => {
     for (const socket of tcpSockets) socket.destroy();
     tcpSockets.clear();
-    const [closingUdp, closingTcp] = [udp, tcp];
-    udp = undefined;
-    tcp = undefined;
-    // A late error with no listener left is thrown, not ignored.
-    closingUdp?.on("error", () => undefined);
-    closingTcp?.on("error", () => undefined);
+    const closingUdp = udpSockets.splice(0);
+    const closingTcp = tcpServers.splice(0);
+    for (const socket of closingUdp) socket.on("error", () => undefined);
+    for (const server of closingTcp) server.on("error", () => undefined);
     await Promise.all([
-      new Promise<void>((resolve) => {
-        if (!closingUdp) return resolve();
-        try { closingUdp.close(resolve); } catch { resolve(); }
-      }),
-      new Promise<void>((resolve) => {
-        if (!closingTcp) return resolve();
-        try { closingTcp.close(() => resolve()); } catch { resolve(); }
-      }),
+      ...closingUdp.map((socket) => new Promise<void>((resolve) => {
+        try { socket.close(resolve); } catch { resolve(); }
+      })),
+      ...closingTcp.map((server) => new Promise<void>((resolve) => {
+        try { server.close(() => resolve()); } catch { resolve(); }
+      })),
     ]);
   };
 
+  function attachUdp(udp: Socket): void {
+    udp.on("message", (message, remote) => {
+      if (!rateLimiter.allow(remote.address)) return;
+      void respond(message, false, remote.address).then((reply) => {
+        if (reply) udp.send(reply, remote.port, remote.address);
+      }).catch(() => undefined);
+    });
+  }
+
+  function attachTcp(tcp: Server): void {
+    tcp.maxConnections = maxTcpConnections;
+    tcp.on("connection", (socket) => {
+      tcpSockets.add(socket);
+      socket.setTimeout(tcpIdleTimeoutMs, () => socket.destroy());
+      socket.on("close", () => tcpSockets.delete(socket));
+      let buffered = Buffer.alloc(0);
+      socket.on("data", (chunk) => {
+        buffered = Buffer.concat([buffered, chunk]);
+        for (;;) {
+          if (buffered.length < 2) return;
+          const size = buffered.readUInt16BE(0);
+          if (buffered.length < size + 2) return;
+          const message = buffered.subarray(2, size + 2);
+          buffered = buffered.subarray(size + 2);
+          const clientAddress = socket.remoteAddress;
+          if (!clientAddress || !rateLimiter.allow(clientAddress)) continue;
+          void respond(message, true, clientAddress).then((reply) => {
+            if (!reply) return;
+            const framed = Buffer.alloc(2 + reply.length);
+            framed.writeUInt16BE(reply.length, 0);
+            reply.copy(framed, 2);
+            socket.write(framed);
+          }).catch(() => socket.destroy());
+        }
+      });
+      socket.on("error", () => socket.destroy());
+    });
+  }
+
   return {
     async listen(port, host) {
-      const binding = await resolveHost(host);
-      assertResolvedAddress(binding, host);
-      // UDP sockets are family-specific. The TCP listener accepts either
-      // family from a hostname, so bind both transports to this one numeric
-      // result instead of letting their separate resolvers choose differently.
-      udp = createSocket({ type: binding.family === 6 ? "udp6" : "udp4", reuseAddr: true });
-      udp.on("message", (message, remote) => {
-        if (!rateLimiter.allow(remote.address)) return;
-        void respond(message, false, remote.address).then((reply) => {
-          if (reply) udp?.send(reply, remote.port, remote.address);
-        }).catch(() => undefined);
-      });
-      tcp = createServer((socket) => {
-        tcpSockets.add(socket);
-        socket.setTimeout(tcpIdleTimeoutMs, () => socket.destroy());
-        socket.on("close", () => tcpSockets.delete(socket));
-        // A TCP message is length-prefixed, and may arrive in pieces.
-        let buffered = Buffer.alloc(0);
-        socket.on("data", (chunk) => {
-          buffered = Buffer.concat([buffered, chunk]);
-          for (;;) {
-            if (buffered.length < 2) return;
-            const size = buffered.readUInt16BE(0);
-            if (buffered.length < size + 2) return;
-            const message = buffered.subarray(2, size + 2);
-            buffered = buffered.subarray(size + 2);
-            const clientAddress = socket.remoteAddress;
-            if (!clientAddress || !rateLimiter.allow(clientAddress)) continue;
-            void respond(message, true, clientAddress).then((reply) => {
-              if (!reply) return;
-              const framed = Buffer.alloc(2 + reply.length);
-              framed.writeUInt16BE(reply.length, 0);
-              reply.copy(framed, 2);
-              socket.write(framed);
-            }).catch(() => socket.destroy());
-          }
+      const bindings = await bindAddresses(host, resolveHost);
+      for (const binding of bindings) {
+        const udp = createSocket({
+          type: binding.family === 6 ? "udp6" : "udp4",
+          reuseAddr: true,
+          ipv6Only: binding.family === 6,
         });
-        socket.on("error", () => socket.destroy());
-      });
-      tcp.maxConnections = maxTcpConnections;
-      // Both transports or neither.
-      //
-      // `Promise.all` rejects the moment one bind fails, while the other goes
-      // on to succeed -- and then nobody owns it. The caller saw a throw, so it
-      // never received the server and has nothing to close; the socket stays
-      // bound for the life of the process. A port race is enough to reach this:
-      // a port is only free until something else takes it.
-      //
-      // That is what an eight-minute silence in a test run turned out to be.
-      // Every test had finished and the process would not leave, holding a UDP
-      // socket and a TCP server that nothing had a reference to.
-      const bound = await Promise.allSettled([
-        new Promise<void>((resolve, reject) => { udp?.once("error", reject); udp?.bind(port, binding.address, resolve); }),
-        new Promise<void>((resolve, reject) => { tcp?.once("error", reject); tcp?.listen(port, binding.address, resolve); }),
-      ]);
-      const failed = bound.find((result) => result.status === "rejected");
-      if (failed) {
-        await shutdown();
-        throw failed.reason;
+        attachUdp(udp);
+        const tcp = createServer();
+        attachTcp(tcp);
+        udpSockets.push(udp);
+        tcpServers.push(tcp);
+        const bound = await Promise.allSettled([
+          new Promise<void>((resolve, reject) => { udp.once("error", reject); udp.bind(port, binding.address, resolve); }),
+          new Promise<void>((resolve, reject) => {
+            tcp.once("error", reject);
+            tcp.listen({ port, host: binding.address, ipv6Only: binding.family === 6 }, resolve);
+          }),
+        ]);
+        const failed = bound.find((result) => result.status === "rejected");
+        if (failed) {
+          await shutdown();
+          throw failed.reason;
+        }
       }
     },
     close: shutdown,
+    async notifyChanged(previous, next) {
+      const destinations = options.notifyTo ?? [];
+      if (destinations.length === 0) return;
+      const send = options.sendNotify ?? sendNotifyDatagram;
+      for (const zone of next) {
+        const before = previous.get(zone.name);
+        if (before !== undefined && before === zone.serial) continue;
+        if (before === undefined && previous.size === 0) continue;
+        const packet = writeNotify(zone.name);
+        for (const destination of destinations) {
+          const parsed = parseNotifyDestination(destination);
+          await send(packet, parsed.address, parsed.port);
+        }
+      }
+    },
   };
+}
+
+async function bindAddresses(host: string, resolveHost: (host: string) => Promise<ResolvedDnsAddress>): Promise<ResolvedDnsAddress[]> {
+  if (host === "0.0.0.0" || host === "*" || host === "::" || host === "[::]") {
+    return [
+      { address: "0.0.0.0", family: 4 },
+      { address: "::", family: 6 },
+    ];
+  }
+  const binding = await resolveHost(host);
+  assertResolvedAddress(binding, host);
+  return [binding];
+}
+
+function parseNotifyDestination(value: string): { address: string; port: number } {
+  const hashed = value.lastIndexOf(":");
+  if (hashed > 0 && !value.startsWith("[")) {
+    const port = Number(value.slice(hashed + 1));
+    if (Number.isInteger(port) && port > 0) return { address: value.slice(0, hashed), port };
+  }
+  return { address: value.replace(/^\[|\]$/gu, ""), port: 53 };
+}
+
+function writeNotify(zone: string): Buffer {
+  const header = Buffer.alloc(12);
+  header.writeUInt16BE(0, 0);
+  header.writeUInt16BE(0x2000, 2);
+  header.writeUInt16BE(1, 4);
+  const typeClass = Buffer.alloc(4);
+  typeClass.writeUInt16BE(TYPE.SOA, 0);
+  typeClass.writeUInt16BE(CLASS_IN, 2);
+  return Buffer.concat([header, writeName(zone), typeClass]);
+}
+
+async function sendNotifyDatagram(packet: Buffer, address: string, port: number): Promise<void> {
+  const family = isIP(address) === 6 || address.includes(":") ? 6 : 4;
+  const socket = createSocket(family === 6 ? "udp6" : "udp4");
+  await new Promise<void>((resolve, reject) => {
+    socket.send(packet, port, address, (error) => {
+      socket.close();
+      if (error) reject(error);
+      else resolve();
+    });
+  });
 }
 
 /** The longest zone whose apex the name sits at or under. */
@@ -294,6 +358,24 @@ function answerFromZone(
   if (name === zone.name && query.question.type === TYPE.SOA) {
     return { query, rcode: RCODE.NOERROR, authoritative: true, answers: [soa] };
   }
+  if (name === zone.name && query.question.type === TYPE.AXFR) {
+    const answers: ResourceRecord[] = [soa];
+    for (const record of zone.records) {
+      try {
+        answers.push({
+          name: absolute(record.name, zone.name),
+          type: rrType(record.type),
+          ttl: record.ttl,
+          data: encodeRdata(record.type, record.content),
+        });
+      } catch (error) {
+        onUnservable?.({ zone: zone.name, name: record.name, type: record.type, reason: message(error) });
+        return { query, rcode: RCODE.SERVFAIL, authoritative: true };
+      }
+    }
+    answers.push(soa);
+    return { query, rcode: RCODE.NOERROR, authoritative: true, answers };
+  }
   let atName: ServedZone["records"] = zone.records.filter((record) => absolute(record.name, zone.name) === name);
 
   if (atName.length === 0) {
@@ -303,6 +385,10 @@ function answerFromZone(
     const exists = name === zone.name
       || zone.records.some((record) => absolute(record.name, zone.name).endsWith(`.${name}`));
     if (exists) return { query, rcode: RCODE.NOERROR, authoritative: true, authority: [soa] };
+    const substitution = dnameSubstitution(zone, name);
+    if (substitution) {
+      return { query, rcode: RCODE.NOERROR, authoritative: true, answers: substitution };
+    }
     atName = wildcardMatch(zone, name);
     if (atName.length === 0) return { query, rcode: RCODE.NXDOMAIN, authoritative: true, authority: [soa] };
   }
@@ -358,6 +444,31 @@ function wildcardMatch(zone: ServedZone, name: string): ServedZone["records"] {
     if (parent === zone.name || !parent.includes(".")) return [];
     parent = parent.slice(parent.indexOf(".") + 1);
   }
+}
+
+/**
+ * RFC 6672: a DNAME at an ancestor substitutes the suffix and synthesizes a
+ * CNAME for the queried name. Without this, every name below a stored DNAME
+ * was NXDOMAIN even though the record existed to cover them.
+ */
+function dnameSubstitution(zone: ServedZone, name: string): ResourceRecord[] | undefined {
+  let parent = name.includes(".") ? name.slice(name.indexOf(".") + 1) : "";
+  while (parent.length > 0) {
+    const records = zone.records.filter((record) => record.type === "DNAME" && absolute(record.name, zone.name) === parent);
+    if (records.length > 0) {
+      const record = records[0] as ServedZone["records"][number];
+      const prefix = name.slice(0, name.length - parent.length);
+      const target = record.content.replace(/\.$/u, "").toLowerCase();
+      const synthesized = `${prefix}${target}`;
+      return [
+        { name: parent, type: TYPE.DNAME, ttl: record.ttl, data: encodeRdata("DNAME", record.content) },
+        { name, type: TYPE.CNAME, ttl: record.ttl, data: writeName(synthesized) },
+      ];
+    }
+    if (parent === zone.name || !parent.includes(".")) break;
+    parent = parent.slice(parent.indexOf(".") + 1);
+  }
+  return undefined;
 }
 
 function soaRecord(zone: ServedZone, negativeTtl: number): ResourceRecord {

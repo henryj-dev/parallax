@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { describe, it } from "node:test";
 
@@ -64,6 +64,22 @@ describe("private file directories", () => {
       );
       assert.equal(await readFile(lockPath, "utf8"), marker,
         "a waiter must not reclaim a pathname that a live replacement writer may own");
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims a lock whose recorded pid is gone on this host without waiting out the timeout", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "parallax-dead-lock-"));
+    try {
+      await chmod(parent, 0o700);
+      const target = join(parent, "state.json");
+      const lockPath = join(parent, ".state.json.lock");
+      await writeFile(lockPath, `${JSON.stringify({ hostname: hostname(), pid: 2_147_483_647, nonce: "dead" })}\n`, { mode: 0o600 });
+
+      let ran = false;
+      await withFileLock(target, async () => { ran = true; }, { timeoutMs: 40, retryMs: 1 });
+      assert.equal(ran, true);
     } finally {
       await rm(parent, { recursive: true, force: true });
     }

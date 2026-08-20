@@ -67,6 +67,8 @@ export interface DnsListenerSettings {
   readonly forwardTo: readonly string[];
   /** Client networks allowed to use those upstreams. */
   readonly forwardAllow: readonly string[];
+  /** Hosts that receive NOTIFY when a served zone's serial rises. `host` or `host:port`. */
+  readonly notifyTo?: readonly string[];
 }
 
 export interface OidcSettings {
@@ -151,11 +153,16 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     throw new Error("PARALLAX_DNS_FORWARD_ALLOW must explicitly name the client CIDRs allowed to recurse when the DNS listener is not loopback");
   }
   const forwardAllow = readDnsClientCidrs(explicitForwardAllow || "127.0.0.0/8,::1/128");
+  const notifyTo = (environment.PARALLAX_DNS_NOTIFY_TO ?? "")
+    .split(",")
+    .map((destination) => destination.trim())
+    .filter((destination) => destination.length > 0);
   return {
     host,
     port: readPort(port, "PARALLAX_DNS_PORT"),
     forwardTo,
     forwardAllow,
+    ...(notifyTo.length > 0 ? { notifyTo } : {}),
   };
 }
 

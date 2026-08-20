@@ -177,6 +177,8 @@ table tbody tr.provider-owned td { background: #edf4f5; color: var(--muted); }
 .fallback-reasons li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; font-size: 11px; }
 .fallback-reasons li small { flex-basis: 100%; color: var(--muted); font: 10px var(--mono); }
 .fallback-conflict span { color: var(--external); font-weight: 650; }
+.fallback-suffix-form { display: grid; gap: 8px; margin: 12px 0; max-width: 360px; }
+.fallback-live-entry { display: inline-flex; align-items: center; gap: 4px; }
 .activity-column { display: grid; gap: 18px; }
 .status-chip { padding: 5px 7px; border-radius: 5px; font: 9px var(--mono); text-transform: uppercase; }
 .status-chip.applied { color: var(--success); background: #e8f4ef; }

@@ -18,6 +18,7 @@ import {
   type Zone,
   type ZoneRevision,
 } from "../domain/dns.ts";
+import { formatZoneFile, parseZoneFile } from "../domain/zone-file.ts";
 import { buildReconcilePlan, type ProviderRecord, type ReconcilePlan } from "../domain/reconciliation.ts";
 import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneRepository } from "./ports.ts";
 
@@ -704,6 +705,68 @@ export class ControlPlane {
 
   apply(zoneName: string, viewName?: string, expectedRevision?: number, actor = "system"): Promise<{ zone: string; revision: number; statuses: ApplyStatus[] }> {
     return this.#exclusive(zoneName, () => this.#apply(zoneName, viewName, expectedRevision, actor));
+  }
+
+  /**
+   * Applies every pending zone from the overview. Applied zones are skipped.
+   * A zone that is already failed, or that fails this run, is reported and the
+   * rest still run -- one broken zone must not hide the ones behind it.
+   */
+  async applyPending(actor = "system"): Promise<{
+    applied: string[];
+    failed: { zone: string; error: string }[];
+    skipped: string[];
+  }> {
+    const applied: string[] = [];
+    const failed: { zone: string; error: string }[] = [];
+    const skipped: string[] = [];
+    let offset = 0;
+    for (;;) {
+      const page = await this.statusOverview({ limit: 500, offset });
+      for (const row of page.zones) {
+        if (row.state === "applied" || row.state === "") {
+          skipped.push(row.zone);
+          continue;
+        }
+        if (row.state === "failed") {
+          failed.push({ zone: row.zone, error: "zone apply previously failed" });
+          continue;
+        }
+        try {
+          await this.apply(row.zone, undefined, undefined, actor);
+          applied.push(row.zone);
+        } catch (error) {
+          failed.push({ zone: row.zone, error: error instanceof Error ? error.message : "apply failed" });
+        }
+      }
+      if (!page.hasMore) break;
+      if (page.zones.length === 0) break;
+      offset += page.zones.length;
+    }
+    return { applied, failed, skipped };
+  }
+
+  exportZoneFile(zoneName: string, viewName = "external"): Promise<string> {
+    return this.getZone(zoneName).then((zone) => {
+      const view = zone.views.find((candidate) => candidate.name === validateViewName(viewName));
+      return formatZoneFile(zone.name, view?.records ?? []);
+    });
+  }
+
+  importZoneFile(zoneName: string, viewName: string, text: string, actor = "system", expectedRevision?: number): Promise<Zone> {
+    return this.#exclusive(zoneName, async () => {
+      const zone = await this.getZone(zoneName);
+      this.#assertExpectedRevision(zone, expectedRevision);
+      const records = parseZoneFile(text, zone.name);
+      const view = validateViewName(viewName);
+      const views = zone.views.filter((candidate) => candidate.name !== view);
+      views.push({ name: view, records });
+      assertProviderManagedIntact(zone.views, views);
+      materializeProviderViews(views);
+      const updated = this.#nextRevision(zone, views);
+      await this.#commitDesiredChange(zone, updated, "desired.replaced", actor, { view, imported: records.length }, [view], expectedRevision);
+      return updated;
+    });
   }
 
   async #apply(zoneName: string, viewName: string | undefined, expectedRevision: number | undefined, actor: string): Promise<{ zone: string; revision: number; statuses: ApplyStatus[] }> {
