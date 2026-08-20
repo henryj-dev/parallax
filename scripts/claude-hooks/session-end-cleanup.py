@@ -207,8 +207,10 @@ def main():
             lines.append(f"브랜치 삭제: {branch}" if rc == 0
                          else f"브랜치 보존: {branch} — 미머지 커밋이 있다")
     try:
-        with open(owners_path, "w", encoding="utf-8") as f:
+        tmp = owners_path + f".{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(owners, f, ensure_ascii=False)
+        os.replace(tmp, owners_path)
     except Exception:
         pass
     fcntl.flock(owner_lock, fcntl.LOCK_UN)

@@ -56,8 +56,8 @@ MUTATING = re.compile(
 # `git worktree list` 가 막혀 상태 조회조차 못 했고, 2026-08-15 에는 `worktree remove` 가
 # 막혀 **남은 워크트리를 회수할 방법이 없었다**(종료 훅은 같은 명령을 쓰는데, 훅은 이
 # 가드를 안 거친다). `worktree add` 는 계속 막는다 — 임의 경로·ref를 허용하지 않고
-# 도구 중립 생성기 `scripts/claude-hooks/enter-worktree.py` 로 만들어야 한다. 생성 뒤 첫 변경
-# 호출에서 이 훅이 소유자를 기록하므로 종료·다음 시작 회수 규칙도 그대로 적용된다(§2-1).
+# 도구 중립 생성기 `scripts/claude-hooks/enter-worktree.py` 로 만들어야 한다. 생성기가
+# 소유자를 즉시 기록하고 이 훅도 후속 변경 때 갱신하므로 종료·다음 시작 회수 규칙이 적용된다.
 # ⚠️ 「막는 쪽」만 검사하면 이런 오탐이 안 잡힌다. 통과 검사를 함께 둘 것.
 ALLOWED = re.compile(r"\bgit\b.*\b(?:worktree|stash|remote|branch|tag|submodule)\s+list\b"
                      r"|\bgit\b.*\btag\s+(?:-l|--list)\b"
