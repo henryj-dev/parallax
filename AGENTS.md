@@ -3,15 +3,16 @@
 ## 에이전트는 워크트리, 사람은 메인에서 작업
 
 에이전트의 `Edit`/`Write`/트리 변경 git 명령은 메인에서 **항상 거부**된다. 사람은 메인에서
-수정·커밋·push 할 수 있다. 에이전트 작업 흐름: `EnterWorktree` → 작업·커밋 →
+수정·커밋·push 할 수 있다. 에이전트 작업 흐름: 하네스 전용 worktree 도구 또는
+`python3 scripts/claude-hooks/enter-worktree.py <name>` → 생성된 경로에서 작업·커밋 →
 `git fetch origin && git rebase origin/main && git push origin HEAD:<branch>`
 
 **That push is what "done with a work cycle" means here — there is no separate
 merge step.** A worktree left with commits but no push has not landed on main
 yet; the cycle isn't finished until `HEAD` is on `origin/main`.
 
-Outside Claude:
-`git worktree add .claude/worktrees/<name> -b <branch> origin/main`
+Raw `git worktree add` remains blocked for agents. The checked-in creator is
+the harness-neutral fallback and records ownership for cleanup.
 
 The main tree fast-forwards on its own when a session starts and ends, and only
 when it is clean. A person leaving uncommitted work on main makes auto-ff skip
@@ -34,6 +35,10 @@ session left behind, for instance — `touch .git/claude-main-tree-rescue`
 **snapshot of stardust's**. It was first taken at its commit `3e1e1ea7` and has
 been re-taken since. stardust holds the canonical copy; this one is allowed to
 fall behind.
+
+**Measured 2026-08-20:** the tool-neutral creator, its regression test, and
+owner-record locking were re-taken from stardust. Repository-specific settings,
+bootstrap, installer, and the intentionally absent correspondence pre-push hook remain fit.
 
 **Measured 2026-08-19** against this re-take and a stardust checkout at
 `a74ebf4c`. The walk is the **union** of both sides' paths under those
