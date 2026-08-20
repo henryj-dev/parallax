@@ -30,6 +30,7 @@
 읽으면 안 된다. 사용자가 자기 셸에서 하는 작업은 애초에 이 훅을 거치지 않는다.
 """
 import json
+import fcntl
 import os
 import re
 import subprocess
@@ -37,6 +38,7 @@ import sys
 import time
 
 OWNERS = "claude-worktree-owners.json"
+OWNER_LOCK = "claude-worktree-owners.lock"
 
 # 트리를 바꾸는 git 하위명령만 본다. 읽기(status·log·diff·show)와 pull/fetch 는 통과 —
 # 메인 트리는 「읽기 + 최신화」 는 계속 할 수 있어야 한다.
@@ -53,8 +55,9 @@ MUTATING = re.compile(
 # 은 읽기이고, `worktree remove|prune|…` 은 *다른* 디렉토리를 지운다. 2026-08-14 에
 # `git worktree list` 가 막혀 상태 조회조차 못 했고, 2026-08-15 에는 `worktree remove` 가
 # 막혀 **남은 워크트리를 회수할 방법이 없었다**(종료 훅은 같은 명령을 쓰는데, 훅은 이
-# 가드를 안 거친다). `worktree add` 는 계속 막는다 — 워크트리는 `EnterWorktree` 로 만들어야
-# 소유자가 기록되고 종료 시 자동 회수된다(§2-1).
+# 가드를 안 거친다). `worktree add` 는 계속 막는다 — 임의 경로·ref를 허용하지 않고
+# 도구 중립 생성기 `scripts/claude-hooks/enter-worktree.py` 로 만들어야 한다. 생성 뒤 첫 변경
+# 호출에서 이 훅이 소유자를 기록하므로 종료·다음 시작 회수 규칙도 그대로 적용된다(§2-1).
 # ⚠️ 「막는 쪽」만 검사하면 이런 오탐이 안 잡힌다. 통과 검사를 함께 둘 것.
 ALLOWED = re.compile(r"\bgit\b.*\b(?:worktree|stash|remote|branch|tag|submodule)\s+list\b"
                      r"|\bgit\b.*\btag\s+(?:-l|--list)\b"
@@ -88,9 +91,10 @@ DENY = """메인 작업 트리는 읽기 전용입니다. 수정은 워크트리
 남의 미완성 변경이 내 커밋에 딸려 들어갑니다. CI 가 붙어 있으면 그것이 그대로
 빌드·배포됩니다. 그리고 메인이 더러워지면 세션 종료 시 자동 pull 이 계속 미뤄집니다.
 
-→ **워크트리에서 작업하십시오.**
-   Claude: `EnterWorktree` 도구를 부르십시오.
-   그 밖(codex 등): git worktree add .claude/worktrees/<이름> -b <브랜치> {base}
+→ **워크트리에서 작업하십시오.** 하네스 전용 도구가 있으면 그것을 쓰고, 없으면:
+   python3 scripts/claude-hooks/enter-worktree.py <이름>
+
+생성기가 출력한 경로로 이동해 작업하십시오. 임의 `git worktree add` 는 계속 거부됩니다.
 
 끝나면 그 워크트리 안에서:
    git fetch origin && git rebase {base} && git push origin HEAD:{branch}
@@ -385,11 +389,6 @@ def record_owner(common, tcwd, sid):
     if not top:
         return
     p = os.path.join(common, OWNERS)
-    try:
-        with open(p, encoding="utf-8") as f:
-            owners = json.load(f)
-    except Exception:
-        owners = {}
     # 🔎 **주인이 살아 있는지 나중에 물으려면 프로세스를 적어 둬야 한다.** `SessionEnd` 가
     #    안 뜨는 하네스(codex 실측)에서는 「끝났다」는 신호가 아예 없으므로, 다음 세션이
     #    **시작할 때** 죽은 주인의 워크트리를 회수하는 수밖에 없다.
@@ -399,15 +398,22 @@ def record_owner(common, tcwd, sid):
     #       사라질 셸인지는 하네스마다 다를 수 있어, 회수 쪽에서 그것을 **가정하지 않고**
     #       검증한다(`worktree-reap` 규칙 참고).
     ppid = os.getppid()
-    owners[os.path.realpath(top)] = {
-        "session_id": sid, "ts": time.time(),
-        "pid": ppid, "pid_start": proc_start(ppid), "pid_cmd": proc_cmd(ppid),
-    }
     try:
-        tmp = p + f".{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(owners, f, ensure_ascii=False)
-        os.replace(tmp, p)
+        with open(os.path.join(common, OWNER_LOCK), "a+", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                with open(p, encoding="utf-8") as f:
+                    owners = json.load(f)
+            except Exception:
+                owners = {}
+            owners[os.path.realpath(top)] = {
+                "session_id": sid, "ts": time.time(),
+                "pid": ppid, "pid_start": proc_start(ppid), "pid_cmd": proc_cmd(ppid),
+            }
+            tmp = p + f".{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(owners, f, ensure_ascii=False)
+            os.replace(tmp, p)
     except Exception:
         pass
 

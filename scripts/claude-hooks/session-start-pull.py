@@ -21,6 +21,7 @@
 fail-open: 무슨 일이 있어도 세션 시작을 막지 않는다.
 """
 import json
+import fcntl
 import os
 import subprocess
 import sys
@@ -82,6 +83,7 @@ def fast_forward_main(git, main_tree):
 
 
 OWNERS = "claude-worktree-owners.json"
+OWNER_LOCK = "claude-worktree-owners.lock"
 GRACE = 120          # 방금 기록한 세션을 죽었다고 오판하지 않기 위한 여유(초)
 
 
@@ -122,17 +124,21 @@ def reap_dead_owners(main_tree, common, my_sid):
     """
     lines = []
     path_owners = os.path.join(common, OWNERS)
-    try:
-        with open(path_owners, encoding="utf-8") as f:
-            owners = json.load(f)
-    except Exception:
-        return lines
-
     rc, out = git(main_tree, "worktree", "list", "--porcelain")
     if rc:
         return lines                    # 목록을 못 읽으면 아무것도 안 한다
     registered = {os.path.realpath(l[9:].strip())
                   for l in out.splitlines() if l.startswith("worktree ")}
+
+    # 생성기·가드·시작·종료 훅이 같은 JSON을 갱신한다. RMW 전체를 잠그지 않으면 동시
+    # 세션 둘이 서로의 소유자 기록을 마지막 os.replace로 잃는다.
+    owner_lock = open(os.path.join(common, OWNER_LOCK), "a+", encoding="utf-8")
+    fcntl.flock(owner_lock, fcntl.LOCK_EX)
+    try:
+        with open(path_owners, encoding="utf-8") as f:
+            owners = json.load(f)
+    except Exception:
+        owners = {}
 
     rc, base = git(main_tree, "rev-parse", "--abbrev-ref", "origin/HEAD")
     if rc:
@@ -178,6 +184,8 @@ def reap_dead_owners(main_tree, common, my_sid):
             os.replace(tmp, path_owners)
         except Exception:
             pass
+    fcntl.flock(owner_lock, fcntl.LOCK_UN)
+    owner_lock.close()
     return lines
 
 

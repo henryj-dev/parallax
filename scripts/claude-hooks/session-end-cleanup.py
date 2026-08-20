@@ -20,12 +20,14 @@
 기록: `<git-common-dir>/claude-session-end.log`
 """
 import json
+import fcntl
 import os
 import subprocess
 import sys
 import time
 
 OWNERS = "claude-worktree-owners.json"
+OWNER_LOCK = "claude-worktree-owners.lock"
 LOG = "claude-session-end.log"
 
 
@@ -124,6 +126,8 @@ def main():
 
     # 1) 이 세션이 소유한 워크트리 회수
     owners_path = os.path.join(common, OWNERS)
+    owner_lock = open(os.path.join(common, OWNER_LOCK), "a+", encoding="utf-8")
+    fcntl.flock(owner_lock, fcntl.LOCK_EX)
     try:
         with open(owners_path, encoding="utf-8") as f:
             owners = json.load(f)
@@ -207,6 +211,8 @@ def main():
             json.dump(owners, f, ensure_ascii=False)
     except Exception:
         pass
+    fcntl.flock(owner_lock, fcntl.LOCK_UN)
+    owner_lock.close()
     git(main_tree, "worktree", "prune")
 
     # 2) 메인 트리 최신화. fetch 는 작업 트리를 안 건드리므로 언제나 해도 된다.

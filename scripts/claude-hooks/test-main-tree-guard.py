@@ -75,7 +75,7 @@ CASES = [
     ("메인에서 git worktree list",         "S1", MAIN,   "Bash", {"command": "git worktree list"},         "ALLOW"),
     ("메인에서 git stash list",            "S1", MAIN,   "Bash", {"command": "git stash list"},            "ALLOW"),
     ("메인에서 git tag -l",                "S1", MAIN,   "Bash", {"command": "git tag -l v1*"},            "ALLOW"),
-    ("그래도 git worktree add 는 막힌다",    "S1", MAIN,   "Bash", {"command": "git worktree add /tmp/x"},   "DENY"),
+    ("임의 git worktree add 는 계속 막힌다",  "S1", MAIN,   "Bash", {"command": "git worktree add /tmp/x"},   "DENY"),
     ("그래도 git stash push 는 막힌다",      "S1", MAIN,   "Bash", {"command": "git stash push -u"},         "DENY"),
     # 워크트리 — 전부 통과
     ("워크트리에서 Edit",                   "S2", WT,     "Edit", {"file_path": f"{WT}/PLAN.md"},           "ALLOW"),
@@ -106,6 +106,7 @@ CASES = [
     # 워크트리 회수 — 종료 훅이 쓰는 그 명령이다. 막으면 남은 워크트리를 치울 길이 없다.
     ("메인에서 worktree remove",           "S1", MAIN,   "Bash", {"command": "git worktree remove .claude/worktrees/x"}, "ALLOW"),
     ("메인에서 worktree prune",            "S1", MAIN,   "Bash", {"command": "git worktree prune"},          "ALLOW"),
+    ("도구 중립 생성기는 메인을 직접 안 고친다", "S1", MAIN, "Bash", {"command": "python3 scripts/claude-hooks/enter-worktree.py agent-x"}, "ALLOW"),
     # 🔴 통과 검사가 뒤따르는 변경까지 덮던 우회로 (2026-08-15 실측 — 셋 다 통과했다).
     #    판정은 **명령 조각마다** 해야 한다.
     ("stash list 뒤의 commit 은 막힌다",    "S1", MAIN,   "Bash", {"command": "git stash list && git commit -m x"}, "DENY"),
@@ -223,7 +224,7 @@ try:
             return mtg.deny_text(r, common)
 
         t = denies("design/feature-x", upstream=False)
-        ok = "HEAD:design/feature-x" in t and "-b <브랜치> design/feature-x" in t
+        ok = "HEAD:design/feature-x" in t and "rebase design/feature-x" in t
         fail += not ok
         print(f"{'✓' if ok else '✗'} 업스트림 없는 feature 브랜치 — 그 브랜치를 기준·대상으로 준다")
 
