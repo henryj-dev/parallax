@@ -733,8 +733,15 @@ export class ControlPlane {
           continue;
         }
         try {
-          await this.apply(row.zone, undefined, undefined, actor);
-          applied.push(row.zone);
+          const result = await this.apply(row.zone, undefined, undefined, actor);
+          // apply() records a failed view and returns; it does not throw. A
+          // pending zone that the provider refused this run is failed, not applied.
+          if (overallApplyState(result.statuses) === "failed") {
+            const message = result.statuses.find((status) => status.state === "failed")?.error ?? "apply failed";
+            failed.push({ zone: row.zone, error: message });
+          } else {
+            applied.push(row.zone);
+          }
         } catch (error) {
           failed.push({ zone: row.zone, error: error instanceof Error ? error.message : "apply failed" });
         }

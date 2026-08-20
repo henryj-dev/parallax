@@ -1224,6 +1224,31 @@ describe("ControlPlane", () => {
     assert.equal((await service.status("pending.example")).statuses.find((status) => status.view === "external")?.state, "applied");
   });
 
+  it("reports a pending zone that fails this bulk run and still applies the rest", async () => {
+    class RefusingOneZone extends InMemoryProvider {
+      override async apply(target: string, operation: Exclude<ReconcileOperation, { kind: "conflict" }>): Promise<void> {
+        if (target.startsWith("broken.example/")) throw new Error("provider refused");
+        return super.apply(target, operation);
+      }
+    }
+    const adapters = createInMemoryAdapters();
+    const provider = new RefusingOneZone();
+    const service = new ControlPlane(adapters.zones, adapters.statuses, provider);
+    await service.createZone("broken.example");
+    await service.createZone("healthy.example");
+    for (const zone of ["broken.example", "healthy.example"]) {
+      await service.upsertRecord(zone, "external", "web", { name: "www", type: "A", content: "8.8.8.8", ttl: 300 });
+    }
+
+    const result = await service.applyPending("alice");
+    assert.deepEqual(result.applied, ["healthy.example"]);
+    assert.equal(result.failed.length, 1);
+    assert.equal(result.failed[0]?.zone, "broken.example");
+    assert.equal(result.failed[0]?.error, "provider operation failed");
+    assert.equal((await service.status("healthy.example")).statuses.find((status) => status.view === "external")?.state, "applied");
+    assert.equal((await service.status("broken.example")).statuses.find((status) => status.view === "external")?.state, "failed");
+  });
+
   it("round-trips a presentation-format zone file through desired state", async () => {
     const { service } = setup();
     await service.createZone("example.com");
