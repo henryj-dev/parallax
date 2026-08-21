@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   gate:
-    runs-on: [self-hosted, runner-01]
+    runs-on: arc-mack-erel-parallax
     # A hung test would otherwise sit for six hours. Bounded, it reports.
     timeout-minutes: 15
     strategy:
@@ -50,7 +50,7 @@ jobs:
   # fails while `gate` passes, that deployment's gate has stopped working and
   # nobody there would have been told.
   deployment-gate:
-    runs-on: [self-hosted, runner-01]
+    runs-on: arc-mack-erel-parallax
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
