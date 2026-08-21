@@ -39,6 +39,8 @@ export interface DnsServerOptions {
   readonly forwardTimeoutMs?: number;
   readonly maxConcurrentForwards?: number;
   readonly tcpIdleTimeoutMs?: number;
+  /** Maximum time to finish one DNS-over-TCP length-prefixed frame. */
+  readonly tcpIncompleteFrameTimeoutMs?: number;
   readonly maxTcpConnections?: number;
   readonly rateLimitPerSecond?: number;
   readonly rateLimitBurst?: number;
@@ -72,6 +74,10 @@ const DEFAULT_TCP_IDLE_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_TCP_CONNECTIONS = 1024;
 const DEFAULT_RATE_LIMIT_PER_SECOND = 100;
 const DEFAULT_RATE_LIMIT_BURST = 200;
+// The DNS-over-TCP prefix is an unsigned 16-bit payload length. Keeping only
+// one incomplete frame means a peer can never make one connection retain more
+// than this, even while it pipelines complete requests behind it.
+const MAX_TCP_INCOMPLETE_FRAME_BYTES = 2 + 0xffff;
 
 /**
  * Answers for the zones this control plane holds, and forwards everything else.
@@ -94,6 +100,10 @@ export function createDnsServer(options: DnsServerOptions): {
   const transferAllow = compileCidrs(options.transferAllow ?? []);
   const maxConcurrentForwards = positiveInteger(options.maxConcurrentForwards ?? DEFAULT_MAX_CONCURRENT_FORWARDS, "maxConcurrentForwards");
   const tcpIdleTimeoutMs = positiveInteger(options.tcpIdleTimeoutMs ?? DEFAULT_TCP_IDLE_TIMEOUT_MS, "tcpIdleTimeoutMs");
+  const tcpIncompleteFrameTimeoutMs = positiveInteger(
+    options.tcpIncompleteFrameTimeoutMs ?? tcpIdleTimeoutMs,
+    "tcpIncompleteFrameTimeoutMs",
+  );
   const maxTcpConnections = positiveInteger(options.maxTcpConnections ?? DEFAULT_MAX_TCP_CONNECTIONS, "maxTcpConnections");
   const rateLimiter = createRateLimiter(
     positiveInteger(options.rateLimitPerSecond ?? DEFAULT_RATE_LIMIT_PER_SECOND, "rateLimitPerSecond"),
@@ -199,25 +209,77 @@ export function createDnsServer(options: DnsServerOptions): {
     tcp.on("connection", (socket) => {
       tcpSockets.add(socket);
       socket.setTimeout(tcpIdleTimeoutMs, () => socket.destroy());
-      socket.on("close", () => tcpSockets.delete(socket));
       let buffered = Buffer.alloc(0);
+      let incompleteFrameTimer: NodeJS.Timeout | undefined;
+      const clearIncompleteFrameTimer = (): void => {
+        if (!incompleteFrameTimer) return;
+        clearTimeout(incompleteFrameTimer);
+        incompleteFrameTimer = undefined;
+      };
+      const armIncompleteFrameTimer = (): void => {
+        if (incompleteFrameTimer) return;
+        incompleteFrameTimer = setTimeout(() => socket.destroy(), tcpIncompleteFrameTimeoutMs);
+        incompleteFrameTimer.unref();
+      };
+      const handleMessage = (message: Buffer): void => {
+        const clientAddress = socket.remoteAddress;
+        if (!clientAddress || !rateLimiter.allow(clientAddress)) return;
+        void respond(message, true, clientAddress).then((reply) => {
+          if (!reply) return;
+          const framed = Buffer.alloc(2 + reply.length);
+          framed.writeUInt16BE(reply.length, 0);
+          reply.copy(framed, 2);
+          socket.write(framed);
+        }).catch(() => socket.destroy());
+      };
+      socket.on("close", () => {
+        clearIncompleteFrameTimer();
+        tcpSockets.delete(socket);
+      });
       socket.on("data", (chunk) => {
-        buffered = Buffer.concat([buffered, chunk]);
-        for (;;) {
-          if (buffered.length < 2) return;
-          const size = buffered.readUInt16BE(0);
-          if (buffered.length < size + 2) return;
-          const message = buffered.subarray(2, size + 2);
-          buffered = buffered.subarray(size + 2);
-          const clientAddress = socket.remoteAddress;
-          if (!clientAddress || !rateLimiter.allow(clientAddress)) continue;
-          void respond(message, true, clientAddress).then((reply) => {
-            if (!reply) return;
-            const framed = Buffer.alloc(2 + reply.length);
-            framed.writeUInt16BE(reply.length, 0);
-            reply.copy(framed, 2);
-            socket.write(framed);
-          }).catch(() => socket.destroy());
+        let remaining = chunk;
+        while (remaining.length > 0) {
+          // Avoid accumulating a whole pipelined chunk. Complete frames go
+          // straight to the handler; only one partial frame is retained.
+          if (buffered.length === 0 && remaining.length >= 2) {
+            const size = remaining.readUInt16BE(0);
+            const frameBytes = size + 2;
+            if (remaining.length >= frameBytes) {
+              handleMessage(Buffer.from(remaining.subarray(2, frameBytes)));
+              remaining = remaining.subarray(frameBytes);
+              continue;
+            }
+          }
+
+          const bytesNeededForPrefixOrFrame = buffered.length >= 2 ? buffered.readUInt16BE(0) + 2 : 2;
+          const needed = bytesNeededForPrefixOrFrame - buffered.length;
+          const take = Math.min(needed, remaining.length);
+          if (buffered.length + take > MAX_TCP_INCOMPLETE_FRAME_BYTES) {
+            socket.destroy();
+            return;
+          }
+          buffered = Buffer.concat([buffered, remaining.subarray(0, take)]);
+          remaining = remaining.subarray(take);
+          if (buffered.length < 2) {
+            if (remaining.length === 0) {
+              armIncompleteFrameTimer();
+              return;
+            }
+            continue;
+          }
+          const frameBytes = buffered.readUInt16BE(0) + 2;
+          if (buffered.length < frameBytes) {
+            // socket.setTimeout() resets for every byte. This deadline does
+            // not, so a slow-drip client cannot reserve a connection forever.
+            if (remaining.length === 0) {
+              armIncompleteFrameTimer();
+              return;
+            }
+            continue;
+          }
+          clearIncompleteFrameTimer();
+          handleMessage(Buffer.from(buffered.subarray(2)));
+          buffered = Buffer.alloc(0);
         }
       });
       socket.on("error", () => socket.destroy());
@@ -284,12 +346,25 @@ async function bindAddresses(host: string, resolveHost: (host: string) => Promis
 }
 
 function parseNotifyDestination(value: string): { address: string; port: number } {
-  const hashed = value.lastIndexOf(":");
-  if (hashed > 0 && !value.startsWith("[")) {
-    const port = Number(value.slice(hashed + 1));
-    if (Number.isInteger(port) && port > 0) return { address: value.slice(0, hashed), port };
+  const bracketed = /^\[([^\]]+)\](?::(\d+))?$/u.exec(value);
+  if (bracketed) {
+    const port = notifyPort(bracketed[2]);
+    if (port !== undefined) return { address: bracketed[1] ?? "", port };
+  }
+  const firstColon = value.indexOf(":");
+  const lastColon = value.lastIndexOf(":");
+  if (firstColon > 0 && firstColon === lastColon) {
+    const port = notifyPort(value.slice(lastColon + 1));
+    if (port !== undefined) return { address: value.slice(0, lastColon), port };
   }
   return { address: value.replace(/^\[|\]$/gu, ""), port: 53 };
+}
+
+function notifyPort(value: string | undefined): number | undefined {
+  if (value === undefined) return 53;
+  if (!/^\d+$/u.test(value)) return undefined;
+  const port = Number(value);
+  return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
 }
 
 function writeNotify(zone: string): Buffer {

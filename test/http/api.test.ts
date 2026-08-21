@@ -131,6 +131,25 @@ describe("HTTP API", () => {
     assert.deepEqual(body.applied, ["pending.example"]);
   });
 
+  it("retries failed zones over HTTP only with retryFailed=true", async () => {
+    const adapters = createInMemoryAdapters();
+    const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
+    assert.equal((await api(request("/api/v1/zones", "POST", { name: "retry.example" }))).status, 201);
+    assert.equal((await api(request("/api/v1/zones/retry.example/views/external/records/web", "PUT", {
+      name: "www", type: "A", content: "8.8.8.8", ttl: 300,
+    }))).status, 200);
+    adapters.provider.failure = new Error("provider refused");
+    await api(request("/api/v1/zones/retry.example/apply", "POST", {}));
+    adapters.provider.failure = undefined;
+
+    const ordinary = await api(request("/api/v1/apply", "POST", {}));
+    assert.deepEqual((await ordinary.json() as { retried: string[]; failed: { zone: string }[] }).retried, []);
+
+    const retry = await api(request("/api/v1/apply?retryFailed=true", "POST", {}));
+    assert.equal(retry.status, 200);
+    assert.deepEqual((await retry.json() as { retried: string[] }).retried, ["retry.example"]);
+  });
+
   it("exports and imports a presentation-format zone file over HTTP", async () => {
     const api = setup();
     assert.equal((await api(request("/api/v1/zones", "POST", { name: "example.com" }))).status, 201);

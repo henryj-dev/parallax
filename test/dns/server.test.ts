@@ -386,6 +386,22 @@ describe("DNS server", () => {
     assert.equal(sent[0]?.packet.readUInt16BE(2), 0x2000);
   });
 
+  it("parses bracketed IPv6 NOTIFY destinations with an optional port", async () => {
+    const sent: Array<{ address: string; port: number }> = [];
+    const zone = { ...EXAMPLE, serial: 12 };
+    const { server } = await start({
+      zones: () => [zone],
+      notifyTo: ["[2001:db8::53]:5300", "[2001:db8::54]", "2001:db8::55"],
+      sendNotify: async (_packet, address, port) => { sent.push({ address, port }); },
+    });
+    await server.notifyChanged(new Map([["example.com", 11]]), [{ ...zone, serial: 12 }]);
+    assert.deepEqual(sent, [
+      { address: "2001:db8::53", port: 5300 },
+      { address: "2001:db8::54", port: 53 },
+      { address: "2001:db8::55", port: 53 },
+    ]);
+  });
+
   it("closes so a subsequent bind on the same ports can succeed", async () => {
     const { port, server } = await start({ zones: () => [EXAMPLE] });
     const http = createServer((socket) => socket.end());
@@ -433,6 +449,30 @@ describe("DNS server", () => {
     const { port } = await start({ zones: () => [EXAMPLE] });
     const reply = await askOverTcp(port, buildQuery("www.example.com"), true);
     assert.equal(readAnswers(reply).length, 2);
+  });
+
+  it("closes a client that trickles an incomplete TCP DNS frame", async () => {
+    const { port } = await start({
+      zones: () => [EXAMPLE],
+      tcpIdleTimeoutMs: 200,
+      tcpIncompleteFrameTimeoutMs: 40,
+    });
+    const socket = connect(port, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+    socket.on("error", () => undefined);
+    const prefix = Buffer.alloc(2);
+    prefix.writeUInt16BE(buildQuery("www.example.com").length, 0);
+    socket.write(prefix);
+    const drip = setInterval(() => { if (!socket.destroyed) socket.write(Buffer.of(0)); }, 10);
+    try {
+      await Promise.race([
+        new Promise<void>((resolve) => socket.once("close", resolve)),
+        new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("slow-drip DNS TCP socket stayed open")), 300)),
+      ]);
+    } finally {
+      clearInterval(drip);
+      socket.destroy();
+    }
   });
 
   it("answers an apex SOA query from the zone serial", async () => {

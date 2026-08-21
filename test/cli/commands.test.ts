@@ -225,6 +225,7 @@ describe("command line parsing", () => {
       zone: "a.example",
       abandonProviderRecords: false,
     });
+    assert.deepEqual(parseInvocation(["apply", "pending", "--retryFailed"]).input, { retryFailed: true });
   });
 
   it("refuses an unusable invocation", () => {

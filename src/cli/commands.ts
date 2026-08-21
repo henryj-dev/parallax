@@ -362,10 +362,10 @@ const COMMANDS: readonly Command[] = [
   },
   {
     name: "apply pending",
-    summary: "Apply every pending zone from the status overview, reporting failures without stopping",
+    summary: "Apply every pending zone; use --retryFailed to explicitly retry failed zones",
     role: "editor",
-    options: [],
-    run: ({ runtime, actor }) => requireControlPlane(runtime).applyPending(actor),
+    options: [{ name: "retryFailed", summary: "Also retry zones whose previous provider apply failed", type: "boolean" }],
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).applyPending(actor, input.retryFailed === true),
   },
   {
     name: "zone export",

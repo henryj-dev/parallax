@@ -1246,6 +1246,25 @@ describe("ControlPlane", () => {
     assert.equal((await service.status("pending.example")).statuses.find((status) => status.view === "external")?.state, "applied");
   });
 
+  it("retries previously failed zones from the overview only when explicitly requested", async () => {
+    const { service, provider } = setup();
+    await service.createZone("retry.example");
+    await service.upsertRecord("retry.example", "external", "web", { name: "www", type: "A", content: "8.8.8.8", ttl: 300 });
+    provider.failure = new Error("provider refused");
+    await service.apply("retry.example");
+    provider.failure = undefined;
+
+    const untouched = await service.applyPending("alice");
+    assert.deepEqual(untouched.retried, []);
+    assert.deepEqual(untouched.failed, [{ zone: "retry.example", error: "zone apply previously failed" }]);
+
+    const retried = await service.applyPending("alice", true);
+    assert.deepEqual(retried.applied, []);
+    assert.deepEqual(retried.retried, ["retry.example"]);
+    assert.deepEqual(retried.failed, []);
+    assert.equal((await service.status("retry.example")).statuses.find((status) => status.view === "external")?.state, "applied");
+  });
+
   it("reports a pending zone that fails this bulk run and still applies the rest", async () => {
     class RefusingOneZone extends InMemoryProvider {
       override async apply(target: string, operation: Exclude<ReconcileOperation, { kind: "conflict" }>): Promise<void> {

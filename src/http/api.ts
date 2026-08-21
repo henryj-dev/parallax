@@ -193,7 +193,8 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
   }
 
   if (area === "apply" && segments.length === 3 && method === "POST") {
-    return { command: "apply pending", input: {} };
+    const retryFailed = readBooleanQuery(url, "retryFailed");
+    return { command: "apply pending", input: retryFailed === undefined ? {} : { retryFailed } };
   }
 
   if (area === "history" && segments.length === 3 && method === "GET") {

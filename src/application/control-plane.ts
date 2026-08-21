@@ -709,15 +709,19 @@ export class ControlPlane {
 
   /**
    * Applies every pending zone from the overview. Applied zones are skipped.
-   * A zone that is already failed, or that fails this run, is reported and the
-   * rest still run -- one broken zone must not hide the ones behind it.
+   * Failed zones stay visible without being retried unless an operator explicitly
+   * asks for them: a bulk apply must not turn a transient provider failure into
+   * repeated provider traffic by itself. With `retryFailed`, each failed zone
+   * follows the same reconciliation path as an explicit per-zone apply.
    */
-  async applyPending(actor = "system"): Promise<{
+  async applyPending(actor = "system", retryFailed = false): Promise<{
     applied: string[];
+    retried: string[];
     failed: { zone: string; error: string }[];
     skipped: string[];
   }> {
     const applied: string[] = [];
+    const retried: string[] = [];
     const failed: { zone: string; error: string }[] = [];
     const skipped: string[] = [];
     let offset = 0;
@@ -728,7 +732,7 @@ export class ControlPlane {
           skipped.push(row.zone);
           continue;
         }
-        if (row.state === "failed") {
+        if (row.state === "failed" && !retryFailed) {
           failed.push({ zone: row.zone, error: "zone apply previously failed" });
           continue;
         }
@@ -740,7 +744,8 @@ export class ControlPlane {
             const message = result.statuses.find((status) => status.state === "failed")?.error ?? "apply failed";
             failed.push({ zone: row.zone, error: message });
           } else {
-            applied.push(row.zone);
+            if (row.state === "failed") retried.push(row.zone);
+            else applied.push(row.zone);
           }
         } catch (error) {
           failed.push({ zone: row.zone, error: error instanceof Error ? error.message : "apply failed" });
@@ -750,7 +755,7 @@ export class ControlPlane {
       if (page.zones.length === 0) break;
       offset += page.zones.length;
     }
-    return { applied, failed, skipped };
+    return { applied, retried, failed, skipped };
   }
 
   exportZoneFile(zoneName: string, viewName = "external"): Promise<string> {
