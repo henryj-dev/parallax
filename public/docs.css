@@ -1,0 +1,77 @@
+/* The API reference page. Tokens, masthead, shell and sidebar come from
+   styles.css; everything here is the reference's own layout. */
+
+.reference { min-width: 0; padding: 30px 34px 90px; max-width: 1080px; }
+.reference:focus { outline: none; }
+
+.notice { padding: 18px 20px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--muted); }
+.notice.failure { border-color: var(--danger); color: var(--ink); }
+.notice b { display: block; margin-bottom: 8px; font-size: 15px; }
+.notice p { margin: 6px 0; }
+
+.overview h1 { margin: 0 0 10px; font-family: var(--display); font-size: 30px; letter-spacing: .04em; }
+.overview .lede { margin: 0 0 14px; font-size: 15px; color: var(--ink); }
+.overview p { margin: 0 0 12px; color: var(--muted); line-height: 1.62; max-width: 74ch; }
+.overview-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 6px; }
+.overview-meta span { padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; font: 10px/1.6 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); background: var(--surface); }
+
+.tag-heading { margin: 46px 0 18px; padding-top: 22px; border-top: 1px solid var(--line); }
+.tag-heading:first-child { border-top: 0; padding-top: 0; }
+.tag-heading h2 { margin: 0 0 6px; font-family: var(--display); font-size: 21px; letter-spacing: .06em; text-transform: uppercase; }
+.tag-heading p { margin: 0; color: var(--muted); max-width: 74ch; }
+
+.operation { margin: 0 0 20px; padding: 20px 22px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); scroll-margin-top: 88px; }
+.operation-title { display: flex; align-items: center; gap: 11px; flex-wrap: wrap; }
+.operation-path { font: 14px/1.5 var(--mono); word-break: break-all; }
+.operation-summary { margin: 12px 0 0; font-size: 15px; font-weight: 620; }
+.operation > p { margin: 10px 0 0; color: var(--muted); line-height: 1.62; max-width: 74ch; }
+
+.method { padding: 3px 9px; border-radius: 5px; font: 10px/1.6 var(--mono); font-weight: 700; letter-spacing: .09em; color: white; background: var(--muted); }
+.method.get { background: var(--blue); }
+.method.post { background: var(--success); }
+.method.put { background: var(--external); }
+.method.patch { background: var(--amber); color: var(--ink); }
+.method.delete { background: var(--danger); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+.chip { padding: 3px 10px; border: 1px solid var(--line-strong); border-radius: 999px; font: 11px/1.7 var(--mono); color: var(--blue-deep); background: var(--surface-blue); cursor: help; }
+
+.block { margin-top: 22px; }
+.block h3 { margin: 0 0 9px; font: 10px/1.2 var(--mono); letter-spacing: .13em; text-transform: uppercase; color: var(--muted); }
+.block > p { margin: 0 0 10px; color: var(--muted); max-width: 74ch; }
+
+.table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 9px; }
+.table-scroll table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table-scroll th { padding: 9px 12px; text-align: left; font: 10px/1.4 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); background: var(--surface-blue); border-bottom: 1px solid var(--line); white-space: nowrap; }
+.table-scroll td { padding: 10px 12px; vertical-align: top; border-top: 1px solid var(--line); line-height: 1.55; }
+.table-scroll td:first-child { white-space: nowrap; }
+.table-scroll code { font: 12px/1.5 var(--mono); }
+.table-scroll .type { color: var(--blue-deep); }
+
+.status.ok { color: var(--success); font-weight: 700; }
+.status.warn { color: var(--external); font-weight: 700; }
+.status.bad { color: var(--danger); font-weight: 700; }
+
+.schema { margin-top: 8px; }
+.schema .table-scroll { border-color: var(--line); }
+.schema .schema { margin-left: 0; margin-top: 10px; padding-left: 12px; border-left: 2px solid var(--line); }
+.enum { margin: 5px 0 0; font: 11px/1.6 var(--mono); color: var(--muted); }
+
+.code { position: relative; }
+.code pre { margin: 0; padding: 14px 92px 14px 14px; overflow-x: auto; border: 1px solid var(--line); border-radius: 9px; background: #10262f; }
+.code code { font: 12px/1.7 var(--mono); color: #d7e7ec; white-space: pre; }
+/* The button sits on the dark block, so it cannot inherit the page's ink. */
+.code button { position: absolute; top: 9px; right: 9px; color: #d7e7ec; border-color: rgba(215,231,236,.34); background: rgba(215,231,236,.08); }
+.code button:hover { color: white; border-color: rgba(215,231,236,.7); background: rgba(215,231,236,.16); }
+
+.index-group { display: block; padding: 16px 12px 6px; }
+.index-item { display: flex; align-items: center; gap: 9px; padding: 7px 12px; border-radius: 7px; color: var(--ink); text-decoration: none; }
+.index-item:hover { background: rgba(255,255,255,.72); }
+.index-item code { font: 11px/1.5 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.index-item .method { padding: 2px 6px; font-size: 9px; }
+
+@media (max-width: 900px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { position: static; height: auto; max-height: 320px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .reference { padding: 22px 18px 70px; }
+}

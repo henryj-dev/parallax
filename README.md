@@ -21,6 +21,8 @@ resulting changes, and applies only records explicitly managed by Parallax.
 - Encrypted, write-only Cloudflare credential management from the admin portal
 - Optional admin/editor/viewer token authentication, OpenID Connect sign-in, and audit actors
 - Health endpoints and security headers
+- A self-describing API: an OpenAPI 3.1 document derived from the command
+  registry and the security layer, and a reference page that reads it
 - Dependency-light Node.js HTTP server and TypeScript test suite
 
 The product and architecture rationale are in
@@ -895,6 +897,41 @@ Two limits worth knowing before you rely on it:
 
 ## HTTP API
 
+Every route is described by an OpenAPI 3.1 document the running process builds
+for itself, and there is a reference page that reads it:
+
+| | |
+| --- | --- |
+| `GET /docs` | A browsable reference. Linked from the portal's masthead. |
+| `GET /api/v1/openapi.json` | The document. Point a Swagger UI, a Redoc, or a client generator at it. |
+| `parallax openapi` | The same document from the command line, with no server and no configuration — for a pipeline that diffs it against a committed copy. |
+
+The document is derived rather than written down beside the code. Each
+operation's summary is read out of the command registry, so the API and the
+command line say the same sentence; `x-parallax-command` names the command each
+route runs; the enumerations come from the domain's own constants; and
+`x-parallax-role` is *computed* from the two gates that enforce it -- the
+command's declared minimum and the security layer -- so a spec that claims
+`editor` cannot outlive a route that quietly became admin-only. What is left,
+the shape of the routes, is walked by `test/http/openapi.test.ts`: every
+documented operation carries a concrete request that the real router has to
+resolve to the command the document names, and every command must be documented
+or explicitly excused. A documented path that nothing serves fails there rather
+than in somebody's generated client.
+
+The reference page is served from this origin like the rest of the portal --
+this server's content security policy allows scripts and styles from itself
+only, so nothing is fetched from a CDN. It does not offer to send the requests
+it documents: a "try it" button on a page served by the control plane it edits
+is one mis-click away from applying a zone somebody was reading about. Each
+operation instead carries the `curl` line for the request the test already
+proved reaches something. It is the one page here that is not translated, and
+deliberately: what it draws is written in English at its source.
+
+`/docs` itself is a static page, but what it draws is not. The document is
+behind the same authentication as the rest of the API, because it describes this
+deployment -- an unauthenticated visitor gets the frame and is asked to sign in.
+
 All control-plane routes are under `/api/v1`.
 
 - `GET|POST /zones` (`GET ?limit=&offset=`, `POST { "name": "example.com" }`)
@@ -918,6 +955,7 @@ All control-plane routes are under `/api/v1`.
 - `GET|PUT|DELETE /credentials/cloudflare/:zone`
 - `POST /credentials/cloudflare/:zone/test` (tests the stored binding, or an unsaved `{ profile }` or `{ token }`)
 - `POST /cli` (runs serving commands, never `migrate`; `{ "argv": ["zone", "list"] }`)
+- `GET /openapi.json` (this API, described)
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics` — Prometheus text format, behind the same authentication as
   everything else. It counts the failures that are otherwise only a line on

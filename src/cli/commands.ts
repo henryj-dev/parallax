@@ -4,8 +4,9 @@ import { fallbackCoverage, overridableZones, type FallbackDomainService } from "
 import { NotFoundError, type ControlPlane, type RecordQuery } from "../application/control-plane.ts";
 import type { SettingsService } from "../application/settings.ts";
 import { DomainValidationError } from "../domain/dns.ts";
+import { buildOpenApiDocument } from "../http/openapi.ts";
 import { MIGRATION_TARGETS, type MigrationRun } from "../infrastructure/migrations.ts";
-import type { Role } from "../security/http-authorization.ts";
+import { ROLES, type Role } from "../security/http-authorization.ts";
 
 /**
  * What a command may reach. A server supplies all of it; a test or a reduced
@@ -66,10 +67,8 @@ export class CommandUnavailableError extends Error {
   override readonly name = "CommandUnavailableError";
 }
 
-const ROLE_RANK: Record<Role, number> = { viewer: 0, editor: 1, admin: 2 };
-
 export function satisfiesRole(actual: Role, required: Role): boolean {
-  return ROLE_RANK[actual] >= ROLE_RANK[required];
+  return ROLES.indexOf(actual) >= ROLES.indexOf(required);
 }
 
 /** Resolves a command by name and runs it after checking role and input. */
@@ -528,6 +527,16 @@ const COMMANDS: readonly Command[] = [
     run: ({ runtime, actor }, input) => requireControlPlane(runtime).restoreRevision(
       String(input.zone), Number(input.revision), actor, expectedRevisionOf(input),
     ),
+  },
+  {
+    name: "openapi",
+    summary: "Print the OpenAPI description of this control plane's HTTP API",
+    role: "viewer",
+    // Needs no runtime at all: the description is built out of this registry and
+    // the security layer. So it answers from a checkout with nothing configured,
+    // which is what a pipeline diffing the spec against a committed copy has.
+    options: [],
+    run: async () => buildOpenApiDocument(),
   },
   {
     name: "migrate",

@@ -4,6 +4,16 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 export type Role = "admin" | "editor" | "viewer";
 
+/**
+ * Every role, least to most.
+ *
+ * Beside the type rather than beside the one comparison that used to hold the
+ * order, because two other places need to walk it now: `satisfiesRole`, and the
+ * OpenAPI document, which works out the least role that reaches each route by
+ * trying them in this order.
+ */
+export const ROLES: readonly Role[] = ["viewer", "editor", "admin"];
+
 export interface TokenRecord {
   readonly token: string;
   readonly role: Role;

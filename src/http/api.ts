@@ -137,7 +137,7 @@ function firstHeaderValue(value: string | string[] | undefined): string | undefi
 }
 
 /** One HTTP request resolved to a command, its input, and how to answer. */
-interface RouteMatch {
+export interface RouteMatch {
   readonly command: string;
   readonly input: CommandInput;
   readonly status?: number;
@@ -145,6 +145,27 @@ interface RouteMatch {
   readonly empty?: boolean;
   /** Include the result's revision as an ETag. */
   readonly revisioned?: boolean;
+  /** `POST /cli` reports which command it ran alongside the result. */
+  readonly envelope?: "cli";
+}
+
+/**
+ * Which command a method and path reach, without running it.
+ *
+ * Exported because the OpenAPI document is a second description of these routes,
+ * and a second description that cannot be compared with the first is one that
+ * will disagree with it. `test/http/openapi.test.ts` walks every documented
+ * operation through here and checks it lands on the command the document names.
+ */
+export async function resolveRoute(method: string, path: string, body?: unknown): Promise<RouteMatch> {
+  const url = new URL(path, "http://parallax.invalid");
+  const request = new Request(url, {
+    method,
+    ...(body === undefined ? {} : { body: JSON.stringify(body), headers: { "content-type": "application/json" } }),
+  });
+  const segments = decodeSegments(url.pathname);
+  if (segments[0] !== "api" || segments[1] !== "v1") throw new NotFoundError("route was not found");
+  return matchRoute(segments, method === "HEAD" ? "GET" : method, url, request);
 }
 
 async function route(runtime: CommandRuntime, request: Request, security: SecurityConfig): Promise<Response> {
@@ -160,24 +181,9 @@ async function route(runtime: CommandRuntime, request: Request, security: Securi
     role: roleOf(request, security),
   };
 
-  // Serving commands, reachable over HTTP through the same dispatcher. The
-  // runtime intentionally has no `migrate` capability, so an HTTP admin can
-  // never turn the server's database role into a schema-changing role.
-  if (segments[2] === "cli" && segments.length === 3 && method === "POST") {
-    const body = await parseJson(request);
-    const argv = body.argv;
-    if (!Array.isArray(argv) || argv.some((token) => typeof token !== "string")) {
-      throw new DomainValidationError(["argv must be an array of strings"]);
-    }
-    const invocation = parseInvocation(argv as string[]);
-    return json({
-      command: invocation.name,
-      result: await runCommand(context, invocation.name, invocation.input),
-    });
-  }
-
   const match = await matchRoute(segments, method, url, request);
   const result = await runCommand(context, match.command, match.input);
+  if (match.envelope === "cli") return json({ command: match.command, result });
   if (match.empty) return new Response(null, { status: 204 });
   if (match.revisioned) return revisionJson(result as { revision: number }, match.status ?? 200);
   return json(result, match.status ?? 200);
@@ -185,6 +191,30 @@ async function route(runtime: CommandRuntime, request: Request, security: Securi
 
 async function matchRoute(segments: string[], method: string, url: URL, request: Request): Promise<RouteMatch> {
   const area = segments[2];
+
+  // Serving commands, reachable over HTTP through the same dispatcher. The
+  // runtime intentionally has no `migrate` capability, so an HTTP admin can
+  // never turn the server's database role into a schema-changing role.
+  //
+  // Resolved here rather than ahead of this function so that every route has
+  // one place that says which command it reaches -- which is the thing the
+  // OpenAPI document is checked against.
+  if (area === "cli" && segments.length === 3 && method === "POST") {
+    const body = await parseJson(request);
+    const argv = body.argv;
+    if (!Array.isArray(argv) || argv.some((token) => typeof token !== "string")) {
+      throw new DomainValidationError(["argv must be an array of strings"]);
+    }
+    const invocation = parseInvocation(argv as string[]);
+    return { command: invocation.name, input: invocation.input, envelope: "cli" };
+  }
+
+  // Its own route rather than a file on disk: the description is derived from
+  // the command registry and the security layer at the moment it is asked for,
+  // so it cannot describe a build that is no longer running.
+  if (area === "openapi.json" && segments.length === 3 && method === "GET") {
+    return { command: "openapi", input: {} };
+  }
 
   // One line per zone, for a list that would otherwise ask once per row. The
   // per-zone page keeps its own route under the zone it describes.

@@ -21,6 +21,14 @@ const SCRIPT = "text/javascript; charset=utf-8";
 export const PORTAL_ASSETS: ReadonlyMap<string, PortalAsset> = new Map([
   ["/", { file: "index.html", type: "text/html; charset=utf-8" }],
   ["/index.html", { file: "index.html", type: "text/html; charset=utf-8" }],
+  // The API reference. A page, not a deployment fact -- what it draws it fetches
+  // from `/api/v1/openapi.json`, which is behind the same authentication as the
+  // rest of the API, so an unauthenticated visitor gets the frame and is told to
+  // sign in rather than being handed a description of this control plane.
+  ["/docs", { file: "docs.html", type: "text/html; charset=utf-8" }],
+  ["/docs.html", { file: "docs.html", type: "text/html; charset=utf-8" }],
+  ["/docs.js", { file: "docs.js", type: SCRIPT }],
+  ["/docs.css", { file: "docs.css", type: "text/css; charset=utf-8" }],
   ["/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
   ["/app.js", { file: "app.js", type: SCRIPT }],
   ["/api-client.js", { file: "api-client.js", type: SCRIPT }],

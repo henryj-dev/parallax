@@ -47,18 +47,31 @@ describe("every module the portal imports is served", () => {
     assert.deepEqual(missing, [], "a portal module imports something the server will not serve");
   });
 
-  it("serves each script the page itself loads", async () => {
-    const html = await readFile(join(PUBLIC, "index.html"), "utf8");
-    const sources = [...html.matchAll(/<script[^>]*\ssrc="([^"]+)"/gu)].map((match) => match[1] as string);
-    // Same shape, one worse: an empty list makes the loop below run zero times,
-    // so the test asserts nothing at all and still passes. Counting the tags a
-    // different way is what makes the loop's silence mean something.
-    const carryingSrc = [...html.matchAll(/<script\b[^>]*>/gu)].filter((tag) => tag[0].includes("src=")).length;
-    assert.ok(carryingSrc > 0, "the page loads at least one script");
-    assert.equal(sources.length, carryingSrc, "a script tag carries a src this did not read");
-    for (const source of sources) {
-      if (/^https?:/u.test(source)) continue;
-      assert.ok(PORTAL_ASSETS.has(source.startsWith("/") ? source : `/${source}`), `index.html loads ${source}`);
+  it("serves each script and stylesheet the pages themselves load", async () => {
+    // Every page, not just the portal's. The reference page is a second document
+    // with its own script and its own stylesheet, and naming `index.html` here
+    // would have left it with exactly the gap this file exists to close.
+    const pages = (await readdir(PUBLIC)).filter((name) => name.endsWith(".html"));
+    assert.ok(pages.length > 1, "the server has more than one page to check");
+
+    for (const page of pages) {
+      const html = await readFile(join(PUBLIC, page), "utf8");
+      const sources = [
+        ...[...html.matchAll(/<script[^>]*\ssrc="([^"]+)"/gu)].map((match) => match[1] as string),
+        ...[...html.matchAll(/<link[^>]*\shref="([^"]+)"/gu)].map((match) => match[1] as string),
+      ];
+      // Same shape as above, one worse: an empty list makes the loop below run
+      // zero times, so the test asserts nothing at all and still passes.
+      // Counting the tags a different way is what makes the loop's silence mean
+      // something.
+      const carryingSrc = [...html.matchAll(/<script\b[^>]*>/gu)].filter((tag) => tag[0].includes("src=")).length
+        + [...html.matchAll(/<link\b[^>]*>/gu)].filter((tag) => tag[0].includes("href=")).length;
+      assert.ok(carryingSrc > 0, `${page} loads at least one script or stylesheet`);
+      assert.equal(sources.length, carryingSrc, `${page} carries a src or href this did not read`);
+      for (const source of sources) {
+        if (/^https?:/u.test(source)) continue;
+        assert.ok(PORTAL_ASSETS.has(source.startsWith("/") ? source : `/${source}`), `${page} loads ${source}`);
+      }
     }
   });
 

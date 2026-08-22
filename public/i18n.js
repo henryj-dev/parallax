@@ -32,6 +32,7 @@ export const messages = Object.freeze({
     "nav.skip": "Skip to workspace",
     "nav.home": "Parallax home",
     "brand.subtitle": "DNS OBSERVATORY",
+    "nav.apiReference": "API reference",
     "provider.settings": "Provider settings",
     "status.controlPlane": "CONTROL PLANE",
     "status.connecting": "Connecting",
@@ -360,7 +361,7 @@ export const messages = Object.freeze({
   },
   ko: {
     "meta.description": "Parallax 분할 DNS 운영 포털", "meta.title": "Parallax — DNS 관측소", "language.label": "언어", "language.english": "English", "language.korean": "한국어",
-    "nav.skip": "작업 영역으로 건너뛰기", "nav.home": "Parallax 홈", "brand.subtitle": "DNS 관측소", "provider.settings": "프로바이더 설정", "status.controlPlane": "컨트롤 플레인", "status.connecting": "연결 중", "status.online": "컨트롤 플레인 온라인", "status.unavailable": "컨트롤 플레인에 연결할 수 없음",
+    "nav.skip": "작업 영역으로 건너뛰기", "nav.home": "Parallax 홈", "brand.subtitle": "DNS 관측소", "nav.apiReference": "API 문서", "provider.settings": "프로바이더 설정", "status.controlPlane": "컨트롤 플레인", "status.connecting": "연결 중", "status.online": "컨트롤 플레인 온라인", "status.unavailable": "컨트롤 플레인에 연결할 수 없음",
     "zones.label": "존", "zones.observed": "관측 중인 존", "zones.create": "존 만들기", "zones.filterLabel": "존 필터", "zones.filterPlaceholder": "도메인으로 필터…", "zones.list": "존 목록", "zones.none": "아직 존이 없습니다. 하나 만들어 시작하세요.", "zones.noMatch": "필터와 일치하는 존이 없습니다.", "zones.loadFailed": "존을 불러오지 못했습니다.", "zones.retry": "다시 시도", "zones.stateUnknown": "조정할 것 없음",
     "policy.label": "관리 정책", "policy.managedOnly": "관리 레코드만", "welcome.eyebrow": "선택한 존 없음", "welcome.title": "관측 지점을 선택하세요.", "welcome.body": "존을 선택하여 내부와 외부 DNS 뷰를 비교하거나 이 컨트롤 플레인에 첫 번째 존을 만드세요.", "welcome.create": "존 만들기",
     "zone.active": "활성 존", "zone.loading": "존 불러오는 중…", "zone.desiredRevision": "목표 리비전 {revision}", "zone.lastChanged": "마지막 변경 {date}", "zone.delete": "존 삭제", "zone.refresh": "새로고침", "zone.revisions": "리비전", "zone.adopt": "기존 레코드 입양", "zone.adoptHint": "프로바이더가 이미 갖고 있는 레코드를 소유권은 그대로 둔 채 기술합니다", "zone.adoptConfirm": "이 프로바이더가 이미 갖고 있는 레코드를 목표 상태로 들여올까요?\n\n소유권은 만든 쪽에 그대로 남습니다. 프로바이더에서 다시 쓰는 것이 없고, 나중에 그쪽이 바뀌면 덮어쓰지 않고 충돌로 보입니다.", "zone.adopted": "프로바이더가 가진 {seen}건 중 {adopted}건을 입양했습니다", "zone.adoptFailed": "입양하지 못했습니다: {error}", "zone.adoptWarning": "입양했지만 짚어둘 점이 있습니다: {warning}", "zone.preview": "계획 미리보기", "zone.apply": "변경 적용", "zone.applying": "적용 중…", "zone.discardChanges": "저장하지 않은 레코드 변경을 버릴까요?", "zone.detailsFailed": "존 상세 정보를 불러오지 못했습니다: {error}", "zone.created": "{name} 존을 만들었습니다.", "zone.createFailed": "존을 만들지 못했습니다: {error}", "zone.creating": "만드는 중…", "zone.deleteConfirm": "{name}을(를) 삭제할까요? 목표 상태가 제거되고 Parallax가 게시한 레코드는 DNS 프로바이더에서 모두 회수됩니다. Parallax가 관리하지 않는 레코드는 그대로 둡니다. 읽을 수 없는 프로바이더 대상은 삭제를 막지 않고 버립니다. 되돌릴 수 없습니다.", "zone.deleted": "{name} 존을 삭제했습니다. 회수할 게시 레코드는 없었습니다.", "zone.deletedRecords.one": "{name} 존을 삭제하고 게시 레코드 1건을 회수했습니다.", "zone.deletedRecords.other": "{name} 존을 삭제하고 게시 레코드 {count}건을 회수했습니다.", "zone.deleteFailed": "존을 삭제하지 못했습니다: {error}",

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Parallax HTTP API reference">
+    <title>Parallax — API reference</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/docs.css">
+    <script src="/docs.js" type="module"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#reference">Skip to the reference</a>
+    <header class="masthead">
+      <a class="brand" href="/" aria-label="Parallax portal">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+        <span><strong>PARALLAX</strong><small>API REFERENCE</small></span>
+      </a>
+      <div class="masthead-status">
+        <a class="button compact quiet" href="/api/v1/openapi.json">OpenAPI document</a>
+        <a class="button compact quiet" href="/">Portal</a>
+      </div>
+    </header>
+
+    <div class="shell">
+      <aside class="sidebar" aria-label="Operations">
+        <div class="sidebar-heading">
+          <div><span class="eyebrow">Operations</span><b id="operation-count">—</b></div>
+        </div>
+        <label class="search">
+          <span class="sr-only">Filter operations</span>
+          <span aria-hidden="true">⌕</span>
+          <input id="operation-search" type="search" placeholder="Filter by path or command…" autocomplete="off">
+        </label>
+        <nav id="operation-index" class="zone-list" aria-label="Operation index"></nav>
+      </aside>
+
+      <main id="reference" class="reference" tabindex="-1">
+        <div id="loading" class="notice">Loading the OpenAPI document…</div>
+        <div id="failure" class="notice failure" hidden></div>
+        <section id="overview" class="overview" hidden></section>
+        <div id="operations"></div>
+      </main>
+    </div>
+  </body>
+</html>
