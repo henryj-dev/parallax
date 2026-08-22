@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "../src/config.ts";
+import { isLoopbackHost, readConfig, usesPlaintextPostgres, usesUnverifiedPostgresTls } from "../src/config.ts";
 
 describe("configuration", () => {
   it("carries only bind address, storage location, and keys", () => {
@@ -141,6 +141,20 @@ describe("configuration", () => {
     assert.equal(isLoopbackHost("0.0.0.0"), false);
   });
 
+  /**
+   * `ssl=true` passes the plaintext check above while `sslmode=require` does
+   * not, and that ordering is backwards -- neither pins the server's identity.
+   * Tightening the refusal would stop an existing deployment at startup, so the
+   * difference is reported instead of enforced.
+   */
+  it("tells encrypted-but-unverified apart from verified", () => {
+    assert.equal(usesUnverifiedPostgresTls("postgres://u:p@db:5432/parallax?ssl=true"), true);
+    assert.equal(usesUnverifiedPostgresTls("postgres://u:p@db:5432/parallax?ssl=1"), true);
+    assert.equal(usesUnverifiedPostgresTls("postgres://u:p@db:5432/parallax?sslmode=verify-full"), false);
+    assert.equal(usesUnverifiedPostgresTls("postgres://u:p@db:5432/parallax"), false);
+    assert.equal(usesUnverifiedPostgresTls("host=db dbname=parallax"), false);
+  });
+
   it("fails closed on malformed and cleartext remote PostgreSQL configuration", () => {
     assert.throws(() => readConfig({ DATABASE_URL: "host=db dbname=parallax" }), /must be a PostgreSQL URL/);
     assert.throws(() => readConfig({ DATABASE_URL: "postgres://u:p@db/parallax" }), /must verify PostgreSQL TLS/);
@@ -223,6 +237,7 @@ describe("configuration", () => {
         PARALLAX_DNS_PORT: "53",
         PARALLAX_DNS_RATE_LIMIT_PER_SECOND: "20",
         PARALLAX_DNS_RATE_LIMIT_BURST: "40",
+        PARALLAX_DNS_RATE_LIMIT_MAX_CLIENTS: "50000",
         PARALLAX_DNS_FORWARD_TIMEOUT_MS: "2000",
         PARALLAX_DNS_MAX_CONCURRENT_FORWARDS: "64",
         PARALLAX_DNS_MAX_TCP_CONNECTIONS: "128",
@@ -230,6 +245,7 @@ describe("configuration", () => {
       {
         rateLimitPerSecond: 20,
         rateLimitBurst: 40,
+        rateLimitMaxClients: 50_000,
         forwardTimeoutMs: 2000,
         maxConcurrentForwards: 64,
         maxTcpConnections: 128,

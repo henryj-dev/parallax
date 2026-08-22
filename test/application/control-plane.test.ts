@@ -1290,6 +1290,35 @@ describe("ControlPlane", () => {
     assert.equal((await service.status("broken.example")).statuses.find((status) => status.view === "external")?.state, "failed");
   });
 
+  /**
+   * The overview is paged, and applying changes the rows it is paging over.
+   *
+   * With an offset that advanced by the page size, a row leaving a page this
+   * loop had already passed would drag an unread row backwards past the offset,
+   * and that zone would never be applied -- by the command whose whole job is
+   * to apply them, silently. It happens not to today because applying changes a
+   * row's state rather than removing it; nothing promises that stays true.
+   * Reading the whole list before applying any of it removes the dependency.
+   */
+  it("applies every pending zone even when the overview pages are small", async () => {
+    const { service } = setup();
+    const zones = ["a.example", "b.example", "c.example", "d.example", "e.example"];
+    for (const zone of zones) {
+      await service.createZone(zone);
+      await service.upsertRecord(zone, "external", "web", { name: "www", type: "A", content: "8.8.8.8", ttl: 300 });
+    }
+
+    const result = await service.applyPending("alice");
+    assert.deepEqual([...result.applied].sort(), [...zones].sort());
+    for (const zone of zones) {
+      assert.equal(
+        (await service.status(zone)).statuses.find((status) => status.view === "external")?.state,
+        "applied",
+        zone,
+      );
+    }
+  });
+
   it("round-trips a presentation-format zone file through desired state", async () => {
     const { service } = setup();
     await service.createZone("example.com");

@@ -90,6 +90,8 @@ export interface DnsListenerLimits {
   readonly rateLimitPerSecond?: number;
   /** How far one client may run ahead of that rate before it is refused. */
   readonly rateLimitBurst?: number;
+  /** How many client addresses the limiter tracks before refusing unknown ones. */
+  readonly rateLimitMaxClients?: number;
   /** How long to wait for an upstream before trying the next one. */
   readonly forwardTimeoutMs?: number;
   /** Relayed queries in flight at once, across every client. */
@@ -224,12 +226,14 @@ function readDnsLimits(environment: NodeJS.ProcessEnv): DnsListenerLimits {
   if (rateLimitPerSecond !== undefined && rateLimitBurst !== undefined && rateLimitBurst < rateLimitPerSecond) {
     throw new Error("PARALLAX_DNS_RATE_LIMIT_BURST must be at least PARALLAX_DNS_RATE_LIMIT_PER_SECOND");
   }
+  const rateLimitMaxClients = bounded("PARALLAX_DNS_RATE_LIMIT_MAX_CLIENTS", 10_000_000);
   const forwardTimeoutMs = bounded("PARALLAX_DNS_FORWARD_TIMEOUT_MS", 60_000);
   const maxConcurrentForwards = bounded("PARALLAX_DNS_MAX_CONCURRENT_FORWARDS", 100_000);
   const maxTcpConnections = bounded("PARALLAX_DNS_MAX_TCP_CONNECTIONS", 100_000);
   return {
     ...(rateLimitPerSecond !== undefined ? { rateLimitPerSecond } : {}),
     ...(rateLimitBurst !== undefined ? { rateLimitBurst } : {}),
+    ...(rateLimitMaxClients !== undefined ? { rateLimitMaxClients } : {}),
     ...(forwardTimeoutMs !== undefined ? { forwardTimeoutMs } : {}),
     ...(maxConcurrentForwards !== undefined ? { maxConcurrentForwards } : {}),
     ...(maxTcpConnections !== undefined ? { maxTcpConnections } : {}),
@@ -413,6 +417,27 @@ export function usesPlaintextPostgres(connectionString: string): boolean {
     return mode !== "verify-ca" && mode !== "verify-full";
   } catch {
     return true;
+  }
+}
+
+/**
+ * Whether the connection is encrypted but unverified.
+ *
+ * `ssl=true` is accepted above as "not plaintext" while `sslmode=require` is
+ * refused, and that ordering is backwards: neither pins the server's identity,
+ * so `ssl=true` is not the stronger of the two. Tightening the refusal would
+ * stop an existing deployment at startup, so this reports rather than refuses
+ * -- an operator who reads it can move to `verify-full`, and nobody finds out
+ * during a rollout.
+ */
+export function usesUnverifiedPostgresTls(connectionString: string): boolean {
+  try {
+    const url = new URL(connectionString);
+    if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") return false;
+    const ssl = url.searchParams.get("ssl");
+    return ssl === "true" || ssl === "1";
+  } catch {
+    return false;
   }
 }
 

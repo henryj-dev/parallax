@@ -313,9 +313,24 @@ function withActor(request: Request, subject: string): Request {
 }
 
 /**
- * Bounds online guessing without letting an attacker lock anyone out: only
- * requests that fail authentication are counted, so a valid token is always
- * accepted immediately no matter how much noise precedes it.
+ * Tells a client that is failing to authenticate to back off, without letting
+ * it lock anybody out.
+ *
+ * Only failures are counted, and the count is taken *after* the credential has
+ * been checked -- so a valid token is accepted immediately however much noise
+ * precedes it, including from the same address. That is the property being
+ * bought, and it is the reason the check is not moved in front: a client key is
+ * an address, many real clients share one behind a proxy or a NAT, and refusing
+ * before checking would turn one attacker into an outage for everyone beside
+ * them.
+ *
+ * The cost of that choice, said plainly because it was once described as
+ * something else: this does **not** slow an attacker down. Every guess is still
+ * evaluated, and the answer still distinguishes a right token from a wrong one
+ * -- 429 rather than 401 is the only difference once the budget is spent. What
+ * makes guessing hopeless is the size of the secret, not this: `MIN_TOKEN_BYTES`
+ * is 32, issued tokens are 32 random bytes, and `isStrongBootstrapToken`
+ * refuses anything else.
  */
 class FailureThrottle {
   readonly #limit: number;

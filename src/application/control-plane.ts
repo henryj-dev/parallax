@@ -724,36 +724,41 @@ export class ControlPlane {
     const retried: string[] = [];
     const failed: { zone: string; error: string }[] = [];
     const skipped: string[] = [];
+    // The whole list is read before anything is applied. Paging by a moving
+    // offset while the rows are being changed underneath means the cursor and
+    // the data disagree: a row that leaves the page this loop has passed takes
+    // an unread row backwards past the offset with it, and that zone is never
+    // applied. It happens not to today, because applying a zone changes its
+    // state rather than removing the row -- but nothing says the overview must
+    // keep every row forever, and the failure would be a zone silently not
+    // applied by the command whose whole job is to apply them.
+    const pending: { zone: string; wasFailed: boolean }[] = [];
     let offset = 0;
     for (;;) {
       const page = await this.statusOverview({ limit: 500, offset });
       for (const row of page.zones) {
-        if (row.state === "applied" || row.state === "") {
-          skipped.push(row.zone);
-          continue;
-        }
-        if (row.state === "failed" && !retryFailed) {
+        if (row.state === "applied" || row.state === "") skipped.push(row.zone);
+        else if (row.state === "failed" && !retryFailed) {
           failed.push({ zone: row.zone, error: "zone apply previously failed" });
-          continue;
-        }
-        try {
-          const result = await this.apply(row.zone, undefined, undefined, actor);
-          // apply() records a failed view and returns; it does not throw. A
-          // pending zone that the provider refused this run is failed, not applied.
-          if (overallApplyState(result.statuses) === "failed") {
-            const message = result.statuses.find((status) => status.state === "failed")?.error ?? "apply failed";
-            failed.push({ zone: row.zone, error: message });
-          } else {
-            if (row.state === "failed") retried.push(row.zone);
-            else applied.push(row.zone);
-          }
-        } catch (error) {
-          failed.push({ zone: row.zone, error: error instanceof Error ? error.message : "apply failed" });
-        }
+        } else pending.push({ zone: row.zone, wasFailed: row.state === "failed" });
       }
-      if (!page.hasMore) break;
-      if (page.zones.length === 0) break;
+      if (!page.hasMore || page.zones.length === 0) break;
       offset += page.zones.length;
+    }
+
+    for (const row of pending) {
+      try {
+        const result = await this.apply(row.zone, undefined, undefined, actor);
+        // apply() records a failed view and returns; it does not throw. A
+        // pending zone that the provider refused this run is failed, not applied.
+        if (overallApplyState(result.statuses) === "failed") {
+          const message = result.statuses.find((status) => status.state === "failed")?.error ?? "apply failed";
+          failed.push({ zone: row.zone, error: message });
+        } else if (row.wasFailed) retried.push(row.zone);
+        else applied.push(row.zone);
+      } catch (error) {
+        failed.push({ zone: row.zone, error: error instanceof Error ? error.message : "apply failed" });
+      }
     }
     return { applied, retried, failed, skipped };
   }

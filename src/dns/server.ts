@@ -44,6 +44,17 @@ export interface DnsServerOptions {
   readonly maxTcpConnections?: number;
   readonly rateLimitPerSecond?: number;
   readonly rateLimitBurst?: number;
+  /**
+   * How many client addresses the limiter will track at once.
+   *
+   * Once the table is full an address it has not seen is refused, because
+   * evicting a live bucket would let an attacker cycling source addresses reset
+   * the allowance of the client it is aiming at. That is the right trade, and
+   * it means a flood of spoofed sources can deny service to genuinely new
+   * clients until the buckets age out -- so a deployment that expects more
+   * distinct clients than this should say so.
+   */
+  readonly rateLimitMaxClients?: number;
   /** Injected only by deterministic tests. */
   readonly now?: () => number;
   /** Resolves a bind or upstream hostname to the address both transports use. */
@@ -81,6 +92,7 @@ const DEFAULT_TCP_IDLE_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_TCP_CONNECTIONS = 1024;
 const DEFAULT_RATE_LIMIT_PER_SECOND = 100;
 const DEFAULT_RATE_LIMIT_BURST = 200;
+const DEFAULT_RATE_LIMIT_MAX_CLIENTS = 10_000;
 // The DNS-over-TCP prefix is an unsigned 16-bit payload length. Keeping only
 // one incomplete frame means a peer can never make one connection retain more
 // than this, even while it pipelines complete requests behind it.
@@ -116,6 +128,7 @@ export function createDnsServer(options: DnsServerOptions): {
     positiveInteger(options.rateLimitPerSecond ?? DEFAULT_RATE_LIMIT_PER_SECOND, "rateLimitPerSecond"),
     positiveInteger(options.rateLimitBurst ?? DEFAULT_RATE_LIMIT_BURST, "rateLimitBurst"),
     options.now ?? Date.now,
+    positiveInteger(options.rateLimitMaxClients ?? DEFAULT_RATE_LIMIT_MAX_CLIENTS, "rateLimitMaxClients"),
   );
   const resolveHost = options.resolveHost ?? resolveDnsAddress;
   const resolveForwardHost = createTimedDnsResolver(resolveHost);
@@ -907,9 +920,13 @@ function positiveInteger(value: number, name: string): number {
   return value;
 }
 
-function createRateLimiter(ratePerSecond: number, burst: number, now: () => number): { allow(address: string): boolean } {
+function createRateLimiter(
+  ratePerSecond: number,
+  burst: number,
+  now: () => number,
+  maxClients: number,
+): { allow(address: string): boolean } {
   const clients = new Map<string, { tokens: number; at: number }>();
-  const maxClients = 10_000;
   const idleExpiryMs = Math.max(1000, Math.ceil(burst * 1000 / ratePerSecond));
   let lastSweep = Number.NEGATIVE_INFINITY;
   return {
