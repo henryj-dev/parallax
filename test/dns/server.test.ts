@@ -547,6 +547,52 @@ describe("DNS server", () => {
     assert.equal(reply.subarray(-2).toString("hex"), "dead", "the upstream's bytes came back as they were");
   });
 
+  describe("messages that are not standard IN queries", () => {
+    /**
+     * The header used to be read for its id and its RD bit and nothing else.
+     * A message whose opcode says UPDATE has a question-shaped first section,
+     * so it parsed, was answered as a question, and had its opcode echoed back
+     * -- which tells the sender the operation was understood.
+     */
+    for (const [name, opcode] of [["UPDATE", 5], ["NOTIFY", 4], ["STATUS", 2]] as const) {
+      it(`answers NOTIMP to an opcode ${name} message`, async () => {
+        const { port } = await start({ zones: () => [EXAMPLE] });
+        const query = buildQuery("www.example.com");
+        query.writeUInt16BE(query.readUInt16BE(2) | (opcode << 11), 2);
+        assert.equal(rcodeOf(received(await ask(port, query))), RCODE.NOTIMP);
+      });
+    }
+
+    it("refuses a non-IN question about a name it is authoritative for", async () => {
+      // Every record here is IN, and `writeRecord` writes IN regardless of what
+      // was asked -- so answering a CHAOS question meant replying to a question
+      // nobody asked.
+      const { port } = await start({ zones: () => [EXAMPLE] });
+      const query = buildQuery("www.example.com");
+      query.writeUInt16BE(3, query.length - 2); // QCLASS CHAOS
+      assert.equal(rcodeOf(received(await ask(port, query))), RCODE.REFUSED);
+    });
+
+    it("still forwards a non-IN question about a name that is not its own", async () => {
+      // `version.bind` CHAOS TXT is an ordinary thing to ask a resolver, and
+      // this process is also a resolver. Refusing non-IN before the forwarding
+      // decision would have made it answer for names it has no business in.
+      const { socket: upstream, port: upstreamPort } = await upstreamOn();
+      upstream.on("message", (message, remote) => {
+        const reply = Buffer.from(message);
+        reply.writeUInt16BE(0x8180, 2);
+        upstream.send(Buffer.concat([reply, Buffer.of(0xc4, 0x05)]), remote.port, remote.address);
+      });
+      closers.push(async () => { upstream.close(); });
+
+      const { port } = await start({ zones: () => [EXAMPLE], forwardTo: [`127.0.0.1#${upstreamPort}`] });
+      const query = buildQuery("version.bind", TYPE.TXT);
+      query.writeUInt16BE(3, query.length - 2); // QCLASS CHAOS
+      const reply = received(await ask(port, query));
+      assert.equal(reply.subarray(-2).toString("hex"), "c405", "the upstream answered, not this process");
+    });
+  });
+
   it("ignores forged-source and mismatched upstream datagrams until a valid response arrives", async () => {
     const { socket: upstream, port: upstreamPort } = await upstreamOn();
     const rogue = createSocket("udp4");

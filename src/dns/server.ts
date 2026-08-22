@@ -5,8 +5,8 @@ import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
 import { encodeRdata, encodeSoa, rrType } from "./rdata.ts";
 import {
-  CLASS_IN, MAX_RDATA_BYTES, MIN_UDP_PAYLOAD, RCODE, TYPE, WireFormatError,
-  isResponseToQuery, readQuery, writeName, writeReply, type ParsedQuery, type ResourceRecord,
+  CLASS_ANY, CLASS_IN, MAX_RDATA_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
+  isResponseToQuery, opcodeOf, readQuery, writeName, writeReply, type ParsedQuery, type ResourceRecord,
 } from "./wire.ts";
 
 /** One zone's answers, as the control plane computed them. */
@@ -147,6 +147,14 @@ export function createDnsServer(options: DnsServerOptions): {
       return forwarded ?? writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: false }, Number.MAX_SAFE_INTEGER);
     };
 
+    // Anything that is not a standard query. UPDATE, NOTIFY and STATUS all
+    // carry a question-shaped first section, so parsing succeeded and the old
+    // code answered them as though they were questions -- echoing the opcode
+    // back, which claims the operation was understood. None of them is a thing
+    // to relay either, so this sits ahead of the forwarder.
+    if (opcodeOf(query) !== OPCODE.QUERY) {
+      return writeReply({ query, rcode: RCODE.NOTIMP, authoritative: false }, Number.MAX_SAFE_INTEGER);
+    }
     if (query.question.type === TYPE.AXFR
       && (!overTcp || !cidrsContain(transferAllow, clientAddress))) {
       return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
@@ -173,6 +181,18 @@ export function createDnsServer(options: DnsServerOptions): {
     // asking for one of our own names.
     if (forwardTo.length > 0 && servedByProvider(zone, query.question.name, query.question.type)) {
       return relay();
+    }
+    // Only now, once this is a name we answer for ourselves. Every record we
+    // hold is IN, and `writeRecord` writes IN whatever was asked -- so a CHAOS
+    // question used to come back carrying IN answers, which is a reply to a
+    // question nobody asked.
+    //
+    // Deliberately after the forwarding decision rather than before it. This
+    // process is also a resolver, and `version.bind` CHAOS TXT is an ordinary
+    // thing for a client to ask an upstream. Refusing non-IN at the top would
+    // have made the forwarder lie about names that are not ours at all.
+    if (query.question.class !== CLASS_IN && query.question.class !== CLASS_ANY) {
+      return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
     }
     const parts = answerFromZone(query, zone, negativeTtl, options.onUnservable);
     const budget = overTcp ? Number.MAX_SAFE_INTEGER : query.udpPayloadSize;

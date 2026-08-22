@@ -31,6 +31,21 @@ const TYPE_NAMES = new Map<number, string>(Object.entries(TYPE).map(([name, valu
 
 export const RCODE = Object.freeze({ NOERROR: 0, FORMERR: 1, SERVFAIL: 2, NXDOMAIN: 3, NOTIMP: 4, REFUSED: 5 });
 
+/** QCLASS 255, the one class a question may carry that is not a class. */
+export const CLASS_ANY = 255;
+
+/**
+ * The opcodes this build knows by name. Everything else is answered NOTIMP:
+ * a message whose opcode says UPDATE is not a question, however much its first
+ * section looks like one.
+ */
+export const OPCODE = Object.freeze({ QUERY: 0 });
+
+/** The four bits of the header that say what kind of message this is. */
+export function opcodeOf(query: Pick<ParsedQuery, "flags">): number {
+  return (query.flags >> 11) & 0xf;
+}
+
 export interface Question {
   /** Lowercased, no trailing dot. The root is the empty string. */
   readonly name: string;
