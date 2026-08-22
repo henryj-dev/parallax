@@ -244,7 +244,10 @@ MVP 이후에는 다중 조직, 추가 DNS view, 자동 apply, 승인 workflow,
 
 - 구현 언어: TypeScript (strict, 타입 스트리핑 — 빌드 없이 `.ts` 를 직접 실행)
 - 런타임: Node.js 24 이상 · 패키지 매니저 pnpm 11 · 모듈 시스템 ESM
-- Git 기본 브랜치: `main` · GitHub 저장소: `mack-erel/parallax`
+- Git 기본 브랜치: `main` · GitHub 저장소: `henryj-dev/parallax`
+  (2026-08-23 에 `mack-erel/parallax` 에서 옮겨 왔다. 형제 프로젝트인
+  `heliopause`·`barycenter` 와 같은 조직이다. 감사 리포트들이 대상으로 적은
+  `mack-erel/parallax` 는 그 시점의 이름이므로 그대로 둔다.)
 
 이 절이 한때 *"아직 확정하지 않았다"* 고 적어 두었던 것들은 모두 정해졌다.
 
