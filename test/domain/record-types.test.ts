@@ -120,3 +120,65 @@ describe("record types", () => {
     );
   });
 });
+
+/**
+ * A record whose RDATA is too large for the wire.
+ *
+ * `RDLENGTH` is a uint16, and nothing used to check it. Content that encoded to
+ * more than 65535 bytes was accepted, stored, and then made the DNS listener
+ * throw while assembling the reply -- past every per-record guard, so the query
+ * was dropped without an answer and without a log line. The types that allow it
+ * are the ones whose content is unbounded base64 or hexadecimal.
+ */
+describe("RDATA that the wire cannot carry", () => {
+  const OVERSIZED = [
+    // 90,000 base64 characters is roughly 67,500 bytes of RDATA.
+    { type: "OPENPGPKEY", content: "a".repeat(90_000) },
+    { type: "DNSKEY", content: `257 3 13 ${"a".repeat(90_000)}` },
+    { type: "CERT", content: `1 12345 8 ${"a".repeat(90_000)}` },
+    // Hexadecimal is two characters to the byte, so these need twice as many.
+    // Digest type 5 is one the length table does not know, which is what keeps
+    // `hasDigestLengthFor` from rejecting the DS sample for the wrong reason.
+    { type: "TLSA", content: `3 1 1 ${"ab".repeat(70_000)}` },
+    { type: "SMIMEA", content: `3 1 1 ${"ab".repeat(70_000)}` },
+    { type: "SSHFP", content: `4 2 ${"ab".repeat(70_000)}` },
+    { type: "DS", content: `12345 8 5 ${"ab".repeat(70_000)}` },
+  ] as const;
+
+  for (const sample of OVERSIZED) {
+    it(`refuses ${sample.type} content that exceeds the RDATA limit`, () => {
+      assert.throws(
+        () => createDesiredRecord("big", { name: "key", type: sample.type, content: sample.content, ttl: 300 }),
+        (error: unknown) => error instanceof DomainValidationError
+          && error.issues.some((issue) => /cannot carry more than 65535/u.test(issue)),
+      );
+    });
+  }
+
+  it("accepts content that fits", () => {
+    // 80,000 base64 characters is 60,000 bytes -- large, and still answerable.
+    const record = createDesiredRecord("fits", {
+      name: "key", type: "OPENPGPKEY", content: "a".repeat(80_000), ttl: 300,
+    });
+    assert.equal(record.type, "OPENPGPKEY");
+  });
+
+  /**
+   * The rule is about what may be written, so it is asked only on the way in.
+   *
+   * Every read of a zone rebuilds its records through `createDesiredRecord`. A
+   * size rule applied there too would make one stored oversized record take the
+   * whole zone away -- `listZones`, readiness and the DNS snapshot with it --
+   * and leave no way to delete the record, since deleting it means reading the
+   * zone first. `readPersistedViewName` made the same call for view names.
+   */
+  it("still reads a record already stored that exceeds the limit", () => {
+    const rehydrated = createDesiredRecord(
+      "big",
+      { name: "key", type: "OPENPGPKEY", content: "a".repeat(90_000), ttl: 300 },
+      { rehydrate: true },
+    );
+    assert.equal(rehydrated.id, "big");
+    assert.equal(rehydrated.content.length, 90_000);
+  });
+});

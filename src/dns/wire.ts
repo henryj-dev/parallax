@@ -55,6 +55,18 @@ export class WireFormatError extends Error {
 const HEADER_BYTES = 12;
 const MAX_NAME_BYTES = 255;
 const MAX_LABEL_BYTES = 63;
+/**
+ * RDLENGTH is an unsigned 16-bit field, so this is what a resource record can
+ * carry -- not a policy, a property of the format.
+ *
+ * Exported because two places have to agree with it and neither is here: the
+ * domain refuses to store content that would exceed it, and the listener
+ * refuses to answer with content that already does. Without the second, a
+ * record stored before this existed would make `writeRecord` throw while
+ * assembling the reply -- past every per-record guard, so the query was
+ * answered with nothing at all and nothing was logged.
+ */
+export const MAX_RDATA_BYTES = 0xffff;
 /** Without an OPT record a client is promised no more than this. */
 export const MIN_UDP_PAYLOAD = 512;
 

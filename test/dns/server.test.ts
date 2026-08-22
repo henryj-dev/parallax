@@ -712,6 +712,34 @@ describe("DNS server", () => {
     assert.match(unservable[0]?.reason ?? "", /not an IPv4 address/);
   });
 
+  it("answers SERVFAIL, and says which record, for RDATA the wire cannot carry", async () => {
+    // Measured, not supposed: this query used to get no reply at all. The
+    // content encodes, so the per-record guard above let it through; the throw
+    // came later, in `writeRecord`, where RDLENGTH is written into a uint16.
+    // Past every guard, the exception reached the socket handler, which drops
+    // the datagram -- so the name went dark and nothing was logged.
+    //
+    // The zone is built here rather than through `createDesiredRecord`, which
+    // now refuses this content on the way in. Going through it would make this
+    // test prove the first defence twice and never reach the second.
+    const unservable: UnservableRecord[] = [];
+    const oversized: ServedZone = {
+      name: "example.com",
+      serial: 1,
+      records: [{ name: "key", type: "OPENPGPKEY", content: "a".repeat(90_000), ttl: 60 }],
+    };
+    const { port } = await start({
+      zones: () => [oversized],
+      onUnservable: (record) => unservable.push(record),
+    });
+    const reply = received(await ask(port, buildQuery("key.example.com", TYPE.OPENPGPKEY)));
+    assert.equal(rcodeOf(reply), RCODE.SERVFAIL);
+    assert.equal(unservable.length, 1);
+    assert.equal(unservable[0]?.name, "key");
+    assert.equal(unservable[0]?.type, "OPENPGPKEY");
+    assert.match(unservable[0]?.reason ?? "", /cannot carry more than 65535/u);
+  });
+
   describe("wildcards", () => {
     // The desired state accepts `*` and `*.name`, and every other publisher of
     // the internal view -- a zone file, PowerDNS, Cloudflare -- expands them.

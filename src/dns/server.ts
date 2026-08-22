@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
 import { encodeRdata, encodeSoa, rrType } from "./rdata.ts";
 import {
-  CLASS_IN, MIN_UDP_PAYLOAD, RCODE, TYPE, WireFormatError,
+  CLASS_IN, MAX_RDATA_BYTES, MIN_UDP_PAYLOAD, RCODE, TYPE, WireFormatError,
   isResponseToQuery, readQuery, writeName, writeReply, type ParsedQuery, type ResourceRecord,
 } from "./wire.ts";
 
@@ -55,6 +55,13 @@ export interface DnsServerOptions {
    * to be told about, not a record to quietly leave out.
    */
   readonly onUnservable?: (record: UnservableRecord) => void;
+  /**
+   * Told when a reply could not be assembled at all, after every per-record
+   * guard has passed. There is no record to name by then, so this says only
+   * which zone and which query -- which is still the difference between a
+   * reported failure and a query that vanished.
+   */
+  readonly onUnanswerable?: (detail: { zone: string; name: string; reason: string }) => void;
   /** Hosts that receive NOTIFY when a served zone's serial rises. `host` or `host:port`. */
   readonly notifyTo?: readonly string[];
   /** Injected by tests that capture NOTIFY instead of sending UDP. */
@@ -168,7 +175,27 @@ export function createDnsServer(options: DnsServerOptions): {
       return relay();
     }
     const parts = answerFromZone(query, zone, negativeTtl, options.onUnservable);
-    return writeReply(parts, overTcp ? Number.MAX_SAFE_INTEGER : query.udpPayloadSize);
+    const budget = overTcp ? Number.MAX_SAFE_INTEGER : query.udpPayloadSize;
+    try {
+      return writeReply(parts, budget);
+    } catch (error) {
+      // Everything that knows which record it was has already run. Whatever is
+      // left -- a name that will not re-encode, a type this build cannot write
+      // -- must still be an answer: dropping the datagram makes the name look
+      // like a black hole to the client and leaves nothing in any log.
+      // `message` names this function's own Buffer parameter here, so the
+      // shared helper of that name is out of reach.
+      options.onUnanswerable?.({
+        zone: zone.name,
+        name: query.question.name,
+        reason: error instanceof Error ? error.message : "unknown error",
+      });
+      try {
+        return writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: true }, budget);
+      } catch {
+        return undefined;
+      }
+    }
   }
 
   /**
@@ -448,7 +475,7 @@ function answerFromZone(
           name: absolute(record.name, zone.name),
           type: rrType(record.type),
           ttl: record.ttl,
-          data: encodeRdata(record.type, record.content),
+          data: servableRdata(record.type, record.content),
         });
       } catch (error) {
         onUnservable?.({ zone: zone.name, name: record.name, type: record.type, reason: message(error) });
@@ -486,7 +513,7 @@ function answerFromZone(
   let unservable = false;
   for (const record of wanted) {
     try {
-      answers.push({ name, type: rrType(record.type), ttl: record.ttl, data: encodeRdata(record.type, record.content) });
+      answers.push({ name, type: rrType(record.type), ttl: record.ttl, data: servableRdata(record.type, record.content) });
     } catch (error) {
       // The whole RRset fails, not just this record. Half an RRset is the
       // dangerous answer: it looks complete, a resolver caches it, and whoever
@@ -502,6 +529,24 @@ function answerFromZone(
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
+}
+
+/**
+ * The record's RDATA, refused here if the wire cannot carry it.
+ *
+ * Measured while the record is still in hand. `writeRecord` would find the same
+ * thing a moment later -- it writes the length into a uint16 -- but by then the
+ * only thing left is a half-assembled buffer, and the caller could say which
+ * zone had a problem and not which record. Both callers of this already report
+ * an unservable record and answer SERVFAIL, which is exactly the right answer;
+ * they just never got the chance, because the throw happened after them.
+ */
+function servableRdata(type: RecordType, content: string): Buffer {
+  const data = encodeRdata(type, content);
+  if (data.length > MAX_RDATA_BYTES) {
+    throw new WireFormatError(`RDATA is ${data.length} bytes and a DNS record cannot carry more than ${MAX_RDATA_BYTES}`);
+  }
+  return data;
 }
 
 /**

@@ -367,7 +367,10 @@ function readZoneSnapshot(value: unknown): Zone {
       const id = readString(record.id, "record id");
       if (recordIds.has(id)) throw new Error(`duplicate record ${id}`);
       recordIds.add(id);
-      return createDesiredRecord(id, record);
+      // Reading, not accepting. A stored record that today's rules would refuse
+      // stays readable so an operator can delete it; refusing here would take
+      // the whole zone away instead.
+      return createDesiredRecord(id, record, { rehydrate: true });
     });
     return { name, records };
   });

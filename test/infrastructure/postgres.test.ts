@@ -623,6 +623,34 @@ describe("PostgresApplyLock", () => {
 
 function normalize(text: string): string { return text.replace(/\s+/g, " ").trim(); }
 
+describe("a stored snapshot the current rules would not accept", () => {
+  /**
+   * The same call `readPersistedViewName` made for view names: what is already
+   * in the store stays readable, so an operator can remove it.
+   *
+   * Reading a zone rebuilds every record through `createDesiredRecord`. If the
+   * RDATA size limit were asked on that path too, one oversized record would
+   * make the zone -- and `listZones`, readiness and the DNS snapshot with it --
+   * unreadable, and deleting the record needs the zone read first.
+   */
+  it("reads a zone whose RDATA is larger than the wire allows", async () => {
+    const oversized: Zone = {
+      name: "example.com", revision: 4,
+      views: [{
+        name: "external",
+        records: [{ id: "oversized", name: "key", type: "OPENPGPKEY", content: "a".repeat(90_000), ttl: 60 }],
+      }],
+      createdAt: "2026-08-08T00:00:00.000Z", updatedAt: "2026-08-08T00:00:00.000Z",
+    };
+    const pool = new FakePool(() => ({ rows: [{ snapshot: oversized }] }));
+    const repository = new PostgresZoneRepository(pool);
+
+    const zone = await repository.get("example.com");
+    assert.equal(zone?.views[0]?.records[0]?.id, "oversized");
+    assert.equal(zone?.views[0]?.records[0]?.content.length, 90_000);
+  });
+});
+
 function zoneFixture(revision: number): Zone {
   return {
     name: "example.com", revision,

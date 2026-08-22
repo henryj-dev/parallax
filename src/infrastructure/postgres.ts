@@ -667,7 +667,10 @@ function readZone(value: unknown): Zone {
       const id = readString(object.id, "record id");
       if (recordIds.has(id)) throw new Error(`invalid PostgreSQL zone snapshot: duplicate record ${id}`);
       recordIds.add(id);
-      return createDesiredRecord(id, object);
+      // Reading, not accepting. A stored record that today's rules would refuse
+      // stays readable so an operator can delete it; refusing here would take
+      // the whole zone away instead.
+      return createDesiredRecord(id, object, { rehydrate: true });
     });
     return { name: viewName, records };
   });

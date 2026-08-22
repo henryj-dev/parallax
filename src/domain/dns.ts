@@ -1,5 +1,6 @@
 import { BlockList, isIP } from "node:net";
 import { encodeRdata } from "../dns/rdata.ts";
+import { MAX_RDATA_BYTES } from "../dns/wire.ts";
 
 /**
  * Every record type Parallax will hold in a desired state.
@@ -542,7 +543,30 @@ function ipv6Groups(text: string): number[] | undefined {
   return parsed.some(Number.isNaN) ? undefined : parsed;
 }
 
-export function createDesiredRecord(id: string, input: unknown): DesiredRecord {
+export interface CreateDesiredRecordOptions {
+  /**
+   * Rebuilding a record that is already in the store, rather than accepting a
+   * new one.
+   *
+   * Every read of a zone runs its records back through this function, so a rule
+   * added here applies retroactively to everything already saved. For a rule
+   * about what may be *written*, that is the wrong direction: one stored record
+   * that breaks it would make the whole zone unreadable -- taking `listZones`,
+   * readiness and the DNS snapshot with it -- and leave no way to delete the
+   * record, because deleting it requires reading the zone first.
+   *
+   * So the size limit is asked only of new content. `readPersistedViewName`
+   * made the same call for view names, for the same reason: stored state stays
+   * readable so an operator can remove it.
+   */
+  readonly rehydrate?: boolean;
+}
+
+export function createDesiredRecord(
+  id: string,
+  input: unknown,
+  options: CreateDesiredRecordOptions = {},
+): DesiredRecord {
   const issues: string[] = [];
   const value = asObject(input);
   const recordId = validateRecordId(id);
@@ -595,7 +619,12 @@ export function createDesiredRecord(id: string, input: unknown): DesiredRecord {
   if (RECORD_TYPES.some((candidate) => candidate === typeValue) && !contentIssue) {
     content = canonicalizeRecordContent(typeValue, content);
     try {
-      encodeRdata(typeValue as RecordType, content);
+      const encoded = encodeRdata(typeValue as RecordType, content);
+      // Only on the way in. A record already in the store that exceeds this is
+      // left readable on purpose -- see `rehydrate` above.
+      if (!options.rehydrate && encoded.length > MAX_RDATA_BYTES) {
+        issues.push(`${typeValue} content encodes to ${encoded.length} bytes of RDATA; a DNS record cannot carry more than ${MAX_RDATA_BYTES}`);
+      }
     } catch (error) {
       issues.push(error instanceof Error ? error.message : `${typeValue} content cannot be encoded`);
     }

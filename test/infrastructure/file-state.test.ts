@@ -365,6 +365,38 @@ describe("FileStateRepository", () => {
   });
 });
 
+describe("state written before a rule existed", () => {
+  /**
+   * A stored record the current rules would refuse must still be readable.
+   *
+   * Every read rebuilds records through `createDesiredRecord`, so a rule about
+   * what may be *written* would apply retroactively to the whole store if it
+   * were asked here too. One oversized record would then make the zone
+   * unreadable -- and deleting the record means reading the zone first, so
+   * there would be no way out. This is the same call `readPersistedViewName`
+   * already made for view names.
+   */
+  it("reads a zone holding RDATA larger than the wire allows, so it can be deleted", async () => {
+    const path = await statePath();
+    const repository = new FileStateRepository(path);
+    await repository.save(zoneFixture("legacy.example", 1));
+
+    // Written straight to the file, because saving it through the repository is
+    // exactly what the new rule refuses.
+    const raw = JSON.parse(await readFile(path, "utf8")) as {
+      zones: Record<string, { views: { records: Record<string, unknown>[] }[] }>;
+    };
+    raw.zones["legacy.example"]!.views[0]!.records.push({
+      id: "oversized", name: "key", type: "OPENPGPKEY", content: "a".repeat(90_000), ttl: 60,
+    });
+    await writeFile(path, JSON.stringify(raw), "utf8");
+
+    const zone = await new FileStateRepository(path).get("legacy.example");
+    assert.equal(zone?.views[0]?.records.length, 2);
+    assert.equal(zone?.views[0]?.records[1]?.id, "oversized");
+  });
+});
+
 async function statePath(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "parallax-file-state-"));
   temporaryDirectories.push(directory);

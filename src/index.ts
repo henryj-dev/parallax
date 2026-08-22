@@ -416,6 +416,12 @@ if (config.dns) {
       // query was answered SERVFAIL, so this line is the only place it is said.
       console.error(`parallax: ${record.zone} ${record.name} ${record.type} could not be answered: ${record.reason}`);
     },
+    onUnanswerable: (detail) => {
+      // No record to name: every per-record guard passed and the reply still
+      // could not be built. Said out loud because the query was answered
+      // SERVFAIL, and this line is the only place the reason exists.
+      console.error(`parallax: ${detail.zone} could not assemble a reply for ${detail.name}: ${detail.reason}`);
+    },
   });
   try {
     await dnsServer.listen(dnsConfig.port, dnsConfig.host);
