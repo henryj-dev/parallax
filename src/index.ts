@@ -411,6 +411,8 @@ if (config.dns) {
     forwardAllow: dnsConfig.forwardAllow,
     transferAllow: dnsConfig.transferAllow,
     ...(dnsConfig.notifyTo ? { notifyTo: dnsConfig.notifyTo } : {}),
+    // Absent values stay absent, so the listener keeps its own defaults.
+    ...dnsConfig.limits,
     onUnservable: (record) => {
       // Stored content the domain accepted and the wire cannot carry. The
       // query was answered SERVFAIL, so this line is the only place it is said.

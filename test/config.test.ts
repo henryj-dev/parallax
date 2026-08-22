@@ -206,7 +206,51 @@ describe("configuration", () => {
       forwardTo: [],
       forwardAllow: ["127.0.0.0/8", "::1/128"],
       transferAllow: [],
+      limits: {},
     });
+  });
+
+  /**
+   * The listener has always had these; nothing reached them, so an operator
+   * could not lower a single one without editing the source. An absent value
+   * must stay absent, or exposing them would change what an existing
+   * deployment does.
+   */
+  it("reads the listener's limits, and leaves them to the listener when unset", () => {
+    assert.deepEqual(readConfig({ PARALLAX_DNS_PORT: "53" }).dns?.limits, {});
+    assert.deepEqual(
+      readConfig({
+        PARALLAX_DNS_PORT: "53",
+        PARALLAX_DNS_RATE_LIMIT_PER_SECOND: "20",
+        PARALLAX_DNS_RATE_LIMIT_BURST: "40",
+        PARALLAX_DNS_FORWARD_TIMEOUT_MS: "2000",
+        PARALLAX_DNS_MAX_CONCURRENT_FORWARDS: "64",
+        PARALLAX_DNS_MAX_TCP_CONNECTIONS: "128",
+      }).dns?.limits,
+      {
+        rateLimitPerSecond: 20,
+        rateLimitBurst: 40,
+        forwardTimeoutMs: 2000,
+        maxConcurrentForwards: 64,
+        maxTcpConnections: 128,
+      },
+    );
+    for (const bad of ["0", "-1", "1.5", "many"]) {
+      assert.throws(
+        () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_RATE_LIMIT_PER_SECOND: bad }),
+        /PARALLAX_DNS_RATE_LIMIT_PER_SECOND must be an integer/u,
+      );
+    }
+    // A bucket that can never fill refuses traffic the rate says is allowed,
+    // and the symptom is intermittent -- worth refusing to start over.
+    assert.throws(
+      () => readConfig({
+        PARALLAX_DNS_PORT: "53",
+        PARALLAX_DNS_RATE_LIMIT_PER_SECOND: "100",
+        PARALLAX_DNS_RATE_LIMIT_BURST: "50",
+      }),
+      /BURST must be at least/u,
+    );
   });
 
   it("takes the DNS listener's own host, and otherwise the portal's, rather than every address", () => {

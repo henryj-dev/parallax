@@ -71,6 +71,31 @@ export interface DnsListenerSettings {
   readonly transferAllow: readonly string[];
   /** Hosts that receive NOTIFY when a served zone's serial rises. `host` or `host:port`. */
   readonly notifyTo?: readonly string[];
+  /**
+   * What the listener will spend on one client and on the network as a whole.
+   *
+   * The listener has always had these; nothing reached them. They belong here
+   * for the same reason the upstreams do -- they decide how much of this
+   * process a stranger on the network can occupy, which is a fact about where
+   * it is deployed and not a preference a portal session should be able to set.
+   *
+   * Absent means the listener's own default, so a deployment that sets none of
+   * them behaves exactly as it did before they were reachable.
+   */
+  readonly limits: DnsListenerLimits;
+}
+
+export interface DnsListenerLimits {
+  /** Queries per second allowed from one client address. */
+  readonly rateLimitPerSecond?: number;
+  /** How far one client may run ahead of that rate before it is refused. */
+  readonly rateLimitBurst?: number;
+  /** How long to wait for an upstream before trying the next one. */
+  readonly forwardTimeoutMs?: number;
+  /** Relayed queries in flight at once, across every client. */
+  readonly maxConcurrentForwards?: number;
+  /** Open DNS-over-TCP connections. */
+  readonly maxTcpConnections?: number;
 }
 
 export interface OidcSettings {
@@ -173,6 +198,41 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     forwardAllow,
     transferAllow,
     ...(notifyTo.length > 0 ? { notifyTo } : {}),
+    limits: readDnsLimits(environment),
+  };
+}
+
+/**
+ * Each one is optional and absent means the listener's own default, so a
+ * deployment that sets none of these is unchanged by their existence.
+ */
+function readDnsLimits(environment: NodeJS.ProcessEnv): DnsListenerLimits {
+  const bounded = (name: string, maximum: number): number | undefined => {
+    const raw = environment[name]?.trim();
+    if (!raw) return undefined;
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+      throw new Error(`${name} must be an integer between 1 and ${maximum}`);
+    }
+    return value;
+  };
+  const rateLimitPerSecond = bounded("PARALLAX_DNS_RATE_LIMIT_PER_SECOND", 1_000_000);
+  const rateLimitBurst = bounded("PARALLAX_DNS_RATE_LIMIT_BURST", 1_000_000);
+  // A burst below the rate is a bucket that can never fill, which refuses
+  // traffic the rate says is allowed -- and the symptom is intermittent, so it
+  // is worth refusing to start over.
+  if (rateLimitPerSecond !== undefined && rateLimitBurst !== undefined && rateLimitBurst < rateLimitPerSecond) {
+    throw new Error("PARALLAX_DNS_RATE_LIMIT_BURST must be at least PARALLAX_DNS_RATE_LIMIT_PER_SECOND");
+  }
+  const forwardTimeoutMs = bounded("PARALLAX_DNS_FORWARD_TIMEOUT_MS", 60_000);
+  const maxConcurrentForwards = bounded("PARALLAX_DNS_MAX_CONCURRENT_FORWARDS", 100_000);
+  const maxTcpConnections = bounded("PARALLAX_DNS_MAX_TCP_CONNECTIONS", 100_000);
+  return {
+    ...(rateLimitPerSecond !== undefined ? { rateLimitPerSecond } : {}),
+    ...(rateLimitBurst !== undefined ? { rateLimitBurst } : {}),
+    ...(forwardTimeoutMs !== undefined ? { forwardTimeoutMs } : {}),
+    ...(maxConcurrentForwards !== undefined ? { maxConcurrentForwards } : {}),
+    ...(maxTcpConnections !== undefined ? { maxTcpConnections } : {}),
   };
 }
 
