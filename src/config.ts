@@ -92,6 +92,14 @@ export interface DnsListenerLimits {
   readonly rateLimitBurst?: number;
   /** How many client addresses the limiter tracks before refusing unknown ones. */
   readonly rateLimitMaxClients?: number;
+  /**
+   * Send an unproven UDP client a truncated reply so it must return over TCP.
+   *
+   * EDNS cookies are always offered and checked; this decides what to do with a
+   * client that has not answered one. Off by default because most resolvers do
+   * not implement RFC 7873 and turning it on sends all of them through TCP.
+   */
+  readonly requireCookie?: boolean;
   /** How long to wait for an upstream before trying the next one. */
   readonly forwardTimeoutMs?: number;
   /** Relayed queries in flight at once, across every client. */
@@ -230,7 +238,9 @@ function readDnsLimits(environment: NodeJS.ProcessEnv): DnsListenerLimits {
   const forwardTimeoutMs = bounded("PARALLAX_DNS_FORWARD_TIMEOUT_MS", 60_000);
   const maxConcurrentForwards = bounded("PARALLAX_DNS_MAX_CONCURRENT_FORWARDS", 100_000);
   const maxTcpConnections = bounded("PARALLAX_DNS_MAX_TCP_CONNECTIONS", 100_000);
+  const requireCookie = readOptIn(environment.PARALLAX_DNS_REQUIRE_COOKIE, "PARALLAX_DNS_REQUIRE_COOKIE");
   return {
+    ...(requireCookie ? { requireCookie } : {}),
     ...(rateLimitPerSecond !== undefined ? { rateLimitPerSecond } : {}),
     ...(rateLimitBurst !== undefined ? { rateLimitBurst } : {}),
     ...(rateLimitMaxClients !== undefined ? { rateLimitMaxClients } : {}),

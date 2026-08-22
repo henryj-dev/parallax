@@ -29,7 +29,19 @@ export const TYPE = Object.freeze({
 
 const TYPE_NAMES = new Map<number, string>(Object.entries(TYPE).map(([name, value]) => [value as number, name]));
 
-export const RCODE = Object.freeze({ NOERROR: 0, FORMERR: 1, SERVFAIL: 2, NXDOMAIN: 3, NOTIMP: 4, REFUSED: 5 });
+export const RCODE = Object.freeze({
+  NOERROR: 0, FORMERR: 1, SERVFAIL: 2, NXDOMAIN: 3, NOTIMP: 4, REFUSED: 5,
+  /**
+   * "I do not speak the EDNS version you asked for." Extended: it does not fit
+   * the header's four bits and is carried in the OPT record, so it can only be
+   * said to a client that sent one -- which is exactly the client that can ask
+   * the question.
+   */
+  BADVERS: 16,
+});
+
+/** The highest EDNS version this build understands. */
+export const MAX_EDNS_VERSION = 0;
 
 /** QCLASS 255, the one class a question may carry that is not a class. */
 export const CLASS_ANY = 255;
@@ -61,6 +73,13 @@ export interface ParsedQuery {
   /** Largest reply the client will accept over UDP, from its OPT record. */
   readonly udpPayloadSize: number;
   readonly hasOpt: boolean;
+  /** EDNS version the client claims. 0 when it sent no OPT record. */
+  readonly ednsVersion: number;
+  /**
+   * The client's EDNS COOKIE option, exactly as it arrived: 8 bytes of client
+   * cookie, optionally followed by 8 to 32 bytes this server minted earlier.
+   */
+  readonly cookie?: Buffer;
 }
 
 export class WireFormatError extends Error {
@@ -113,8 +132,10 @@ export function readQuery(message: Buffer): ParsedQuery {
     // The client's advertised size is a ceiling, not a floor: sending more than
     // it asked for is how a reply gets fragmented and dropped. Only the absent
     // case falls back to 512, and an absurdly large claim is capped.
-    udpPayloadSize: opt === undefined ? MIN_UDP_PAYLOAD : Math.min(Math.max(opt, 512), 4096),
+    udpPayloadSize: opt === undefined ? MIN_UDP_PAYLOAD : Math.min(Math.max(opt.payloadSize, 512), 4096),
     hasOpt: opt !== undefined,
+    ednsVersion: opt?.version ?? 0,
+    ...(opt?.cookie ? { cookie: opt.cookie } : {}),
   };
 }
 
@@ -143,13 +164,42 @@ export function isResponseToQuery(message: Buffer, query: ParsedQuery): boolean 
 
 /**
  * Walks the records after the question looking for the client's OPT record,
- * which is where it says how large a reply it can take.
+ * which is where it says how large a reply it can take and which version of
+ * EDNS it is speaking.
  *
  * Returns `undefined` rather than throwing when the rest of the message cannot
  * be walked: a query whose additional section is malformed is still a question
  * that can be answered, and the only thing lost is the larger size.
  */
-function findOpt(message: Buffer, start: number, answers: number, authority: number, additional: number): number | undefined {
+/** The OPT record's own option codes. Only the one this build acts on. */
+export const OPT_OPTION = Object.freeze({ COOKIE: 10 });
+
+/**
+ * One option out of an OPT record's RDATA, which is a run of
+ * `code, length, value` triples. Bounded by the RDATA length the caller read,
+ * so a malformed run cannot walk into the rest of the message.
+ */
+function findOptionInRdata(message: Buffer, start: number, rdataLength: number, wanted: number): Buffer | undefined {
+  const end = Math.min(start + rdataLength, message.length);
+  let offset = start;
+  while (offset + 4 <= end) {
+    const code = message.readUInt16BE(offset);
+    const length = message.readUInt16BE(offset + 2);
+    const valueStart = offset + 4;
+    if (valueStart + length > end) return undefined;
+    if (code === wanted) return Buffer.from(message.subarray(valueStart, valueStart + length));
+    offset = valueStart + length;
+  }
+  return undefined;
+}
+
+function findOpt(
+  message: Buffer,
+  start: number,
+  answers: number,
+  authority: number,
+  additional: number,
+): { payloadSize: number; version: number; cookie?: Buffer } | undefined {
   let offset = start;
   try {
     for (let index = 0; index < answers + authority + additional; index += 1) {
@@ -158,7 +208,16 @@ function findOpt(message: Buffer, start: number, answers: number, authority: num
       if (offset + 10 > message.length) return undefined;
       const type = message.readUInt16BE(offset);
       const size = message.readUInt16BE(offset + 8);
-      if (type === TYPE.OPT) return message.readUInt16BE(offset + 2);
+      if (type === TYPE.OPT) {
+        // The OPT record reuses the record header's fields for other things:
+        // CLASS carries the payload size, and the top byte of TTL the version.
+        const cookie = findOptionInRdata(message, offset + 10, size, OPT_OPTION.COOKIE);
+        return {
+          payloadSize: message.readUInt16BE(offset + 2),
+          version: message.readUInt8(offset + 4),
+          ...(cookie ? { cookie } : {}),
+        };
+      }
       offset += 10 + size;
     }
   } catch {
@@ -240,6 +299,12 @@ export interface ReplyParts {
   readonly authoritative: boolean;
   readonly answers?: readonly ResourceRecord[];
   readonly authority?: readonly ResourceRecord[];
+  /**
+   * The EDNS COOKIE to send back: the client's 8 bytes followed by this
+   * server's. Omitted when the client sent none, which is every client that
+   * does not implement RFC 7873.
+   */
+  readonly cookie?: Buffer;
 }
 
 /**
@@ -254,6 +319,19 @@ export function writeReply(parts: ReplyParts, maxBytes: number): Buffer {
   const authority = parts.authority ?? [];
   const full = assemble(parts, answers, authority);
   if (full.length <= maxBytes) return full;
+  return writeTruncatedReply(parts);
+}
+
+/**
+ * The reply with nothing in it and TC set: the question, the OPT record, and
+ * the instruction to ask again over TCP.
+ *
+ * Reached two ways. A reply too large for the client's advertised size takes
+ * this because the alternative is a mangled answer -- and a listener refusing
+ * to hand a large answer to an address that has not proved it is there takes
+ * it because that is the whole point: small in, small out.
+ */
+export function writeTruncatedReply(parts: ReplyParts): Buffer {
   const empty = assemble(parts, [], []);
   const header = Buffer.from(empty.subarray(0, empty.length));
   header.writeUInt16BE(header.readUInt16BE(2) | 0x0200, 2);
@@ -279,7 +357,7 @@ function assemble(parts: ReplyParts, answers: readonly ResourceRecord[], authori
   chunks[2]?.writeUInt16BE(query.question.type, 0);
   chunks[2]?.writeUInt16BE(query.question.class, 2);
   for (const record of [...answers, ...authority]) chunks.push(writeRecord(record));
-  if (query.hasOpt) chunks.push(writeOpt(query.udpPayloadSize));
+  if (query.hasOpt) chunks.push(writeOpt(query.udpPayloadSize, parts.rcode, parts.cookie));
   return Buffer.concat(chunks);
 }
 
@@ -294,12 +372,26 @@ function writeRecord(record: ResourceRecord): Buffer {
 }
 
 /** Answers the client's OPT with our own, so EDNS stays negotiated. */
-function writeOpt(payloadSize: number): Buffer {
+function writeOpt(payloadSize: number, rcode: number, cookie?: Buffer): Buffer {
+  const options = cookie
+    ? (() => {
+      const header = Buffer.alloc(4);
+      header.writeUInt16BE(OPT_OPTION.COOKIE, 0);
+      header.writeUInt16BE(cookie.length, 2);
+      return Buffer.concat([header, cookie]);
+    })()
+    : Buffer.alloc(0);
   const opt = Buffer.alloc(11);
   opt.writeUInt8(0, 0);
   opt.writeUInt16BE(TYPE.OPT, 1);
   opt.writeUInt16BE(payloadSize, 3);
-  return opt;
+  // An rcode is 12 bits once EDNS is in play, and only the low four fit in the
+  // header. The top eight live in the first byte of this record's TTL field --
+  // which is why BADVERS (16) cannot be told to a client that sent no OPT, and
+  // why nothing above 15 could be said at all until this was written.
+  opt.writeUInt8((rcode >> 4) & 0xff, 5);
+  opt.writeUInt16BE(options.length, 9);
+  return Buffer.concat([opt, options]);
 }
 
 export function typeName(type: number): string {

@@ -3,10 +3,12 @@ import { lookup } from "node:dns/promises";
 import { connect, createServer, isIP, type Server, type Socket as TcpSocket } from "node:net";
 import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
+import { createDnsCookies } from "./cookies.ts";
 import { encodeRdata, encodeSoa, rrType } from "./rdata.ts";
 import {
-  CLASS_ANY, CLASS_IN, MAX_RDATA_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
-  isResponseToQuery, opcodeOf, readQuery, writeName, writeReply, type ParsedQuery, type ResourceRecord,
+  CLASS_ANY, CLASS_IN, MAX_EDNS_VERSION, MAX_RDATA_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
+  isResponseToQuery, opcodeOf, readQuery, writeName, writeReply, writeTruncatedReply,
+  type ParsedQuery, type ResourceRecord,
 } from "./wire.ts";
 
 /** One zone's answers, as the control plane computed them. */
@@ -55,6 +57,20 @@ export interface DnsServerOptions {
    * distinct clients than this should say so.
    */
   readonly rateLimitMaxClients?: number;
+  /**
+   * Answer an unproven UDP client with a truncated reply instead of the whole
+   * thing, so it has to come back over TCP.
+   *
+   * Off by default, and deliberately. Cookies are always offered and checked --
+   * that costs a client nothing and it is how one becomes proven -- but most
+   * resolvers do not implement RFC 7873, and turning this on sends every one of
+   * them through TCP. It is for a listener reachable from a network the
+   * deployment does not trust, where an answer many times larger than its
+   * question is worth denying to an address that has not proved it is there.
+   */
+  readonly requireCookie?: boolean;
+  /** Injected by tests that need a stable server cookie. */
+  readonly cookieSecret?: Buffer;
   /** Injected only by deterministic tests. */
   readonly now?: () => number;
   /** Resolves a bind or upstream hostname to the address both transports use. */
@@ -130,6 +146,8 @@ export function createDnsServer(options: DnsServerOptions): {
     options.now ?? Date.now,
     positiveInteger(options.rateLimitMaxClients ?? DEFAULT_RATE_LIMIT_MAX_CLIENTS, "rateLimitMaxClients"),
   );
+  const cookies = createDnsCookies(options.cookieSecret ? { secret: options.cookieSecret } : {});
+  const requireCookie = options.requireCookie ?? false;
   const resolveHost = options.resolveHost ?? resolveDnsAddress;
   const resolveForwardHost = createTimedDnsResolver(resolveHost);
   const udpSockets: Socket[] = [];
@@ -146,10 +164,18 @@ export function createDnsServer(options: DnsServerOptions): {
       if (error instanceof WireFormatError) return undefined;
       throw error;
     }
+    const verdict = cookies.evaluate(query.cookie, clientAddress);
+    // Every reply carries a fresh server cookie when the client sent one, so a
+    // client that is unproven now becomes proven on its next query.
+    const cookie = verdict.kind === "absent" || verdict.kind === "malformed" ? undefined : verdict.reply;
+    /** A reply with no records in it, carrying whatever cookie is owed. */
+    const answer = (rcode: number): Buffer => writeReply(
+      { query, rcode, authoritative: false, ...(cookie ? { cookie } : {}) },
+      Number.MAX_SAFE_INTEGER,
+    );
+
     const relay = async (): Promise<Buffer> => {
-      if (activeForwards >= maxConcurrentForwards) {
-        return writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: false }, Number.MAX_SAFE_INTEGER);
-      }
+      if (activeForwards >= maxConcurrentForwards) return answer(RCODE.SERVFAIL);
       activeForwards += 1;
       let forwarded: Buffer | undefined;
       try {
@@ -157,7 +183,9 @@ export function createDnsServer(options: DnsServerOptions): {
       } finally {
         activeForwards -= 1;
       }
-      return forwarded ?? writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: false }, Number.MAX_SAFE_INTEGER);
+      // A relayed answer is the upstream's bytes, cookie and all. Ours would be
+      // about a conversation the client is not having with us.
+      return forwarded ?? answer(RCODE.SERVFAIL);
     };
 
     // Anything that is not a standard query. UPDATE, NOTIFY and STATUS all
@@ -165,21 +193,28 @@ export function createDnsServer(options: DnsServerOptions): {
     // code answered them as though they were questions -- echoing the opcode
     // back, which claims the operation was understood. None of them is a thing
     // to relay either, so this sits ahead of the forwarder.
-    if (opcodeOf(query) !== OPCODE.QUERY) {
-      return writeReply({ query, rcode: RCODE.NOTIMP, authoritative: false }, Number.MAX_SAFE_INTEGER);
+    if (opcodeOf(query) !== OPCODE.QUERY) return answer(RCODE.NOTIMP);
+    // A client speaking a later EDNS is told which version this one speaks,
+    // rather than being answered as though the question had been understood.
+    // RFC 6891 says the reply carries no answer and the client retries lower.
+    if (query.ednsVersion > MAX_EDNS_VERSION) return answer(RCODE.BADVERS);
+    // A cookie that is not a cookie. RFC 7873 asks for FORMERR rather than a
+    // guess at what was meant.
+    if (verdict.kind === "malformed") return answer(RCODE.FORMERR);
+    // Over UDP, and only where the deployment asked: an address that has not
+    // shown it can receive an answer does not get a large one. TC costs the
+    // client one TCP retry and costs a spoofed victim nothing.
+    if (requireCookie && !overTcp && verdict.kind !== "proven") {
+      return writeTruncatedReply({ query, rcode: RCODE.NOERROR, authoritative: false, ...(cookie ? { cookie } : {}) });
     }
     if (query.question.type === TYPE.AXFR
       && (!overTcp || !cidrsContain(transferAllow, clientAddress))) {
-      return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
+      return answer(RCODE.REFUSED);
     }
     const zone = matchZone(options.zones(), query.question.name);
     if (!zone) {
-      if (forwardTo.length === 0) {
-        return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
-      }
-      if (!cidrsContain(forwardAllow, clientAddress)) {
-        return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
-      }
+      if (forwardTo.length === 0) return answer(RCODE.REFUSED);
+      if (!cidrsContain(forwardAllow, clientAddress)) return answer(RCODE.REFUSED);
       return relay();
     }
     // A name the provider serves itself carries a placeholder address that
@@ -205,9 +240,9 @@ export function createDnsServer(options: DnsServerOptions): {
     // thing for a client to ask an upstream. Refusing non-IN at the top would
     // have made the forwarder lie about names that are not ours at all.
     if (query.question.class !== CLASS_IN && query.question.class !== CLASS_ANY) {
-      return writeReply({ query, rcode: RCODE.REFUSED, authoritative: false }, Number.MAX_SAFE_INTEGER);
+      return answer(RCODE.REFUSED);
     }
-    const parts = answerFromZone(query, zone, negativeTtl, options.onUnservable);
+    const parts = { ...answerFromZone(query, zone, negativeTtl, options.onUnservable), ...(cookie ? { cookie } : {}) };
     const budget = overTcp ? Number.MAX_SAFE_INTEGER : query.udpPayloadSize;
     try {
       return writeReply(parts, budget);
@@ -224,7 +259,7 @@ export function createDnsServer(options: DnsServerOptions): {
         reason: error instanceof Error ? error.message : "unknown error",
       });
       try {
-        return writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: true }, budget);
+        return writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: true, ...(cookie ? { cookie } : {}) }, budget);
       } catch {
         return undefined;
       }

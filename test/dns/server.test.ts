@@ -563,6 +563,140 @@ describe("DNS server", () => {
       });
     }
 
+    /**
+     * BADVERS is 16, and an rcode is four bits in the header. The top eight
+     * live in the OPT record's TTL field, so this could not be said at all
+     * until the writer learned to put them there.
+     */
+    it("tells a client asking for a later EDNS version which one it speaks", async () => {
+      const { port } = await start({ zones: () => [EXAMPLE] });
+      const query = buildQuery("www.example.com");
+      // One OPT record claiming EDNS version 1.
+      const opt = Buffer.alloc(11);
+      opt.writeUInt8(0, 0);
+      opt.writeUInt16BE(TYPE.OPT, 1);
+      opt.writeUInt16BE(4096, 3);
+      opt.writeUInt8(1, 5);
+      const withOpt = Buffer.concat([query, opt]);
+      withOpt.writeUInt16BE(1, 10);
+
+      const reply = received(await ask(port, withOpt));
+      // The header's four bits are the low half; the OPT record carries the
+      // rest, and 16 is entirely in that upper half.
+      assert.equal(rcodeOf(reply), 0);
+      const extended = reply.readUInt8(reply.length - 6);
+      assert.equal((extended << 4) | rcodeOf(reply), RCODE.BADVERS);
+      assert.equal(reply.readUInt16BE(6), 0, "a BADVERS reply carries no answer");
+    });
+
+    it("answers a client speaking the EDNS version it knows", async () => {
+      const { port } = await start({ zones: () => [EXAMPLE] });
+      const query = buildQuery("www.example.com");
+      const opt = Buffer.alloc(11);
+      opt.writeUInt8(0, 0);
+      opt.writeUInt16BE(TYPE.OPT, 1);
+      opt.writeUInt16BE(4096, 3);
+      const withOpt = Buffer.concat([query, opt]);
+      withOpt.writeUInt16BE(1, 10);
+
+      const reply = received(await ask(port, withOpt));
+      assert.equal(rcodeOf(reply), RCODE.NOERROR);
+      assert.equal(reply.readUInt8(reply.length - 6), 0, "no extended rcode on a normal answer");
+      assert.ok(reply.readUInt16BE(6) > 0);
+    });
+
+    /**
+     * EDNS cookies (RFC 7873) are how a UDP server tells a client that really
+     * is at the address it claims from one that is not. Measured motivation:
+     * a 44-byte question here draws a 3944-byte answer, and a forged source
+     * address makes that somebody else's problem.
+     */
+    describe("EDNS cookies", () => {
+      const CLIENT_COOKIE = Buffer.from("0102030405060708", "hex");
+
+      function withCookie(name: string, cookie: Buffer): Buffer {
+        const query = buildQuery(name);
+        const option = Buffer.alloc(4);
+        option.writeUInt16BE(10, 0);
+        option.writeUInt16BE(cookie.length, 2);
+        const opt = Buffer.alloc(11);
+        opt.writeUInt8(0, 0);
+        opt.writeUInt16BE(TYPE.OPT, 1);
+        opt.writeUInt16BE(4096, 3);
+        opt.writeUInt16BE(option.length + cookie.length, 9);
+        const built = Buffer.concat([query, opt, option, cookie]);
+        built.writeUInt16BE(1, 10);
+        return built;
+      }
+
+      /**
+       * The COOKIE option's value out of a reply's OPT record, read rather than
+       * assumed: root name (one zero byte), type 41, then the record header and
+       * a run of `code, length, value` options.
+       */
+      function cookieOf(reply: Buffer): Buffer {
+        for (let index = reply.length - 11; index >= 12; index -= 1) {
+          if (reply[index] !== 0 || reply.readUInt16BE(index + 1) !== TYPE.OPT) continue;
+          const rdataEnd = index + 11 + reply.readUInt16BE(index + 9);
+          let option = index + 11;
+          while (option + 4 <= rdataEnd) {
+            const code = reply.readUInt16BE(option);
+            const length = reply.readUInt16BE(option + 2);
+            if (code === 10) return reply.subarray(option + 4, option + 4 + length);
+            option += 4 + length;
+          }
+          return Buffer.alloc(0);
+        }
+        return Buffer.alloc(0);
+      }
+
+      it("answers a cookie-sending client with its own cookie plus a server cookie", async () => {
+        const { port } = await start({ zones: () => [EXAMPLE], cookieSecret: Buffer.alloc(32, 7) });
+        const reply = received(await ask(port, withCookie("www.example.com", CLIENT_COOKIE)));
+        assert.equal(rcodeOf(reply), RCODE.NOERROR);
+        const returned = cookieOf(reply);
+        assert.equal(returned.length, 16, "8 bytes of client cookie and 8 of server cookie");
+        assert.deepEqual([...returned.subarray(0, 8)], [...CLIENT_COOKIE], "the client's own bytes come back");
+      });
+
+      it("leaves a client that sends no cookie exactly as it was", async () => {
+        // Most resolvers do not implement RFC 7873. They must not notice this.
+        const { port } = await start({ zones: () => [EXAMPLE], cookieSecret: Buffer.alloc(32, 7) });
+        const reply = received(await ask(port, buildQuery("www.example.com")));
+        assert.equal(rcodeOf(reply), RCODE.NOERROR);
+        assert.ok(reply.readUInt16BE(6) > 0, "answered normally");
+      });
+
+      it("answers FORMERR to a cookie that is not one", async () => {
+        const { port } = await start({ zones: () => [EXAMPLE] });
+        const reply = received(await ask(port, withCookie("www.example.com", Buffer.alloc(3))));
+        assert.equal(rcodeOf(reply), RCODE.FORMERR);
+      });
+
+      it("truncates an unproven UDP client only where the deployment asked", async () => {
+        const secret = Buffer.alloc(32, 9);
+        const { port } = await start({ zones: () => [EXAMPLE], requireCookie: true, cookieSecret: secret });
+
+        // First query: the client has no server cookie yet, so it is unproven.
+        const first = received(await ask(port, withCookie("www.example.com", CLIENT_COOKIE)));
+        assert.equal((first.readUInt16BE(2) & 0x0200) >> 9, 1, "TC set");
+        assert.equal(first.readUInt16BE(6), 0, "and nothing to amplify");
+
+        // It returns the server cookie it was just given, and is now proven.
+        const proven = received(await ask(port, withCookie("www.example.com", cookieOf(first))));
+        assert.equal((proven.readUInt16BE(2) & 0x0200) >> 9, 0, "not truncated");
+        assert.ok(proven.readUInt16BE(6) > 0, "answered in full");
+      });
+
+      it("does not truncate a proven client over TCP either way", async () => {
+        const { port } = await start({ zones: () => [EXAMPLE], requireCookie: true, cookieSecret: Buffer.alloc(32, 9) });
+        // TCP already proves the address; requiring a cookie there would cost a
+        // round trip for a fact the handshake has established.
+        const reply = received(await askOverTcp(port, buildQuery("www.example.com")));
+        assert.ok(reply.readUInt16BE(6) > 0);
+      });
+    });
+
     it("refuses a non-IN question about a name it is authoritative for", async () => {
       // Every record here is IN, and `writeRecord` writes IN regardless of what
       // was asked -- so answering a CHAOS question meant replying to a question
