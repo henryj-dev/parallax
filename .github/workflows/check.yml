@@ -26,10 +26,36 @@ jobs:
         node: [24, 26]
     steps:
       - uses: actions/checkout@v4
+      # Node links against libatomic from 25 on, and the runner image does not
+      # carry it. setup-node treats that as a warning rather than a failure --
+      # its environment details print `node:` and `npm:` blank -- and hands the
+      # job on to the first step that actually needs node. runner-01 had the
+      # library, so this only became reachable when the runners moved to ARC.
+      #
+      # The durable fix is the runner image; this step is what this repository
+      # can do on its own, and it costs nothing on a runner that already has it.
+      - name: Ensure libatomic is present
+        run: |
+          if ldconfig -p 2>/dev/null | grep -q 'libatomic\.so\.1' \
+            || ls /usr/lib/*/libatomic.so.1 >/dev/null 2>&1; then
+            echo "libatomic.so.1 already present"
+            exit 0
+          fi
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends libatomic1
+          else
+            apt-get update && apt-get install -y --no-install-recommends libatomic1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: corepack enable
+      # `corepack enable` stood here, and on the 24 leg it still would work:
+      # corepack ships with that release. Node 25 dropped it from the
+      # distribution, so the 26 leg failed at `corepack: command not found`,
+      # exit 127, on every run since the leg was added -- it has never once been
+      # green. This action reads the same `packageManager` field corepack read,
+      # so the pnpm version stays declared in exactly one place.
+      - uses: pnpm/action-setup@v4
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm run check:portal
