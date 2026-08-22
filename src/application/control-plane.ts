@@ -8,13 +8,16 @@ import {
   normalizeZoneName,
   providerManagement,
   readPersistedViewName,
+  RECORD_TYPES,
   validateExternalRecords,
+  validateRecordId,
   validateViewName,
   type AuditEntry,
   type DesiredRecord,
   type DnsView,
   type ManagedByService,
   type ProviderManagement,
+  type ProviderView,
   type Zone,
   type ZoneRevision,
 } from "../domain/dns.ts";
@@ -147,6 +150,48 @@ export type Paged<Key extends string, Item> = { [K in Key]: Item[] } & {
   offset: number;
   hasMore: boolean;
 };
+
+/** How a caller narrows a record listing. Every field given must match. */
+export interface RecordQuery {
+  /** One view's records instead of every view's. */
+  readonly view?: string;
+  /** The owner name exactly, as stored: `@` for the apex, otherwise relative. */
+  readonly name?: string;
+  readonly type?: string;
+  /** Case-insensitive substring of the record's canonical content. */
+  readonly content?: string;
+  readonly proxied?: boolean;
+  /** Case-insensitive substring of either the name or the content. */
+  readonly search?: string;
+}
+
+/**
+ * A record and where it lives. A listing spans views, and a record id is unique
+ * only within one, so an entry that did not carry its view would be ambiguous.
+ */
+export type LocatedRecord = DesiredRecord & { readonly zone: string; readonly view: string };
+
+/**
+ * One record and the zone revision it was read or written at, so the caller can
+ * put that revision straight into the `If-Match` of its next request.
+ */
+export interface RecordResult {
+  readonly record: LocatedRecord;
+  readonly revision: number;
+}
+
+export type RecordPage = Paged<"records", LocatedRecord> & {
+  /** Matches before paging, so a caller knows whether to ask for more. */
+  readonly total: number;
+  readonly revision: number;
+};
+
+export interface RecordBatchResult {
+  /** Every record the batch created or changed, as it now stands. */
+  readonly records: LocatedRecord[];
+  readonly deleted: string[];
+  readonly revision: number;
+}
 
 /** Clamps caller-supplied paging so one request can never read an unbounded history. */
 function boundedPage(page: PageRequest | undefined): { limit: number; offset: number } {
@@ -404,17 +449,33 @@ export class ControlPlane {
     const zone = await this.getZone(zoneName);
     this.#assertExpectedRevision(zone, expectedRevision);
     const view = validateViewName(viewName);
-    let record = createDesiredRecord(id, input);
-    if (view === "external") [record] = normalizeExternalRecords([record]) as [DesiredRecord];
+    const record = normalizedRecord(view, createDesiredRecord(id, input));
+    return this.#writeView(zone, view, actor, expectedRevision, "record.upserted", { view, record }, (records) =>
+      replaceOrAppend(records, record));
+  }
+
+  /**
+   * The write half every record change shares: put the caller's records into a
+   * copy of the view, prove the whole view is still valid, and commit one
+   * revision. Validating the finished view rather than the one record is what
+   * catches a CNAME that cannot coexist with the sibling already stored.
+   */
+  async #writeView(
+    zone: Zone,
+    view: ProviderView,
+    actor: string,
+    expectedRevision: number | undefined,
+    action: AuditEntry["action"],
+    metadata: Record<string, unknown>,
+    mutate: (records: DesiredRecord[]) => DesiredRecord[],
+  ): Promise<Zone> {
     const views = zone.views.map(cloneView);
     let target = views.find((candidate) => candidate.name === view);
     if (!target) {
       target = { name: view, records: [] };
       views.push(target);
     }
-    const existingIndex = target.records.findIndex((candidate) => candidate.id === record.id);
-    if (existingIndex >= 0) target.records[existingIndex] = record;
-    else target.records.push(record);
+    target.records = mutate(target.records);
     ensureUniqueRecordKeys(target.records);
     if (view === "external") validateExternalRecords(target.records);
     target.records.sort((left, right) => left.id.localeCompare(right.id));
@@ -422,7 +483,7 @@ export class ControlPlane {
     assertProviderManagedIntact(zone.views, views);
     materializeProviderViews(views);
     const updated = this.#nextRevision(zone, views);
-    await this.#commitDesiredChange(zone, updated, "record.upserted", actor, { view, record }, [view], expectedRevision);
+    await this.#commitDesiredChange(zone, updated, action, actor, metadata, [view], expectedRevision);
     return updated;
   }
 
@@ -444,6 +505,154 @@ export class ControlPlane {
     const updated = this.#nextRevision(zone, views);
     await this.#commitDesiredChange(zone, updated, "record.deleted", actor, { view, record }, [view], expectedRevision);
     return updated;
+  }
+
+  /**
+   * Records across a zone's views, narrowed by whatever the caller asked for.
+   *
+   * Reading one record used to mean reading the whole zone and filtering in the
+   * client, which makes every integration reimplement the same match rules --
+   * and get the case folding wrong in a different place each time.
+   */
+  async listRecords(zoneName: string, query: RecordQuery = {}, page?: PageRequest): Promise<RecordPage> {
+    const zone = await this.getZone(zoneName);
+    const bounds = boundedPage(page);
+    if (query.view !== undefined && !zone.views.some((candidate) => candidate.name === query.view)) {
+      throw new NotFoundError(`view ${query.view} was not found in zone ${zone.name}`);
+    }
+    const matched = matchRecords(zone, query);
+    const records = matched.slice(bounds.offset, bounds.offset + bounds.limit);
+    return {
+      records,
+      ...bounds,
+      hasMore: bounds.offset + records.length < matched.length,
+      total: matched.length,
+      revision: zone.revision,
+    };
+  }
+
+  async getRecord(zoneName: string, viewName: string, id: string): Promise<RecordResult> {
+    const zone = await this.getZone(zoneName);
+    const view = validateViewName(viewName);
+    const record = zone.views.find((candidate) => candidate.name === view)?.records
+      .find((candidate) => candidate.id === id);
+    if (!record) throw new NotFoundError(`record ${id} was not found in view ${view}`);
+    return { record: locate(zone, view, record), revision: zone.revision };
+  }
+
+  /**
+   * Adds one record and reports the id it was given.
+   *
+   * `upsertRecord` needs the caller to have chosen an id already, which a client
+   * synchronising from somewhere else does not have. Here the id may be supplied
+   * -- and is then refused if it is taken, rather than silently overwriting --
+   * or left out and derived from what the record is.
+   */
+  createRecord(zoneName: string, viewName: string, input: unknown, actor = "system", expectedRevision?: number): Promise<RecordResult> {
+    return this.#exclusive(zoneName, () => this.#createRecord(zoneName, viewName, input, actor, expectedRevision));
+  }
+
+  async #createRecord(zoneName: string, viewName: string, input: unknown, actor: string, expectedRevision?: number): Promise<RecordResult> {
+    const zone = await this.getZone(zoneName);
+    this.#assertExpectedRevision(zone, expectedRevision);
+    const view = validateViewName(viewName);
+    const existing = zone.views.find((candidate) => candidate.name === view)?.records ?? [];
+    const record = normalizedRecord(view, buildNewRecord(input, new Set(existing.map((candidate) => candidate.id)), view));
+    const updated = await this.#writeView(zone, view, actor, expectedRevision, "record.upserted", { view, record }, (records) =>
+      [...records, record]);
+    return { record: locate(updated, view, record), revision: updated.revision };
+  }
+
+  /**
+   * Changes only the fields the caller named, leaving every other one as stored.
+   *
+   * Read-modify-write done here rather than by the client: the merge happens
+   * under the same zone lock as the commit, so two integrations editing
+   * different fields of one record cannot overwrite each other.
+   */
+  patchRecord(zoneName: string, viewName: string, id: string, patch: unknown, actor = "system", expectedRevision?: number): Promise<RecordResult> {
+    return this.#exclusive(zoneName, () => this.#patchRecord(zoneName, viewName, id, patch, actor, expectedRevision));
+  }
+
+  async #patchRecord(zoneName: string, viewName: string, id: string, patch: unknown, actor: string, expectedRevision?: number): Promise<RecordResult> {
+    const zone = await this.getZone(zoneName);
+    this.#assertExpectedRevision(zone, expectedRevision);
+    const view = validateViewName(viewName);
+    const stored = zone.views.find((candidate) => candidate.name === view)?.records
+      .find((candidate) => candidate.id === id);
+    if (!stored) throw new NotFoundError(`record ${id} was not found in view ${view}`);
+    const record = normalizedRecord(view, createDesiredRecord(id, mergeRecordPatch(stored, patch)));
+    const updated = await this.#writeView(zone, view, actor, expectedRevision, "record.upserted", { view, record }, (records) =>
+      replaceOrAppend(records, record));
+    return { record: locate(updated, view, record), revision: updated.revision };
+  }
+
+  /**
+   * Several record changes committed as one revision.
+   *
+   * Sending them one at a time is not the same thing: each call is its own
+   * revision and its own provider apply, so a client moving a service between
+   * addresses publishes an intermediate state that was never desired. Here the
+   * whole set is validated against the finished view before anything commits.
+   */
+  batchRecords(zoneName: string, viewName: string, input: unknown, actor = "system", expectedRevision?: number): Promise<RecordBatchResult> {
+    return this.#exclusive(zoneName, () => this.#batchRecords(zoneName, viewName, input, actor, expectedRevision));
+  }
+
+  async #batchRecords(zoneName: string, viewName: string, input: unknown, actor: string, expectedRevision?: number): Promise<RecordBatchResult> {
+    const zone = await this.getZone(zoneName);
+    this.#assertExpectedRevision(zone, expectedRevision);
+    const view = validateViewName(viewName);
+    const batch = parseRecordBatch(input);
+    const stored = zone.views.find((candidate) => candidate.name === view)?.records ?? [];
+    const byId = new Map(stored.map((record) => [record.id, record]));
+    const taken = new Set(byId.keys());
+    const deleted: string[] = [];
+    const written: DesiredRecord[] = [];
+
+    // Deletes first, so a batch may free an id or an RRset the same batch then
+    // reuses. Cloudflare orders its batch the same way, and a client that has
+    // one working against them should not have to reorder it here.
+    for (const entry of batch.deletes) {
+      if (!byId.has(entry.id)) throw new NotFoundError(`record ${entry.id} was not found in view ${view}`);
+      byId.delete(entry.id);
+      taken.delete(entry.id);
+      deleted.push(entry.id);
+    }
+    for (const entry of batch.patches) {
+      const current = byId.get(entry.id);
+      if (!current) throw new NotFoundError(`record ${entry.id} was not found in view ${view}`);
+      const record = normalizedRecord(view, createDesiredRecord(entry.id, mergeRecordPatch(current, entry.body)));
+      byId.set(record.id, record);
+      written.push(record);
+    }
+    for (const entry of batch.puts) {
+      const record = normalizedRecord(view, createDesiredRecord(entry.id, entry.body));
+      byId.set(record.id, record);
+      taken.add(record.id);
+      written.push(record);
+    }
+    for (const entry of batch.posts) {
+      const record = normalizedRecord(view, buildNewRecord(entry, taken, view));
+      byId.set(record.id, record);
+      taken.add(record.id);
+      written.push(record);
+    }
+
+    const next = [...byId.values()];
+    // `desired.replaced` rather than an action of its own: a batch does replace
+    // the view's desired records, and every copy of the action list -- a CHECK
+    // constraint and a label map that cannot import it -- already knows this one.
+    const updated = await this.#writeView(
+      zone, view, actor, expectedRevision, "desired.replaced",
+      { view, created: batch.posts.length, updated: batch.patches.length + batch.puts.length, deleted: deleted.length },
+      () => next,
+    );
+    return {
+      records: written.map((record) => locate(updated, view, record)),
+      deleted,
+      revision: updated.revision,
+    };
   }
 
   replaceDesiredState(zoneName: string, input: unknown, actor = "system", expectedRevision?: number): Promise<Zone> {
@@ -530,7 +739,7 @@ export class ControlPlane {
       // Already Parallax's, or already described by a record that matches it.
       if (record.managed) continue;
       if (target.records.some((desired) => describesSameValue(desired, record))) continue;
-      const id = adoptedId(record, taken);
+      const id = derivedRecordId(record, taken);
       taken.add(id);
       const desired = describeAdopted(id, record);
       adopted.push(desired);
@@ -1275,6 +1484,175 @@ function pendingForRevision(status: ApplyStatus, desiredRevision: number, keepAt
   };
 }
 
+function locate(zone: Zone, view: string, record: DesiredRecord): LocatedRecord {
+  return { ...record, zone: zone.name, view };
+}
+
+/** The external view stores records as the provider will hold them, not as sent. */
+function normalizedRecord(view: ProviderView, record: DesiredRecord): DesiredRecord {
+  if (view !== "external") return record;
+  const [normalized] = normalizeExternalRecords([record]) as [DesiredRecord];
+  return normalized;
+}
+
+function replaceOrAppend(records: DesiredRecord[], record: DesiredRecord): DesiredRecord[] {
+  const index = records.findIndex((candidate) => candidate.id === record.id);
+  if (index < 0) return [...records, record];
+  const next = [...records];
+  next[index] = record;
+  return next;
+}
+
+function matchRecords(zone: Zone, query: RecordQuery): LocatedRecord[] {
+  const name = query.name?.trim().toLowerCase();
+  const type = query.type?.trim().toUpperCase();
+  const content = query.content?.trim().toLowerCase();
+  const search = query.search?.trim().toLowerCase();
+  // Refused rather than answered with nothing: an empty page for a misspelt type
+  // reads as "this zone has no MX records", which is a different fact.
+  if (type !== undefined && !RECORD_TYPES.some((candidate) => candidate === type)) {
+    throw new DomainValidationError([`type must be one of ${RECORD_TYPES.join(", ")}`]);
+  }
+  return zone.views
+    .filter((view) => query.view === undefined || view.name === query.view)
+    .flatMap((view) => view.records.map((record) => locate(zone, view.name, record)))
+    .filter((record) => {
+      if (name !== undefined && record.name !== name) return false;
+      if (type !== undefined && record.type !== type) return false;
+      if (content !== undefined && !record.content.toLowerCase().includes(content)) return false;
+      if (query.proxied !== undefined && (record.proxied ?? false) !== query.proxied) return false;
+      // The separator keeps a search from matching across the two fields and
+      // reporting a record that contains the text in neither of them.
+      if (search !== undefined && !`${record.name} ${record.content}`.toLowerCase().includes(search)) return false;
+      return true;
+    })
+    .sort((left, right) => left.view.localeCompare(right.view) || left.id.localeCompare(right.id));
+}
+
+function asRecordObject(input: unknown, subject = "record"): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new DomainValidationError([`${subject} must be an object`]);
+  }
+  return input as Record<string, unknown>;
+}
+
+/**
+ * A record for a caller that did not choose an id.
+ *
+ * An id may still be supplied, and is then refused if it is taken rather than
+ * overwriting -- creating and replacing are different requests. Without one the
+ * id is derived from the name and type, so it reads like the record it names.
+ * Repeating an identical create is refused by the RRset uniqueness rule, not by
+ * the id, since the derived id steps around what is already there.
+ */
+function buildNewRecord(input: unknown, taken: ReadonlySet<string>, view: ProviderView): DesiredRecord {
+  const body = asRecordObject(input);
+  const requested = body.id;
+  if (requested !== undefined && typeof requested !== "string") {
+    throw new DomainValidationError(["id must be a string"]);
+  }
+  if (typeof requested === "string") {
+    const id = validateRecordId(requested);
+    if (taken.has(id)) throw new ConflictError(`record ${id} already exists in view ${view}`);
+    return createDesiredRecord(id, body);
+  }
+  const name = typeof body.name === "string" ? body.name : "";
+  const type = typeof body.type === "string" ? body.type : "";
+  return createDesiredRecord(derivedRecordId({ name, type }, taken), body);
+}
+
+/** The fields a patch may name. `id` is deliberately not one of them. */
+const PATCHABLE_RECORD_FIELDS: readonly string[] = ["name", "type", "content", "ttl", "proxied", "acknowledgeNonGlobalIp"];
+
+/**
+ * The stored record with the caller's fields written over it.
+ *
+ * `managedBy` is carried across untouched because it is not patchable and the
+ * result is rebuilt through `createDesiredRecord`: dropping it here would turn
+ * every patch into the one edit that unbinds a provider-managed record.
+ */
+function mergeRecordPatch(stored: DesiredRecord, patch: unknown): Record<string, unknown> {
+  const body = asRecordObject(patch, "patch");
+  const issues: string[] = [];
+  const merged: Record<string, unknown> = { ...stored };
+  for (const [key, value] of Object.entries(body)) {
+    if (key === "id") {
+      issues.push("id cannot be changed by a patch; delete the record and create it again");
+    } else if (!PATCHABLE_RECORD_FIELDS.includes(key)) {
+      issues.push(`unknown field ${key}`);
+    } else if (value === null) {
+      // The only way to say "stop proxying" or "drop the acknowledgement".
+      // Leaving a field out means leaving it as it is, so absence cannot say it.
+      delete merged[key];
+    } else {
+      merged[key] = value;
+    }
+  }
+  if (issues.length > 0) throw new DomainValidationError(issues);
+  return merged;
+}
+
+interface RecordBatchEntry {
+  readonly id: string;
+  readonly body: Record<string, unknown>;
+}
+
+interface ParsedRecordBatch {
+  readonly deletes: readonly { readonly id: string }[];
+  readonly patches: readonly RecordBatchEntry[];
+  readonly puts: readonly RecordBatchEntry[];
+  readonly posts: readonly Record<string, unknown>[];
+}
+
+const BATCH_SECTIONS: readonly string[] = ["deletes", "patches", "puts", "posts"];
+/** One request may not rewrite an unbounded view; the cap is the whole batch. */
+export const MAX_BATCH_OPERATIONS = 500;
+
+function parseRecordBatch(input: unknown): ParsedRecordBatch {
+  const body = asRecordObject(input, "batch");
+  const issues: string[] = [];
+  for (const key of Object.keys(body)) {
+    if (!BATCH_SECTIONS.includes(key)) issues.push(`unknown batch section ${key}`);
+  }
+  const section = (key: string): Record<string, unknown>[] => {
+    const value = body[key];
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) {
+      issues.push(`${key} must be an array`);
+      return [];
+    }
+    return value.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        issues.push(`${key}[${index}] must be an object`);
+        return {};
+      }
+      return entry as Record<string, unknown>;
+    });
+  };
+  // The id is lifted out of the body rather than left in it: inside a batch it
+  // names which record the operation is for, which is not the same request as a
+  // patch asking to be given a different id -- and that one stays refused.
+  const identified = (key: string, entries: Record<string, unknown>[]): RecordBatchEntry[] =>
+    entries.map((entry, index) => {
+      const { id: raw, ...body } = entry;
+      if (typeof raw !== "string") {
+        issues.push(`${key}[${index}] requires an id`);
+        return { id: "", body };
+      }
+      return { id: validateRecordId(raw), body };
+    });
+
+  const deletes = identified("deletes", section("deletes")).map(({ id }) => ({ id }));
+  const patches = identified("patches", section("patches"));
+  const puts = identified("puts", section("puts"));
+  const posts = section("posts");
+  const total = deletes.length + patches.length + puts.length + posts.length;
+  if (total === 0) issues.push("a batch must carry at least one operation");
+  if (total > MAX_BATCH_OPERATIONS) issues.push(`a batch may carry at most ${MAX_BATCH_OPERATIONS} operations, not ${total}`);
+  if (issues.length > 0) throw new DomainValidationError(issues);
+  return { deletes, patches, puts, posts };
+}
+
 function ensureUniqueRecordKeys(records: DesiredRecord[]): void {
   const seenValues = new Map<string, string>();
   const seenIds = new Set<string>();
@@ -1418,8 +1796,11 @@ function describesSameValue(desired: DesiredRecord, actual: ProviderRecord): boo
  * A stable, readable id for a record that arrived without one. Derived from what
  * the record is, so adopting twice reuses the same id rather than accumulating
  * duplicates under new names.
+ *
+ * Shared with `createRecord`, which faces the same question from the other side:
+ * a client synchronising from its own source of truth has no id to offer either.
  */
-function adoptedId(record: ProviderRecord, taken: ReadonlySet<string>): string {
+function derivedRecordId(record: { readonly name: string; readonly type: string }, taken: ReadonlySet<string>): string {
   const base = `${record.name === "@" ? "root" : record.name}-${record.type}`
     .toLowerCase()
     .replace(/[^a-z0-9_-]+/gu, "-")

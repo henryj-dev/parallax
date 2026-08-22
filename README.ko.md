@@ -518,7 +518,10 @@ CLI와 서버는 같은 저장소의 최신 값을 읽습니다. 파일 백엔�
 
 - `GET|POST /zones` (`GET ?limit=&offset=`, `POST { "name": "example.com" }`)
 - `GET|PUT|DELETE /zones/:zone` (`DELETE ?abandonProviderRecords=true`)
-- `PUT|DELETE /zones/:zone/views/:view/records/:id`
+- `GET /zones/:zone/records` (`?view=&name=&type=&content=&proxied=&search=&limit=&offset=`)
+- `GET|POST /zones/:zone/views/:view/records` (같은 필터. `POST`는 레코드 하나를 추가)
+- `POST /zones/:zone/views/:view/records/batch` (`{ deletes, patches, puts, posts }`)
+- `GET|PUT|PATCH|DELETE /zones/:zone/views/:view/records/:id`
 - `GET|POST /zones/:zone/preview`
 - `POST /zones/:zone/apply`
 - `GET /zones/:zone/status`
@@ -559,6 +562,48 @@ CLI와 서버는 같은 저장소의 최신 값을 읽습니다. 파일 백엔�
 동기화 가능한 뷰는 `internal`과 `external`뿐입니다. 다른 뷰 이름은 쓰기 시점에
 거부되므로, 어떤 프로바이더도 적용할 수 없는 목표 상태가 존에 저장되는 일은
 발생하지 않습니다.
+
+### 레코드를 하나씩 다루기
+
+레코드 경로는 다른 곳에서 레코드를 동기화해 오는 호출자 -- 주소 관리 시스템,
+인증서 발급기, 클러스터 컨트롤러 -- 를 위한 것입니다. 한 줄을 바꾸려고 존 전체를
+읽고 고쳐 다시 쓰는 일을 하지 않아도 됩니다.
+
+`GET /zones/:zone/records`는 두 뷰를 함께 읽고, `GET
+/zones/:zone/views/:view/records`는 한 뷰만 읽습니다. 필터는 모두 AND입니다.
+`name`은 저장된 그대로의 소유자 이름과 정확히 일치해야 하고(apex 는 `@`),
+`type`도 정확히, `content`는 대소문자를 가리지 않는 부분 문자열, `search`는 이름
+또는 내용의 부분 문자열, `proxied`는 `true`나 `false`입니다. 컨트롤 플레인이 모르는
+`type`은 빈 페이지 대신 거부합니다. 오타 난 타입에 대한 빈 페이지는 그 존에 대한
+사실처럼 읽히기 때문입니다. 목록은 다른 목록과 같은 방식으로 페이지를 나누며,
+페이지를 나누기 전의 일치 개수를 `total`로 함께 보고합니다. 각 항목은 자신이 나온
+`view`를 함께 싣습니다. 레코드 id 는 한 뷰 안에서만 유일하기 때문입니다.
+
+`POST /zones/:zone/views/:view/records`는 레코드를 추가하고 부여된 id 를
+응답합니다. 본문에 `id`를 넣어 직접 고를 수 있으며, 이미 쓰이는 id 라면 `409`로
+거부됩니다 -- 생성은 교체가 아니기 때문입니다. 생략하면 이름과 타입에서
+유도되어 `api`/`A`는 `api-a`가 됩니다. 이미 가진 레코드를 그대로 다시 생성하면
+거부됩니다. 유도된 id 는 기존 레코드를 비켜 가고, 그 중복은 같은 이름과 타입이
+같은 내용을 두 번 가질 수 없다는 규칙에 걸립니다.
+
+`PATCH /zones/:zone/views/:view/records/:id`는 본문이 지명한 필드만 바꾸고 나머지는
+저장된 그대로 둡니다. `null`은 선택 필드를 제거하며, 이것이 "프록시를 끈다"고
+말하는 유일한 방법입니다. 필드를 생략하는 것은 그대로 두라는 뜻이기 때문입니다.
+병합은 커밋과 같은 존 잠금 안에서 일어나므로, 한 레코드의 서로 다른 필드를 고치는
+두 호출자가 서로를 덮어쓸 수 없습니다. 병합된 레코드는 전체로 검증됩니다. 패치
+자체는 멀쩡해 보여도 뷰를 불법으로 만드는 패치는 거부됩니다.
+
+`POST /zones/:zone/views/:view/records/batch`는 여러 변경을 하나의 리비전으로
+커밋합니다. 순서는 `deletes`, `patches`, `puts`, `posts`이고 최대 500개입니다. 하나씩
+보내는 것과 같지 않습니다. 요청 하나가 각각 리비전 하나이자 프로바이더 적용
+하나이므로, 서비스를 다른 주소로 옮기는 동안 의도한 적 없는 중간 상태가
+게시됩니다. 배치는 완성된 뷰로 검증한 뒤에야 커밋하며, 한 작업이 거부되면 존은
+그대로 남습니다. 삭제가 먼저 실행되므로 배치 안에서 이름을 비우고 다시 쓸 수
+있습니다.
+
+이 모두가 `If-Match: "<revision>"`을 받고 `ETag`로 존의 리비전을 돌려주므로,
+호출자가 읽은 리비전을 바로 다음 쓰기에 실을 수 있습니다. 레코드의 `PUT`과
+`DELETE`는 그대로입니다.
 
 존을 삭제하면 목표 상태를 제거하기 전에 Parallax가 게시한 모든 레코드를
 프로바이더에서 회수하고, 무엇을 제거했는지 `removedProviderRecords`로

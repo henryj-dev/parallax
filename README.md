@@ -900,7 +900,10 @@ All control-plane routes are under `/api/v1`.
 - `GET|POST /zones` (`GET ?limit=&offset=`, `POST { "name": "example.com" }`)
 - `GET|PUT|DELETE /zones/:zone` (`DELETE ?abandonProviderRecords=true`)
 - `POST /zones/:zone/adopt?view=external`
-- `PUT|DELETE /zones/:zone/views/:view/records/:id`
+- `GET /zones/:zone/records` (`?view=&name=&type=&content=&proxied=&search=&limit=&offset=`)
+- `GET|POST /zones/:zone/views/:view/records` (the same filters; `POST` adds one record)
+- `POST /zones/:zone/views/:view/records/batch` (`{ deletes, patches, puts, posts }`)
+- `GET|PUT|PATCH|DELETE /zones/:zone/views/:view/records/:id`
 - `GET|POST /zones/:zone/preview`
 - `POST /zones/:zone/apply`
 - `GET /zones/:zone/status`
@@ -938,6 +941,53 @@ the items.
 The only reconcilable views are `internal` and `external`; any other view name is
 rejected at write time so a zone can never hold desired state no provider can
 apply.
+
+### Managing records one at a time
+
+The record routes exist for a caller that is synchronising records from
+somewhere else -- an address manager, a certificate issuer, a cluster
+controller -- and does not want to read, edit and write back the whole zone to
+change one line.
+
+`GET /zones/:zone/records` reads across both views; `GET
+/zones/:zone/views/:view/records` reads one. Every filter is an AND: `name`
+matches the owner exactly as it is stored (`@` for the apex), `type` exactly,
+`content` as a case-insensitive substring, `search` as a substring of either the
+name or the content, and `proxied` as `true` or `false`. A `type` the control
+plane does not know is refused rather than answered with an empty page, because
+an empty page for a misspelt type reads as a fact about the zone. Listings are
+paged like every other listing here and also report `total`, the number of
+matches before paging. Each entry carries the `view` it came from, since a
+record id is unique only within one.
+
+`POST /zones/:zone/views/:view/records` adds a record and answers with the id it
+was given. Supply an `id` in the body to choose one -- it is refused with `409`
+if it is taken, because creating is not replacing -- or leave it out and it is
+derived from the name and type, so `api`/`A` becomes `api-a`. Repeating a create
+of a record the view already holds is refused: the derived id steps around the
+existing record, and the duplicate is then caught by the rule that one name and
+type cannot hold the same content twice.
+
+`PATCH /zones/:zone/views/:view/records/:id` changes only the fields the body
+names and leaves every other one as stored; `null` removes an optional field,
+which is the only way to say "stop proxying", since leaving a field out means
+leaving it alone. The merge happens under the same zone lock as the commit, so
+two callers editing different fields of one record cannot overwrite each other.
+The merged record is then validated whole -- a patch that would make the view
+illegal is refused even when the patch itself looks fine.
+
+`POST /zones/:zone/views/:view/records/batch` commits several changes as one
+revision, in the order `deletes`, `patches`, `puts`, `posts`, with at most 500
+operations. This is not the same as sending them one at a time: each single
+request is its own revision and its own provider apply, so moving a service
+between addresses publishes an intermediate state that was never desired. A
+batch is validated as a finished view before anything commits, and one refused
+operation leaves the zone exactly as it was. Deletes run first, so a batch may
+free a name and reuse it.
+
+Every one of these accepts `If-Match: "<revision>"` and answers with the zone's
+revision in an `ETag`, so a caller can carry the revision it read straight into
+the write that follows. `PUT` and `DELETE` on a record are unchanged.
 
 Deleting a zone withdraws every record Parallax published for it before removing
 the desired state, and responds with `removedProviderRecords` describing exactly

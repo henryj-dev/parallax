@@ -340,18 +340,62 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
         revisioned: true,
       };
     }
-    if (action === "views" && segments[6] === "records" && segments.length === 8) {
+    // Every record in the zone, across its views. The per-view listing below
+    // takes the same filters; this one exists because a caller synchronising a
+    // zone does not want to know how many views it has before it can ask.
+    if (action === "records" && segments.length === 5 && method === "GET") {
+      return { command: "record list", input: { zone, ...readRecordQuery(url), ...readPageQuery(url) }, revisioned: true };
+    }
+
+    if (action === "views" && segments[6] === "records") {
       const view = requireSegment(segments[5]);
-      const id = requireSegment(segments[7]);
-      if (method === "PUT") {
+      if (segments.length === 7 && method === "GET") {
+        // The path names the view, so a `?view=` in the query string cannot
+        // widen or redirect the listing away from the one that was asked for.
         return {
-          command: "record set",
-          input: { zone, view, id, record: await parseJson(request), expectedRevision },
+          command: "record list",
+          input: { zone, ...readRecordQuery(url), view, ...readPageQuery(url) },
           revisioned: true,
         };
       }
-      if (method === "DELETE") {
-        return { command: "record delete", input: { zone, view, id, expectedRevision }, revisioned: true };
+      if (segments.length === 7 && method === "POST") {
+        return {
+          command: "record create",
+          input: { zone, view, record: await parseJson(request), expectedRevision },
+          status: 201,
+          revisioned: true,
+        };
+      }
+      // Before the `{id}` routes, and unambiguous despite `batch` being a legal
+      // record id: no method posts to a single record, so nothing else claims
+      // this path. A record whose id is `batch` is still reachable by the rest.
+      if (segments.length === 8 && segments[7] === "batch" && method === "POST") {
+        return {
+          command: "record batch",
+          input: { zone, view, operations: await parseJson(request), expectedRevision },
+          revisioned: true,
+        };
+      }
+      if (segments.length === 8) {
+        const id = requireSegment(segments[7]);
+        if (method === "GET") return { command: "record get", input: { zone, view, id }, revisioned: true };
+        if (method === "PUT") {
+          return {
+            command: "record set",
+            input: { zone, view, id, record: await parseJson(request), expectedRevision },
+            revisioned: true,
+          };
+        }
+        if (method === "PATCH") {
+          return {
+            command: "record patch",
+            input: { zone, view, id, record: await parseJson(request), expectedRevision },
+            revisioned: true,
+          };
+        }
+        if (method === "DELETE") {
+          return { command: "record delete", input: { zone, view, id, expectedRevision }, revisioned: true };
+        }
       }
     }
   }
@@ -508,6 +552,22 @@ function readBooleanQuery(url: URL, key: string): boolean | undefined {
   if (value === null) return undefined;
   if (value !== "true" && value !== "false") throw new DomainValidationError([`${key} must be true or false`]);
   return value === "true";
+}
+
+/**
+ * The record filters, taken from the query string. Each is left out entirely
+ * when absent, so the command layer sees the same input a CLI invocation
+ * without the flag would produce.
+ */
+function readRecordQuery(url: URL): Record<string, string | boolean> {
+  const filters: Record<string, string | boolean> = {};
+  for (const key of ["view", "name", "type", "content", "search"]) {
+    const value = url.searchParams.get(key);
+    if (value !== null) filters[key] = value;
+  }
+  const proxied = readBooleanQuery(url, "proxied");
+  if (proxied !== undefined) filters.proxied = proxied;
+  return filters;
 }
 
 function readPageQuery(url: URL): { limit?: number; offset?: number } {

@@ -103,6 +103,21 @@ describe("HTTP role authorization", () => {
     assert.equal(authorize(editor, request("/api/v1/zones/example.com", "DELETE")), false);
   });
 
+  it("treats every record route as desired-state editing", () => {
+    const editor = { role: "editor", subject: "operator" } as const;
+    const viewer = { role: "viewer", subject: "read-only" } as const;
+    const records = "/api/v1/zones/example.com/views/external/records";
+    assert.equal(authorize(editor, request(records, "POST")), true);
+    assert.equal(authorize(editor, request(`${records}/root`, "PATCH")), true);
+    assert.equal(authorize(editor, request(`${records}/batch`, "POST")), true);
+    // Reading them is a read like any other; writing them is not.
+    assert.equal(authorize(viewer, request("/api/v1/zones/example.com/records")), true);
+    assert.equal(authorize(viewer, request(records)), true);
+    assert.equal(authorize(viewer, request(records, "POST")), false);
+    assert.equal(authorize(viewer, request(`${records}/root`, "PATCH")), false);
+    assert.equal(authorize(viewer, request(`${records}/batch`, "POST")), false);
+  });
+
   it("keeps zone adopt off the viewer path", () => {
     const viewer = { role: "viewer", subject: "read-only" } as const;
     assert.equal(authorize(viewer, request("/api/v1/zones/example.com/adopt", "POST")), false);

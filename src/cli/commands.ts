@@ -1,7 +1,7 @@
 import { TOKEN_REFRESH_INTERVAL_MS, type AccessTokenService } from "../application/access-tokens.ts";
 import type { CloudflareCredentialManager } from "../application/cloudflare-credentials.ts";
 import { fallbackCoverage, overridableZones, type FallbackDomainService } from "../application/fallback-domains.ts";
-import { NotFoundError, type ControlPlane } from "../application/control-plane.ts";
+import { NotFoundError, type ControlPlane, type RecordQuery } from "../application/control-plane.ts";
 import type { SettingsService } from "../application/settings.ts";
 import { DomainValidationError } from "../domain/dns.ts";
 import { MIGRATION_TARGETS, type MigrationRun } from "../infrastructure/migrations.ts";
@@ -230,6 +230,18 @@ function expectedRevisionOf(input: CommandInput): number | undefined {
   return input.expectedRevision === undefined ? undefined : Number(input.expectedRevision);
 }
 
+/** The listing filters, left out entirely when the caller named none of them. */
+function recordQuery(input: CommandInput): RecordQuery {
+  return {
+    ...(input.view === undefined ? {} : { view: String(input.view) }),
+    ...(input.name === undefined ? {} : { name: String(input.name) }),
+    ...(input.type === undefined ? {} : { type: String(input.type) }),
+    ...(input.content === undefined ? {} : { content: String(input.content) }),
+    ...(input.proxied === undefined ? {} : { proxied: input.proxied === true }),
+    ...(input.search === undefined ? {} : { search: String(input.search) }),
+  };
+}
+
 const ZONE = { name: "zone", summary: "Apex domain", required: true } as const;
 const VIEW = { name: "view", summary: "internal or external" } as const;
 const EXPECTED = { name: "expectedRevision", summary: "Fail unless the zone is at this revision", type: "number" } as const;
@@ -335,6 +347,76 @@ const COMMANDS: readonly Command[] = [
     options: [ZONE, { ...VIEW, required: true }, { name: "id", summary: "Record identifier", required: true }, EXPECTED],
     run: ({ runtime, actor }, input) => requireControlPlane(runtime).deleteRecord(
       String(input.zone), String(input.view), String(input.id), actor, expectedRevisionOf(input),
+    ),
+  },
+  {
+    name: "record list",
+    summary: "List a zone's records, narrowed by view, name, type or content",
+    role: "viewer",
+    options: [
+      ZONE,
+      VIEW,
+      { name: "name", summary: "Owner name exactly, @ for the apex" },
+      { name: "type", summary: "Record type, e.g. A or TXT" },
+      { name: "content", summary: "Substring of the record's content" },
+      { name: "proxied", summary: "Only records that are, or are not, proxied", type: "boolean" },
+      { name: "search", summary: "Substring of either the name or the content" },
+      ...PAGING,
+    ],
+    run: ({ runtime }, input) => requireControlPlane(runtime).listRecords(
+      String(input.zone), recordQuery(input), page(input),
+    ),
+  },
+  {
+    name: "record get",
+    summary: "Read one record",
+    role: "viewer",
+    options: [ZONE, { ...VIEW, required: true }, { name: "id", summary: "Record identifier", required: true }],
+    run: ({ runtime }, input) => requireControlPlane(runtime).getRecord(
+      String(input.zone), String(input.view), String(input.id),
+    ),
+  },
+  {
+    name: "record create",
+    summary: "Add one record, deriving an identifier when none is given",
+    role: "editor",
+    options: [
+      ZONE,
+      { ...VIEW, required: true },
+      { name: "record", summary: "Record body as JSON; may carry its own id", type: "json", required: true },
+      EXPECTED,
+    ],
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).createRecord(
+      String(input.zone), String(input.view), input.record, actor, expectedRevisionOf(input),
+    ),
+  },
+  {
+    name: "record patch",
+    summary: "Change only the named fields of one record",
+    role: "editor",
+    options: [
+      ZONE,
+      { ...VIEW, required: true },
+      { name: "id", summary: "Record identifier", required: true },
+      { name: "record", summary: "Fields to change as JSON; null removes an optional one", type: "json", required: true },
+      EXPECTED,
+    ],
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).patchRecord(
+      String(input.zone), String(input.view), String(input.id), input.record, actor, expectedRevisionOf(input),
+    ),
+  },
+  {
+    name: "record batch",
+    summary: "Apply deletes, patches, puts and posts to one view as a single revision",
+    role: "editor",
+    options: [
+      ZONE,
+      { ...VIEW, required: true },
+      { name: "operations", summary: "{deletes,patches,puts,posts} as JSON", type: "json", required: true },
+      EXPECTED,
+    ],
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).batchRecords(
+      String(input.zone), String(input.view), input.operations, actor, expectedRevisionOf(input),
     ),
   },
   {

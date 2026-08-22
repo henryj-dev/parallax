@@ -146,10 +146,15 @@ export function authorize(principal: Principal, request: Request): boolean {
   if (segments.length === 7 && segments[4] === "revisions" && segments[6] === "restore" && method === "POST") return true;
 
   // Individual record mutations are desired-state editing, not zone deletion.
-  return segments.length === 8
-    && segments[4] === "views"
-    && segments[6] === "records"
-    && (method === "PUT" || method === "DELETE");
+  if (segments[4] !== "views" || segments[6] !== "records") return false;
+  // Adding a record the caller did not name an id for.
+  if (segments.length === 7) return method === "POST";
+  if (segments.length !== 8) return false;
+  // A batch is several record edits committed as one revision. Every operation
+  // in it is one this role may already make on its own, so the grouping is what
+  // changes, not the permission.
+  if (segments[7] === "batch" && method === "POST") return true;
+  return method === "PUT" || method === "PATCH" || method === "DELETE";
 }
 
 /**
