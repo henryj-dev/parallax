@@ -11,10 +11,12 @@ on:
 permissions:
   contents: read
 
-# One run per ref at a time, newest wins. Five pushes to main inside forty
-# minutes left five runs queued behind a scale set that serves roughly one job
-# at a time, and the oldest of them was gating a commit four commits behind the
-# tip by the time a runner reached it.
+# One run per ref at a time, newest wins. This was written when runs queued
+# behind a self-hosted scale set that served roughly one job at a time: five
+# pushes to main inside forty minutes left five runs queued, and the oldest was
+# gating a commit four behind the tip by the time a runner reached it. Hosted
+# runners took that queue away, and the setting stays for the reason that
+# outlived it -- a superseded run is answering about a commit nobody will ship.
 #
 # The cost is that an intermediate commit on main no longer gets its own
 # verdict -- only the tip does. That is a real loss for bisecting, and it is
@@ -25,17 +27,22 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Where a job runs depends on what triggered it. A push to `main` is this
-# repository's own code and runs on the self-hosted scale set, which sits inside
-# the network the deployment lives in. A pull request is not: once this
-# repository is public, anyone can open one, and a self-hosted runner would
-# execute their code with that network around it. Those PRs go to a
-# GitHub-hosted runner, which is disposable and outside.
+# Everything runs on GitHub-hosted runners.
 #
-# The checks themselves are identical either way -- only the machine differs.
+# It used to be a self-hosted scale set, and for one commit this file split the
+# two: push on the scale set, pull request on a hosted runner, because forks of
+# a public repository can open a pull request and a self-hosted runner would
+# execute that code inside the network the deployment lives in.
+#
+# That split is gone because it does not hold. For a `pull_request` GitHub runs
+# the workflow as the pull request defines it, so a fork can edit this very file
+# and point `runs-on` back at the scale set. A rule a stranger can rewrite is not
+# a rule. Hosted for everything is the version that does not depend on nobody
+# trying -- and it costs this repository nothing, because none of these checks
+# reach the deployment's network.
 jobs:
   gate:
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'arc-mack-erel-parallax' }}
+    runs-on: ubuntu-latest
     # A hung test would otherwise sit for six hours. Bounded, it reports.
     timeout-minutes: 15
     strategy:
@@ -48,26 +55,11 @@ jobs:
         node: [24, 26]
     steps:
       - uses: actions/checkout@v4
-      # Node links against libatomic from 25 on, and the runner image does not
-      # carry it. setup-node treats that as a warning rather than a failure --
-      # its environment details print `node:` and `npm:` blank -- and hands the
-      # job on to the first step that actually needs node. runner-01 had the
-      # library, so this only became reachable when the runners moved to ARC.
-      #
-      # The durable fix is the runner image; this step is what this repository
-      # can do on its own, and it costs nothing on a runner that already has it.
-      - name: Ensure libatomic is present
-        run: |
-          if ldconfig -p 2>/dev/null | grep -q 'libatomic\.so\.1' \
-            || ls /usr/lib/*/libatomic.so.1 >/dev/null 2>&1; then
-            echo "libatomic.so.1 already present"
-            exit 0
-          fi
-          if command -v sudo >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends libatomic1
-          else
-            apt-get update && apt-get install -y --no-install-recommends libatomic1
-          fi
+      # A step installing `libatomic1` stood here. Node links against it from 25
+      # on, the ARC image did not carry it, and setup-node treated that as a
+      # warning rather than a failure -- so the 26 leg died at the first step
+      # that actually wanted node. Hosted images carry the library, so the step
+      # is gone. If this ever moves back to an image of our own, it comes back.
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -98,7 +90,7 @@ jobs:
   # fails while `gate` passes, that deployment's gate has stopped working and
   # nobody there would have been told.
   deployment-gate:
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'arc-mack-erel-parallax' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
