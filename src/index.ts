@@ -200,9 +200,16 @@ function debounce(run: () => void, delay = 250): () => void {
 async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
   setSecurityHeaders(response);
-  // With no access token every caller would be an administrator, so a request
-  // that reached this process through a proxy is refused rather than trusted.
-  if (!accessTokens.security().enabled && pathname.startsWith("/api/") && isProxiedRequest(request)) {
+  // With nothing to authenticate against, every caller would be an administrator,
+  // so a request that reached this process through a proxy is refused rather than
+  // trusted.
+  //
+  // Asked of `securityConfig()` and not of the access tokens alone. An identity
+  // provider is the second way to be a principal, and a deployment that offers
+  // only that one has authentication -- callers must present a session. Reading
+  // the token side here refused every proxied API request on such a deployment,
+  // session or no session, which is the whole surface behind one reverse proxy.
+  if (!securityConfig().enabled && pathname.startsWith("/api/") && isProxiedRequest(request)) {
     response.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     response.end(JSON.stringify({
       error: "unauthorized",
@@ -217,7 +224,10 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     response.end(JSON.stringify({
       status: "ok",
       service: "parallax",
-      authentication: accessTokens.security().enabled ? "required" : "disabled",
+      // `securityConfig()`, so an identity-provider-only deployment reports that
+      // it authenticates. The portal draws itself from this answer, and reading
+      // the token side alone told it a closed control plane was open.
+      authentication: securityConfig().enabled ? "required" : "disabled",
       // Whether a sign-in button should be drawn. Its absence is what an
       // unauthenticated caller sees anyway when it presses one that is not
       // wired, so saying it here costs nothing and saves a dead button.
@@ -421,7 +431,9 @@ if (config.dns) {
 
 server.listen(config.port, config.host, () => {
   console.log(`parallax: ${config.tls ? "https" : "http"}://${config.host}:${config.port}`);
-  if (!accessTokens.security().enabled) {
+  // `securityConfig()`, so this is not printed on a deployment whose identity
+  // provider is the way in. There, callers are not administrators by default.
+  if (!securityConfig().enabled) {
     console.warn("parallax: no access token exists; every caller that reaches this port is an administrator. Issue one from the portal before exposing it.");
   }
   if (settingsService.current().allowLocalProvider) {
