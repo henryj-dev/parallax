@@ -25,9 +25,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Where a job runs depends on what triggered it. A push to `main` is this
+# repository's own code and runs on the self-hosted scale set, which sits inside
+# the network the deployment lives in. A pull request is not: once this
+# repository is public, anyone can open one, and a self-hosted runner would
+# execute their code with that network around it. Those PRs go to a
+# GitHub-hosted runner, which is disposable and outside.
+#
+# The checks themselves are identical either way -- only the machine differs.
 jobs:
   gate:
-    runs-on: arc-mack-erel-parallax
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'arc-mack-erel-parallax' }}
     # A hung test would otherwise sit for six hours. Bounded, it reports.
     timeout-minutes: 15
     strategy:
@@ -90,7 +98,7 @@ jobs:
   # fails while `gate` passes, that deployment's gate has stopped working and
   # nobody there would have been told.
   deployment-gate:
-    runs-on: arc-mack-erel-parallax
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'arc-mack-erel-parallax' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
