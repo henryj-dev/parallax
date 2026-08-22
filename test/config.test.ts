@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { isLoopbackHost, readConfig, usesPlaintextPostgres, usesUnverifiedPostgresTls } from "../src/config.ts";
+import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "../src/config.ts";
 
 describe("configuration", () => {
   it("carries only bind address, storage location, and keys", () => {
@@ -142,17 +142,26 @@ describe("configuration", () => {
   });
 
   /**
-   * `ssl=true` passes the plaintext check above while `sslmode=require` does
-   * not, and that ordering is backwards -- neither pins the server's identity.
-   * Tightening the refusal would stop an existing deployment at startup, so the
-   * difference is reported instead of enforced.
+   * `ssl=true` is accepted and `sslmode=require` is not, which reads backwards
+   * until it is measured against the driver actually in use.
+   *
+   * `pg-connection-string` 2.14.0 turns `ssl=true` into the boolean `true`,
+   * which reaches `tls.connect` as its whole options object -- and Node's
+   * default there is `rejectUnauthorized: true`. Chain and hostname are both
+   * checked. This pins the reading so the next person does not undo it from
+   * the names alone, as this audit briefly did.
    */
-  it("tells encrypted-but-unverified apart from verified", () => {
-    assert.equal(usesUnverifiedPostgresTls("postgres://u:p@db:5432/parallax?ssl=true"), true);
-    assert.equal(usesUnverifiedPostgresTls("postgres://u:p@db:5432/parallax?ssl=1"), true);
-    assert.equal(usesUnverifiedPostgresTls("postgres://u:p@db:5432/parallax?sslmode=verify-full"), false);
-    assert.equal(usesUnverifiedPostgresTls("postgres://u:p@db:5432/parallax"), false);
-    assert.equal(usesUnverifiedPostgresTls("host=db dbname=parallax"), false);
+  it("accepts the ssl form that verifies and refuses the one that need not", () => {
+    assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?ssl=true"), false);
+    assert.equal(usesPlaintextPostgres("postgres://u:p@db:5432/parallax?sslmode=require"), true);
+    assert.throws(
+      () => readConfig({ DATABASE_URL: "postgres://u:p@db:5432/parallax?sslmode=require" }),
+      /verify-full/u,
+    );
+    assert.equal(
+      readConfig({ DATABASE_URL: "postgres://u:p@db:5432/parallax?ssl=true" }).databaseUrl,
+      "postgres://u:p@db:5432/parallax?ssl=true",
+    );
   });
 
   it("fails closed on malformed and cleartext remote PostgreSQL configuration", () => {

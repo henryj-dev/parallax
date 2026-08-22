@@ -430,26 +430,24 @@ export function usesPlaintextPostgres(connectionString: string): boolean {
   }
 }
 
-/**
- * Whether the connection is encrypted but unverified.
+/*
+ * `ssl=true` is accepted above and `sslmode=require` is not, which reads
+ * backwards until it is measured. It is not.
  *
- * `ssl=true` is accepted above as "not plaintext" while `sslmode=require` is
- * refused, and that ordering is backwards: neither pins the server's identity,
- * so `ssl=true` is not the stronger of the two. Tightening the refusal would
- * stop an existing deployment at startup, so this reports rather than refuses
- * -- an operator who reads it can move to `verify-full`, and nobody finds out
- * during a rollout.
+ * `pg-connection-string` turns `ssl=true` into the boolean `true`, which
+ * reaches `tls.connect` as its whole options object -- and Node's default there
+ * is `rejectUnauthorized: true`, so the chain and the hostname are both checked
+ * against the system CAs. That is verify-full behaviour by another spelling.
+ *
+ * `sslmode=require` becomes an options object, and the same library currently
+ * treats `prefer`, `require` and `verify-ca` as aliases for `verify-full` while
+ * warning that pg v9 will give them libpq's weaker meaning. Refusing it today
+ * is stricter than that library needs and exactly right for the day it changes.
+ *
+ * Measured against `pg` 8.22.0 / `pg-connection-string` 2.14.0. A warning that
+ * called `ssl=true` unverified was written here and removed once measured; if
+ * this is revisited, measure it again rather than reasoning from the names.
  */
-export function usesUnverifiedPostgresTls(connectionString: string): boolean {
-  try {
-    const url = new URL(connectionString);
-    if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") return false;
-    const ssl = url.searchParams.get("ssl");
-    return ssl === "true" || ssl === "1";
-  } catch {
-    return false;
-  }
-}
 
 function readPostgresConnection(
   source: string | undefined,

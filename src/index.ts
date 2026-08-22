@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { isLoopbackHost, readConfig, usesPlaintextPostgres, usesUnverifiedPostgresTls } from "./config.ts";
+import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "./config.ts";
 import { createDnsServer, type ServedZone } from "./dns/server.ts";
 import { servedZones } from "./dns/snapshot.ts";
 import { PORTAL_ASSETS } from "./http/portal-assets.ts";
@@ -452,9 +452,6 @@ server.listen(config.port, config.host, () => {
   }
   if (!config.credentialMasterKey) {
     console.warn("parallax: PARALLAX_CREDENTIAL_MASTER_KEY is not set, so provider credentials cannot be stored. Generate one with: openssl rand -base64 32");
-  }
-  if (config.databaseUrl && usesUnverifiedPostgresTls(config.databaseUrl)) {
-    console.warn("parallax: DATABASE_URL uses ssl=true, which encrypts the session without checking who is on the other end. Prefer sslmode=verify-full.");
   }
   if (config.databaseUrl && usesPlaintextPostgres(config.databaseUrl)) {
     console.warn("parallax: DATABASE_URL does not request TLS; zone data and audit history cross the network in cleartext. Append ?sslmode=verify-full unless PostgreSQL is reached over a trusted local socket.");
