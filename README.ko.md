@@ -65,6 +65,11 @@ pnpm start
 | `PARALLAX_DNS_HOST` | DNS 리스너가 바인드할 주소. 기본값은 `HOST`이고, 지정하지 않았다면 루프백이다 |
 | `PARALLAX_DNS_FORWARD_TO` | 관리 존 밖의 이름을 넘길 상위 리졸버 목록(`host` 또는 `host#port`, 쉼표 구분). 비어 있으면 넘기지 않고 `REFUSED`로 답한다 |
 | `PARALLAX_DNS_FORWARD_ALLOW` | 재귀 전달을 허용할 클라이언트 CIDR. 기본값은 루프백이며, 비루프백 리스너에서 전달하려면 명시해야 함 |
+| `PARALLAX_DNS_TRANSFER_ALLOW` | TCP AXFR을 허용할 클라이언트 CIDR. 비어 있으면 모든 전송을 거절 |
+| `PARALLAX_DNS_NOTIFY_TO` | 서비스 중인 존의 serial이 오를 때 NOTIFY를 받을 호스트(`host` 또는 `host:port`) |
+| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND`, `PARALLAX_DNS_RATE_LIMIT_BURST`, `PARALLAX_DNS_RATE_LIMIT_MAX_CLIENTS` | 클라이언트 하나가 쓸 수 있는 양과 추적하는 클라이언트 수. 기본 100, 200, 10000이며 버스트는 초당 속도보다 작을 수 없다 |
+| `PARALLAX_DNS_FORWARD_TIMEOUT_MS`, `PARALLAX_DNS_MAX_CONCURRENT_FORWARDS`, `PARALLAX_DNS_MAX_TCP_CONNECTIONS` | 전달과 열린 TCP 연결의 한도. 기본 4000, 256, 1024 |
+| `PARALLAX_DNS_REQUIRE_COOKIE` | EDNS 쿠키(RFC 7873)를 돌려주지 않은 UDP 클라이언트에게 잘린 응답을 보내 TCP로 다시 오게 한다. 기본은 꺼짐 — 쿠키는 항상 주고받고 검증하지만, 대부분의 리졸버는 쿠키를 보내지 않으므로 켜면 그 전부가 TCP를 거친다 |
 | `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | 이 프로세스가 직접 TLS를 종단할 인증서와 키. 둘 다 설정하거나 둘 다 비워야 함 |
 | `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP에 저장된 `publicOrigin`으로의 리다이렉트를 내는 포트. TLS와 해당 설정이 모두 필요 |
 | `PARALLAX_AUTH_TOKENS` | `{"token","subject","role"}` 객체의 JSON 배열. `role`은 `admin`, `editor`, `viewer` 중 하나이고, 토큰은 임의의 32바이트를 패딩 없는 canonical base64url로 인코딩한 43자 값. 루프백에서는 선택, **그 외 주소에 바인드하려면 필수** |

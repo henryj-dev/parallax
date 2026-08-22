@@ -63,6 +63,11 @@ bind, how to reach the store, and the keys that protect what is stored.
 | `PARALLAX_DNS_HOST` | Address the DNS listener binds; defaults to `HOST`, which is loopback unless set |
 | `PARALLAX_DNS_FORWARD_TO` | Comma-separated upstreams (`host` or `host#port`) for names outside every zone. Empty answers `REFUSED` instead of relaying |
 | `PARALLAX_DNS_FORWARD_ALLOW` | Client CIDRs allowed to recurse. Defaults to loopback; required explicitly for forwarding on a non-loopback listener |
+| `PARALLAX_DNS_TRANSFER_ALLOW` | Client CIDRs allowed to request AXFR over TCP. Empty denies every transfer |
+| `PARALLAX_DNS_NOTIFY_TO` | Hosts (`host` or `host:port`) told when a served zone's serial rises |
+| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND`, `PARALLAX_DNS_RATE_LIMIT_BURST`, `PARALLAX_DNS_RATE_LIMIT_MAX_CLIENTS` | What one client may spend and how many clients are tracked. Default 100, 200 and 10000; the burst may not be below the rate |
+| `PARALLAX_DNS_FORWARD_TIMEOUT_MS`, `PARALLAX_DNS_MAX_CONCURRENT_FORWARDS`, `PARALLAX_DNS_MAX_TCP_CONNECTIONS` | Bounds on relaying and on open TCP connections. Default 4000, 256 and 1024 |
+| `PARALLAX_DNS_REQUIRE_COOKIE` | Answer a UDP client that has not returned an EDNS cookie (RFC 7873) with a truncated reply, so it comes back over TCP. Off by default: cookies are always offered and checked, but most resolvers do not send them, and this sends all of those through TCP |
 | `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | Certificate and key for this process to end TLS itself; set both or neither |
 | `PARALLAX_HTTP_REDIRECT_PORT` | Port answering plain HTTP with a redirect to the stored `publicOrigin`; needs both TLS and that setting |
 | `PARALLAX_READINESS_MAX_STALENESS_SECONDS` | How old a desired-state read may be before readiness reports 503; defaults to 10. Raise it where a readiness probe gates endpoints that also carry DNS |
