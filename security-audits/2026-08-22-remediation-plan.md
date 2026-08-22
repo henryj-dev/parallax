@@ -305,6 +305,14 @@ Domain 없음이 `__Host-`의 조건이고 셋 다 이미 만족하지만, **`Se
 
 #### 4-1. M4 — 종료 데드라인
 
+> **재현 결과가 이 항목의 전제 하나를 지웠다.** §0-4 대로 먼저 재현했더니,
+> "유휴 keep-alive 커넥션이 `keepAliveTimeout` 까지 종료를 붙잡는다"는 절반은
+> 사실이 아니었다 — Node 19+ 의 `server.close()` 는 유휴 커넥션을 스스로 닫고,
+> 유휴 커넥션을 열어둔 채 잰 종료는 데드라인 없이도 밀리초에 끝났다.
+> 남는 것은 **응답하지 않는 in-flight 요청**이고, 그것은 재현됐다: 멈춘 요청
+> 하나가 `shutdownProcess` 를 120초 넘게 붙잡았다. 리포트의 M4 도 고쳤다.
+
+
 `shutdownProcess`의 `http`/`redirect` 타입에 `closeIdleConnections?()`를 선택
 필드로 추가하고(`src/shutdown.ts:7-8`), 서버를 닫기 전에 호출한 뒤 전체에 상한을
 건다. 선택 필드여야 `test/dns/server.test.ts:411`의 기존 호출이 그대로 컴파일된다.
