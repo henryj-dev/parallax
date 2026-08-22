@@ -729,3 +729,7 @@ pnpm test:coverage
 pnpm check
 pnpm build
 ```
+
+## 라이선스
+
+Apache License 2.0 — [`LICENSE`](LICENSE) 를 보십시오.

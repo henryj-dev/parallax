@@ -1113,3 +1113,7 @@ pnpm test:coverage
 pnpm check
 pnpm build
 ```
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE).

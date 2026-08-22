@@ -148,6 +148,21 @@ and what those fixtures pin is what `scripts/what-ships.sh` answers for them:
 | `tsconfig.test.json` | does not ship | it and `tsconfig.build.json` are both children of `tsconfig.json`, and the walk goes toward parents -- a sibling is unreachable |
 | `security-audits/*.md` | does not ship | no `COPY` reaches it |
 
+⚠️ **A third way to flip the second one: delete it.** Going public raised the
+question of whether the audit reports should stay in a public repository at all
+— they describe the attack surface of a deployment that is running. The answer
+here is that they stay, and the reason is not preference. `what-ships.test.ts`
+names `security-audits/2026-08-15-security-audit.md` by path and commits a touch
+to it in a clone; their (G) fixture pins the same directory. Removing it breaks
+this side's test and their gate at once, in the same way rewriting `main` does,
+and for the same reason — the dependency lives in a file nothing here can see.
+
+What was done instead is narrower: the one real zone name in the 2026-08-10
+report was redacted, that report's head records the redaction, and every finding
+those reports carry has been remediated. The remaining addresses in them
+(`10.9.9.9`, `1.2.3.4`, `6.6.6.6`) are invented. **If these ever should leave,
+that is a conversation with stardust first, not a `git rm`.**
+
 Both are measured in `test/scripts/what-ships.test.ts` rather than left to this
 table, because a paragraph is what went stale above. Two things flip the first
 without anything in their repository moving: making the test config a link in
