@@ -89,15 +89,15 @@ describe("the override report over HTTP", () => {
     // often the day the token is the broken thing.
     const adapters = createInMemoryAdapters();
     const control = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider);
-    await control.createZone("tinymail.app");
-    await control.createZone("tinyuniver.se");
-    await control.upsertRecord("tinyuniver.se", "internal", "inside", { name: "www", type: "A", content: "10.17.192.11", ttl: 300 });
+    await control.createZone("tenant-mail.example");
+    await control.createZone("tenant-zone.example");
+    await control.upsertRecord("tenant-zone.example", "internal", "inside", { name: "www", type: "A", content: "10.0.0.11", ttl: 300 });
     const api = createApiHandler(
       {
         controlPlane: control,
         credentials: credentialsHolding([
-          { zone: "tinymail.app", profile: "main" },
-          { zone: "tinyuniver.se", profile: "main" },
+          { zone: "tenant-mail.example", profile: "main" },
+          { zone: "tenant-zone.example", profile: "main" },
         ]) as unknown as Parameters<typeof createApiHandler>[0]["credentials"],
       },
       security,
@@ -109,8 +109,8 @@ describe("the override report over HTTP", () => {
     assert.equal(body.profile, "main");
     assert.deepEqual(body.zones, [
       // Bound, but nothing to answer for, so the listener claims no authority.
-      { zone: "tinymail.app", covered: false, reason: "empty", profile: "main" },
-      { zone: "tinyuniver.se", covered: true, reason: "covered", profile: "main" },
+      { zone: "tenant-mail.example", covered: false, reason: "empty", profile: "main" },
+      { zone: "tenant-zone.example", covered: true, reason: "covered", profile: "main" },
     ]);
   });
 
@@ -126,7 +126,7 @@ describe("the override report over HTTP", () => {
       set: async (profile: string, entry: { suffix: string; dnsServer?: readonly string[] }) => {
         calls.push({ method: "set", suffix: entry.suffix });
         assert.equal(profile, "main");
-        assert.deepEqual(entry.dnsServer, ["10.17.192.11"]);
+        assert.deepEqual(entry.dnsServer, ["10.0.0.11"]);
         return { domains: [entry], outcome: "added" as const };
       },
       remove: async (profile: string, suffix: string) => {
@@ -140,16 +140,16 @@ describe("the override report over HTTP", () => {
       fallbackDomains: domains as unknown as Parameters<typeof createApiHandler>[0]["fallbackDomains"],
     }, security);
 
-    const set = await api(request("/api/v1/fallback/main/domains/tinyuniver.se", "PUT", { dnsServer: ["10.17.192.11"] }));
+    const set = await api(request("/api/v1/fallback/main/domains/tenant-zone.example", "PUT", { dnsServer: ["10.0.0.11"] }));
     assert.equal(set.status, 200);
     const setBody = await set.json() as { outcome: string };
     assert.equal(setBody.outcome, "added");
 
-    const removed = await api(request("/api/v1/fallback/main/domains/tinyuniver.se", "DELETE"));
+    const removed = await api(request("/api/v1/fallback/main/domains/tenant-zone.example", "DELETE"));
     assert.equal(removed.status, 200);
     assert.deepEqual(calls, [
-      { method: "set", suffix: "tinyuniver.se" },
-      { method: "remove", suffix: "tinyuniver.se" },
+      { method: "set", suffix: "tenant-zone.example" },
+      { method: "remove", suffix: "tenant-zone.example" },
     ]);
   });
 
@@ -163,7 +163,7 @@ describe("the override report over HTTP", () => {
       fallbackDomains: domains as unknown as Parameters<typeof createApiHandler>[0]["fallbackDomains"],
     }, security);
 
-    const response = await api(request("/api/v1/fallback/main/domains/lan", "PUT", { dnsServer: ["10.17.192.11"] }));
+    const response = await api(request("/api/v1/fallback/main/domains/lan", "PUT", { dnsServer: ["10.0.0.11"] }));
     assert.equal(response.status, 409);
     assert.deepEqual(await response.json(), {
       error: "conflict",

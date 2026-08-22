@@ -70,8 +70,8 @@ describe("portal mapping", () => {
       },
     });
     const store = createStore(client);
-    await store.saveSettings({ fallbackResolver: "10.17.192.11" });
-    assert.equal(bodies[0]?.fallbackResolver, "10.17.192.11");
+    await store.saveSettings({ fallbackResolver: "10.0.0.11" });
+    assert.equal(bodies[0]?.fallbackResolver, "10.0.0.11");
   });
 
   it("does not treat a failed status or history fetch as pending or empty", async () => {
@@ -159,11 +159,11 @@ describe("portal mapping", () => {
     });
     const store = createStore(client);
     store.getState().profiles = [{ name: "main" }];
-    assert.equal(await store.setFallbackSuffix("main", "example.com", "10.17.192.11"), true);
+    assert.equal(await store.setFallbackSuffix("main", "example.com", "10.0.0.11"), true);
     const put = seen.find((call) => call.method === "PUT");
     assert.ok(put, "set must PUT the suffix");
     assert.match(put.url, /\/fallback\/main\/domains\/example.com$/);
-    assert.equal(JSON.parse(String(put.body)).dnsServer, "10.17.192.11");
+    assert.equal(JSON.parse(String(put.body)).dnsServer, "10.0.0.11");
 
     seen.length = 0;
     assert.equal(await store.deleteFallbackSuffix("main", "example.com"), true);

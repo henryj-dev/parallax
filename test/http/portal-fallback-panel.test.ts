@@ -12,8 +12,8 @@ import { fallbackPanel } from "../../public/panels.js";
  * plane already holds, so it is drawn either way.
  */
 const COVERAGE = [
-  { zone: "tinyuniver.se", covered: true, reason: "covered", profile: "main" },
-  { zone: "tinymail.app", covered: false, reason: "empty", profile: "main" },
+  { zone: "tenant-zone.example", covered: true, reason: "covered", profile: "main" },
+  { zone: "tenant-mail.example", covered: false, reason: "empty", profile: "main" },
   { zone: "other.example", covered: false, reason: "otherProfile", profile: "second" },
   { zone: "stray.test", covered: false, reason: "unbound" },
 ];
@@ -25,11 +25,11 @@ describe("the override panel", () => {
       fallbackCoverage: COVERAGE,
       fallbackPlan: null,
       fallbackPlanError: "Cloudflare API request failed (HTTP 403)",
-      settings: { fallbackResolver: "10.17.192.70" },
+      settings: { fallbackResolver: "10.0.0.53" },
     });
-    assert.deepEqual(panel.covered, ["tinyuniver.se"]);
+    assert.deepEqual(panel.covered, ["tenant-zone.example"]);
     assert.deepEqual(panel.excluded, [
-      { zone: "tinymail.app", reason: "empty", profile: "main" },
+      { zone: "tenant-mail.example", reason: "empty", profile: "main" },
       { zone: "other.example", reason: "otherProfile", profile: "second" },
       { zone: "stray.test", reason: "unbound" },
     ]);
@@ -45,7 +45,7 @@ describe("the override panel", () => {
     const panel = fallbackPanel({
       fallbackProfile: "main",
       fallbackCoverage: COVERAGE,
-      fallbackPlan: { add: [{ suffix: "tinyuniver.se" }], update: [], adopt: [], remove: [], conflict: [], unchanged: 0, untouched: 3 },
+      fallbackPlan: { add: [{ suffix: "tenant-zone.example" }], update: [], adopt: [], remove: [], conflict: [], unchanged: 0, untouched: 3 },
       settings: { fallbackResolver: "  " },
     });
     assert.equal(panel.resolverMissing, true);
@@ -58,13 +58,13 @@ describe("the override panel", () => {
       fallbackProfile: "main",
       fallbackCoverage: COVERAGE,
       fallbackPlan: {
-        add: [{ suffix: "tinyuniver.se" }],
+        add: [{ suffix: "tenant-zone.example" }],
         update: [], adopt: [{ suffix: "already.example" }],
         remove: [{ suffix: "gone.example" }],
         conflict: [{ suffix: "theirs.example", reason: "an entry for this suffix sends it somewhere else" }],
         unchanged: 2, untouched: 6,
       },
-      settings: { fallbackResolver: "10.17.192.70" },
+      settings: { fallbackResolver: "10.0.0.53" },
     });
     assert.equal(panel.syncable, true);
     assert.equal(panel.pending, 3, "add, adopt and remove; a conflict is not work this will do");
@@ -77,7 +77,7 @@ describe("the override panel", () => {
       fallbackProfile: "main",
       fallbackCoverage: [COVERAGE[0]],
       fallbackPlan: { add: [], update: [], adopt: [], remove: [], conflict: [], unchanged: 1, untouched: 3 },
-      settings: { fallbackResolver: "10.17.192.70" },
+      settings: { fallbackResolver: "10.0.0.53" },
     });
     assert.equal(panel.inStep, true);
     assert.equal(panel.syncable, false);
@@ -99,11 +99,11 @@ describe("the override panel", () => {
       fallbackEntries: [
         { suffix: "localhost" },
         { suffix: "lan", owned: false },
-        { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"], owned: true },
+        { suffix: "tenant-zone.example", dnsServer: ["10.0.0.53"], owned: true },
       ],
     });
     assert.deepEqual(panel.entries.map((entry) => [entry.suffix, entry.owned, entry.actions]), [
-      ["localhost", false, []], ["lan", false, []], ["tinyuniver.se", true, ["delete"]],
+      ["localhost", false, []], ["lan", false, []], ["tenant-zone.example", true, ["delete"]],
     ]);
   });
 });

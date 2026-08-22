@@ -7,10 +7,10 @@ import { createHmac, timingSafeEqual } from "node:crypto";
  *
  * Cloudflare rejects a record comment longer than 100 characters, so the marker
  * has a hard budget. Version 2 spent it badly -- it carried the target as well,
- * base64-encoded, which made the length depend on the zone's name. A zone called
- * `tinytools.work` produced 104 characters and every create and update against
- * it failed with HTTP 400. Nothing local could see this: a stubbed fetch accepts
- * any string.
+ * base64-encoded, which made the length depend on the zone's name. A fourteen-
+ * character zone name produced 104 characters, and every create and update
+ * against that zone failed with HTTP 400. Nothing local could see this: a
+ * stubbed fetch accepts any string.
  *
  * Version 3 drops the target. It was only ever compared against a target the
  * caller already knew, and the signature covers it, so a marker copied to

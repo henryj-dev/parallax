@@ -106,11 +106,11 @@ describe("portal API client", () => {
         return Response.json({ outcome: "added" });
       },
     });
-    await client.setFallbackSuffix("main", "example.com", "10.17.192.11");
+    await client.setFallbackSuffix("main", "example.com", "10.0.0.11");
     await client.deleteFallbackSuffix("main", "example.com");
     assert.equal(calls[0]?.method, "PUT");
     assert.equal(calls[0]?.url, "https://portal.example/api/v1/fallback/main/domains/example.com");
-    assert.equal(JSON.parse(String(calls[0]?.body)).dnsServer, "10.17.192.11");
+    assert.equal(JSON.parse(String(calls[0]?.body)).dnsServer, "10.0.0.11");
     assert.equal(calls[1]?.method, "DELETE");
     assert.equal(calls[1]?.url, "https://portal.example/api/v1/fallback/main/domains/example.com");
   });

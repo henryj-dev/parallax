@@ -1089,7 +1089,7 @@ describe("DNS server", () => {
         { name: "@", type: "AAAA", content: "100::", ttl: 300 },
         { name: "@", type: "MX", content: "10 mx.example.com", ttl: 300 },
         { name: "@", type: "TXT", content: "v=spf1 -all", ttl: 300 },
-        { name: "inside", type: "A", content: "10.17.192.11", ttl: 60 },
+        { name: "inside", type: "A", content: "10.0.0.11", ttl: 60 },
       ],
     };
 
@@ -1139,7 +1139,7 @@ describe("DNS server", () => {
       const { port, asked } = await withUpstream({
         ...WORKERS,
         records: WORKERS.records.map((record) => (record.type === "AAAA"
-          ? { ...record, managedBy: { service: "worker" as const, resource: "tinyuniverse-dashboard" } }
+          ? { ...record, managedBy: { service: "worker" as const, resource: "example-dashboard" } }
           : record)),
       });
       const reply = received(await ask(port, buildQuery("example.com", TYPE.AAAA)));
@@ -1163,7 +1163,7 @@ describe("DNS server", () => {
       const { port, asked } = await withUpstream(WORKERS);
       const reply = received(await ask(port, buildQuery("inside.example.com", TYPE.A)));
       assert.equal(reply.readUInt16BE(2) & 0x0400, 0x0400);
-      assert.deepEqual(readAnswers(reply).map((record) => [...record.data]), [[10, 17, 192, 11]]);
+      assert.deepEqual(readAnswers(reply).map((record) => [...record.data]), [[10, 0, 0, 11]]);
       assert.deepEqual(asked, []);
     });
 

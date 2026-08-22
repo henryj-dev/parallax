@@ -54,7 +54,7 @@ describe("provider-managed records", () => {
   });
 
   it("does not claim ordinary records", () => {
-    assert.equal(providerManagement({ type: "A", content: "10.17.192.11" }), undefined);
+    assert.equal(providerManagement({ type: "A", content: "10.0.0.11" }), undefined);
     assert.equal(providerManagement({ type: "AAAA", content: "2606:4700::1" }), undefined);
     assert.equal(providerManagement({ type: "TXT", content: "100::" }), undefined, "the text is not an address here");
   });
@@ -65,10 +65,10 @@ describe("provider-managed records", () => {
     // the only thing that tells them apart, so it is the thing that locks.
     const worker = providerManagement({
       type: "CNAME", content: "origin.example.net",
-      managedBy: { service: "worker", resource: "tinyuniverse-dashboard" },
+      managedBy: { service: "worker", resource: "example-dashboard" },
     });
     assert.ok(worker, "the binding claims the record");
-    assert.match(worker.reason, /Worker tinyuniverse-dashboard/u, "the refusal names what to go and change");
+    assert.match(worker.reason, /Worker example-dashboard/u, "the refusal names what to go and change");
     assert.equal(worker.originless, false, "the service answers, so the name still resolves");
 
     assert.equal(providerManagement({ type: "CNAME", content: "origin.example.net" }), undefined,
@@ -82,26 +82,26 @@ describe("provider-managed records", () => {
     // address query, and turning it off for these names answers `100::` inside.
     const apex = providerManagement({
       type: "AAAA", content: "100::",
-      managedBy: { service: "worker", resource: "tinyuniverse-dashboard" },
+      managedBy: { service: "worker", resource: "example-dashboard" },
     });
     assert.ok(apex);
-    assert.match(apex.reason, /Worker tinyuniverse-dashboard/u, "the owner is the service");
+    assert.match(apex.reason, /Worker example-dashboard/u, "the owner is the service");
     assert.equal(apex.originless, true, "and the address is still one nobody can reach");
 
     // An R2 custom domain is a CNAME to a name that does resolve, so the same
     // rule reaches the opposite answer -- from the value, not from the label.
     const bucket = providerManagement({
       type: "CNAME", content: "public.r2.dev",
-      managedBy: { service: "r2", resource: "tnuv-static" },
+      managedBy: { service: "r2", resource: "example-static" },
     });
     assert.equal(bucket?.originless, false);
   });
 
   it("shows a service record as the service, and everything else as its type", () => {
     const bucket = { id: "assets", name: "static", type: "CNAME" as const, content: "public.r2.dev", ttl: 1,
-      managedBy: { service: "r2" as const, resource: "tnuv-static" } };
+      managedBy: { service: "r2" as const, resource: "example-static" } };
     assert.equal(recordTypeLabel(bucket), "R2");
-    assert.equal(recordContentLabel(bucket), "tnuv-static", "the bucket, not the value it is stored as");
+    assert.equal(recordContentLabel(bucket), "example-static", "the bucket, not the value it is stored as");
 
     const plain = { id: "web", name: "www", type: "A" as const, content: "8.8.8.10", ttl: 300 };
     assert.equal(recordTypeLabel(plain), "A");
@@ -112,8 +112,8 @@ describe("provider-managed records", () => {
     // A dropped binding is a record that silently became editable, which is the
     // one failure this whole mechanism exists to prevent.
     assert.equal(readManagedByService(undefined), undefined);
-    assert.deepEqual(readManagedByService({ service: "R2", resource: "tnuv-static" }),
-      { service: "r2", resource: "tnuv-static" });
+    assert.deepEqual(readManagedByService({ service: "R2", resource: "example-static" }),
+      { service: "r2", resource: "example-static" });
     for (const broken of [
       { service: "pages", resource: "site" },
       { service: "worker" },
@@ -131,9 +131,9 @@ describe("provider-managed records", () => {
     // it dropped would be a lock that holds until the next restart.
     const record = createDesiredRecord("dash", {
       name: "www", type: "CNAME", content: "origin.example.net", ttl: 300,
-      managedBy: { service: "worker", resource: "tinyuniverse-dashboard" },
+      managedBy: { service: "worker", resource: "example-dashboard" },
     });
-    assert.deepEqual(record.managedBy, { service: "worker", resource: "tinyuniverse-dashboard" });
+    assert.deepEqual(record.managedBy, { service: "worker", resource: "example-dashboard" });
     assert.ok(providerManagement(record), "and it is locked on the way back out");
   });
 });

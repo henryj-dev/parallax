@@ -140,7 +140,7 @@ parallax migrate
       `publicOrigin` 이 각각 이를 복구함을 확인한다. 쿠키 속성, HSTS, 미인증 readiness
       차단, 교차 사이트 Origin 거부, 그리고 자체 TLS 에서의 인증서 무중단 교체까지
 - [x] **Cloudflare 실계정** — `pnpm verify:cloudflare`. **`ef61201`, 2026-08-12,
-      실계정 `tinytools.work`.** 네 번 돌려 결함 셋이 나왔고 앞의 것이 뒤의 것을 가리고
+      실계정(존 이름은 비공개).** 네 번 돌려 결함 셋이 나왔고 앞의 것이 뒤의 것을 가리고
       있었다 — 감사 리포트 §9.8 참조. 자격 증명이 없으면 건너뛴다
 
 - [x] **내장 DNS 리스너** — `pnpm verify:dns`. Docker 도 네트워크도 필요 없다. 도메인이

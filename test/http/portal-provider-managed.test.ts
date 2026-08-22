@@ -14,8 +14,8 @@ import { desiredState, providerManagedReason, readRecords } from "../../public/s
  * wrong first.
  */
 const CASES: readonly { type: RecordType; content: string; managed: boolean; managedBy?: unknown }[] = [
-  { type: "CNAME", content: "origin.example.net", managed: true, managedBy: { service: "worker", resource: "tinyuniverse-dashboard" } },
-  { type: "CNAME", content: "public.r2.dev", managed: true, managedBy: { service: "r2", resource: "tnuv-static" } },
+  { type: "CNAME", content: "origin.example.net", managed: true, managedBy: { service: "worker", resource: "example-dashboard" } },
+  { type: "CNAME", content: "public.r2.dev", managed: true, managedBy: { service: "r2", resource: "example-static" } },
   { type: "A", content: "8.8.8.10", managed: true, managedBy: { service: "worker", resource: "tiny-contract-api" } },
   // A binding neither side can read is not a binding either side may act on.
   { type: "CNAME", content: "origin.example.net", managed: false, managedBy: { service: "pages", resource: "site" } },
@@ -29,7 +29,7 @@ const CASES: readonly { type: RecordType; content: string; managed: boolean; man
   { type: "AAAA", content: "2606:4700::1", managed: false },
   { type: "A", content: "192.0.2.0", managed: true },
   { type: "A", content: "192.0.2.1", managed: false },
-  { type: "A", content: "10.17.192.11", managed: false },
+  { type: "A", content: "10.0.0.11", managed: false },
   { type: "CNAME", content: "pub-1234.r2.dev", managed: true },
   { type: "CNAME", content: "PUB-1234.R2.DEV.", managed: true },
   { type: "CNAME", content: "notr2.dev", managed: false },
@@ -73,7 +73,7 @@ describe("portal and domain agree on which records the provider owns", () => {
         name: "external",
         records: [
           { id: "assets", name: "static-apps", type: "CNAME", content: "public.r2.dev", ttl: 1, proxied: true,
-            managedBy: { service: "r2", resource: "tnuv-static" } },
+            managedBy: { service: "r2", resource: "example-static" } },
           { id: "api", name: "contract-api", type: "CNAME", content: "origin.example.net", ttl: 1, proxied: true,
             managedBy: { service: "worker", resource: "tiny-contract-api" } },
           { id: "web", name: "www", type: "A", content: "8.8.8.10", ttl: 300 },
@@ -82,7 +82,7 @@ describe("portal and domain agree on which records the provider owns", () => {
     });
     const bucket = rows.find((row) => row.id === "assets");
     assert.equal(bucket?.typeLabel, "R2");
-    assert.equal(bucket?.views.external.label, "tnuv-static");
+    assert.equal(bucket?.views.external.label, "example-static");
     assert.equal(bucket?.views.external.content, "public.r2.dev", "what is stored is still stored");
     assert.equal(bucket?.views.external.managed, "service", "and the row is closed");
 
@@ -104,12 +104,12 @@ describe("portal and domain agree on which records the provider owns", () => {
       views: [{
         name: "external",
         records: [{ id: "assets", name: "static-apps", type: "CNAME", content: "public.r2.dev", ttl: 1, proxied: true,
-          managedBy: { service: "r2", resource: "tnuv-static" } }],
+          managedBy: { service: "r2", resource: "example-static" } }],
       }],
     });
     const sent = desiredState(rows) as { views: { name: string; records: { managedBy?: unknown }[] }[] };
     const external = sent.views.find((view) => view.name === "external");
-    assert.deepEqual(external?.records[0]?.managedBy, { service: "r2", resource: "tnuv-static" });
+    assert.deepEqual(external?.records[0]?.managedBy, { service: "r2", resource: "example-static" });
   });
 
   it("leaves a record that exists only inside unmarked", () => {

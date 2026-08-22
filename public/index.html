@@ -299,7 +299,7 @@
           <label><span data-i18n="settings.publicOrigin">Public origin</span><input name="publicOrigin" type="text" autocomplete="off" spellcheck="false" placeholder="https://dns.example.com"></label>
           <label><span data-i18n="settings.revisionRetention">Revisions kept per zone</span><input name="revisionRetention" type="number" min="0" step="1" required data-validation-label="settings.revisionRetention"></label>
           <label><span data-i18n="settings.auditRetentionDays">Audit history kept (days)</span><input name="auditRetentionDays" type="number" min="0" step="1" required data-validation-label="settings.auditRetentionDays"></label>
-          <label><span data-i18n="settings.fallbackResolver">Fallback resolver address</span><input name="fallbackResolver" type="text" autocomplete="off" spellcheck="false" placeholder="10.17.192.11" data-validation-label="settings.fallbackResolver"><small data-i18n="settings.fallbackResolverHelp">Address devices should use for this control plane's zones. Required before device-settings sync can run.</small></label>
+          <label><span data-i18n="settings.fallbackResolver">Fallback resolver address</span><input name="fallbackResolver" type="text" autocomplete="off" spellcheck="false" placeholder="10.0.0.11" data-validation-label="settings.fallbackResolver"><small data-i18n="settings.fallbackResolverHelp">Address devices should use for this control plane's zones. Required before device-settings sync can run.</small></label>
           <div class="form-error" id="settings-form-error" role="alert" hidden></div>
           <div class="dialog-actions"><button class="button primary" id="save-settings-button" type="submit" data-i18n="settings.save">Save settings</button></div>
         </form>

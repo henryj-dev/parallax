@@ -1499,8 +1499,8 @@ describe("ControlPlane", () => {
         "the zone starts settled, which is what makes the next assertion mean something");
 
       provider.seedServiceOwnership("example.com/external", [
-        { name: "@", service: "worker", resource: "tinyuniverse-dashboard" },
-        { name: "static-apps", service: "r2", resource: "tnuv-static" },
+        { name: "@", service: "worker", resource: "example-dashboard" },
+        { name: "static-apps", service: "r2", resource: "example-static" },
       ]);
       const result = await service.adoptProviderRecords("example.com", "external", "operator");
       assert.equal(result.adopted.length, 0, "nothing new was described");

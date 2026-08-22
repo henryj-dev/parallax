@@ -17,13 +17,13 @@ const ZONE = {
     {
       name: "external",
       records: [
-        { id: "root", name: "@", type: "AAAA", content: "100::", ttl: 1, proxied: true, managedBy: { service: "worker", resource: "tinyuniverse-dashboard" } },
-        { id: "apps", name: "static-apps", type: "CNAME", content: "public.r2.dev", ttl: 1, proxied: true, managedBy: { service: "r2", resource: "tnuv-static" } },
-        { id: "counter", name: "counter", type: "A", content: "158.247.220.150", ttl: 300, proxied: true },
+        { id: "root", name: "@", type: "AAAA", content: "100::", ttl: 1, proxied: true, managedBy: { service: "worker", resource: "example-dashboard" } },
+        { id: "apps", name: "static-apps", type: "CNAME", content: "public.r2.dev", ttl: 1, proxied: true, managedBy: { service: "r2", resource: "example-static" } },
+        { id: "counter", name: "counter", type: "A", content: "198.51.100.150", ttl: 300, proxied: true },
         { id: "mail", name: "@", type: "MX", content: "21 route3.mx.cloudflare.net", ttl: 1 },
       ],
     },
-    { name: "internal", records: [{ id: "counter", name: "counter", type: "A", content: "10.17.192.11", ttl: 300 }] },
+    { name: "internal", records: [{ id: "counter", name: "counter", type: "A", content: "10.0.0.11", ttl: 300 }] },
   ],
 };
 
@@ -44,8 +44,8 @@ describe("a row the provider owns", () => {
   it("names the service on both sides, not the value it is stored as", () => {
     const worker = rowFor("root");
     assert.equal(worker.typeLabel, "Worker");
-    assert.equal(worker.inside.text, "tinyuniverse-dashboard");
-    assert.equal(worker.outside.text, "tinyuniverse-dashboard");
+    assert.equal(worker.inside.text, "example-dashboard");
+    assert.equal(worker.outside.text, "example-dashboard");
     // `100::` is the one answer the internal resolver never gives: it relays an
     // address query for this name to the public answer. Showing it inside stated
     // something no client receives.
@@ -54,8 +54,8 @@ describe("a row the provider owns", () => {
 
     const bucket = rowFor("apps");
     assert.equal(bucket.typeLabel, "R2");
-    assert.equal(bucket.inside.text, "tnuv-static");
-    assert.equal(bucket.outside.text, "tnuv-static");
+    assert.equal(bucket.inside.text, "example-static");
+    assert.equal(bucket.outside.text, "example-static");
   });
 
   it("keeps the proxy badge on the side that is proxied", () => {
@@ -155,7 +155,7 @@ describe("an ordinary row", () => {
 
   it("shows its own internal answer where it has one", () => {
     const inside = rowFor("counter").inside;
-    assert.equal(inside.text, "10.17.192.11");
+    assert.equal(inside.text, "10.0.0.11");
     assert.equal(inside.inherited, false, "an override is the row's own answer, not an inherited one");
   });
 

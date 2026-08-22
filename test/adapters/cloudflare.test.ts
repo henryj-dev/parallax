@@ -305,7 +305,7 @@ describe("CloudflareProviderAdapter", () => {
         return Response.json({
           success: true,
           result: [
-            { id: "d1", hostname: "example.com", service: "tinyuniverse-dashboard", zone_id: "zone-1" },
+            { id: "d1", hostname: "example.com", service: "example-dashboard", zone_id: "zone-1" },
             { id: "d2", hostname: "contract-api.example.com", service: "tiny-contract-api", zone_id: "zone-1" },
           ],
         });
@@ -315,13 +315,13 @@ describe("CloudflareProviderAdapter", () => {
         return Response.json({
           success: true,
           result: {
-            domains: bucket === "tnuv-static"
+            domains: bucket === "example-static"
               ? [{ domain: "static-apps.example.com", enabled: true }, { domain: "cdn.elsewhere.test", enabled: true }]
               : [{ domain: "static-toss.example.com", enabled: false }],
           },
         });
       }
-      return Response.json({ success: true, result: { buckets: [{ name: "tnuv-static" }, { name: "appintoss" }] } });
+      return Response.json({ success: true, result: { buckets: [{ name: "example-static" }, { name: "appintoss" }] } });
     };
 
     it("names the worker and the bucket behind each hostname in this zone", async () => {
@@ -332,9 +332,9 @@ describe("CloudflareProviderAdapter", () => {
       });
 
       assert.deepEqual(await adapter.serviceOwnership("example.com/external"), [
-        { name: "@", service: "worker", resource: "tinyuniverse-dashboard" },
+        { name: "@", service: "worker", resource: "example-dashboard" },
         { name: "contract-api", service: "worker", resource: "tiny-contract-api" },
-        { name: "static-apps", service: "r2", resource: "tnuv-static" },
+        { name: "static-apps", service: "r2", resource: "example-static" },
         // Disabled, not removed: the bucket stopped serving the name, it did
         // not hand the record back, so the record is still not ours to edit.
         { name: "static-toss", service: "r2", resource: "appintoss" },

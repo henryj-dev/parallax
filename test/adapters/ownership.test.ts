@@ -22,9 +22,9 @@ describe("ownership marker", () => {
   it("stays within the provider's limit whatever the zone is called", () => {
     // Version 2 carried the target, so the marker grew with the zone's name and
     // silently crossed Cloudflare's 100-character comment limit -- every create
-    // and update against `tinytools.work` failed with HTTP 400, and no local
+    // and update against `sometools.test` failed with HTTP 400, and no local
     // test could see it because a stubbed fetch accepts any string.
-    const zones = ["a.io", "tinytools.work", "bottlecollection.app", `${"a".repeat(60)}.example`];
+    const zones = ["a.test", "sometools.test", "longer-collection.example", `${"a".repeat(60)}.example`];
     const lengths = new Set(zones.map((zone) => ownershipComment(`${zone}/external`, "verify", SECRET).length));
     assert.equal(lengths.size, 1, `length varied by zone: ${[...lengths].join(", ")}`);
     assert.ok([...lengths][0]! <= MAX_MARKER_LENGTH);

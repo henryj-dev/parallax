@@ -36,7 +36,7 @@ const DEFAULTS: FallbackDomain[] = [
   { suffix: "localhost" }, { suffix: "internal" }, { suffix: "lan" },
 ];
 const OWNERSHIP_SECRET = "a-secret-long-enough-to-sign-with-000000000000";
-const owned = (suffix: string, dnsServer = ["10.17.192.70"]): FallbackDomain => ({
+const owned = (suffix: string, dnsServer = ["10.0.0.53"]): FallbackDomain => ({
   suffix,
   dnsServer,
   description: ownershipComment(`fallback/${suffix}`, "entry", OWNERSHIP_SECRET),
@@ -67,13 +67,13 @@ describe("fallback domains", () => {
     // that this fails -- it is that it succeeds and takes the defaults with it.
     const provider = stubProvider(DEFAULTS);
     const change = await serviceOver(provider).set("main", {
-      suffix: "tinyuniver.se",
-      dnsServer: ["10.17.192.70"],
+      suffix: "tenant-zone.example",
+      dnsServer: ["10.0.0.53"],
       description: "internal view",
     });
     assert.equal(change.outcome, "added");
     assert.deepEqual(change.domains.map((domain) => domain.suffix),
-      ["localhost", "internal", "lan", "tinyuniver.se"]);
+      ["localhost", "internal", "lan", "tenant-zone.example"]);
     const written = provider.calls.find((call) => call.method === "PUT")?.body as unknown[];
     assert.equal(written.length, 4, "the whole list went back, not just the new entry");
   });
@@ -85,24 +85,24 @@ describe("fallback domains", () => {
   });
 
   it("replaces an entry rather than adding a second one for the same suffix", async () => {
-    const provider = stubProvider([...DEFAULTS, owned("tinyuniver.se", ["10.17.239.78"])]);
-    const change = await serviceOver(provider).set("main", { suffix: "TinyUniver.SE.", dnsServer: ["10.17.192.70"] });
+    const provider = stubProvider([...DEFAULTS, owned("tenant-zone.example", ["10.0.0.78"])]);
+    const change = await serviceOver(provider).set("main", { suffix: "Tenant-Zone.EXAMPLE.", dnsServer: ["10.0.0.53"] });
     assert.equal(change.outcome, "updated");
-    const matching = change.domains.filter((domain) => domain.suffix.toLowerCase().startsWith("tinyuniver"));
+    const matching = change.domains.filter((domain) => domain.suffix.toLowerCase().startsWith("tenant-zone"));
     assert.equal(matching.length, 1, "case and the trailing dot are spelling, not a second entry");
-    assert.deepEqual(matching[0]?.dnsServer, ["10.17.192.70"]);
+    assert.deepEqual(matching[0]?.dnsServer, ["10.0.0.53"]);
   });
 
   it("writes nothing when the entry is already what was asked for", async () => {
-    const provider = stubProvider([...DEFAULTS, owned("tinyuniver.se")]);
-    const change = await serviceOver(provider).set("main", { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] });
+    const provider = stubProvider([...DEFAULTS, owned("tenant-zone.example")]);
+    const change = await serviceOver(provider).set("main", { suffix: "tenant-zone.example", dnsServer: ["10.0.0.53"] });
     assert.equal(change.outcome, "unchanged");
     assert.deepEqual(provider.calls.map((call) => call.method), ["GET"], "no write at all");
   });
 
   it("removes one suffix and leaves the rest", async () => {
-    const provider = stubProvider([...DEFAULTS, owned("tinyuniver.se")]);
-    const change = await serviceOver(provider).remove("main", "tinyuniver.se");
+    const provider = stubProvider([...DEFAULTS, owned("tenant-zone.example")]);
+    const change = await serviceOver(provider).remove("main", "tenant-zone.example");
     assert.equal(change.outcome, "removed");
     assert.deepEqual(change.domains.map((domain) => domain.suffix), ["localhost", "internal", "lan"]);
   });
@@ -116,21 +116,21 @@ describe("fallback domains", () => {
 
   it("signs a newly managed suffix and reports ownership without claiming defaults", async () => {
     const provider = stubProvider(DEFAULTS);
-    await serviceOver(provider).set("main", { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] });
+    await serviceOver(provider).set("main", { suffix: "tenant-zone.example", dnsServer: ["10.0.0.53"] });
     const domains = await serviceOver(provider).list("main");
     assert.deepEqual(domains.map((entry) => [entry.suffix, entry.owned]), [
-      ["localhost", false], ["internal", false], ["lan", false], ["tinyuniver.se", true],
+      ["localhost", false], ["internal", false], ["lan", false], ["tenant-zone.example", true],
     ]);
   });
 
   it("refuses to replace an unsigned matching suffix and never writes the provider list", async () => {
-    const provider = stubProvider([...DEFAULTS, { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] }]);
+    const provider = stubProvider([...DEFAULTS, { suffix: "tenant-zone.example", dnsServer: ["10.0.0.53"] }]);
     await assert.rejects(
-      serviceOver(provider).set("main", { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] }),
+      serviceOver(provider).set("main", { suffix: "tenant-zone.example", dnsServer: ["10.0.0.53"] }),
       (error: unknown) => error instanceof FallbackDomainOwnershipError,
     );
     assert.deepEqual(provider.calls.map((call) => call.method), ["GET"]);
-    assert.deepEqual(provider.stored().map((entry) => entry.suffix), ["localhost", "internal", "lan", "tinyuniver.se"]);
+    assert.deepEqual(provider.stored().map((entry) => entry.suffix), ["localhost", "internal", "lan", "tenant-zone.example"]);
   });
 
   it("refuses to remove unsigned defaults, foreign markers, and a marker moved to another suffix", async () => {
@@ -148,15 +148,15 @@ describe("fallback domains", () => {
   });
 
   it("does not delete a foreign duplicate beside an owned suffix", async () => {
-    const provider = stubProvider([owned("tinyuniver.se"), { suffix: "tinyuniver.se", dnsServer: ["10.0.0.9"] }]);
-    await assert.rejects(serviceOver(provider).remove("main", "tinyuniver.se"), FallbackDomainOwnershipError);
+    const provider = stubProvider([owned("tenant-zone.example"), { suffix: "tenant-zone.example", dnsServer: ["10.0.0.9"] }]);
+    await assert.rejects(serviceOver(provider).remove("main", "tenant-zone.example"), FallbackDomainOwnershipError);
     assert.deepEqual(provider.calls.map((call) => call.method), ["GET"]);
     assert.equal(provider.stored().length, 2);
   });
 
   it("preserves a requested description beside its ownership marker", async () => {
     const provider = stubProvider(DEFAULTS);
-    await serviceOver(provider).set("main", { suffix: "tinyuniver.se", description: "Office resolver" });
+    await serviceOver(provider).set("main", { suffix: "tenant-zone.example", description: "Office resolver" });
     assert.match(provider.stored().at(-1)?.description ?? "", /^Office resolver parallax-managed:v3:/u);
   });
 
@@ -210,8 +210,8 @@ describe("fallback domains", () => {
         }), { status: 200 }),
       }),
     });
-    await assert.rejects(service.set("main", { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"] }),
-      /did not return tinyuniver\.se/u);
+    await assert.rejects(service.set("main", { suffix: "tenant-zone.example", dnsServer: ["10.0.0.53"] }),
+      /did not return tenant-zone\.example/u);
   });
 
   it("never puts the token in a transport failure message", async () => {
@@ -233,8 +233,8 @@ describe("keeping the overrides in step with the zones", () => {
 
   /** The live list: other teams' entries, the defaults, and one of ours. */
   const OTHERS: FallbackDomain[] = [
-    { suffix: "hackers.com", dnsServer: ["15.165.65.2"] },
-    { suffix: "kosaf.go.kr", dnsServer: ["168.126.63.1", "168.126.63.2"] },
+    { suffix: "otherteam.example.com", dnsServer: ["192.0.2.53"] },
+    { suffix: "partner.example.net", dnsServer: ["192.0.2.61", "192.0.2.62"] },
     { suffix: "localhost" },
   ];
 
@@ -250,9 +250,9 @@ describe("keeping the overrides in step with the zones", () => {
 
   it("adds an entry for a zone that has none, and derives it rather than being told", async () => {
     const { service } = syncing(OTHERS);
-    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
-    assert.deepEqual(plan.add.map((entry) => entry.suffix), ["tinyuniver.se"]);
-    assert.deepEqual(plan.add[0]?.dnsServer, ["10.17.192.70"]);
+    const plan = await service.plan("main", ["tenant-zone.example"], "10.0.0.53");
+    assert.deepEqual(plan.add.map((entry) => entry.suffix), ["tenant-zone.example"]);
+    assert.deepEqual(plan.add[0]?.dnsServer, ["10.0.0.53"]);
     assert.equal(plan.untouched, 3, "everyone else's entries are counted, not planned");
   });
 
@@ -261,40 +261,40 @@ describe("keeping the overrides in step with the zones", () => {
     // dashboard leaves behind. Refusing it forever would report a conflict that
     // can only be cleared by deleting the entry -- and deleting it drops the
     // internal view for every device until the next write lands.
-    const { service, provider } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"], description: "internal view" }]);
-    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
-    assert.deepEqual(plan.adopt.map((entry) => entry.suffix), ["tinyuniver.se"]);
+    const { service, provider } = syncing([...OTHERS, { suffix: "tenant-zone.example", dnsServer: ["10.0.0.53"], description: "internal view" }]);
+    const plan = await service.plan("main", ["tenant-zone.example"], "10.0.0.53");
+    assert.deepEqual(plan.adopt.map((entry) => entry.suffix), ["tenant-zone.example"]);
     assert.deepEqual(plan.conflict, []);
-    const { domains } = await service.sync("main", ["tinyuniver.se"], "10.17.192.70");
-    const claimed = domains.find((entry) => entry.suffix === "tinyuniver.se");
-    assert.deepEqual(claimed?.dnsServer, ["10.17.192.70"], "where it points did not move");
+    const { domains } = await service.sync("main", ["tenant-zone.example"], "10.0.0.53");
+    const claimed = domains.find((entry) => entry.suffix === "tenant-zone.example");
+    assert.deepEqual(claimed?.dnsServer, ["10.0.0.53"], "where it points did not move");
     assert.notEqual(claimed?.description, "internal view", "only the marker changed");
     assert.equal(domains.length, OTHERS.length + 1, "nobody else's entry moved");
     void provider;
   });
 
   it("still refuses an unsigned entry that sends the name somewhere else", async () => {
-    const { service } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.0.0.9"] }]);
-    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    const { service } = syncing([...OTHERS, { suffix: "tenant-zone.example", dnsServer: ["10.0.0.9"] }]);
+    const plan = await service.plan("main", ["tenant-zone.example"], "10.0.0.53");
     assert.deepEqual(plan.adopt, [], "claiming it would move where the name resolves");
-    assert.deepEqual(plan.conflict.map((entry) => entry.suffix), ["tinyuniver.se"]);
+    assert.deepEqual(plan.conflict.map((entry) => entry.suffix), ["tenant-zone.example"]);
   });
 
   it("never writes over an entry it did not create", async () => {
     // Somebody added this suffix by hand. Taking it over would move another
     // team's DNS on the strength of a name collision.
-    const { service, provider } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.0.0.9"] }]);
-    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
-    assert.deepEqual(plan.conflict.map((entry) => entry.suffix), ["tinyuniver.se"]);
+    const { service, provider } = syncing([...OTHERS, { suffix: "tenant-zone.example", dnsServer: ["10.0.0.9"] }]);
+    const plan = await service.plan("main", ["tenant-zone.example"], "10.0.0.53");
+    assert.deepEqual(plan.conflict.map((entry) => entry.suffix), ["tenant-zone.example"]);
     assert.deepEqual(plan.add, []);
     assert.deepEqual(plan.update, []);
-    await service.sync("main", ["tinyuniver.se"], "10.17.192.70");
+    await service.sync("main", ["tenant-zone.example"], "10.0.0.53");
     assert.equal(provider.calls.filter((call) => call.method === "PUT").length, 0, "a conflict writes nothing");
   });
 
   it("keeps every other entry when it does write", async () => {
     const { service, provider } = syncing(OTHERS);
-    const { domains } = await service.sync("main", ["tinyuniver.se"], "10.17.192.70");
+    const { domains } = await service.sync("main", ["tenant-zone.example"], "10.0.0.53");
     assert.equal(domains.length, 4);
     for (const entry of OTHERS) {
       const kept = domains.find((domain) => domain.suffix === entry.suffix);
@@ -303,14 +303,14 @@ describe("keeping the overrides in step with the zones", () => {
   });
 
   it("moves its own entry when the resolver changes, and leaves the marker verifiable", async () => {
-    const { service } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.17.239.78"], description: marker("tinyuniver.se") }]);
-    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
-    assert.deepEqual(plan.update.map((entry) => entry.dnsServer), [["10.17.192.70"]]);
+    const { service } = syncing([...OTHERS, { suffix: "tenant-zone.example", dnsServer: ["10.0.0.78"], description: marker("tenant-zone.example") }]);
+    const plan = await service.plan("main", ["tenant-zone.example"], "10.0.0.53");
+    assert.deepEqual(plan.update.map((entry) => entry.dnsServer), [["10.0.0.53"]]);
     assert.equal(plan.add.length + plan.remove.length, 0);
   });
 
   it("refuses when an entry changes ownership between planning and writing", async () => {
-    const provider = stubProvider([...OTHERS, owned("tinyuniver.se", ["10.17.239.78"])]);
+    const provider = stubProvider([...OTHERS, owned("tenant-zone.example", ["10.0.0.78"])]);
     let reads = 0;
     const service = new FallbackDomainService({
       secrets: { getProfileSecret: async (name) => ({ name, accountId: "acct-1", token: "tok-secret" }) },
@@ -320,9 +320,9 @@ describe("keeping the overrides in step with the zones", () => {
         fetch: async (input, init) => {
           if ((init?.method ?? "GET") === "GET" && ++reads === 2) {
             provider.replaceStored([...OTHERS, {
-              suffix: "tinyuniver.se",
+              suffix: "tenant-zone.example",
               dnsServer: ["10.0.0.9"],
-              description: ownershipComment("fallback/tinyuniver.se", "entry", "someone-elses-secret-000000000000000"),
+              description: ownershipComment("fallback/tenant-zone.example", "entry", "someone-elses-secret-000000000000000"),
             }]);
           }
           return provider.fetch(input, init);
@@ -330,7 +330,7 @@ describe("keeping the overrides in step with the zones", () => {
       }),
     });
     await assert.rejects(
-      service.sync("main", ["tinyuniver.se"], "10.17.192.70"),
+      service.sync("main", ["tenant-zone.example"], "10.0.0.53"),
       FallbackDomainOwnershipError,
     );
     assert.equal(provider.calls.filter((call) => call.method === "PUT").length, 0);
@@ -338,19 +338,19 @@ describe("keeping the overrides in step with the zones", () => {
 
   it("does not adopt an entry carrying another control plane's marker", async () => {
     const foreign = {
-      suffix: "tinyuniver.se",
-      dnsServer: ["10.17.192.70"],
-      description: ownershipComment("fallback/tinyuniver.se", "entry", "someone-elses-secret-000000000000000"),
+      suffix: "tenant-zone.example",
+      dnsServer: ["10.0.0.53"],
+      description: ownershipComment("fallback/tenant-zone.example", "entry", "someone-elses-secret-000000000000000"),
     };
     const { service } = syncing([...OTHERS, foreign]);
-    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    const plan = await service.plan("main", ["tenant-zone.example"], "10.0.0.53");
     assert.deepEqual(plan.adopt, []);
-    assert.deepEqual(plan.conflict.map((entry) => entry.suffix), ["tinyuniver.se"]);
+    assert.deepEqual(plan.conflict.map((entry) => entry.suffix), ["tenant-zone.example"]);
   });
 
   it("removes its own entry for a zone it no longer holds", async () => {
-    const { service } = syncing([...OTHERS, { suffix: "gone.example", dnsServer: ["10.17.192.70"], description: marker("gone.example") }]);
-    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    const { service } = syncing([...OTHERS, { suffix: "gone.example", dnsServer: ["10.0.0.53"], description: marker("gone.example") }]);
+    const plan = await service.plan("main", ["tenant-zone.example"], "10.0.0.53");
     assert.deepEqual(plan.remove.map((entry) => entry.suffix), ["gone.example"]);
   });
 
@@ -364,28 +364,28 @@ describe("keeping the overrides in step with the zones", () => {
         ...options,
         fetch: async (input, init) => {
           if ((init?.method ?? "GET") === "GET" && ++reads === 2) {
-            provider.replaceStored([...OTHERS, { suffix: "gone.example", dnsServer: ["10.17.192.70"] }]);
+            provider.replaceStored([...OTHERS, { suffix: "gone.example", dnsServer: ["10.0.0.53"] }]);
           }
           return provider.fetch(input, init);
         },
       }),
     });
-    await assert.rejects(service.sync("main", [], "10.17.192.70"), FallbackDomainOwnershipError);
+    await assert.rejects(service.sync("main", [], "10.0.0.53"), FallbackDomainOwnershipError);
     assert.equal(provider.calls.filter((call) => call.method === "PUT").length, 0);
   });
 
   it("does not accept a marker minted for another suffix", async () => {
     // The marker is signed for the suffix it sits on, so lifting one onto a
     // different entry does not make that entry ours to delete.
-    const { service } = syncing([...OTHERS, { suffix: "hackers.co.kr", dnsServer: ["15.165.65.2"], description: marker("tinyuniver.se") }]);
-    const plan = await service.plan("main", ["tinyuniver.se"], "10.17.192.70");
+    const { service } = syncing([...OTHERS, { suffix: "otherteam.example.net", dnsServer: ["192.0.2.53"], description: marker("tenant-zone.example") }]);
+    const plan = await service.plan("main", ["tenant-zone.example"], "10.0.0.53");
     assert.deepEqual(plan.remove, [], "not ours, so not removed");
-    assert.deepEqual(plan.add.map((entry) => entry.suffix), ["tinyuniver.se"]);
+    assert.deepEqual(plan.add.map((entry) => entry.suffix), ["tenant-zone.example"]);
   });
 
   it("reports nothing to do without writing", async () => {
-    const { service, provider } = syncing([...OTHERS, { suffix: "tinyuniver.se", dnsServer: ["10.17.192.70"], description: marker("tinyuniver.se") }]);
-    const { plan } = await service.sync("main", ["tinyuniver.se"], "10.17.192.70");
+    const { service, provider } = syncing([...OTHERS, { suffix: "tenant-zone.example", dnsServer: ["10.0.0.53"], description: marker("tenant-zone.example") }]);
+    const { plan } = await service.sync("main", ["tenant-zone.example"], "10.0.0.53");
     assert.equal(plan.unchanged, 1);
     assert.equal(provider.calls.filter((call) => call.method === "PUT").length, 0);
   });
@@ -398,12 +398,12 @@ describe("keeping the overrides in step with the zones", () => {
       secrets: { getProfileSecret: async (name) => ({ name, accountId: "acct-1", token: "tok-secret" }) },
       createClient: (options) => new CloudflareFallbackDomains({ ...options, fetch: provider.fetch }),
     });
-    await assert.rejects(service.plan("main", ["tinyuniver.se"], "10.17.192.70"), /OWNERSHIP_SECRET/u);
+    await assert.rejects(service.plan("main", ["tenant-zone.example"], "10.0.0.53"), /OWNERSHIP_SECRET/u);
   });
 
   it("refuses to plan with no resolver address", async () => {
     const { service } = syncing(OTHERS);
-    await assert.rejects(service.plan("main", ["tinyuniver.se"], "  "), /fallbackResolver/u);
+    await assert.rejects(service.plan("main", ["tenant-zone.example"], "  "), /fallbackResolver/u);
   });
 });
 
@@ -412,10 +412,10 @@ describe("which zones get an override at all", () => {
     name, revision: 1, createdAt: "2026-08-16T00:00:00.000Z", updatedAt: "2026-08-16T00:00:00.000Z",
     views: internal.length > 0 ? [{ name: "internal", records: internal }] : [],
   });
-  const record = { id: "a", name: "www", type: "A" as const, content: "10.17.192.11", ttl: 60 };
+  const record = { id: "a", name: "www", type: "A" as const, content: "10.0.0.11", ttl: 60 };
   const BINDINGS = [
-    { zone: "tinyuniver.se", profile: "main" },
-    { zone: "tinymail.app", profile: "main" },
+    { zone: "tenant-zone.example", profile: "main" },
+    { zone: "tenant-mail.example", profile: "main" },
     { zone: "other.example", profile: "second" },
   ];
 
@@ -424,25 +424,25 @@ describe("which zones get an override at all", () => {
     // it claims no authority and the query goes upstream. Sending devices here
     // for it would add a dependency and buy nothing -- which is what a live
     // preview caught before anything was written.
-    const zones = [zone("tinyuniver.se", [record]), zone("tinymail.app", [])];
-    assert.deepEqual(overridableZones(BINDINGS, zones, "main"), ["tinyuniver.se"]);
+    const zones = [zone("tenant-zone.example", [record]), zone("tenant-mail.example", [])];
+    assert.deepEqual(overridableZones(BINDINGS, zones, "main"), ["tenant-zone.example"]);
   });
 
   it("includes it again once it has something to answer", () => {
     // By name, not by the order the bindings happen to be stored in: the list
     // is a set of suffixes to a plan, and an order that depends on insertion
     // makes two runs over the same state look like different answers.
-    const zones = [zone("tinyuniver.se", [record]), zone("tinymail.app", [record])];
-    assert.deepEqual(overridableZones(BINDINGS, zones, "main"), ["tinymail.app", "tinyuniver.se"]);
+    const zones = [zone("tenant-zone.example", [record]), zone("tenant-mail.example", [record])];
+    assert.deepEqual(overridableZones(BINDINGS, zones, "main"), ["tenant-mail.example", "tenant-zone.example"]);
   });
 
   it("keeps to the profile it was asked about", () => {
-    const zones = [zone("tinyuniver.se", [record]), zone("other.example", [record])];
+    const zones = [zone("tenant-zone.example", [record]), zone("other.example", [record])];
     assert.deepEqual(overridableZones(BINDINGS, zones, "second"), ["other.example"]);
   });
 
   it("leaves out a zone that is bound but not held here", () => {
-    assert.deepEqual(overridableZones(BINDINGS, [zone("tinyuniver.se", [record])], "main"), ["tinyuniver.se"]);
+    assert.deepEqual(overridableZones(BINDINGS, [zone("tenant-zone.example", [record])], "main"), ["tenant-zone.example"]);
   });
 });
 
@@ -454,10 +454,10 @@ describe("why a zone is or is not covered", () => {
     updatedAt: "2026-01-01T00:00:00.000Z",
     views: [{ name: "internal", records }, ...(external.length > 0 ? [{ name: "external", records: external }] : [])],
   });
-  const record = { id: "a", name: "www", type: "A" as const, content: "10.17.192.11", ttl: 60 };
+  const record = { id: "a", name: "www", type: "A" as const, content: "10.0.0.11", ttl: 60 };
   const BINDINGS = [
-    { zone: "tinyuniver.se", profile: "main" },
-    { zone: "tinymail.app", profile: "main" },
+    { zone: "tenant-zone.example", profile: "main" },
+    { zone: "tenant-mail.example", profile: "main" },
     { zone: "other.example", profile: "second" },
   ];
 
@@ -468,8 +468,8 @@ describe("why a zone is or is not covered", () => {
     // look identical in a list of what to write, and an operator can act on
     // each of them differently.
     const rows = fallbackCoverage(BINDINGS, [
-      zone("tinyuniver.se", [record]),
-      zone("tinymail.app", []),
+      zone("tenant-zone.example", [record]),
+      zone("tenant-mail.example", []),
       zone("other.example", [record]),
       zone("stray.test", [record]),
     ], "main");
@@ -477,8 +477,8 @@ describe("why a zone is or is not covered", () => {
     assert.deepEqual(rows, [
       { zone: "other.example", covered: false, reason: "otherProfile", profile: "second" },
       { zone: "stray.test", covered: false, reason: "unbound" },
-      { zone: "tinymail.app", covered: false, reason: "empty", profile: "main" },
-      { zone: "tinyuniver.se", covered: true, reason: "covered", profile: "main" },
+      { zone: "tenant-mail.example", covered: false, reason: "empty", profile: "main" },
+      { zone: "tenant-zone.example", covered: true, reason: "covered", profile: "main" },
     ]);
   });
 
@@ -490,14 +490,14 @@ describe("why a zone is or is not covered", () => {
       { id: "a", name: "www", type: "A" as const, content: "10.0.0.1", ttl: 60 },
       { id: "a", name: "www", type: "A" as const, content: "10.0.0.1", ttl: 60 },
     ];
-    const rows = fallbackCoverage(BINDINGS, [zone("tinyuniver.se", clash)], "main");
+    const rows = fallbackCoverage(BINDINGS, [zone("tenant-zone.example", clash)], "main");
     assert.equal(rows[0]?.reason, "invalid");
     assert.equal(rows[0]?.covered, false);
     assert.ok(rows[0]?.detail, "the composition failure is carried, not just its existence");
   });
 
   it("agrees with the list a sync writes, because that list is derived from it", () => {
-    const zones = [zone("tinyuniver.se", [record]), zone("tinymail.app", [record]), zone("stray.test", [record])];
+    const zones = [zone("tenant-zone.example", [record]), zone("tenant-mail.example", [record]), zone("stray.test", [record])];
     const covered = fallbackCoverage(BINDINGS, zones, "main").filter((row) => row.covered).map((row) => row.zone);
     assert.deepEqual(covered, overridableZones(BINDINGS, zones, "main"));
   });
@@ -505,8 +505,8 @@ describe("why a zone is or is not covered", () => {
   it("needs no provider, so it answers when the credential is the broken thing", () => {
     // No token, no account id, no permission and no network: this is the report
     // an operator reads on the day the provider call is what fails.
-    assert.deepEqual(fallbackCoverage([], [zone("tinyuniver.se", [record])], "main"), [
-      { zone: "tinyuniver.se", covered: false, reason: "unbound" },
+    assert.deepEqual(fallbackCoverage([], [zone("tenant-zone.example", [record])], "main"), [
+      { zone: "tenant-zone.example", covered: false, reason: "unbound" },
     ]);
   });
 });
