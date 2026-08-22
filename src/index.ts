@@ -252,7 +252,14 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   // only that one has authentication -- callers must present a session. Reading
   // the token side here refused every proxied API request on such a deployment,
   // session or no session, which is the whole surface behind one reverse proxy.
-  if (!securityConfig().enabled && pathname.startsWith("/api/") && isProxiedRequest(request)) {
+  //
+  // `/metrics` is behind this too, and not because it is an API. With nothing
+  // to authenticate against it has no other gate, and it describes the
+  // deployment -- how many zones are answered for, how stale the view is. The
+  // two open routes stay open on purpose: `/health/live` is how the portal
+  // learns whether it can offer sign-in, and `/health/ready` gives an
+  // unauthenticated caller a bare verdict and no detail.
+  if (!securityConfig().enabled && describesDeployment(pathname) && isProxiedRequest(request)) {
     response.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     response.end(JSON.stringify({
       error: "unauthorized",
@@ -399,6 +406,18 @@ function setSecurityHeaders(response: ServerResponse): void {
   // Only meaningful once a browser has already reached the portal over TLS, so
   // it is safe to send unconditionally and is ignored on plain HTTP.
   response.setHeader("strict-transport-security", "max-age=31536000; includeSubDomains");
+}
+
+/**
+ * Whether answering this path tells the caller something about the deployment
+ * rather than about the request.
+ *
+ * One list, so a route added later is a decision rather than an omission --
+ * `/metrics` was added and reached the outside for exactly one commit because
+ * the guard above named `/api/` and nothing else.
+ */
+function describesDeployment(pathname: string): boolean {
+  return pathname.startsWith("/api/") || pathname === "/metrics";
 }
 
 function isProxiedRequest(request: IncomingMessage): boolean {
