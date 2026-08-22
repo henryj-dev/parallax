@@ -684,7 +684,11 @@ export function effectiveExternalTtl(record: Pick<DesiredRecord, "type" | "ttl" 
     : record.ttl;
 }
 
-/** CoreDNS needs a concrete duration when it inherits Cloudflare's Auto TTL sentinel. */
+/**
+ * The internal view needs a concrete duration where it inherited Cloudflare's
+ * Auto TTL sentinel. `1` means "the provider decides" to Cloudflare and one
+ * second to everything else, including this control plane's own listener.
+ */
 export function concreteDnsTtl(ttl: number): number {
   return ttl === CLOUDFLARE_AUTO_TTL ? CLOUDFLARE_AUTO_TTL_SECONDS : ttl;
 }

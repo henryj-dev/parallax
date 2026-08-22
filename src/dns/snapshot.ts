@@ -11,9 +11,9 @@ import type { ServedZone } from "./server.ts";
  *
  * Nothing is reconciled on the way: no provider is called, no ownership marker
  * is written, and no state is compared. That is the difference between this
- * listener and the CoreDNS and PowerDNS adapters, which publish the same view
- * into a server that then answers for it. Here the desired state is the answer,
- * which is why a change is visible as soon as the snapshot is re-read and why
+ * listener and a provider adapter, which publishes the same view into a server
+ * that then answers for it. Here the desired state is the answer, which is why
+ * a change is visible as soon as the snapshot is re-read and why
  * `parallax apply` is not involved.
  */
 export function servedZones(zones: readonly Zone[], onSkipped?: (zone: string, reason: string) => void): ServedZone[] {

@@ -402,11 +402,9 @@ if (config.httpRedirectPort !== undefined) {
  * background scan, which also feeds the constant-time readiness cache.
  *
  * Nothing here reconciles. This listener answers from the desired state
- * directly, which is why it does not conflict with the CoreDNS or PowerDNS
- * adapters -- those publish the same view into a server that answers for it,
- * and only one of those may be configured at a time. Running this alongside one
- * of them is two servers answering, which is a deployment's decision about
- * which address clients ask.
+ * directly, which is why it does not conflict with a provider that publishes
+ * the internal view into a server of its own. Running both is two servers
+ * answering, which is a deployment's decision about which address clients ask.
  */
 if (config.dns) {
   const dnsConfig = config.dns;

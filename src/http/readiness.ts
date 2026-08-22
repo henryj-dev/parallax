@@ -141,9 +141,9 @@ function allTargetsServed(
  *
  * The built-in DNS listener answers the internal view out of the desired state
  * itself, so where it is running that view is served and needs no provider.
- * Without this, a deployment that uses the listener instead of publishing into
- * CoreDNS or PowerDNS would fail its readiness probe forever while answering
- * every query correctly -- and would never be sent traffic to prove it.
+ * Without this, a deployment that uses the listener instead of publishing that
+ * view through a provider would fail its readiness probe forever while
+ * answering every query correctly -- and would never be sent traffic to prove it.
  */
 export function unservedTargets(
   zones: readonly Zone[],

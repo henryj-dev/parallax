@@ -213,11 +213,6 @@ async function writeFailure(path: string): Promise<string | undefined> {
 }
 
 /**
- * Confines the administrator-owned CoreDNS directory setting beneath a root
- * chosen by the deployment. Both lexical traversal and symlink escapes are
- * checked before the generic writability test is allowed to run.
- */
-/**
  * Just enough to apply the schema. `createRuntime` reads settings and tokens out
  * of the store while starting, which cannot work on a database whose tables do
  * not exist yet -- the exact situation migrating exists to resolve. This builds
