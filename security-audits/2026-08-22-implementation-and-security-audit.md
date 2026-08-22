@@ -62,6 +62,9 @@ $ grep -c 'armIncompleteFrameTimer' src/dns/server.ts
 - **규모**: `src/` + `cmd/` TypeScript 13,765줄 / 44파일, `public/` JavaScript 3,005줄
 - **방법**: 전체 소스 정독 → 가설 수립 → 스크래치패드 스크립트로 실행 재현.
   주석의 보안·동작 주장은 증거로 인정하지 않고 코드 경로를 끝까지 추적해 확인함.
+- **수정 계획**: [`2026-08-22-remediation-plan.md`](2026-08-22-remediation-plan.md).
+  이 리포트는 무엇이 잘못되었는지까지만 말하고, 어떤 순서로 고칠지와 각 수정이
+  어디서 깨질 수 있는지는 그쪽에 있다.
 
 ---
 
