@@ -117,6 +117,31 @@ describe("a deployment whose only credential is an identity provider", () => {
     assert.equal(refused.status, 401);
   });
 
+  /**
+   * `/metrics` describes the deployment -- how many zones it answers for, how
+   * stale its view is -- so it sits behind the same rule `/health/ready` uses
+   * for its detail. A scraper sends a bearer token the way it does anywhere.
+   */
+  it("keeps the metrics behind the same authentication as the rest", async () => {
+    const origin = await start();
+
+    const anonymous = await fetch(`${origin}/metrics`);
+    assert.equal(anonymous.status, 401);
+
+    const authenticated = await fetch(`${origin}/metrics`, {
+      headers: { cookie: `parallax_identity=${encodeURIComponent(session("viewer"))}` },
+    });
+    assert.equal(authenticated.status, 200);
+    assert.match(authenticated.headers.get("content-type") ?? "", /text\/plain/u);
+    const body = await authenticated.text();
+    // The counter this endpoint exists for: zero, and present at zero, so an
+    // alert written against it can tell "never happened" from "no such series".
+    assert.match(body, /^parallax_dns_unservable_records_total 0$/mu);
+    assert.match(body, /^parallax_ready [01]$/mu);
+    // No listener in this deployment, so the zone count is absent rather than 0.
+    assert.doesNotMatch(body, /parallax_dns_served_zones/u);
+  });
+
   it("reports that it authenticates, so the portal does not draw itself as open", async () => {
     const origin = await start();
 

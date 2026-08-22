@@ -697,6 +697,51 @@ describe("DNS server", () => {
       });
     });
 
+    /**
+     * MNAME is where a secondary asks for updates and sends them. It used to be
+     * `ns.<zone>` unconditionally -- written in because every zone has an apex,
+     * not because that name exists. A zone with secondaries needs to name one
+     * that does.
+     */
+    describe("the synthesized SOA", () => {
+      /** MNAME and RNAME, read back off the wire as two consecutive names. */
+      function soaNamesOf(reply: Buffer): [string, string] {
+        const answers = readAnswers(reply);
+        const data = answers[0]?.data as Buffer;
+        const first = readName(data, 0);
+        const second = readName(data, first.offset);
+        return [first.name, second.name];
+      }
+
+      it("derives a primary from the zone when nothing names one", async () => {
+        const { port } = await start({ zones: () => [EXAMPLE] });
+        const reply = received(await ask(port, buildQuery("example.com", TYPE.SOA)));
+        assert.deepEqual(soaNamesOf(reply), ["ns.example.com", "hostmaster.example.com"]);
+      });
+
+      it("uses the names the deployment gave", async () => {
+        const { port } = await start({
+          zones: () => [EXAMPLE],
+          soa: { primary: "ns1.real.example", mailbox: "dns.real.example" },
+        });
+        const reply = received(await ask(port, buildQuery("example.com", TYPE.SOA)));
+        assert.deepEqual(soaNamesOf(reply), ["ns1.real.example", "dns.real.example"]);
+      });
+
+      it("carries the timers a secondary reads", async () => {
+        const { port } = await start({
+          zones: () => [EXAMPLE],
+          soa: { timers: { refresh: 120, retry: 30, expire: 1_209_600 } },
+        });
+        const reply = received(await ask(port, buildQuery("example.com", TYPE.SOA)));
+        const data = readAnswers(reply)[0]?.data as Buffer;
+        const numbers = data.subarray(data.length - 20);
+        assert.equal(numbers.readUInt32BE(4), 120, "refresh");
+        assert.equal(numbers.readUInt32BE(8), 30, "retry");
+        assert.equal(numbers.readUInt32BE(12), 1_209_600, "expire");
+      });
+    });
+
     it("refuses a non-IN question about a name it is authoritative for", async () => {
       // Every record here is IN, and `writeRecord` writes IN regardless of what
       // was asked -- so answering a CHAOS question meant replying to a question

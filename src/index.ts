@@ -15,6 +15,10 @@ import { createNodeHandler, requestOrigin } from "./http/api.ts";
 import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.ts";
 import { createReadinessMonitor } from "./http/readiness.ts";
 import { redirectLocation } from "./http/redirect.ts";
+import { gauge, render as renderMetrics } from "./observability/metrics.ts";
+import {
+  certificateReloadFailed, notifyFailed, recordUnservable, refreshFailed, replyUnanswerable, zoneSkipped,
+} from "./observability/signals.ts";
 import { createRuntime, type ParallaxRuntime } from "./runtime.ts";
 import { authenticate, withIdentityProvider, type SecurityConfig } from "./security/http-authorization.ts";
 import { shutdownProcess } from "./shutdown.ts";
@@ -57,16 +61,50 @@ const readiness = createReadinessMonitor(
     onZones: (zones) => {
       if (!config.dns) return;
       const next = servedZones(zones, (zone, reason) => {
+        zoneSkipped();
         console.error(`parallax: not answering for ${zone}, its internal view could not be composed: ${reason}`);
       });
       const previous = previousDnsSerials;
       previousDnsSerials = new Map(next.map((zone) => [zone.name, zone.serial]));
       dnsSnapshot = next;
       void dnsServer?.notifyChanged(previous, next).catch((error: unknown) => {
+        notifyFailed();
         console.error(`parallax: NOTIFY failed: ${error instanceof Error ? error.message : "unknown error"}`);
       });
     },
   },
+);
+
+// Read at scrape time from whoever already owns the value. Copying them into
+// the metrics registry is how the copy goes stale.
+gauge("parallax_ready", "1 when this process would pass its readiness probe.", () => (readiness.ready() ? 1 : 0));
+gauge(
+  "parallax_desired_state_age_seconds",
+  "How long since the desired state was last read successfully.",
+  () => {
+    const { ageMs } = readiness.staleness();
+    return ageMs === undefined ? undefined : ageMs / 1000;
+  },
+);
+gauge(
+  "parallax_desired_state_max_age_seconds",
+  "How stale that read may get before readiness fails.",
+  () => readiness.staleness().maxMs / 1000,
+);
+gauge(
+  "parallax_access_token_cache_age_seconds",
+  "How long since the access-token cache was last refreshed successfully.",
+  () => accessTokens.readiness().staleForMs / 1000,
+);
+gauge(
+  "parallax_access_token_cache_ready",
+  "1 while the cached access tokens are fresh enough to authenticate with.",
+  () => (accessTokens.readiness().ready ? 1 : 0),
+);
+gauge(
+  "parallax_dns_served_zones",
+  "Zones the DNS listener answers for. Absent when no listener is configured.",
+  () => (config.dns ? dnsSnapshot.length : undefined),
 );
 
 const securityConfig = (): SecurityConfig => {
@@ -80,18 +118,22 @@ if (!securityConfig().enabled && !isLoopbackHost(config.host)) {
 }
 
 accessTokens.startRefreshing(undefined, (error) => {
+  refreshFailed({ subsystem: "access-tokens" });
   console.error(`parallax: could not refresh access tokens: ${error instanceof Error ? error.message : "unknown error"}`);
 });
 settingsService.startRefreshing(undefined, (error) => {
+  refreshFailed({ subsystem: "settings" });
   console.error(`parallax: could not refresh settings: ${error instanceof Error ? error.message : "unknown error"}`);
 });
 credentials?.startRefreshing(undefined, (error) => {
+  refreshFailed({ subsystem: "credentials" });
   console.error(`parallax: could not refresh provider credentials: ${error instanceof Error ? error.message : "unknown error"}`);
 });
 
 const refreshDesiredState = (): void => {
   void readiness.refresh().catch((error: unknown) => {
     // DNS keeps its last known-good snapshot, while readiness fails closed.
+    refreshFailed({ subsystem: "desired-state" });
     console.error(`parallax: desired state could not be refreshed: ${error instanceof Error ? error.message : "unknown error"}`);
   });
 };
@@ -179,6 +221,7 @@ if (config.tls && tlsServer) {
     } catch (error) {
       // A half-written pair during rotation must not take the server down; the
       // context in use stays valid and the next event tries again.
+      certificateReloadFailed();
       console.error(`parallax: keeping the current certificate, the new one could not be read: ${error instanceof Error ? error.message : "unknown error"}`);
     }
   });
@@ -215,6 +258,26 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       error: "unauthorized",
       message: "issue an access token before serving this control plane through a proxy",
     }));
+    return;
+  }
+  if (pathname === "/metrics") {
+    // Behind authentication for the same reason `/health/ready` keeps its
+    // detail there: these numbers describe the deployment. A scraper sends a
+    // bearer token the same way it sends one to anything else.
+    if (securityConfig().enabled && !isAuthenticated(request)) {
+      response.writeHead(401, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+        "www-authenticate": "Bearer",
+      });
+      response.end(JSON.stringify({ error: "unauthorized", message: "authentication required" }));
+      return;
+    }
+    response.writeHead(200, {
+      "content-type": "text/plain; version=0.0.4; charset=utf-8",
+      "cache-control": "no-store",
+    });
+    response.end(request.method === "HEAD" ? undefined : renderMetrics());
     return;
   }
   if (pathname === "/health/live") {
@@ -416,15 +479,21 @@ if (config.dns) {
     ...(dnsConfig.notifyTo ? { notifyTo: dnsConfig.notifyTo } : {}),
     // Absent values stay absent, so the listener keeps its own defaults.
     ...dnsConfig.limits,
+    soa: {
+      ...(dnsConfig.soaPrimary ? { primary: dnsConfig.soaPrimary } : {}),
+      ...(dnsConfig.soaMailbox ? { mailbox: dnsConfig.soaMailbox } : {}),
+    },
     onUnservable: (record) => {
       // Stored content the domain accepted and the wire cannot carry. The
       // query was answered SERVFAIL, so this line is the only place it is said.
+      recordUnservable();
       console.error(`parallax: ${record.zone} ${record.name} ${record.type} could not be answered: ${record.reason}`);
     },
     onUnanswerable: (detail) => {
       // No record to name: every per-record guard passed and the reply still
       // could not be built. Said out loud because the query was answered
       // SERVFAIL, and this line is the only place the reason exists.
+      replyUnanswerable();
       console.error(`parallax: ${detail.zone} could not assemble a reply for ${detail.name}: ${detail.reason}`);
     },
   });

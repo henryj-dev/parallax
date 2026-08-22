@@ -68,6 +68,7 @@ bind, how to reach the store, and the keys that protect what is stored.
 | `PARALLAX_DNS_RATE_LIMIT_PER_SECOND`, `PARALLAX_DNS_RATE_LIMIT_BURST`, `PARALLAX_DNS_RATE_LIMIT_MAX_CLIENTS` | What one client may spend and how many clients are tracked. Default 100, 200 and 10000; the burst may not be below the rate |
 | `PARALLAX_DNS_FORWARD_TIMEOUT_MS`, `PARALLAX_DNS_MAX_CONCURRENT_FORWARDS`, `PARALLAX_DNS_MAX_TCP_CONNECTIONS` | Bounds on relaying and on open TCP connections. Default 4000, 256 and 1024 |
 | `PARALLAX_DNS_REQUIRE_COOKIE` | Answer a UDP client that has not returned an EDNS cookie (RFC 7873) with a truncated reply, so it comes back over TCP. Off by default: cookies are always offered and checked, but most resolvers do not send them, and this sends all of those through TCP |
+| `PARALLAX_DNS_SOA_PRIMARY`, `PARALLAX_DNS_SOA_MAILBOX` | What the synthesized SOA names. Defaults are derived from the zone (`ns.<zone>`, `hostmaster.<zone>`) and are guesses, not hosts known to exist — name real ones where secondaries transfer these zones, since MNAME is where they ask for updates |
 | `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | Certificate and key for this process to end TLS itself; set both or neither |
 | `PARALLAX_HTTP_REDIRECT_PORT` | Port answering plain HTTP with a redirect to the stored `publicOrigin`; needs both TLS and that setting |
 | `PARALLAX_READINESS_MAX_STALENESS_SECONDS` | How old a desired-state read may be before readiness reports 503; defaults to 10. Raise it where a readiness probe gates endpoints that also carry DNS |
@@ -915,6 +916,13 @@ All control-plane routes are under `/api/v1`.
 - `POST /credentials/cloudflare/:zone/test` (tests the stored binding, or an unsaved `{ profile }` or `{ token }`)
 - `POST /cli` (runs serving commands, never `migrate`; `{ "argv": ["zone", "list"] }`)
 - `GET /health/live` and `GET /health/ready`
+- `GET /metrics` — Prometheus text format, behind the same authentication as
+  everything else. It counts the failures that are otherwise only a line on
+  stderr: a stored record the wire cannot carry, a reply that could not be
+  assembled, a zone left unanswered, a background refresh that failed, a
+  certificate reload that did not take. Each is present at zero before it ever
+  happens, so an alert can tell "never" from "no such series". No zone, record
+  or client names appear — the labels are a small fixed set.
 
 Supply `Authorization: Bearer <token>` when authentication is enabled. Desired
 state is stored before provider changes; preview never mutates a provider, and

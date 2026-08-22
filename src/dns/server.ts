@@ -4,7 +4,7 @@ import { connect, createServer, isIP, type Server, type Socket as TcpSocket } fr
 import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
 import { createDnsCookies } from "./cookies.ts";
-import { encodeRdata, encodeSoa, rrType } from "./rdata.ts";
+import { DEFAULT_SOA_TIMERS, encodeRdata, encodeSoa, rrType, type SoaTimers } from "./rdata.ts";
 import {
   CLASS_ANY, CLASS_IN, MAX_EDNS_VERSION, MAX_RDATA_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
   isResponseToQuery, opcodeOf, readQuery, writeName, writeReply, writeTruncatedReply,
@@ -93,6 +93,20 @@ export interface DnsServerOptions {
   readonly notifyTo?: readonly string[];
   /** Injected by tests that capture NOTIFY instead of sending UDP. */
   readonly sendNotify?: (packet: Buffer, address: string, port: number) => Promise<void>;
+  /** What the synthesized SOA says. Every field falls back to a derived default. */
+  readonly soa?: SoaSettings;
+}
+
+export interface SoaSettings {
+  /**
+   * MNAME -- where a secondary asks for updates and sends them. Defaults to
+   * `ns.<zone>`, which is a guess: a deployment with secondaries should name a
+   * host that exists.
+   */
+  readonly primary?: string;
+  /** RNAME, the responsible mailbox with `@` written as a dot. */
+  readonly mailbox?: string;
+  readonly timers?: SoaTimers;
 }
 
 export interface ResolvedDnsAddress {
@@ -148,6 +162,7 @@ export function createDnsServer(options: DnsServerOptions): {
   );
   const cookies = createDnsCookies(options.cookieSecret ? { secret: options.cookieSecret } : {});
   const requireCookie = options.requireCookie ?? false;
+  const soaSettings = options.soa ?? {};
   const resolveHost = options.resolveHost ?? resolveDnsAddress;
   const resolveForwardHost = createTimedDnsResolver(resolveHost);
   const udpSockets: Socket[] = [];
@@ -242,7 +257,10 @@ export function createDnsServer(options: DnsServerOptions): {
     if (query.question.class !== CLASS_IN && query.question.class !== CLASS_ANY) {
       return answer(RCODE.REFUSED);
     }
-    const parts = { ...answerFromZone(query, zone, negativeTtl, options.onUnservable), ...(cookie ? { cookie } : {}) };
+    const parts = {
+      ...answerFromZone(query, zone, negativeTtl, options.onUnservable, soaSettings),
+      ...(cookie ? { cookie } : {}),
+    };
     const budget = overTcp ? Number.MAX_SAFE_INTEGER : query.udpPayloadSize;
     try {
       return writeReply(parts, budget);
@@ -525,9 +543,10 @@ function answerFromZone(
   zone: ServedZone,
   negativeTtl: number,
   onUnservable: DnsServerOptions["onUnservable"],
+  soaSettings: SoaSettings,
 ) {
   const name = query.question.name;
-  const soa = soaRecord(zone, negativeTtl);
+  const soa = soaRecord(zone, negativeTtl, soaSettings);
   // SOA is synthesized, not stored. A query that asks for it at the apex must
   // get it in the answer section — authority-only is how we talk about
   // negatives, and `dig SOA` / a secondary asking for the zone's SOA is not a
@@ -666,12 +685,30 @@ function dnameSubstitution(zone: ServedZone, name: string): ResourceRecord[] | u
   return undefined;
 }
 
-function soaRecord(zone: ServedZone, negativeTtl: number): ResourceRecord {
+/**
+ * The zone's SOA, which this listener synthesizes rather than stores.
+ *
+ * The primary name matters and used to be invented. `ns.<zone>` was written in
+ * because every zone has an apex, not because that name exists -- and a
+ * secondary that transfers this zone reads MNAME as where to ask for updates
+ * and where to send them. Pointing it at a name that does not resolve is not a
+ * cosmetic default; it is an answer about somebody else's next step.
+ *
+ * So a deployment that has secondaries names its own. One that has none never
+ * notices either way, which is why the invented name survived this long.
+ */
+function soaRecord(zone: ServedZone, negativeTtl: number, soa: SoaSettings): ResourceRecord {
   return {
     name: zone.name,
     type: TYPE.SOA,
     ttl: negativeTtl,
-    data: encodeSoa(`ns.${zone.name}`, `hostmaster.${zone.name}`, zone.serial, negativeTtl),
+    data: encodeSoa(
+      soa.primary ?? `ns.${zone.name}`,
+      soa.mailbox ?? `hostmaster.${zone.name}`,
+      zone.serial,
+      negativeTtl,
+      soa.timers ?? DEFAULT_SOA_TIMERS,
+    ),
   };
 }
 

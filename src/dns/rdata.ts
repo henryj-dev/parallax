@@ -73,12 +73,30 @@ export function encodeRdata(type: RecordType, content: string): Buffer {
 }
 
 /** SOA is synthesized rather than stored, so it is built from its parts. */
-export function encodeSoa(primary: string, mailbox: string, serial: number, negativeTtl: number): Buffer {
+export interface SoaTimers {
+  /** How often a secondary re-checks the serial. */
+  readonly refresh: number;
+  /** How soon it retries after a failed check. */
+  readonly retry: number;
+  /** When it stops answering for the zone because it has not reached us. */
+  readonly expire: number;
+}
+
+/** What a zone with no secondaries and a control plane behind it can afford. */
+export const DEFAULT_SOA_TIMERS: SoaTimers = Object.freeze({ refresh: 3600, retry: 600, expire: 604_800 });
+
+export function encodeSoa(
+  primary: string,
+  mailbox: string,
+  serial: number,
+  negativeTtl: number,
+  timers: SoaTimers = DEFAULT_SOA_TIMERS,
+): Buffer {
   const numbers = Buffer.alloc(20);
   numbers.writeUInt32BE(serial, 0);
-  numbers.writeUInt32BE(3600, 4);
-  numbers.writeUInt32BE(600, 8);
-  numbers.writeUInt32BE(604_800, 12);
+  numbers.writeUInt32BE(timers.refresh, 4);
+  numbers.writeUInt32BE(timers.retry, 8);
+  numbers.writeUInt32BE(timers.expire, 12);
   numbers.writeUInt32BE(negativeTtl, 16);
   return Buffer.concat([writeName(primary), writeName(mailbox), numbers]);
 }

@@ -285,6 +285,31 @@ describe("configuration", () => {
     assert.equal(readConfig({ PARALLAX_DNS_PORT: "53", HOST: "10.0.0.5", PARALLAX_DNS_HOST: "0.0.0.0" }).dns?.host, "0.0.0.0");
   });
 
+  /**
+   * Checked at startup rather than at the first query. A name that will not
+   * encode makes every SOA throw while it is being assembled -- and an SOA is
+   * what a negative answer carries, so the symptom would be that NXDOMAIN
+   * stops working on a listener that looks healthy.
+   */
+  it("validates the SOA names, and derives them when unset", () => {
+    assert.equal(readConfig({ PARALLAX_DNS_PORT: "53" }).dns?.soaPrimary, undefined);
+    assert.equal(
+      readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_SOA_PRIMARY: "NS1.Real.Example." }).dns?.soaPrimary,
+      "ns1.real.example",
+    );
+    assert.equal(
+      readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_SOA_MAILBOX: "dns.real.example" }).dns?.soaMailbox,
+      "dns.real.example",
+    );
+    for (const bad of ["notfullyqualified", "has space.example", "-leading.example", "a..b"]) {
+      assert.throws(
+        () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_SOA_PRIMARY: bad }),
+        /PARALLAX_DNS_SOA_PRIMARY must be a fully-qualified domain name/u,
+        bad,
+      );
+    }
+  });
+
   it("reads NOTIFY destinations only when they are named", () => {
     assert.equal(readConfig({ PARALLAX_DNS_PORT: "53" }).dns?.notifyTo, undefined);
     assert.deepEqual(

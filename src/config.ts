@@ -83,6 +83,18 @@ export interface DnsListenerSettings {
    * them behaves exactly as it did before they were reachable.
    */
   readonly limits: DnsListenerLimits;
+  /**
+   * What the synthesized SOA says about who is authoritative.
+   *
+   * Only matters where a secondary transfers these zones: MNAME is where it
+   * asks for updates, and the default is derived from the zone name rather than
+   * known to exist. A deployment with no secondaries can leave this alone.
+   *
+   * Not in `limits` -- these say what the answer contains, not what the
+   * listener will spend.
+   */
+  readonly soaPrimary?: string;
+  readonly soaMailbox?: string;
 }
 
 export interface DnsListenerLimits {
@@ -197,6 +209,8 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     environment.PARALLAX_DNS_TRANSFER_ALLOW ?? "",
     "PARALLAX_DNS_TRANSFER_ALLOW",
   );
+  const soaPrimary = readDnsName(environment.PARALLAX_DNS_SOA_PRIMARY, "PARALLAX_DNS_SOA_PRIMARY");
+  const soaMailbox = readDnsName(environment.PARALLAX_DNS_SOA_MAILBOX, "PARALLAX_DNS_SOA_MAILBOX");
   const notifyTo = (environment.PARALLAX_DNS_NOTIFY_TO ?? "")
     .split(",")
     .map((destination) => destination.trim())
@@ -209,6 +223,8 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     transferAllow,
     ...(notifyTo.length > 0 ? { notifyTo } : {}),
     limits: readDnsLimits(environment),
+    ...(soaPrimary ? { soaPrimary } : {}),
+    ...(soaMailbox ? { soaMailbox } : {}),
   };
 }
 
@@ -248,6 +264,24 @@ function readDnsLimits(environment: NodeJS.ProcessEnv): DnsListenerLimits {
     ...(maxConcurrentForwards !== undefined ? { maxConcurrentForwards } : {}),
     ...(maxTcpConnections !== undefined ? { maxTcpConnections } : {}),
   };
+}
+
+/**
+ * A name that has to survive being written to the wire.
+ *
+ * Checked here rather than at the first query, because the alternative is a
+ * listener that starts, looks healthy, and throws while assembling every SOA --
+ * and an SOA is what a negative answer carries, so the symptom would be that
+ * NXDOMAIN stops working.
+ */
+function readDnsName(value: string | undefined, setting: string): string | undefined {
+  const name = value?.trim().replace(/\.$/u, "").toLowerCase();
+  if (!name) return undefined;
+  const valid = name.length <= 253
+    && name.includes(".")
+    && name.split(".").every((label) => /^(?!-)[a-z0-9_-]{1,63}(?<!-)$/u.test(label));
+  if (!valid) throw new Error(`${setting} must be a fully-qualified domain name`);
+  return name;
 }
 
 function readDnsClientCidrs(source: string, setting: string): string[] {

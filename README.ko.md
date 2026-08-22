@@ -70,6 +70,7 @@ pnpm start
 | `PARALLAX_DNS_RATE_LIMIT_PER_SECOND`, `PARALLAX_DNS_RATE_LIMIT_BURST`, `PARALLAX_DNS_RATE_LIMIT_MAX_CLIENTS` | 클라이언트 하나가 쓸 수 있는 양과 추적하는 클라이언트 수. 기본 100, 200, 10000이며 버스트는 초당 속도보다 작을 수 없다 |
 | `PARALLAX_DNS_FORWARD_TIMEOUT_MS`, `PARALLAX_DNS_MAX_CONCURRENT_FORWARDS`, `PARALLAX_DNS_MAX_TCP_CONNECTIONS` | 전달과 열린 TCP 연결의 한도. 기본 4000, 256, 1024 |
 | `PARALLAX_DNS_REQUIRE_COOKIE` | EDNS 쿠키(RFC 7873)를 돌려주지 않은 UDP 클라이언트에게 잘린 응답을 보내 TCP로 다시 오게 한다. 기본은 꺼짐 — 쿠키는 항상 주고받고 검증하지만, 대부분의 리졸버는 쿠키를 보내지 않으므로 켜면 그 전부가 TCP를 거친다 |
+| `PARALLAX_DNS_SOA_PRIMARY`, `PARALLAX_DNS_SOA_MAILBOX` | 합성되는 SOA가 지목하는 이름. 기본값은 존에서 파생한 `ns.<zone>`·`hostmaster.<zone>`이고 이는 추측이지 존재가 확인된 호스트가 아니다. 세컨더리가 이 존을 전송받는다면 실재하는 이름을 지정할 것 — MNAME은 세컨더리가 갱신을 물으러 가는 곳이다 |
 | `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | 이 프로세스가 직접 TLS를 종단할 인증서와 키. 둘 다 설정하거나 둘 다 비워야 함 |
 | `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP에 저장된 `publicOrigin`으로의 리다이렉트를 내는 포트. TLS와 해당 설정이 모두 필요 |
 | `PARALLAX_AUTH_TOKENS` | `{"token","subject","role"}` 객체의 JSON 배열. `role`은 `admin`, `editor`, `viewer` 중 하나이고, 토큰은 임의의 32바이트를 패딩 없는 canonical base64url로 인코딩한 43자 값. 루프백에서는 선택, **그 외 주소에 바인드하려면 필수** |
@@ -533,6 +534,12 @@ CLI와 서버는 같은 저장소의 최신 값을 읽습니다. 파일 백엔�
 - `POST /credentials/cloudflare/:zone/test` — 저장된 연결, 또는 아직 저장하지 않은 `{ profile }`·`{ token }` 테스트
 - `POST /cli` (서빙 runtime의 명령 실행. `migrate`는 제외. `{ "argv": ["zone", "list"] }`)
 - `GET /health/live`, `GET /health/ready`
+- `GET /metrics` — Prometheus 텍스트 형식, 나머지와 같은 인증 뒤에 있다. 지금까지
+  stderr 한 줄로만 나가던 실패들을 센다: 와이어가 담을 수 없는 저장된 레코드,
+  조립되지 못한 응답, 답하지 못하게 된 존, 실패한 백그라운드 갱신, 적용되지 않은
+  인증서 재적재. 각각 일어나기 전에도 0으로 존재하므로, 알림이 "한 번도 없음"과
+  "그런 시계열 없음"을 구분할 수 있다. 존·레코드·클라이언트 이름은 나오지 않으며
+  레이블은 고정된 작은 집합이다
 
 인증을 활성화한 경우 `Authorization: Bearer <token>`을 전달합니다. 목표 상태는
 프로바이더 변경보다 먼저 저장됩니다. 미리보기는 프로바이더를 변경하지 않으며,
