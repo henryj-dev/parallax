@@ -269,9 +269,16 @@ DDL(런타임에서 `migrate` 능력을 의도적으로 제외, `runtime.ts:146-
   거부한다(`dns.ts:212`). 즉 SOA·DNSKEY·긴 TXT를 여러 줄로 쓰는 **BIND의 통상 표기가
   전부 실패**한다. ③`$INCLUDE`·`$GENERATE` 미지원(단 `$INCLUDE` 미지원은 파일 읽기
   표면을 막아주므로 **의도적으로 유지할 것**).
-- **확신도:** 코드 추적으로 확인. 실제 BIND 덤프 대상 재현은 미수행.
+- **확신도:** 확인됨(2026-08-22 재현).
 - **수정 제안:** 파서에 괄호 이어짐 상태를 추가하고, 이어붙인 뒤의 content에 대해서만
   구조 문자 검사를 적용한다. `import --dry-run`(뷰 교체 전 diff 미리보기)도 함께 권고.
+- ⚠️ **재현 중에 같은 경로에서 결함 둘이 더 나왔다.** 괄호를 고치고 나니 다음 줄에서
+  걸렸다 — `uniqueId`(`domain/zone-file.ts`)가 만드는 레코드 id가
+  `validateRecordId`의 두 규칙을 모두 어긴다. ①`_dmarc`·`_acme-challenge` 같은
+  underscored owner는 `_`로 시작하는 id를 만드는데 id는 letter/digit로 시작해야 한다.
+  ②길이를 60자로 자르는데 상한은 36자다. 둘 다 zone file import 전용이고 괄호와
+  무관하게 원래 있었으며, 증상은 "record id must be 1 to 36..."이라는 **파일과
+  무관해 보이는 메시지**였다.
 
 ### M4. 종료에 데드라인이 없어 SIGTERM이 grace period를 넘길 수 있다
 - **성격:** 신뢰성(운영)
