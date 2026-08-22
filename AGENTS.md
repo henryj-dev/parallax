@@ -50,8 +50,8 @@ an answer about everything that glob covers.
 
 | | count | |
 |---|---|---|
-| both sides, byte-identical | 12 | the nine under `scripts/claude-hooks/**`, `pre-commit`, `test-pre-commit.py`, `.codex/hooks.json` |
-| both sides, different | 1 | `scripts/git-hooks/install.sh` — fit, below |
+| both sides, byte-identical | 11 | the nine under `scripts/claude-hooks/**`, `pre-commit`, `test-pre-commit.py` |
+| both sides, different | 2 | `scripts/git-hooks/install.sh`, `.codex/hooks.json` — both fit, below |
 | only there | 2 | `scripts/git-hooks/pre-push`, `scripts/git-hooks/test-pre-push.py` (`00ee877e`) |
 | only here | 0 | |
 
@@ -81,6 +81,18 @@ correspondence documents here, and no `pre-push` file to install, so taking
 that installer would `chmod` a path that does not exist and the installer
 would stop. The difference is **fit, not staleness**: leave it, and re-take it
 only if this repository ever grows the thing that hook guards.
+
+**2026-08-23 — `.codex/hooks.json` left that set, and for the same kind of
+reason.** Its first `PreToolUse` entry auto-approved `ssh`/`scp` to any
+`10.0.0.0/8` host, tagged `mesh-10/8-ssh`. That is a fine thing to carry in a
+private repository and the wrong thing to publish: it tells a reader that a
+private mesh exists, and it hands every future contributor who clones this an
+auto-approval into it. The entry is gone here; the three that call
+`scripts/claude-hooks/**` are untouched, so what the file does for the main-tree
+guard is unchanged. **Fit, not staleness** — the divergence is this repository
+going public, not stardust moving ahead, and re-taking the file would put the
+entry back. If stardust changes the guard wiring, take that part and leave the
+ssh entry out.
 
 The two files that exist only there are the same decision, not a second one.
 Taking `pre-push` itself would be a third copy of a hook whose job does not

@@ -24,3 +24,11 @@ coverage.*
 .idea/
 .vscode/
 .DS_Store
+
+# Agent run state: notes, plans, handoffs, session logs, project memory. One
+# machine's working memory. Until now only a personal global ignore kept this
+# out of a commit -- which held for one checkout and for nobody else's.
+# `.omc/skills/` is the documented exception: project-scoped skills are meant
+# to be committed, so the entry lists the directory's contents and spares it.
+/.omc/*
+!/.omc/skills/

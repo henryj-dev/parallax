@@ -4,7 +4,8 @@
 확인할 것** — 없으면 손으로 건다. `.env` 는 추적되지 않으므로 항상 손으로 가져와야 한다.
 
 ```bash
-MAIN=/Users/henry/github/mack-erel/parallax
+# 메인 트리 경로. 워크트리 안에서도 공용 .git 을 가리키므로 여기서 유도된다.
+MAIN=$(dirname "$(git rev-parse --git-common-dir)")
 
 [ -e node_modules ] || ln -s "$MAIN/node_modules" node_modules   # 심링크가 안 걸렸을 때만
 cp "$MAIN/.env" .env                                             # 추적 안 됨 — 항상 필요
