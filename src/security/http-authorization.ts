@@ -1,4 +1,5 @@
 import { readSession, assertSessionSecret } from "./session-token.ts";
+import { readCookie as readCookieValue } from "./cookies.ts";
 import { createHash, timingSafeEqual } from "node:crypto";
 
 export type Role = "admin" | "editor" | "viewer";
@@ -436,26 +437,9 @@ function matchToken(candidate: string, tokens: readonly PreparedToken[]): Princi
   return match;
 }
 
+/** A credential, so the value has to look like one as well as be unshadowed. */
 function readCookie(header: string | null, name: string): string | undefined {
-  if (!header) return undefined;
-  let candidate: string | undefined;
-  for (const part of header.split(";")) {
-    const separator = part.indexOf("=");
-    if (separator < 1) continue;
-    const key = part.slice(0, separator).trim();
-    if (key !== name || candidate !== undefined) {
-      if (key === name) return undefined;
-      continue;
-    }
-    try {
-      const decoded = decodeURIComponent(part.slice(separator + 1).trim());
-      if (!TOKEN_PATTERN.test(decoded) || decoded.length === 0) return undefined;
-      candidate = decoded;
-    } catch {
-      return undefined;
-    }
-  }
-  return candidate;
+  return readCookieValue(header, name, (value) => TOKEN_PATTERN.test(value));
 }
 
 const DIGEST_BYTES = 32;

@@ -1,4 +1,5 @@
 import type { OidcSettings } from "../config.ts";
+import { readCookie as readCookieValue } from "../security/cookies.ts";
 import { hasSameOrigin, IDENTITY_COOKIE } from "../security/http-authorization.ts";
 import { beginAuthorization, endSessionUrl, exchangeCode, readIdentity, OidcError, type OidcConfig } from "../security/oidc.ts";
 import { randomUrlSafe, signSession } from "../security/session-token.ts";
@@ -66,18 +67,19 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
     const { url: authorize, state, verifier } = beginAuthorization(config);
     const returnTo = safeReturnPath(url.searchParams.get("next"));
     return redirect(authorize, [
-      handshakeCookie(STATE_COOKIE, state, url),
-      handshakeCookie(VERIFIER_COOKIE, verifier, url),
-      handshakeCookie(RETURN_COOKIE, returnTo, url),
+      handshakeCookie(handshakeName(STATE_COOKIE, url), state, url),
+      handshakeCookie(handshakeName(VERIFIER_COOKIE, url), verifier, url),
+      handshakeCookie(handshakeName(RETURN_COOKIE, url), returnTo, url),
     ]);
   }
 
   async function finishLogin(request: Request, url: URL): Promise<Response> {
     const cookies = request.headers.get("cookie");
-    const expectedState = readCookie(cookies, STATE_COOKIE);
-    const verifier = readCookie(cookies, VERIFIER_COOKIE);
-    const returnTo = safeReturnPath(readCookie(cookies, RETURN_COOKIE));
-    const cleared = [STATE_COOKIE, VERIFIER_COOKIE, RETURN_COOKIE].map((name) => clearedCookie(name, url));
+    const expectedState = readCookie(cookies, handshakeName(STATE_COOKIE, url));
+    const verifier = readCookie(cookies, handshakeName(VERIFIER_COOKIE, url));
+    const returnTo = safeReturnPath(readCookie(cookies, handshakeName(RETURN_COOKIE, url)));
+    const cleared = [STATE_COOKIE, VERIFIER_COOKIE, RETURN_COOKIE]
+      .map((name) => clearedCookie(handshakeName(name, url), url));
 
     const provided = url.searchParams.get("error");
     if (provided) {
@@ -143,6 +145,23 @@ function redirect(location: string, cookies: string[]): Response {
   return new Response(null, { status: 302, headers });
 }
 
+/**
+ * `__Host-` where the scheme allows it, and the plain name where it does not.
+ *
+ * The prefix is what stops the shadowing in the first place: a browser refuses
+ * to accept a `__Host-` cookie that carries a Domain, so no sibling host can
+ * set one of these for the parent domain. Refusing a duplicate when reading is
+ * the other half -- it turns the attack into a failed sign-in rather than
+ * somebody else's session -- but this is the half that prevents it.
+ *
+ * Conditional because the prefix also requires `Secure`, which a plain-HTTP
+ * loopback deployment cannot have. There the browser would reject the cookie
+ * outright and no sign-in would ever complete.
+ */
+function handshakeName(base: string, url: URL): string {
+  return url.protocol === "https:" ? `__Host-${base}` : base;
+}
+
 function handshakeCookie(name: string, value: string, url: URL): string {
   // Lax, not Strict: the provider redirects the browser here from its own site,
   // and a Strict cookie is not sent on that navigation -- the callback would
@@ -169,19 +188,18 @@ function cookie(name: string, value: string, url: URL, maxAgeSeconds: number, sa
   ].join("; ");
 }
 
+/**
+ * No value rule here on purpose.
+ *
+ * `parallax_oidc_return` holds a path the portal built from `location.search`
+ * and `location.hash`, so the token alphabet the authentication side requires
+ * would drop every return path with a query string -- silently, landing the
+ * person on the root after signing in. `safeReturnPath` already checks that
+ * value, `state` is compared against what this server generated, and the id
+ * token is the provider's to read. What is shared is the duplicate rule.
+ */
 function readCookie(header: string | null, name: string): string | undefined {
-  if (!header) return undefined;
-  for (const part of header.split(";")) {
-    const separator = part.indexOf("=");
-    if (separator < 0) continue;
-    if (part.slice(0, separator).trim() !== name) continue;
-    try {
-      return decodeURIComponent(part.slice(separator + 1).trim());
-    } catch {
-      return undefined;
-    }
-  }
-  return undefined;
+  return readCookieValue(header, name);
 }
 
 export const IDENTITY_TEST_COOKIES = { STATE_COOKIE, VERIFIER_COOKIE, RETURN_COOKIE, ID_TOKEN_COOKIE, randomUrlSafe };

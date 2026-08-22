@@ -65,11 +65,15 @@ describe("identity sign-in", () => {
     const started = await handler(new Request("https://parallax.example/auth/login?next=/zones"));
     assert.equal(started?.status, 302);
     const handshake = cookiesOf(started as Response);
-    const state = handshake.get("parallax_oidc_state") as string;
+    // Over https the handshake cookies carry the `__Host-` prefix, which is what
+    // stops a sibling host from setting one of them for the parent domain.
+    const state = handshake.get("__Host-parallax_oidc_state") as string;
     assert.match((started as Response).headers.get("location") ?? "", /code_challenge_method=S256/);
 
     const done = await handler(new Request(`https://parallax.example/auth/callback?code=abc&state=${state}`, {
-      headers: { cookie: `parallax_oidc_state=${state}; parallax_oidc_verifier=${handshake.get("parallax_oidc_verifier")}; parallax_oidc_return=/zones` },
+      headers: {
+        cookie: `__Host-parallax_oidc_state=${state}; __Host-parallax_oidc_verifier=${handshake.get("__Host-parallax_oidc_verifier")}; __Host-parallax_oidc_return=/zones`,
+      },
     }));
     assert.equal(done?.status, 302);
     assert.equal((done as Response).headers.get("location"), "/zones");
@@ -188,7 +192,78 @@ describe("identity sign-in", () => {
     const handler = createIdentityHandler({ settings: SETTINGS, fetchImpl: provider({ sub: "u", entitlements: ["viewer"] }) });
     for (const hostile of ["//evil.example", "/\\evil.example", "https://evil.example"]) {
       const started = await handler(new Request(`https://parallax.example/auth/login?next=${encodeURIComponent(hostile)}`));
-      assert.equal(cookiesOf(started as Response).get("parallax_oidc_return"), "/", hostile);
+      assert.equal(cookiesOf(started as Response).get("__Host-parallax_oidc_return"), "/", hostile);
     }
+  });
+
+  /**
+   * A cookie name that appears twice is one somebody else is also setting.
+   *
+   * Anything under a shared parent domain can set a cookie for that parent, and
+   * the browser sends both. Reading the first one let a sibling host choose the
+   * `state` and `verifier` this callback compares against -- so the victim's
+   * browser would complete the attacker's authorization code and the session
+   * that came back would be the attacker's account.
+   */
+  it("refuses a handshake whose state cookie somebody else is also setting", async () => {
+    const handler = createIdentityHandler({
+      settings: SETTINGS,
+      fetchImpl: provider({ sub: "attacker", entitlements: ["admin"] }),
+    });
+
+    // Two sign-ins were started: the attacker's, and the victim's own. The
+    // attacker holds the code and the state from theirs, and is positioned to
+    // set a cookie for the parent domain, so the victim's browser now sends
+    // both -- the attacker's first.
+    const attacker = cookiesOf(await handler(new Request("https://parallax.example/auth/login?next=/")) as Response);
+    const victim = cookiesOf(await handler(new Request("https://parallax.example/auth/login?next=/zones")) as Response);
+    const attackerState = attacker.get("__Host-parallax_oidc_state") as string;
+
+    // The callback carries the attacker's code and the attacker's state. Read
+    // first-wins, the pair matches, the exchange completes -- and the session
+    // the victim's browser is left holding belongs to the attacker's account.
+    const shadowed = await handler(new Request(`https://parallax.example/auth/callback?code=attacker-code&state=${attackerState}`, {
+      headers: {
+        cookie: [
+          `__Host-parallax_oidc_state=${attackerState}`,
+          `__Host-parallax_oidc_verifier=${attacker.get("__Host-parallax_oidc_verifier")}`,
+          `__Host-parallax_oidc_state=${victim.get("__Host-parallax_oidc_state")}`,
+          `__Host-parallax_oidc_verifier=${victim.get("__Host-parallax_oidc_verifier")}`,
+        ].join("; "),
+      },
+    }));
+    assert.equal(shadowed?.status, 302);
+    assert.match((shadowed as Response).headers.get("location") ?? "", /signin_error/u);
+    // Not cleared -- never set. The failure path does not reach the exchange.
+    assert.equal(cookiesOf(shadowed as Response).get(IDENTITY_COOKIE), undefined, "no session may be issued");
+  });
+
+  /**
+   * The return cookie holds a path, not a token.
+   *
+   * Sharing the authentication side's value rule would have been the obvious
+   * way to share the duplicate rule, and it would have dropped every return
+   * path with a query string -- `?` is not in the token alphabet. The portal
+   * builds `next` from `location.search` and `location.hash`, so the symptom
+   * would have been landing on the root after signing in, with nothing said.
+   */
+  it("carries a return path that has a query string and a fragment", async () => {
+    const handler = createIdentityHandler({ settings: SETTINGS, fetchImpl: provider({ sub: "u", entitlements: ["viewer"] }) });
+    const next = "/zones?view=internal#rec";
+    const started = await handler(new Request(`https://parallax.example/auth/login?next=${encodeURIComponent(next)}`));
+    const handshake = cookiesOf(started as Response);
+    assert.equal(handshake.get("__Host-parallax_oidc_return"), next);
+
+    const state = handshake.get("__Host-parallax_oidc_state") as string;
+    const done = await handler(new Request(`https://parallax.example/auth/callback?code=abc&state=${state}`, {
+      headers: {
+        cookie: [
+          `__Host-parallax_oidc_state=${state}`,
+          `__Host-parallax_oidc_verifier=${handshake.get("__Host-parallax_oidc_verifier")}`,
+          `__Host-parallax_oidc_return=${encodeURIComponent(next)}`,
+        ].join("; "),
+      },
+    }));
+    assert.equal((done as Response).headers.get("location"), next);
   });
 });
