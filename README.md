@@ -1,10 +1,61 @@
 # Parallax
 
+[![check](https://github.com/henryj-dev/parallax/actions/workflows/check.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/check.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A5%2024-5FA04E)](package.json)
+
 English | [한국어](README.ko.md)
 
 Parallax is a split-horizon DNS control plane and operations portal. It keeps
 one desired state for internal DNS and external Cloudflare DNS, previews the
 resulting changes, and applies only records explicitly managed by Parallax.
+
+```
+                          one desired state
+                                 │
+            ┌────────────────────┴────────────────────┐
+            ▼                                         ▼
+       internal view                            external view
+      app.example.com                          app.example.com
+         10.0.0.11                               203.0.113.7
+```
+
+One name, two answers. The internal view is answered by the built-in DNS
+listener over UDP and TCP; the external view is applied to Cloudflare, and only
+ever the records Parallax manages.
+
+<details>
+<summary><b>Contents</b></summary>
+
+- [Included features](#included-features)
+- [Requirements](#requirements)
+- [Run locally](#run-locally)
+- [Configuration](#configuration)
+  - [Upgrading an existing deployment](#upgrading-an-existing-deployment)
+  - [Access tokens](#access-tokens)
+  - [Signing in through an identity provider](#signing-in-through-an-identity-provider)
+  - [Ending TLS in the process](#ending-tls-in-the-process)
+  - [Serving the portal behind a reverse proxy](#serving-the-portal-behind-a-reverse-proxy)
+  - [Provider credentials](#provider-credentials)
+  - [Publishing the internal view](#publishing-the-internal-view)
+  - [Answering and being ready are not the same thing](#answering-and-being-ready-are-not-the-same-thing)
+  - [Pointing a resolver at the internal view](#pointing-a-resolver-at-the-internal-view)
+  - [Reading the history](#reading-the-history)
+  - [Restoring a revision](#restoring-a-revision)
+  - [Retention](#retention)
+- [One surface, three ways in](#one-surface-three-ways-in)
+- [Command line](#command-line)
+- [Record types](#record-types)
+- [Adopting records that already exist](#adopting-records-that-already-exist)
+  - [Client-side resolver overrides](#client-side-resolver-overrides)
+- [HTTP API](#http-api)
+  - [Managing records one at a time](#managing-records-one-at-a-time)
+- [Container image](#container-image)
+- [Verifying against real dependencies](#verifying-against-real-dependencies)
+- [Development workflow](#development-workflow)
+- [License](#license)
+
+</details>
 
 ## Included features
 
