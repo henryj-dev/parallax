@@ -6,7 +6,7 @@
 # The base tracks `engines.node` in package.json. If one moves, move the other:
 # a build that passes on an older runtime only proves nothing 24-only is in use
 # *yet*, and the day that changes it breaks at runtime, not at build time.
-FROM node:24-alpine AS build
+FROM node:26-alpine AS build
 WORKDIR /app
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable
@@ -18,14 +18,14 @@ RUN pnpm build
 # Runtime dependencies are resolved separately rather than carried over from the
 # build stage. This application declares exactly one -- `pg` -- so the difference
 # is the whole TypeScript toolchain.
-FROM node:24-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --prod --frozen-lockfile --ignore-scripts
 
-FROM node:24-alpine
+FROM node:26-alpine
 WORKDIR /app
 RUN addgroup -g 10001 -S parallax && adduser -u 10001 -S -G parallax parallax
 
