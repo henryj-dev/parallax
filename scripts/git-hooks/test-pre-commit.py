@@ -118,6 +118,18 @@ try:
     })
     check("설치 env 만으로는 안 막는다", rc == 0)
 
+    # ③-e 목록이 **지금 쓰이는 하네스의 실제 변수 이름**을 담고 있는가.
+    #     ③-c 는 `AGENT_ENV` 를 돌므로 이름이 **빠지면** 검사가 그만큼 줄 뿐 통과한다.
+    #     그 구멍으로 2026-08-23 까지 Claude Code 가 사람으로 분류돼 있었다: 목록은
+    #     `CLAUDE_CODE`/`CLAUDE_SESSION_ID` 를 찾는데 실제로 심기는 `CLAUDECODE`/
+    #     `CLAUDE_CODE_SESSION_ID` 였다. 한 끗 차이라 눈으로는 맞아 보인다.
+    #     여기만 목록을 **다시 적는다.** 위의 동적 로드와 목적이 다르다 — 그쪽은
+    #     「목록에 있는 것이 도는가」(동작), 이쪽은 「있어야 할 것이 있는가」(완전성).
+    #     하네스가 또 이름을 바꾸면 이 검사가 깨지고, 깨지는 것이 이 검사의 일이다.
+    for k in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID",
+              "CURSOR_AGENT", "GROK_AGENT"):
+        check(f"목록이 {k} 를 담는다", k in AGENT_ENV)
+
     # ④ --no-verify 는 에이전트도 우회한다 — 알려진 한계이므로 **성질로 고정**해 둔다.
     rc, out = touch_and_commit(main, "m2.txt", "--no-verify", extra_env=agent())
     check("--no-verify 는 에이전트도 우회한다(알려진 한계)", rc == 0)

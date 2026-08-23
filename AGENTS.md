@@ -36,11 +36,32 @@ session left behind, for instance — `touch .git/claude-main-tree-rescue`
 been re-taken since. stardust holds the canonical copy; this one is allowed to
 fall behind.
 
-**Measured 2026-08-20:** the tool-neutral creator, its regression test, and
-owner-record locking were re-taken from stardust. Repository-specific settings,
-bootstrap, installer, and the intentionally absent correspondence pre-push hook remain fit.
+**Measured 2026-08-23:** `main-tree-guard.py` and its regression test were
+re-taken from stardust. They had drifted in the three days since the previous
+measurement, while the paragraph above still said the nine were identical —
+exactly the staleness the warning below describes, and the second time this
+record has been caught a step behind the thing it records. stardust's
+`390af71c` fixes a false positive: an Add File into a **new nested directory**
+inside a worktree has no existing parent, so the walk fell back to the session
+cwd — usually main — and refused legitimate worktree work as a main-tree edit.
+Repository-specific settings, bootstrap, installer, and the intentionally
+absent correspondence pre-push hook remain fit.
 
-**Measured 2026-08-20** against this re-take and stardust `094e404b`.
+The same walk sent a fix the other way, which is the direction this file had
+not yet had an occasion to record. `scripts/git-hooks/pre-commit` looked for
+`CLAUDE_CODE` and `CLAUDE_SESSION_ID`; Claude Code actually plants `CLAUDECODE`
+and `CLAUDE_CODE_SESSION_ID`. One character apart, so the list read as correct.
+Measured with `printenv` inside a Bash tool subprocess: **all eight** of the
+list's names are empty there, so the git layer had been classifying Claude
+sessions as *people*. A/B from a main tree, same cwd and the real session
+environment — old hook `exit 0`, fixed hook `exit 1`. PreToolUse normally
+refuses first, so nothing visibly broke; but all three layers fail open, and
+this was the layer meant to catch the other two doing so. It went to stardust
+first (`4e04d5c0`) and came back here in the same re-take, so both sides stay
+byte-identical. Nothing was wrong here that was not also wrong there — which
+is the case the "fix it upstream" rule exists for.
+
+**Measured 2026-08-23** against this re-take and stardust `4e04d5c0`.
 The walk is the **union** of both sides' paths under those
 globs — a file that exists on only one side is a difference, the same way a
 byte-unequal file is. The 2026-08-18 measurement walked the files this side
@@ -55,12 +76,14 @@ an answer about everything that glob covers.
 | only there | 2 | `scripts/git-hooks/pre-push`, `scripts/git-hooks/test-pre-push.py` (`00ee877e`) |
 | only here | 0 | |
 
-The last commit there to touch any of the identical ten is `bdd4420b` — the
-2026-08-19 change that lets a person commit on main and still refuses an
-agent. The two that exist only there arrived at `00ee877e`. Today's identical
-ten match after this re-take; before it, `pre-commit` and
-`test-pre-commit.py` had already drifted while the previous paragraph still
-said they had not.
+The last commit there to touch any of the identical eleven is `4e04d5c0` —
+the `AGENT_ENV` fix above, authored from this side. The two that exist only
+there still date from `00ee877e`. The eleven match after this re-take; before
+it, `main-tree-guard.py` and `test-main-tree-guard.py` had drifted while the
+previous paragraph still said they had not. That is the same sentence the
+2026-08-20 measurement had to write about two different files, so treat the
+pattern rather than the pair as the finding: **the record goes stale between
+occasions to run the walk, and only running it says which files moved.**
 
 ⚠️ **This paragraph said `80bb6dbd` for two of those files, and that was wrong
 one commit after it was written.** `66959a3` wrote the sentence; `409d2c2` took

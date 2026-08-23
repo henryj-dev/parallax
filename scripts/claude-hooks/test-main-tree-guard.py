@@ -125,6 +125,8 @@ CASES = [
     #    실제로 메인 트리에 `_codex_probe.txt` 가 생겼다. 같은 키가 두 뜻을 갖는다.
     ("apply_patch(command 키) 메인 편집 → 막는다", "S1", MAIN, "apply_patch", {"command": f"*** Begin Patch\n*** Add File: {MAIN}/_probe.txt\n+x\n*** End Patch"}, "DENY"),
     ("apply_patch(command 키) 워크트리는 통과",   "S1", MAIN, "apply_patch", {"command": f"*** Begin Patch\n*** Update File: {WT}/PLAN.md\n+x\n*** End Patch"}, "ALLOW"),
+    ("apply_patch 새 워크트리 하위 경로는 통과", "S1", MAIN, "apply_patch", {"command": f"*** Begin Patch\n*** Add File: {WT}/_new_route/deep/+page.svelte\n+x\n*** End Patch"}, "ALLOW"),
+    ("apply_patch 새 메인 하위 경로는 막는다",   "S1", MAIN, "apply_patch", {"command": f"*** Begin Patch\n*** Add File: {MAIN}/_new_route/deep/+page.svelte\n+x\n*** End Patch"}, "DENY"),
     ("apply_patch(input 키)도 막는다",           "S1", MAIN, "apply_patch", {"input": f"*** Begin Patch\n*** Update File: {MAIN}/PLAN.md\n+x\n*** End Patch"}, "DENY"),
     ("모르는 이름 + 워크트리 경로는 통과",     "S1", MAIN,   "apply_patch", {"input": f"*** Begin Patch\n*** Update File: {WT}/PLAN.md\n+x\n*** End Patch"}, "ALLOW"),
     ("모르는 이름 + path/content 도 막는다",  "S1", MAIN,   "write_file", {"path": f"{MAIN}/docs/x.md", "content": "x"}, "DENY"),
