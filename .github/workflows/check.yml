@@ -66,7 +66,7 @@ jobs:
       matrix:
         node: [24, 26]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Nothing in this job pushes. By default checkout leaves the job's
           # token in `.git/config` as an auth header, where every subsequent
@@ -81,7 +81,7 @@ jobs:
       # warning rather than a failure -- so the 26 leg died at the first step
       # that actually wanted node. Hosted images carry the library, so the step
       # is gone. If this ever moves back to an image of our own, it comes back.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       # `corepack enable` stood here, and on the 24 leg it still would work:
@@ -90,7 +90,7 @@ jobs:
       # exit 127, on every run since the leg was added -- it has never once been
       # green. This action reads the same `packageManager` field corepack read,
       # so the pnpm version stays declared in exactly one place.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm run check:portal
@@ -114,10 +114,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: node --test test/infrastructure/schema-surface.test.ts
