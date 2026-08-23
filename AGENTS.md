@@ -150,6 +150,24 @@ stardust's `.codex/config.toml` is deliberately **not** taken: it sets shell
 environment for that repository, and copying it here would put a second copy of
 someone's credentials in a second place.
 
+### 스냅샷을 CI 에서 돌리기 시작하니 하나가 흔들린다
+
+**측정 2026-08-23.** `scripts.yml` 이 이 스위트들을 처음으로 실제로 돌리기 시작했고,
+`test-session-end-cleanup.py` 의 `동시 실행을 실패로 보고하지 않는다` 가 **CI 11회 중
+1회** 실패한다. 같은 커밋을 재실행하면 통과한다. 맥에서 격리 클론으로 12회 돌려서는
+**0회** 나온다 — 러너에서만 보이는 쪽이다.
+
+무엇이 흔들리는지는 좁혀져 있다. 그 검사는 `fast_forward_main` 을 **8 스레드로 동시에**
+부르고, 각 스레드가 먼저 `git fetch origin` 을 한다. 바로 앞 줄의
+`동시 8개에서도 실제로 최신화된다` 는 **같은 실행에서 통과했다** — 즉 트리는 v2 로
+올라갔고, 여덟 중 하나가 그 과정에서 실패를 *보고* 했을 뿐이다. git 의 ref/index 락
+경합으로 읽는 것이 자연스럽고, 러너가 느리고 더 붐빈다는 것과도 맞는다.
+
+⚠️ **여기서 고치지 않는다.** Parallax 에 국한된 문제가 아니라 가드 자신의 동시성
+처리이므로, 위의 규칙대로 stardust 로 가야 한다. 여기서 고치면 `cmp` 한 줄로 드리프트를
+볼 수 있게 해 주는 성질이 사라진다. 이 문단은 그때까지의 기록이다 — 그리고 이런 종류의
+간헐 실패는 **게이트를 믿지 않게 만드는 쪽으로 비싸다.**
+
 ⚠️ Nothing detects stardust moving ahead. This is a record, not a mechanism: if
 those hooks change there, this copy goes quietly stale, and the staleness lives
 in a different repository than the check would. A fix belongs here rather than
