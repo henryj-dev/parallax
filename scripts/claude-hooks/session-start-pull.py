@@ -106,6 +106,14 @@ def _lost_the_race(git, main_tree, upstream, merge_output):
             continue                     # 못 읽었다 — 판단하지 않는다
         if head2 == target2:
             return True, None            # 경합에서 졌을 뿐 — 다른 세션이 이미 올렸다
+        # ⚠️ **다시 읽는 것만으로는 부족한 경우가 하나 남는다.** 위 두 줄은 「남이 이미
+        #    올렸는가」만 답한다. 우리 merge 가 `index.lock` 을 놓쳐 실패했는데 **아무도
+        #    이기지 않았다면**, HEAD 는 영원히 업스트림과 다르고 이 루프는 몇 번을 읽어도
+        #    실패로 끝난다 — 한 번 더 시도했으면 성공했을 자리에서. 락을 놓친 것뿐이면
+        #    이번엔 우리가 잡는다.
+        rc_retry, out_retry = git(main_tree, "merge", "--ff-only", upstream)
+        if rc_retry == 0:
+            return True, (out_retry.splitlines() or ["ok"])[0][:80]
     return False, (merge_output.splitlines() or ["merge 실패"])[0][:80]
 
 

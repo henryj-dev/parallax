@@ -227,6 +227,29 @@ try:
     ok_stuck, _ = ff_with(lambda ref, reads: (0, "aaaaaaa" if ref == "HEAD" else "bbbbbbb"))
     check("끝까지 다르면 실패로 적는다", not ok_stuck)
 
+    # ⚠️ **위 셋은 「남이 이미 올렸는가」만 묻는다.** 락을 놓쳐 실패했는데 아무도 이기지
+    #    않았다면 HEAD 는 끝까지 업스트림과 다르고, 다시 읽는 것만으로는 영원히 실패다 —
+    #    한 번 더 시도했으면 성공했을 자리에서. merge 가 처음엔 실패하고 그 다음엔
+    #    성공하는 대역으로 그 자리를 고정한다.
+    def ff_retry():
+        state = {"merges": 0}
+
+        def fake(cwd, *args):
+            if args[:2] == ("rev-parse", "--abbrev-ref"):
+                return 0, "origin/main"
+            if args[0] == "rev-parse":
+                return 0, ("aaaaaaa" if args[1] == "HEAD" else "bbbbbbb")
+            if args[0] == "merge":
+                state["merges"] += 1
+                if state["merges"] == 1:
+                    return 1, "fatal: Unable to create '.../index.lock': File exists."
+                return 0, "Updating aaaaaaa..bbbbbbb"
+            return 0, ""
+        return sec.fast_forward_main(fake, "/x"), state
+
+    (ok_retry, _m), st_retry = ff_retry()
+    check("락을 놓쳤을 뿐이면 다시 시도해서 실제로 당긴다", ok_retry and st_retry["merges"] >= 2)
+
     # 변이 검사 — 위 셋이 공허하지 않은가. rc 확인을 지우면 창 2 가 통과해 버려야 한다.
     src_ff = open(SCRIPT, encoding="utf-8").read()
     mut_ff = src_ff.replace("        if rc_head or rc_target:\n            continue",
