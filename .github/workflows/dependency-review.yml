@@ -1,0 +1,42 @@
+name: dependency-review
+
+# Reads the dependency diff a pull request introduces and refuses known-vulnerable
+# additions and licences this repository cannot ship.
+#
+# This is deliberately not `pnpm audit`. Audit answers "is anything in the tree
+# vulnerable today", which on a pull request mostly reports what `main` already
+# had -- a finding the author of an unrelated change cannot act on and learns to
+# scroll past. This one answers "does *this diff* add one", which is a question
+# the person opening it can actually do something about. The tree-wide question
+# is Dependabot's job, on its own schedule.
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@v4
+        with:
+          # `moderate` matches the `audit` script in package.json. The two ask
+          # different questions but they should not disagree about what counts
+          # as bad enough to stop.
+          fail-on-severity: moderate
+          # This repository is Apache-2.0 and its image is redistributed. A
+          # copyleft dependency arriving unnoticed is a licensing problem that
+          # is far cheaper to catch in the pull request than after a release.
+          deny-licenses: AGPL-3.0, AGPL-3.0-only, AGPL-3.0-or-later, GPL-2.0, GPL-3.0, SSPL-1.0
+          comment-summary-in-pr: on-failure

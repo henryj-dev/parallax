@@ -1,0 +1,66 @@
+name: codeql
+
+# Static analysis of the TypeScript that serves the API, the portal, and the
+# DNS listener. `check.yml` answers "does it compile and do the tests pass";
+# this answers a different question -- whether a path exists from something a
+# stranger controls to something that matters. Neither substitutes for the
+# other, so they are separate workflows with separate verdicts.
+#
+# The schedule matters more than the push trigger. CodeQL's query packs are
+# updated continuously, so a weekly run over unchanged code finds things the
+# run at commit time could not have known to look for.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Monday 05:17 UTC. Off the hour on purpose -- GitHub's scheduler queues
+    # the top of every hour heavily, and a cron at :00 can drift by tens of
+    # minutes before a runner picks it up.
+    - cron: "17 5 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # Writing the results into the Security tab is the whole point; without
+      # this the analysis runs and its answer goes nowhere.
+      security-events: write
+      contents: read
+      # A pull request from a fork gets a read-only token, so the upload of its
+      # results is deferred by GitHub and attached once the run is trusted.
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # This job never pushes. Leaving the token in `.git/config` would
+          # hand it to anything the analysis subsequently runs.
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@v3
+        with:
+          # One language. `javascript-typescript` covers both the `src/` server
+          # and the browser code under `public/`.
+          languages: javascript-typescript
+          # `security-extended` over the default suite: this is a control plane
+          # that holds Cloudflare credentials and answers DNS, so the extra
+          # queries' lower precision is a cost worth paying here.
+          queries: security-extended
+
+      # No build step. CodeQL extracts TypeScript without compiling it, and
+      # `check.yml` already proves the project builds -- running `pnpm build`
+      # again here would only add a way for this workflow to fail for a reason
+      # that has nothing to do with security.
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"

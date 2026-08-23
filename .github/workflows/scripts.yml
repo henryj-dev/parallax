@@ -1,0 +1,105 @@
+name: scripts
+
+# The repository's non-TypeScript surface: the shell verifiers under `scripts/`
+# and the python hook suites under `scripts/claude-hooks/` and
+# `scripts/git-hooks/`.
+#
+# Those python suites are the reason this file exists. There were six of them,
+# fully written, with mutation cases that prove they are not vacuous -- and
+# nothing ran them. `pnpm test` is `node --test`, which does not see a `.py`
+# file, so the guards that decide whether an agent may write to the main tree
+# were the least-tested code here despite having the most tests. A test nobody
+# runs is documentation with a shebang.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # `scripts/**/test-*.py` -- the hook guards.
+  #
+  # These are not unit tests. `test-pre-commit.py` stands up a throwaway git
+  # repository in a temp directory and runs real `git commit` calls against it,
+  # because how git invokes the hook -- and from which cwd -- is the entire
+  # judgement being tested. So this job needs git configured with an identity,
+  # and it needs to run somewhere the suites can create worktrees.
+  hooks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # `test-pre-commit.py` derives a base ref from the upstream branch and
+          # falls back to the local tip. A depth-1 checkout leaves it deriving
+          # from a history with one commit in it, which is not the shape the
+          # suite is written against.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          # The suites use `ast` to read the hook's own source and check the
+          # agent-environment list is what it claims. Nothing newer is needed.
+          python-version: "3.12"
+
+      - name: configure a git identity
+        # `git commit` refuses without one, and a runner has none. The suites
+        # commit inside their own temp repositories, never this checkout.
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: run the hook suites
+        # Every suite prints "실패 N 건" and exits non-zero on a failure, so the
+        # loop can simply let a non-zero exit stop the step. `set -e` is on by
+        # default in the `bash -e` shell Actions uses, but the loop would
+        # swallow it -- hence the explicit exit.
+        #
+        # ⚠️ The suites' own docstrings warn that they must not inherit an agent
+        # session's environment: `test-pre-commit.py` builds a "this is a human"
+        # fixture, and a stray `CLAUDECODE` or `GROK_AGENT` in the environment
+        # turns that fixture into an agent and the suite reports a failure that
+        # is really about where it was run. A runner has none of those set, which
+        # is exactly why this is the right place for them to run.
+        run: |
+          status=0
+          for suite in scripts/claude-hooks/test-*.py scripts/git-hooks/test-pre-commit.py; do
+            echo "::group::$suite"
+            python3 "$suite" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+  # `scripts/*.sh` -- the verifiers `pnpm verify:integration` drives.
+  #
+  # Scoped to this repository's own shell scripts on purpose. `scripts/git-hooks/`
+  # and `scripts/claude-hooks/` are a snapshot of stardust's and are kept
+  # byte-identical there deliberately (see AGENTS.md); linting them here would
+  # produce findings whose only available fix is to break the property that makes
+  # drift checkable with one `cmp`. `scripts/git-hooks/pre-commit` is python
+  # despite having no extension, and shellcheck errors out on it (SC1071), so the
+  # glob would have to exclude it in any case.
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        # `severity=warning` lets three long-standing `info` findings stand --
+        # SC2015 in verify-dns.sh, SC2016 there too, SC2012 in verify-postgres.sh
+        # -- all of which are correct as written for what those scripts do. The
+        # bar is set where a finding means "fix this", so that a red result here
+        # is worth reading.
+        run: |
+          shellcheck --version
+          shellcheck --severity=warning scripts/*.sh

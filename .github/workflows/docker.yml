@@ -1,0 +1,83 @@
+name: docker
+
+# Builds the image. It does not push one.
+#
+# The Dockerfile is how this ships, and until now nothing built it outside a
+# deployment -- so a change that broke it was found at deploy time, by whoever
+# was deploying, in the middle of deploying. The build is the cheap half of
+# that discovery and it belongs here.
+#
+# It is a genuinely separate question from `check.yml`. That workflow runs
+# `pnpm build` against the repository's own tsconfig on a runner that already
+# has the whole dependency tree installed. The image resolves runtime
+# dependencies in a second stage from `pnpm-lock.yaml` alone, copies `public/`
+# and `migrations/` to specific paths, and drops to an unprivileged uid. Each of
+# those is a way to be broken that `pnpm build` passing says nothing about.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # No registry credentials exist in this workflow and none should. A
+          # pull request from a fork would otherwise be able to publish under
+          # this repository's name by editing this file, which it is allowed to
+          # do -- the workflow that runs for a `pull_request` is the one the
+          # pull request defines.
+          push: false
+          # Keep it in the runner's docker daemon so the smoke step below can
+          # actually run it. Without this the build result stays in buildx's
+          # cache and `docker run` finds no such image.
+          load: true
+          tags: parallax:ci
+          # GitHub's own cache backend. `mode=max` keeps the intermediate stages
+          # too -- the `deps` stage in particular, which is a full `pnpm install`
+          # that changes only when the lockfile does.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: the image runs, and runs as nobody special
+        # A build that succeeds proves the layers assembled. It does not prove
+        # the entrypoint resolves, that `findPublicDirectory()` finds `public/`
+        # from where the compiled entry point ended up, or that the unprivileged
+        # uid the Dockerfile creates is the one the process gets. Three cheap
+        # assertions, because "the image built" is a weaker claim than it sounds.
+        run: |
+          set -euo pipefail
+
+          uid=$(docker run --rm --entrypoint id parallax:ci -u)
+          echo "runtime uid: $uid"
+          test "$uid" = "10001" || { echo "expected to run as uid 10001, got $uid"; exit 1; }
+
+          # The portal's assets have to be reachable from the compiled entry
+          # point's directory -- the Dockerfile's own comment explains the walk.
+          docker run --rm --entrypoint ls parallax:ci -1 /app/public >/dev/null
+
+          # `migrations/` stays root-owned and unwritable by the serving uid on
+          # purpose: compromising the service must not let it plant SQL for a
+          # later privileged `parallax migrate`. That is a security property of
+          # the image, so it gets asserted rather than assumed.
+          if docker run --rm --entrypoint sh parallax:ci -c 'touch /app/migrations/evil.sql' 2>/dev/null; then
+            echo "migrations/ is writable by the serving uid -- it must not be"
+            exit 1
+          fi

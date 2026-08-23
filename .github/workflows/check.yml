@@ -3,6 +3,18 @@ name: check
 # What ran by hand until now. A deployment applies its own gate at push time, so
 # it only sees a commit once somebody pushes the mirror -- sometimes days later.
 # This closes the window at the commit instead of at the deploy.
+#
+# This file's scope is the TypeScript: does it typecheck, does it build, do the
+# `node --test` suites pass. Three things it deliberately does not answer, each
+# with its own workflow and its own verdict, so that a red result names its own
+# cause instead of being one job that failed for any of six reasons:
+#
+#   scripts.yml   the python hook suites and the shell verifiers -- neither of
+#                 which `node --test` can see
+#   docker.yml    the image, which resolves its dependencies differently than
+#                 this job does and can break while this one stays green
+#   codeql.yml    static analysis, on a schedule as well as at the commit,
+#                 because its queries change without this code changing
 on:
   push:
     branches: [main]
@@ -55,6 +67,15 @@ jobs:
         node: [24, 26]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Nothing in this job pushes. By default checkout leaves the job's
+          # token in `.git/config` as an auth header, where every subsequent
+          # step inherits it -- and the steps after this one run this
+          # repository's own build, tests, and whatever those transitively
+          # execute from `node_modules`. The token is read-only here, so the
+          # exposure is small; it is also unnecessary, which is the whole
+          # argument for turning it off.
+          persist-credentials: false
       # A step installing `libatomic1` stood here. Node links against it from 25
       # on, the ARC image did not carry it, and setup-node treated that as a
       # warning rather than a failure -- so the 26 leg died at the first step
@@ -94,6 +115,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24

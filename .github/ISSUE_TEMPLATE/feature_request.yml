@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose a capability Parallax does not have.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Parallax deliberately manages only the records it is told to manage, and
+        keeps one desired state across two views. Proposals that fit that shape
+        are much easier to say yes to than ones that widen what it touches.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do, and where does Parallax stop you? Describe the
+        situation rather than the feature — the feature is the next field.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: >
+        Existing commands, a script around the API, doing it by hand in
+        Cloudflare. What was wrong with those is usually the strongest part of
+        the case.
+
+  - type: checkboxes
+    id: blast-radius
+    attributes:
+      label: Does this change what Parallax writes?
+      description: >
+        Anything that applies records Parallax does not currently manage is a
+        much larger change than it looks, because "only ever the records Parallax
+        manages" is a safety property people rely on.
+      options:
+        - label: This would let Parallax create, change, or delete records it does not manage today
+        - label: This touches credential handling or authentication

@@ -1,0 +1,12 @@
+# `false` closes the "open a blank issue" escape hatch. The two forms below are
+# short on purpose, so the cost of using one is lower than the cost of writing a
+# free-form issue that then needs three round trips to become actionable.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/henryj-dev/parallax/security/advisories/new
+    about: Report privately, never as an issue. See SECURITY.md for scope and timelines.
+  - name: Question or idea
+    url: https://github.com/henryj-dev/parallax/discussions
+    about: For anything that is not yet a bug report or a concrete request.

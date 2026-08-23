@@ -1,0 +1,54 @@
+version: 2
+
+# Three ecosystems, because this repository has three places a version is
+# pinned and they do not move together: `package.json` + `pnpm-lock.yaml`,
+# the `uses:` lines in `.github/workflows/`, and the `FROM node:24-alpine`
+# lines in the Dockerfile. A bump in one says nothing about the other two.
+updates:
+  # The lockfile is pnpm's. Dependabot reads `packageManager` in package.json
+  # and drives pnpm accordingly -- which is why there is no `package-lock.json`
+  # beside it any more: two lockfiles would have produced two pull requests per
+  # bump, disagreeing with each other.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+    groups:
+      # One pull request for the whole dev toolchain. `typescript` and
+      # `@types/node` are the entire devDependencies list here, and a patch on
+      # either is not worth its own review round.
+      dev-dependencies:
+        dependency-type: development
+        update-types: [minor, patch]
+    # Majors are deliberately *not* ignored. The whole direct dependency list is
+    # three packages -- `pg`, `typescript`, `@types/node` -- so a major here
+    # arrives perhaps twice a year and each one is worth a human read: `pg` talks
+    # to the store, and a TypeScript major can change what typechecks. An
+    # `ignore` rule would also have applied to Dependabot's security updates,
+    # which is the one category that must never be silenced.
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, ci]
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # `engines.node` in package.json, the `FROM node:24-alpine` stages, and the
+  # `node-version` matrix in check.yml all name the same runtime. Dependabot
+  # can only see the Dockerfile's copy, so a pull request from here is a prompt
+  # to check the other two by hand -- see the note at the top of the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: [dependencies, docker]
