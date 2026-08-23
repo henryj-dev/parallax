@@ -3,6 +3,12 @@ name: dependency-review
 # Reads the dependency diff a pull request introduces and refuses known-vulnerable
 # additions and licences this repository cannot ship.
 #
+# ⚠️ This workflow needs the repository's **Dependency graph** enabled, under
+# Settings → Code security. Without it the action stops at "Dependency review is
+# not supported on this repository" before looking at anything -- which is how
+# its first run went. Dependabot opening version pull requests is not evidence
+# the graph is on: those are driven from the manifest directly.
+#
 # This is deliberately not `pnpm audit`. Audit answers "is anything in the tree
 # vulnerable today", which on a pull request mostly reports what `main` already
 # had -- a finding the author of an unrelated change cannot act on and learns to
@@ -19,6 +25,12 @@ concurrency:
 
 permissions:
   contents: read
+  # `comment-summary-in-pr` below needs this, and the first run without it would
+  # have failed at the comment rather than at the finding. It grants nothing to a
+  # pull request from a fork: GitHub hands those a read-only token whatever this
+  # block says, so the summary appears on same-repo pull requests (Dependabot's,
+  # in practice) and quietly does not on forks.
+  pull-requests: write
 
 jobs:
   review:
