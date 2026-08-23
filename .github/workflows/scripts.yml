@@ -49,12 +49,36 @@ jobs:
           # agent-environment list is what it claims. Nothing newer is needed.
           python-version: "3.12"
 
-      - name: configure a git identity
-        # `git commit` refuses without one, and a runner has none. The suites
-        # commit inside their own temp repositories, never this checkout.
+      - name: give the runner the git environment these suites assume
+        # Three settings, each of which a developer's machine supplies without
+        # anyone noticing and a runner does not. All three were found by running
+        # this job, not by reading the suites -- which is the argument for the
+        # job existing.
         run: |
+          # 1. An identity. `git commit` refuses without one. The suites commit
+          #    inside their own temp repositories, never this checkout.
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 2. `init.defaultBranch`. `test-session-start-pull.py` builds its
+          #    fixture as `git init --bare origin`, then pushes `main` to it and
+          #    clones it. With this unset git names the bare repo's HEAD
+          #    `refs/heads/master`, nothing ever creates that branch, and the
+          #    clone checks out an empty tree -- "warning: remote HEAD refers to
+          #    nonexistent ref". The suite then dies reading `work/A.md`, whose
+          #    absence says nothing about the hook it is testing.
+          #
+          #    ⚠️ This is why the suite passes on a Mac and failed here: Apple's
+          #    /Library/Developer/CommandLineTools/.../gitconfig sets it to
+          #    `main` system-wide, so the fixture is silently correct there.
+          git config --global init.defaultBranch main
+
+          # 3. `refs/remotes/origin/HEAD`. `git clone` creates it; actions/checkout
+          #    does not, because it fetches refs rather than cloning. The worktree
+          #    the session-end suite creates resolves its base through origin/HEAD
+          #    and dies on "fatal: invalid reference: origin/HEAD".
+          git remote set-head origin --auto || git remote set-head origin main
+          git symbolic-ref refs/remotes/origin/HEAD
 
       - name: run the hook suites
         # Every suite prints "실패 N 건" and exits non-zero on a failure, so the
