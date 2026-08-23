@@ -94,9 +94,22 @@ an answer about everything that glob covers.
 | only there | 2 | `scripts/git-hooks/pre-push`, `scripts/git-hooks/test-pre-push.py` (`00ee877e`) |
 | only here | 0 | |
 
-The last commit there to touch any of the identical eleven is `4e04d5c0` —
-the `AGENT_ENV` fix above, authored from this side. The two that exist only
-there still date from `00ee877e`. The eleven match after this re-take; before
+⚠️ **Re-measured later the same day, after `511fd79`: the counts above still
+hold — 11 / 2 / 2 / 0, walked again as the union — but the baseline sentence
+that used to sit here did not.** It named `4e04d5c0` as the last commit there
+to touch the identical eleven. Three landed after it, all on 2026-08-23:
+`a0b2c953` (the race-recheck fix, authored from this side), `8b6ca178` (four
+guard defects), and `fa1b2667` (a fixture leaning on the default branch name of
+the *git build* it runs under). So the last one is now **`fa1b2667`**, and it is
+here — the eleven are byte-identical against a stardust tree that contains it.
+
+📌 **That is the third time this record has been a step behind the thing it
+records**, after the `80bb6dbd` correction above and the pair before it. The
+counts survived because they get re-walked; the commit number did not, because
+nothing re-derives it. Treat a sha in this section as **the date it was written
+on**, not as a current fact — and re-run the walk rather than reading it.
+
+The two that exist only there still date from `00ee877e`. The eleven match after this re-take; before
 it, `main-tree-guard.py` and `test-main-tree-guard.py` had drifted while the
 previous paragraph still said they had not. That is the same sentence the
 2026-08-20 measurement had to write about two different files, so treat the
@@ -174,8 +187,22 @@ HEAD 와 업스트림을 다시 읽어 「남이 이미 올렸나」를 보는�
 결정적으로** 잰다. 두 창 각각 + 「끝까지 다르면 실패」 + rc 확인을 지운 변이본.
 
 **고친 곳은 stardust** (`a0b2c953`) — Parallax 에 국한된 문제가 아니라 가드 자신의
-동시성 처리라, 위의 규칙대로 정본에서 고치고 여기로 다시 떴다. 아홉 파일 전부 바이트
-동일을 유지한다. 검사 수는 end-cleanup 23→27 · start-pull 19→23.
+동시성 처리라, 위의 규칙대로 정본에서 고치고 여기로 다시 떴다(`f29d177`).
+
+**그리고 그것으로 끝이 아니었다.** 같은 날 `511fd79` 가 정본을 **통째로** 다시 떴고,
+그때 딸려 온 것이 이 건을 포함해 넷이었다 — 즉 이 사본은 이 건 말고도 **세 가지가 더
+뒤처져 있었다**:
+
+| | 무엇이 | 왜 나쁜가 |
+|---|---|---|
+| ① | `MUTATING` 정규식의 지수 백트래킹 | 이 훅은 **모든 도구 호출 앞**에서 돈다. 실측 n=26 에 **40초** — fail-open 은 「오류가 나면 통과」이지 **「멈추면 통과」가 아니다** |
+| ② | 다중 경로에서 앞의 하나가 전체를 대표 | 남의 저장소 경로를 앞에 세우면 뒤에 붙은 우리 트리 파일이 그대로 실려 갔다 |
+| ③ | `apply_patch` 인식이 세 곳에서 두 답 | 봉투를 배열로 주거나 머리말을 빼면 같은 편집이 지나갔다 |
+| ④ | 이 문단의 경합 재확인 | 위 참조. 정본은 여기에 **락 재시도**까지 붙였다 |
+
+📌 **한 건을 좇아 정본에 갔더니 세 건이 더 있었다.** 「우리 것만 고쳐 오면 된다」로
+좁게 뜨면 나머지 셋은 그대로 남는다 — 부분 스냅샷보다 **전체 재스냅샷이 맞다**는 쪽의
+증거다. 이후 `fa1b2667` 까지 들어와 지금 열한 개가 바이트 동일이다.
 
 ⚠️ **재스냅샷하다 한 번 헛짚었다.** 소스를 stardust 의 **메인 트리**로 잡았는데 그쪽이
 3커밋 뒤처져 있었다 — `cmp` 는 「전부 동일」이라 답했고 그건 **옛것끼리 비교한 결과**다.
