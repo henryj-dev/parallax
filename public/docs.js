@@ -399,7 +399,18 @@ function hasVisibleAfter(heading, stopClass, itemClass) {
 }
 
 function cssEscape(value) {
-  return typeof CSS !== "undefined" && CSS.escape ? CSS.escape(value) : value.replace(/"/g, '\\"');
+  // The fallback escaped the quote and not the backslash, which is the one
+  // ordering that does not work: a value ending in `\` turned into `[data-id="a\"]`,
+  // where the backslash escapes the closing quote instead of being one, and the
+  // selector runs on past it. Backslash first, then quote -- the other order
+  // re-escapes the backslashes this line just added.
+  //
+  // Nothing reaches this today: `entry.id` comes from the server's own OpenAPI
+  // document, and every browser that runs the portal has `CSS.escape`. It is
+  // fixed because a fallback is exactly the code that gets read as safe and is
+  // never exercised until the day it is.
+  if (typeof CSS !== "undefined" && CSS.escape) return CSS.escape(value);
+  return value.replace(/\\/gu, "\\\\").replace(/"/gu, '\\"');
 }
 
 // ---- copying --------------------------------------------------------------

@@ -56,16 +56,23 @@ describe("every module the portal imports is served", () => {
 
     for (const page of pages) {
       const html = await readFile(join(PUBLIC, page), "utf8");
+      // ⚠️ Case-insensitive, all four of them, and the `includes` below folds
+      // case too. HTML tag names are not case-sensitive, so `<SCRIPT SRC="x">`
+      // is a script this page loads -- and every pattern here used to miss it.
+      // Fixing only some of them is worse than fixing none: the two counts are
+      // meant to disagree exactly when the scan is wrong, so a `src=` the
+      // pattern reads and the plain count does not would fail this file for a
+      // reason that has nothing to do with the portal.
       const sources = [
-        ...[...html.matchAll(/<script[^>]*\ssrc="([^"]+)"/gu)].map((match) => match[1] as string),
-        ...[...html.matchAll(/<link[^>]*\shref="([^"]+)"/gu)].map((match) => match[1] as string),
+        ...[...html.matchAll(/<script[^>]*\ssrc="([^"]+)"/giu)].map((match) => match[1] as string),
+        ...[...html.matchAll(/<link[^>]*\shref="([^"]+)"/giu)].map((match) => match[1] as string),
       ];
       // Same shape as above, one worse: an empty list makes the loop below run
       // zero times, so the test asserts nothing at all and still passes.
       // Counting the tags a different way is what makes the loop's silence mean
       // something.
-      const carryingSrc = [...html.matchAll(/<script\b[^>]*>/gu)].filter((tag) => tag[0].includes("src=")).length
-        + [...html.matchAll(/<link\b[^>]*>/gu)].filter((tag) => tag[0].includes("href=")).length;
+      const carryingSrc = [...html.matchAll(/<script\b[^>]*>/giu)].filter((tag) => tag[0].toLowerCase().includes("src=")).length
+        + [...html.matchAll(/<link\b[^>]*>/giu)].filter((tag) => tag[0].toLowerCase().includes("href=")).length;
       assert.ok(carryingSrc > 0, `${page} loads at least one script or stylesheet`);
       assert.equal(sources.length, carryingSrc, `${page} carries a src or href this did not read`);
       for (const source of sources) {
