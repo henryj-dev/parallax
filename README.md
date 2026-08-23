@@ -1,1212 +1,585 @@
-# Parallax
+<div align="center">
+
+<pre>
+██████╗  █████╗ ██████╗  █████╗ ██╗     ██╗      █████╗ ██╗  ██╗
+██╔══██╗██╔══██╗██╔══██╗██╔══██╗██║     ██║     ██╔══██╗╚██╗██╔╝
+██████╔╝███████║██████╔╝███████║██║     ██║     ███████║ ╚███╔╝
+██╔═══╝ ██╔══██║██╔══██╗██╔══██║██║     ██║     ██╔══██║ ██╔██╗
+██║     ██║  ██║██║  ██║██║  ██║███████╗███████╗██║  ██║██╔╝ ██╗
+╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
+</pre>
+
+### One name, two answers.
+
+**A split-horizon DNS control plane and operations portal.**
+
+One desired state for internal DNS and external provider DNS — previewed before
+it moves, and applied only to the records it owns.
 
 [![check](https://github.com/henryj-dev/parallax/actions/workflows/check.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/check.yml)
 [![scripts](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml)
 [![docker](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml)
 [![codeql](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml)
 [![dependency-review](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml)
+
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2024-5FA04E)](package.json)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6)](tsconfig.json)
+[![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1-6BA539)](#-http-api)
 
-English | [한국어](README.ko.md)
+English · [한국어](README.ko.md)
 
-Parallax is a split-horizon DNS control plane and operations portal. It keeps
-one desired state for internal DNS and external Cloudflare DNS, previews the
-resulting changes, and applies only records explicitly managed by Parallax.
+</div>
 
+---
+
+## The problem, in one picture
+
+The same name has to mean two different things depending on who is asking.
+Keeping that in two systems means keeping it right twice.
+
+```mermaid
+flowchart TD
+    D["one desired state<br/>app.example.com"]
+
+    D --> I["internal view"]
+    D --> E["external view"]
+
+    I --> IL["built-in DNS listener<br/>UDP · TCP"]
+    E --> CF["Cloudflare<br/>only records Parallax owns"]
+
+    IL --> IA["10.0.0.11"]
+    CF --> EA["203.0.113.7"]
+
+    IA --> LAN(["on the LAN"])
+    EA --> NET(["everywhere else"])
 ```
-                          one desired state
-                                 │
-            ┌────────────────────┴────────────────────┐
-            ▼                                         ▼
-       internal view                            external view
-      app.example.com                          app.example.com
-         10.0.0.11                               203.0.113.7
+
+Parallax holds **one** desired state, projects it into **two** views, and
+reconciles each view with whatever is actually there — after showing you the
+plan.
+
+---
+
+## ✨ What it does
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🎯 One state, two views
+Every record lives once. `internal` and `external` are projections of it, and
+every provider target is addressed as `<zone>/<view>`.
+
+</td>
+<td width="50%" valign="top">
+
+### 🛡️ Touches only what it owns
+Each published record carries an **HMAC-signed ownership marker**. Records it
+did not write are counted, reported, and left alone.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 👁️ Preview before apply
+`preview` builds a plan — creates, updates, deletes, conflicts — and an
+explicit count of the records it will **not** touch, so "nothing to do" can
+never be mistaken for "there is nothing there".
+
+</td>
+<td valign="top">
+
+### 📡 Answers DNS itself
+An authoritative listener for the internal view over UDP and TCP: EDNS(0), DNS
+cookies, AXFR (denied by default), outbound NOTIFY, allow-listed forwarding,
+and per-client rate limiting.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### ⏪ Every change is a revision
+Numbered revisions, snapshot restore, and a ten-action audit trail that reports
+how many records each revision added, removed and changed.
+
+</td>
+<td valign="top">
+
+### 🤝 Adopt without seizing
+`zone adopt` *describes* what already exists at the provider. Taking records
+over is a separate, explicit decision.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 🔐 Roles, tokens, and SSO
+`viewer` · `editor` · `admin`. Issued access tokens, or OpenID Connect sign-in
+written directly against the protocol.
+
+</td>
+<td valign="top">
+
+### 🧭 Same brain, three faces
+The portal, the HTTP API and the CLI all invoke **the same command layer** — so
+they cannot drift apart.
+
+</td>
+</tr>
+</table>
+
+---
+
+## 🚀 Quick start
+
+```bash
+git clone https://github.com/henryj-dev/parallax
+cd parallax
+corepack enable
+pnpm install --frozen-lockfile
 ```
 
-One name, two answers. The internal view is answered by the built-in DNS
-listener over UDP and TCP; the external view is applied to Cloudflare, and only
-ever the records Parallax manages.
+**Run it.** With nothing configured it binds loopback and keeps state in files —
+no database, no token, no ceremony:
+
+```bash
+pnpm dev                       # http://127.0.0.1:3000
+```
+
+**Or drive it from the command line.** The CLI reaches the store directly:
+
+```bash
+pnpm cli zone create --zone example.com
+pnpm cli record set --zone example.com --view internal \
+                    --id app --name app --type A --content 10.0.0.11 --ttl 300
+pnpm cli record set --zone example.com --view external \
+                    --id app --name app --type A --content 203.0.113.7 --ttl 300
+
+pnpm cli preview --zone example.com     # what would change
+pnpm cli apply   --zone example.com     # make it so
+pnpm cli status  --zone example.com     # how far each view got
+```
+
+> [!IMPORTANT]
+> Parallax **refuses to start on a non-loopback address with no access token**.
+> Issue one from a loopback session, or set `PARALLAX_AUTH_TOKENS`. That is a
+> startup check, not a warning.
+
+---
+
+## 🏗️ How it fits together
+
+```mermaid
+flowchart LR
+    subgraph faces["three faces"]
+        P["🖥️ Portal"]
+        A["🔌 HTTP API"]
+        C["⌨️ CLI"]
+    end
+
+    faces --> CMD["command layer<br/>47 commands"]
+    CMD --> CP["control plane<br/>zones · revisions · audit"]
+
+    CP --> ST[("store")]
+    CP --> RT["provider router"]
+
+    ST --- PG[("PostgreSQL")]
+    ST --- FS[("single-node files")]
+
+    RT --> CFA["Cloudflare adapter"]
+    RT --> LOC["local file provider"]
+    CP --> DNS["DNS listener"]
+```
+
+The command layer is the only way in. The HTTP API is a thin mapping onto it —
+each operation in the OpenAPI document names the command it reaches — and the
+CLI acts with full rights because a shell on the box *is* control-plane access.
 
 <details>
-<summary><b>Contents</b></summary>
+<summary><b>The source tree</b></summary>
 
-- [Included features](#included-features)
-- [Requirements](#requirements)
-- [Run locally](#run-locally)
-- [Configuration](#configuration)
-  - [Upgrading an existing deployment](#upgrading-an-existing-deployment)
-  - [Access tokens](#access-tokens)
-  - [Signing in through an identity provider](#signing-in-through-an-identity-provider)
-  - [Ending TLS in the process](#ending-tls-in-the-process)
-  - [Serving the portal behind a reverse proxy](#serving-the-portal-behind-a-reverse-proxy)
-  - [Provider credentials](#provider-credentials)
-  - [Publishing the internal view](#publishing-the-internal-view)
-  - [Answering and being ready are not the same thing](#answering-and-being-ready-are-not-the-same-thing)
-  - [Pointing a resolver at the internal view](#pointing-a-resolver-at-the-internal-view)
-  - [Reading the history](#reading-the-history)
-  - [Restoring a revision](#restoring-a-revision)
-  - [Retention](#retention)
-- [One surface, three ways in](#one-surface-three-ways-in)
-- [Command line](#command-line)
-- [Record types](#record-types)
-- [Adopting records that already exist](#adopting-records-that-already-exist)
-  - [Client-side resolver overrides](#client-side-resolver-overrides)
-- [HTTP API](#http-api)
-  - [Managing records one at a time](#managing-records-one-at-a-time)
-- [Container image](#container-image)
-- [Verifying against real dependencies](#verifying-against-real-dependencies)
-- [Development workflow](#development-workflow)
-- [License](#license)
+| Directory | What lives there |
+|---|---|
+| `src/domain/` | Record types, validation, the reconciliation planner, zone files |
+| `src/application/` | Control plane, settings, access tokens, credentials, fallback domains |
+| `src/adapters/` | Cloudflare, the ownership marker, the provider router |
+| `src/dns/` | Wire format, RDATA, cookies, the authoritative listener, snapshots |
+| `src/http/` | API, identity routes, OpenAPI generation, readiness, portal assets |
+| `src/infrastructure/` | PostgreSQL, file state, atomic writes, migrations |
+| `src/security/` | Authorization, OIDC, session tokens, encrypted credential store |
+| `src/observability/` | Prometheus metrics and signals |
+| `public/` | The portal — vanilla JS, no bundler |
+| `cmd/parallax/` | The command-line entry point |
 
 </details>
 
-## Included features
+---
 
-- Browser portal for zones, internal/external records, preview, apply, status,
-  audit history, immutable revisions, restore, and zone deletion
-- Every common record type, validated by its RDATA grammar, with Cloudflare proxy constraints,
-  including RFC 8552 underscored names such as `_dmarc` and `_acme-challenge`
-- Deterministic `managed-only` reconciliation that leaves foreign records alone
-- Durable single-node JSON state and provider state with atomic writes
-- Optional PostgreSQL source of truth with transactional immutable revisions
-- Optional Cloudflare API adapter
-- Optional built-in DNS listener that answers the internal view from the desired
-  state over UDP and TCP, and relays every other name to an upstream
-- Encrypted, write-only Cloudflare credential management from the admin portal
-- Optional admin/editor/viewer token authentication, OpenID Connect sign-in, and audit actors
-- Health endpoints and security headers
-- A self-describing API: an OpenAPI 3.1 document derived from the command
-  registry and the security layer, and a reference page that reads it
-- Dependency-light Node.js HTTP server and TypeScript test suite
+## 🛡️ The ownership model
 
-The product and architecture rationale are in
-[docs/product-design.md](docs/product-design.md).
+This is the part that lets Parallax share a zone with a human, a Terraform run,
+and a certificate bot without any of them stepping on the others.
 
-## Requirements
-
-- Node.js 24 or later
-- pnpm 11 or later
-
-## Run locally
-
-```sh
-pnpm install
-pnpm test
-pnpm check
-pnpm build
-pnpm start
-```
-
-Open `http://127.0.0.1:3000`. Local state is stored under `data/`, which is
-ignored by Git. During development, use `pnpm dev`.
-
-## Configuration
-
-The environment carries only what cannot be read out of the store: where to
-bind, how to reach the store, and the keys that protect what is stored.
-
-| Variable | Purpose |
-| --- | --- |
-| `HOST`, `PORT` | Server bind address; defaults to `127.0.0.1:3000` |
-| `DATABASE_URL` | PostgreSQL source of truth. A non-loopback URL must use `sslmode=verify-full` or `verify-ca` |
-| `PARALLAX_ALLOW_PLAINTEXT_POSTGRES` | Explicitly allow a non-loopback PostgreSQL URL without verified TLS; use only on a separately protected network |
-| `PARALLAX_STATE_FILE` | Zones, revisions, statuses and audit, when no database is configured |
-| `PARALLAX_CONFIG_FILE` | Settings, credentials and access tokens, when no database is configured |
-| `PARALLAX_PROVIDER_STATE_FILE` | Local provider state, used only while the local provider is enabled |
-| `PARALLAX_OWNERSHIP_SECRET` | 32+ byte secret that signs managed-record ownership markers |
-| `PARALLAX_CREDENTIAL_MASTER_KEY` | Exactly 32 bytes as base64 or 64 hexadecimal characters; encrypts stored credentials |
-| `PARALLAX_DNS_PORT` | Answer DNS for the internal view from this process. Unset leaves the port unbound |
-| `PARALLAX_DNS_HOST` | Address the DNS listener binds; defaults to `HOST`, which is loopback unless set |
-| `PARALLAX_DNS_FORWARD_TO` | Comma-separated upstreams (`host` or `host#port`) for names outside every zone. Empty answers `REFUSED` instead of relaying |
-| `PARALLAX_DNS_FORWARD_ALLOW` | Client CIDRs allowed to recurse. Defaults to loopback; required explicitly for forwarding on a non-loopback listener |
-| `PARALLAX_DNS_TRANSFER_ALLOW` | Client CIDRs allowed to request AXFR over TCP. Empty denies every transfer |
-| `PARALLAX_DNS_NOTIFY_TO` | Hosts (`host` or `host:port`) told when a served zone's serial rises |
-| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND`, `PARALLAX_DNS_RATE_LIMIT_BURST`, `PARALLAX_DNS_RATE_LIMIT_MAX_CLIENTS` | What one client may spend and how many clients are tracked. Default 100, 200 and 10000; the burst may not be below the rate |
-| `PARALLAX_DNS_FORWARD_TIMEOUT_MS`, `PARALLAX_DNS_MAX_CONCURRENT_FORWARDS`, `PARALLAX_DNS_MAX_TCP_CONNECTIONS` | Bounds on relaying and on open TCP connections. Default 4000, 256 and 1024 |
-| `PARALLAX_DNS_REQUIRE_COOKIE` | Answer a UDP client that has not returned an EDNS cookie (RFC 7873) with a truncated reply, so it comes back over TCP. Off by default: cookies are always offered and checked, but most resolvers do not send them, and this sends all of those through TCP |
-| `PARALLAX_DNS_SOA_PRIMARY`, `PARALLAX_DNS_SOA_MAILBOX` | What the synthesized SOA names. Defaults are derived from the zone (`ns.<zone>`, `hostmaster.<zone>`) and are guesses, not hosts known to exist — name real ones where secondaries transfer these zones, since MNAME is where they ask for updates |
-| `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | Certificate and key for this process to end TLS itself; set both or neither |
-| `PARALLAX_HTTP_REDIRECT_PORT` | Port answering plain HTTP with a redirect to the stored `publicOrigin`; needs both TLS and that setting |
-| `PARALLAX_READINESS_MAX_STALENESS_SECONDS` | How old a desired-state read may be before readiness reports 503; defaults to 10. Raise it where a readiness probe gates endpoints that also carry DNS |
-| `PARALLAX_AUTH_TOKENS` | JSON array of `{"token","subject","role"}`; tokens must be canonical base64url encodings of 32 random bytes. Optional on loopback, **required to bind any other address** |
-
-File-backed deployments require the parent directory of each configured data
-file to be owned by the service user and have mode **exactly `0700`**. A missing
-directory is created with that mode, but Parallax deliberately does not `chmod`
-an existing directory: a path may name a shared parent such as `/tmp`, and
-silently restricting it would break unrelated services. Before upgrading an
-older installation whose data directory is commonly `0755`, stop every writer
-and provision the existing directory explicitly (repeat for each distinct
-parent directory):
-
-```sh
-# Default relative file paths in a source installation:
-chmod 0700 data
-
-# Example system-service path:
-sudo chown parallax:parallax /var/lib/parallax
-sudo chmod 0700 /var/lib/parallax
-```
-
-Use the actual service account and path for the deployment. Change only the
-directory mode, not every file recursively. This permission migration is
-separate from stale-lock recovery: do not remove a lock for a mode error; follow
-the named-lock procedure below only after confirming that no writer is active.
-
-### Upgrading an existing deployment
-
-**The version you are replacing reads the new configuration first.** A rolling
-replacement changes the secret or the environment before the new image arrives,
-so the running one restarts against it. Every configuration change made for an
-upgrade therefore has to be accepted by *both* versions, and a value that only
-the new one understands takes the service down until the new one lands.
-
-The dangerous direction is the one where **the older version is laxer**. A value
-it accepts without complaint may be one the incoming version refuses, and that
-failure arrives after the replacement rather than during it. The canonical-form
-requirement on `PARALLAX_AUTH_TOKENS` is exactly this: the version before it
-accepted any sufficiently long string.
-
-A record missing `subject` or `role` is not that case -- both versions reject it,
-with the same message -- so generating a token string is only half of the change.
-A deployment that replaced the value with a conforming token and no `role` was
-down for five minutes on a record neither version would have accepted.
-
-Four things this version refuses to run without, and none of them announces
-itself before the restart:
-
-| | Refuses | Fix |
-|---|---|---|
-| `PARALLAX_AUTH_TOKENS` | to start | canonical base64url of 32 random bytes; `subject` and `role` are required by **both** versions, so keep them |
-| Data directory mode | to start | `chmod 0700` each parent, as above; file backends only |
-| `DATABASE_URL` without TLS | to start | `sslmode=verify-full`, or `PARALLAX_ALLOW_PLAINTEXT_POSTGRES=true` for a separately protected network |
-| Schema older than the code | to write | `parallax migrate`; apply reports a constraint error until it runs |
-
-The first three stop the process, which a readiness probe reports. The fourth
-starts cleanly and fails at the first write, which it does not.
-
-**Whether a release changes the schema is a question with a mechanical answer.**
-It matters because a deployment that replaces pods one at a time runs both
-versions at once for a few seconds, and the older one has to tolerate the newer
-schema for that long. Rather than reading commit messages for it:
-
-```sh
-git diff --name-only <deployed>..<new> -- migrations/ src/infrastructure/migrations.ts
-```
-
-Empty output means the schema is untouched and the versions may overlap. Any
-output means they may not: deploy that release without overlap, then go back.
-The second path is included because the table that records which migrations have
-run lives there rather than in a `.sql` file.
-
-Everything else -- provider wiring, retention, proxy origin, access tokens and
-provider credentials -- is stored alongside the zones and managed from the
-portal's **Provider settings** screen. A local change takes effect immediately;
-each other server or CLI process re-reads settings every five seconds and runs
-the same machine-specific verifier before re-wiring itself. Nothing needs a
-redeploy, and a replica that cannot safely apply a value keeps its last good
-wiring and reports the refresh failure.
-
-| Setting | Effect |
-| --- | --- |
-| `allowLocalProvider` | Publish to a local file when no real provider is configured. Off by default, so an unrouted target fails loudly instead of reporting success |
-| `publicOrigin` | HTTPS origin browsers reach the portal at (HTTP is accepted only on loopback) |
-| `trustForwardedHeaders` | Trust proxy headers; requires `publicOrigin` so forwarded host/protocol never choose the security origin |
-| `revisionRetention` | Newest revision snapshots kept per zone; `0` keeps every one |
-| `auditRetentionDays` | Days of audit history kept per zone; `0` keeps every entry |
-
-### Access tokens
-
-Tokens are issued from the portal and stored only as SHA-256 digests, so the
-store can verify a presented token but never reproduce one. A new token is shown
-exactly once. With no token anywhere the control plane is open, which is
-intended for loopback development: it refuses to bind a non-loopback address in
-that state, and refuses API requests that arrive with proxy forwarding headers.
-`PARALLAX_AUTH_TOKENS` remains as a break-glass path for a deployment that has
-locked itself out; those tokens are listed as managed and cannot be revoked
-through the API. The last administrator token cannot be revoked.
-
-Issue one token per person or per automation, not one for the deployment. The
-audit trail records the token's subject as the actor, so a shared token makes
-every change -- portal, `curl`, another session -- look like the same actor, and
-there is no way to tell them apart afterwards.
-
-A server reads the tokens at startup and re-reads them every five seconds, so a
-token issued or revoked from the command line, another replica, or a second
-server takes effect within that window rather than at the next restart. The
-delay matters in both directions: a freshly issued token is refused for a
-moment, and a revoked one keeps working for the same moment. A brief store
-failure keeps the last list, but after 60 seconds stored-token authentication
-fails closed and `/health/ready` reports not ready. Environment break-glass
-tokens remain available for recovery. Once a process has observed any token it
-never falls back to authentication-disabled mode, even if the store becomes
-empty or unavailable.
-
-It is also the only way to start a deployment that is not on loopback, since
-there is no loopback session to issue the first token from. Any container image
-binds `0.0.0.0`, so a container always needs it:
-
-Generate the required canonical 43-character base64url value with
-`openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'`, then place it in the
-JSON array as `{"token":"…","subject":"deploy","role":"admin"}`.
-
-Anything else is refused before the server binds:
+Every record Parallax publishes carries a marker in the provider's free-text
+field — a Cloudflare record comment, a trailing comment in a zone file:
 
 ```
-parallax: refusing to serve a non-loopback address with no access token.
-Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.
+parallax-managed:v3:<record-id>:<hmac-signature>
 ```
 
-### Signing in through an identity provider
-
-Access tokens stay: the command line uses them, automation uses them, and
-`PARALLAX_AUTH_TOKENS` is how a deployment that has locked itself out gets back
-in. What this adds is a way for a person to sign in as themselves.
-
-```sh
-PARALLAX_OIDC_ISSUER=https://idp.example
-PARALLAX_OIDC_CLIENT_ID=parallax
-PARALLAX_OIDC_CLIENT_SECRET=…
-PARALLAX_OIDC_REDIRECT_URI=https://parallax.example/auth/callback
-PARALLAX_OIDC_SESSION_SECRET=…            # 32 bytes or more
-PARALLAX_OIDC_SCOPES="openid profile email"   # optional
-PARALLAX_OIDC_SESSION_SECONDS=43200           # optional, 60..604800
+```mermaid
+flowchart TD
+    R{"record at the provider"}
+    R -->|"marker verifies"| M["managed<br/>update it · delete it"]
+    R -->|"marker missing"| U["untouched<br/>counted and reported, never written"]
+    R -->|"marker present but invalid"| X["conflict<br/>surfaced, never silently overwritten"]
 ```
 
-Setting some but not all of the required five is refused at startup. A partly
-configured deployment meant to offer this, and starting anyway would leave a
-sign-in button that fails only when somebody presses it.
+The signature covers the **target** as well as the record id, so a marker copied
+to another zone stops verifying there. The marker deliberately does *not* carry
+the target itself: a Cloudflare comment is capped at 100 characters, and
+spending that budget on a value the caller already knows once made every write
+against a long zone name fail.
 
-#### Sending everyone to the provider
+> [!NOTE]
+> Rotating `PARALLAX_OWNERSHIP_SECRET` orphans every record already published —
+> they stop verifying and become *untouched*.
 
-```sh
-PARALLAX_PORTAL_SIGN_IN=idp     # default: prompt
+---
+
+## 🖥️ The portal
+
+Served from the same process, in **English and Korean**, with no build step.
+
+- **Horizon lens** — one record, both answers, side by side
+- **Zone workspace** — records, sync state per view, revision progress
+- **Apply plan dialog** — review the plan, then apply from it
+- **Revision history** — browse snapshots and restore one
+- **Credential settings** — profiles, zone bindings, resolver overrides, tokens
+- **Sign-in** — access token or your identity provider
+
+---
+
+## ⌨️ CLI
+
+47 commands. Add `--json` to any of them for machine-readable output; run
+`parallax help <command>` for its options.
+
+<details open>
+<summary><b>Zones &amp; records</b></summary>
+
+| Command | |
+|---|---|
+| `zone list` · `zone get` · `zone create` · `zone delete` | The basics |
+| `zone replace` | Replace a zone's complete desired state |
+| `zone adopt` | Describe what already exists at the provider, without taking it over |
+| `zone export` · `zone import` | Presentation-format zone files, per view |
+| `record list` · `get` · `set` · `create` · `patch` · `delete` | One record at a time |
+| `record batch` | Deletes, patches, puts and posts as a **single revision** |
+
+</details>
+
+<details>
+<summary><b>Reconciliation</b></summary>
+
+| Command | |
+|---|---|
+| `preview` | Compare desired and actual state, change nothing |
+| `apply` | Reconcile one zone's providers |
+| `apply pending` | Apply every pending zone; `--retryFailed` to retry failures |
+| `status` | How far each view has been applied |
+
+</details>
+
+<details>
+<summary><b>History</b></summary>
+
+| Command | |
+|---|---|
+| `history` | The audit trail, newest first |
+| `revision list` · `revision get` | Stored snapshots |
+| `revision restore` | Restore a snapshot as a **new** revision |
+
+</details>
+
+<details>
+<summary><b>Credentials &amp; access</b></summary>
+
+| Command | |
+|---|---|
+| `credential profile list` · `get` · `set` · `delete` · `test` | Reusable account credentials |
+| `credential zone list` · `get` · `set` · `delete` · `test` | Bind an apex domain to a profile and zone id |
+| `token list` · `token issue` · `token revoke` | Access tokens — issued tokens are returned exactly once |
+| `settings get` · `settings set` | Stored operational settings |
+
+</details>
+
+<details>
+<summary><b>Client-side resolver overrides</b></summary>
+
+Cloudflare's local-domain fallback list, driven by the credential the profile
+already holds — nobody types a second token.
+
+| Command | |
+|---|---|
+| `fallback list` | Show the overrides |
+| `fallback coverage` | For every zone held here: is it covered, and why not |
+| `fallback preview` · `fallback sync` | Show, then make, the overrides match this profile's zones |
+| `fallback set` · `fallback delete` | One suffix at a time |
+
+</details>
+
+<details>
+<summary><b>Operations</b></summary>
+
+| Command | |
+|---|---|
+| `config check` | Report what would stop this process from starting — **without starting it** |
+| `migrate` | Apply the database schema; safe to re-run |
+| `openapi` | Print this control plane's own OpenAPI description |
+
+</details>
+
+---
+
+## 🔌 HTTP API
+
+**40 paths**, described by an OpenAPI 3.1 document the process generates from
+its own command table — so the description cannot drift from the behaviour.
+
+```
+GET /api/v1/openapi.json
 ```
 
-With this, a browser that asks for the portal without a session is redirected
-straight to the provider rather than being shown the page and its token field.
-For a deployment where accounts are administered in the directory, an access
-token is a machine's credential and the field is an invitation to paste one into
-a browser.
-
-It changes what a *page* does and nothing else:
+<details>
+<summary><b>Every route</b></summary>
 
 | | |
 |---|---|
-| `GET /` with no session | `302` to `/auth/login?next=…` |
-| `GET /api/…` with no credential | `401` as before — a command-line client cannot sign in at a browser, and a redirect would read to it as success |
-| `GET /app.js` and the rest | served as before; the page that loads them has already been redirected |
-| Anyone holding a session or a token | unaffected |
+| **Zones** | `GET POST /zones` · `GET PUT DELETE /zones/{zone}` |
+| **Records** | `GET /zones/{zone}/records`<br/>`GET POST /zones/{zone}/views/{view}/records`<br/>`GET PUT PATCH DELETE …/records/{id}`<br/>`POST …/records/batch` |
+| **Reconcile** | `GET POST /zones/{zone}/preview` · `POST /zones/{zone}/apply` · `POST /apply` · `POST /zones/{zone}/adopt` |
+| **State** | `GET /status` · `GET /zones/{zone}/status` · `GET /zones/{zone}/export` · `POST /zones/{zone}/import` |
+| **History** | `GET /history` · `GET /zones/{zone}/history` · `GET /zones/{zone}/audit`<br/>`GET /zones/{zone}/revisions` · `GET …/revisions/{revision}` · `POST …/restore` |
+| **Admin** | `GET PUT /settings` · `GET POST /tokens` · `DELETE /tokens/{id}` |
+| **Credentials** | `GET /credentials/profiles` · `GET PUT DELETE /credentials/profiles/{name}` · `POST …/test`<br/>`GET /credentials/cloudflare` · `GET PUT DELETE /credentials/cloudflare/{zone}` · `POST …/test` |
+| **Fallback** | `GET /fallback/{profile}` · `…/coverage` · `…/preview` · `POST …/sync` · `PUT DELETE …/domains/{suffix}` |
+| **Meta** | `POST /cli` · `GET /openapi.json` · `POST DELETE /session` |
+| **Probes** | `GET /health/live` · `GET /health/ready` · `GET /metrics` |
 
-`idp` without the five settings above is refused at startup. Falling back would
-leave the prompt this setting exists to remove, and the only symptom would be a
-login page somebody thought they had taken away.
+</details>
 
-**The way back in does not change.** `POST /api/v1/session` still exchanges a
-bearer token for a session cookie, so `PARALLAX_AUTH_TOKENS` remains what a
-deployment uses when the provider is the thing that is broken.
+**Roles.** `viewer` reads. `editor` changes records. `admin` gets everything —
+and credentials, settings and tokens are admin-only **including reads**, because
+each one exposes or changes who can act.
 
-#### Asking before the rollout
+**Optimistic concurrency.** Mutating operations accept an `expectedRevision` and
+refuse if the zone moved on.
 
-```sh
-parallax config check          # add --json for a machine to read
-environment=ok portalSignIn=idp identityProvider=configured dns=0.0.0.0:5353 forward=2 …
-```
+---
 
-Startup validation is fail-closed: a setting this process cannot honour stops it
-rather than quietly doing something else. Where this pod is a resolver's only
-upstream, that refusal is not one pod -- it is name resolution for everything
-behind it, found at the moment the pod it replaced is already gone.
+## ⚙️ Configuration
 
-`config check` gives the same reading a minute earlier. It reads the environment
-only: it opens no store, binds no port, and exits `78` with the message the
-server would have printed. It reports names and shapes, never values, because a
-preflight's output goes wherever a deployment's output goes.
+Nothing below is required to start on loopback with file state.
 
-⚠️ It cannot answer for the store. A stored setting this process cannot act on
-also fails startup closed, and that is not what this looks at.
+<details open>
+<summary><b>Core</b></summary>
 
-**The role comes from the provider, not from here.** Parallax reads the
-`entitlements` claim the provider returns for this client and takes the highest
-of `admin`, `editor` and `viewer`. Keys it does not know are ignored. An account
-the provider grants nothing to is refused -- authenticating proves who someone
-is, not that they are anyone here, and a default would turn every account in the
-directory into an account in this control plane.
+| Variable | |
+|---|---|
+| `HOST` · `PORT` | Where the API and portal bind. Defaults `127.0.0.1:3000` |
+| `DATABASE_URL` | Use PostgreSQL. Absent means single-node files |
+| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | Where those files live |
+| `PARALLAX_AUTH_TOKENS` | Break-glass tokens, as JSON. Normal tokens are issued through the portal |
+| `PARALLAX_OWNERSHIP_SECRET` | Signs ownership markers |
+| `PARALLAX_CREDENTIAL_MASTER_KEY` | Encrypts stored provider credentials (AES-256-GCM) |
 
-⚠️ **`entitlements`, not `roles` or `groups`.** A provider that distinguishes
-them means the distinction: `roles` says what a person *is* and is meant to be
-displayed, `groups` says where they sit in the organization, and neither is a
-grant. Reading either as permission turns a label into authority, and the label
-is usually maintained by someone who does not know it is doing that.
+</details>
 
-So a person is granted access wherever the other services' access is granted.
-With KeyStone that is a per-client entitlement, whose keys must be `admin`,
-`editor` or `viewer` for Parallax to recognise them.
+<details>
+<summary><b>TLS &amp; identity</b></summary>
 
-The client authenticates with `client_secret_post` -- the secret travels in the
-token request body, not in an `Authorization` header -- so a provider that asks
-how to authenticate this client must be told that.
+| Variable | |
+|---|---|
+| `PARALLAX_TLS_CERT_FILE` · `PARALLAX_TLS_KEY_FILE` | End TLS in-process instead of behind a proxy. Reloaded on change |
+| `PARALLAX_HTTP_REDIRECT_PORT` | Answer plain HTTP with a redirect to the TLS origin |
+| `PARALLAX_OIDC_ISSUER` · `_CLIENT_ID` · `_CLIENT_SECRET` · `_REDIRECT_URI` · `_SCOPES` | OpenID Connect sign-in |
+| `PARALLAX_OIDC_SESSION_SECRET` · `_SESSION_SECONDS` | Session signing and lifetime |
+| `PARALLAX_PORTAL_SIGN_IN` | What the portal offers a visitor who has not signed in |
 
-The flow is Authorization Code with PKCE. `/auth/login` sends the browser to the
-provider, `/auth/callback` finishes, `/auth/logout` ends both sessions. Nothing
-it sets is readable by script, and the state and PKCE values live only for the
-ten minutes a sign-in takes.
+</details>
 
-`PARALLAX_OIDC_SESSION_SECRET` signs the browser session. Unlike the other two
-secrets, **rotating it is safe** -- it ends every session and nothing else. The
-session is self-contained, which is also why it cannot be revoked before it
-expires: shorten `PARALLAX_OIDC_SESSION_SECONDS` if that matters more than how
-often people sign in.
+<details>
+<summary><b>The DNS listener</b></summary>
 
-### Ending TLS in the process
+Setting `PARALLAX_DNS_PORT` is what turns it on. Everything else has a default,
+and the defaults are the careful ones.
 
-A deployment with no proxy in front of it can serve TLS itself. Point both
-variables at a certificate and its key, and the main port speaks HTTPS:
+| Variable | |
+|---|---|
+| `PARALLAX_DNS_PORT` | **Enables the listener.** Unset leaves the port unbound |
+| `PARALLAX_DNS_HOST` | Defaults to `HOST`, then to `127.0.0.1` |
+| `PARALLAX_DNS_FORWARD_TO` | Upstreams for names outside every zone. Empty answers `REFUSED` |
+| `PARALLAX_DNS_FORWARD_ALLOW` | Client CIDRs allowed to recurse. Defaults to loopback — and is **required** if the listener is not loopback and forwarding is on |
+| `PARALLAX_DNS_TRANSFER_ALLOW` | Client CIDRs allowed `AXFR`. **Defaults to deny all** |
+| `PARALLAX_DNS_NOTIFY_TO` | Hosts that get NOTIFY when a served zone's serial rises |
+| `PARALLAX_DNS_SOA_PRIMARY` · `_SOA_MAILBOX` | SOA fields |
+| `PARALLAX_DNS_REQUIRE_COOKIE` | Require RFC 7873 DNS cookies |
+| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND` · `_BURST` · `_MAX_CLIENTS` | Per-client rate limiting |
+| `PARALLAX_DNS_MAX_TCP_CONNECTIONS` · `_MAX_CONCURRENT_FORWARDS` · `_FORWARD_TIMEOUT_MS` | Resource ceilings |
 
-```sh
-PARALLAX_TLS_CERT_FILE=/etc/tls/tls.crt \
-PARALLAX_TLS_KEY_FILE=/etc/tls/tls.key \
-PARALLAX_HTTP_REDIRECT_PORT=80 \
-HOST=0.0.0.0 PORT=443 parallax-server
-```
+</details>
 
-Nothing else changes. The server knows it ended the connection, so the same
-proof of same-origin that `publicOrigin` supplies behind a proxy is derived
-without configuration, and cookies carry `Secure`. Before enabling the redirect
-port, set `publicOrigin` to the public HTTPS origin. The redirect listener uses
-only that trusted value and never reflects a request's `Host`; until a target is
-configured, or whenever it is cleared, the redirect port answers `503`.
+<details>
+<summary><b>Stored settings</b> — in the store, not the environment</summary>
 
-A certificate replaced on disk is picked up without a restart. The directory is
-watched rather than the file, because a Kubernetes secret mount is renewed by
-swapping a symlink; a half-written pair during rotation leaves the running
-certificate in place and is retried. Without this a pod would present an expired
-certificate until something happened to restart it.
+| Setting | |
+|---|---|
+| `allowLocalProvider` | Publish to a local file when no real provider is configured |
+| `publicOrigin` | Absolute origin browsers reach the portal at; empty derives it per request |
+| `trustForwardedHeaders` | Trust `X-Forwarded-Proto` / `X-Forwarded-Host` |
+| `revisionRetention` | Newest snapshots kept per zone; `0` keeps every one |
+| `auditRetentionDays` | Days of audit history kept per zone; `0` keeps everything |
+| `fallbackResolver` | Address a client-side resolver override should point at |
 
-Set neither variable and the server is plain HTTP, which is what local
-development and a deployment behind a terminating proxy both want.
+</details>
 
-### Serving the portal behind a reverse proxy
+---
 
-Cookie-authenticated mutations must prove same-origin, which needs the origin a
-browser actually used. Behind TLS termination, set `publicOrigin` to the public
-HTTPS origin. Turn on `trustForwardedHeaders` only when a trusted proxy is the
-sole route to the process; the setting is refused without `publicOrigin`, so a
-forwarded Host or protocol can never choose the security origin.
+## 📊 Observability
 
-Authentication is disabled only when `PARALLAX_AUTH_TOKENS` is absent, which is
-intended for loopback development: every caller that reaches the port would
-otherwise be an administrator. API requests that arrive with proxy forwarding
-headers are refused while authentication is disabled, and the service logs a
-warning at startup. Configure tokens before putting anything in front of it.
-Each token is exactly 32 random bytes in canonical base64url form; use the
-generation command above.
-Repeated authentication failures are answered with `429` and a `Retry-After`
-header. Budgets are isolated per trusted transport client, and a successful
-request does not erase that client's failed guesses; valid tokens themselves
-are never delayed.
+| Endpoint | |
+|---|---|
+| `GET /health/live` | The process is up |
+| `GET /health/ready` | It would answer correctly — fails closed on stale desired state |
+| `GET /metrics` | Prometheus text format |
 
-The portal exchanges a token for a session cookie rather than holding it in
-memory: `POST /api/v1/session` with `{ "token": "..." }` replies with
-`HttpOnly; SameSite=Strict; Path=/` (and `Secure` when the request arrived over
-HTTPS), and `DELETE /api/v1/session` clears it. Both require proof the request
-came from this origin, so only the portal can obtain or drop a session. Because
-the cookie is `HttpOnly`, page script never sees the credential. API clients can
-keep using `Authorization: Bearer` and skip sessions entirely.
-
-### Provider credentials
-
-Cloudflare credentials are split so an account-wide token is entered once. A
-**profile** holds the reusable account ID and API token; each **apex domain**
-binds to a profile, and its Cloudflare zone ID is looked up from the domain
-rather than typed. Rotating a token on
-one profile immediately re-routes every domain that uses it, and a profile
-cannot be deleted while a domain still points at it.
-
-The admin portal's **Provider settings** screen manages both: one tab lists
-saved profiles with the domains reusing them, the other binds apex domains to a
-profile. Tokens are write-only -- they are encrypted at rest and never returned
-to the portal, so the field is blank until you type a replacement.
-
-Store files written before profiles existed are migrated on first read: each
-distinct token becomes one profile, named after the first zone that used it, and
-every zone keeps its own zone ID. Nothing has to be re-entered.
-
-Each server re-reads the encrypted credential document every five seconds.
-Profile rotation and zone unbinding therefore reach every replica without a
-restart; a removed binding is also removed from that replica's provider router
-instead of retaining a decrypted token in memory indefinitely.
-
-The encrypted envelope carries an authenticated, increasing revision. A process
-that has observed a newer revision rejects an older valid envelope, as well as
-ordinary ciphertext tampering. A cold process has no external monotonic trust
-anchor, however, so restoring the entire credential store to an older valid
-ciphertext before that process starts cannot be distinguished cryptographically.
-Deployments whose threat model includes privileged store rollback need that
-anchor in their storage platform (for example immutable backup/audit controls),
-not only the envelope key.
-
-The token needs two zone permissions, scoped to the domains it manages:
-
-| Permission | Why |
-| --- | --- |
-| `Zone` → `DNS` → `Edit` | every record read and write; this is the whole runtime surface |
-| `Zone` → `Zone` → `Read` | resolving a domain to its zone ID, once, when a binding is created |
-
-The zone ID is resolved at bind time and stored, so applying never exercises the
-second permission -- a compromised process can do no more with it than one
-without it.
-
-Two account permissions are optional, and only adoption uses them. They are what
-lets a record a Cloudflare service publishes for itself be shown as that service
-and locked against editing -- a Workers custom domain as `Worker` and the name of
-the worker, an R2 custom domain as `R2` and the name of the bucket. A DNS record
-does not carry that: over the records API a Workers custom domain and a
-hand-written `CNAME` are the same object, so the answer comes from the service
-that holds the binding.
-
-| Permission | Why |
-| --- | --- |
-| `Account` → `Workers Scripts` → `Read` | which hostnames in this zone are Workers custom domains, and for which worker |
-| `Account` → `Workers R2 Storage` → `Read` | which hostnames are R2 custom domains, and for which bucket |
-
-Both need the profile to carry an account ID, because these endpoints are
-account-scoped where DNS is zone-scoped. Without them -- no account ID, a token
-without the permission, a provider with no such services -- a zone still
-reconciles and every record still publishes; adopting reports that it could not
-read who owns what, and leaves the records already marked as service-owned
-marked. It never unlocks one on the strength of a lookup that failed.
-
-Use a minimum-scope Cloudflare API token. When authentication is configured,
-the portal asks for an access token and keeps it only in the current browser
-tab's memory. Generate the credential-store key with `openssl rand -base64 32`.
-The provider settings dialog and credential API are admin-only. API tokens are
-write-only: list and metadata responses contain only zone, zone ID, and update
-time.
-
-Cloudflare [TTL](https://developers.cloudflare.com/dns/manage-dns-records/reference/ttl/)
-uses the [API representation](https://developers.cloudflare.com/api/resources/dns/subresources/records/)
-`1` for **Auto**. Proxied A, AAAA,
-and CNAME records are always normalized to Auto because Cloudflare does not
-allow their TTL to be edited. DNS-only records accept Auto or 60–86400 seconds.
-Cloudflare Enterprise zones can support a 30-second minimum, but Parallax keeps
-the non-Enterprise 60-second safety floor until provider plan capabilities are
-configured explicitly.
-
-### Publishing the internal view
-
-The internal view is answered by this process, out of the desired state. There is
-no publishing step: nothing is written to another DNS server, no ownership marker
-is involved, and nothing is compared against a provider. That is why `apply` is
-not part of it and why a change appears within one refresh rather than after a
-reconcile.
-
-Earlier versions could instead publish the view into CoreDNS zone files or a
-PowerDNS database, and both are gone. They existed because this process could not
-answer for itself; it can. What went with them is the one arrangement where
-Parallax being down did not take the internal view with it -- a deployment that
-needs that property needs a DNS server in front, not a publisher behind.
-
-The listener is off unless `PARALLAX_DNS_PORT` names a port, and then it binds
-`PARALLAX_DNS_HOST` -- or `HOST`, which is loopback unless a deployment said
-otherwise. A resolver that starts answering the whole network because a port was
-set is not a default anybody should have to discover.
-
-The upstreams stay in the environment rather than the stored settings, with the
-keys, and for the same reason: everything this process is not authoritative for
-is relayed to them, so whoever can change them can silently answer for every
-name in the network that is not in a managed zone. That is not a tuning knob.
-
-Two things are worth knowing before pointing anything at it:
-
-**A zone whose internal view is empty is left out, not answered for.** That is
-the normal state right after [adopting](#adopting-records-that-already-exist) a
-zone, and claiming authority for it would answer NXDOMAIN for every name the
-zone holds. Left out, those names go to the upstreams and keep resolving
-publicly until an override exists.
-
-**The listener follows changes made by another process.** File-backed reads do
-not retain a process-lifetime snapshot: mutations take a cross-process lock,
-re-read under that lock, and atomically replace the durable file. The listener's
-five-second refresh therefore observes CLI writes without a restart. PostgreSQL
-instances likewise read the shared rows.
-
-A process killed during a file mutation can leave its hidden lock file behind.
-Parallax deliberately never removes a pre-existing lock automatically: doing so
-cannot be made race-free with a replacement writer. After the 15-second timeout,
-the error names the lock. Verify that no Parallax process is writing that data
-file, then remove only the named stale lock manually.
-
-Forwarding is limited to client CIDRs in `PARALLAX_DNS_FORWARD_ALLOW` (loopback
-only by default); a non-loopback listener with upstreams refuses to start until
-the allow-list is explicit. UDP and TCP replies are rate-limited per source
-(100/s with a burst of 200), concurrent upstream queries are capped at 256, and
-TCP uses a 10-second idle timeout with at most 1,024 connections. Upstream UDP
-sockets are connected, and a reply is accepted only when its source, QR/opcode,
-transaction id, and complete question match the query.
-
-⚠️ **The allow-list compares the address this socket sees.** Behind NAT -- a mesh,
-a gateway that forwards on behalf of its own clients -- the source of a query is
-the rewriting hop, not the host that asked. A CIDR here says which addresses may
-reach this listener and recurse, not which hosts. A deployment that needs the
-stronger claim has to make the network preserve the source, or refuse the
-forwarding path at the boundary instead of here.
-
-### Answering and being ready are not the same thing
-
-Once the listener is up, nothing about the store stops it answering: a failed
-refresh is logged and the last known-good snapshot keeps serving. Readiness is
-the opposite -- `/health/ready` needs a successful read within the last **10
-seconds**, so a store that is unreachable for longer reports 503 while every
-query is still answered correctly, out of a snapshot that is still right.
-
-⚠️ **That decoupling only survives if nothing outside re-couples it.** Where a
-readiness probe gates the endpoints of the service that carries DNS, a store
-outage withdraws a resolver that is healthy and holding the right answers. On a
-deployment where this listener is the only resolver, check which way that is
-wired before deciding the probe is free -- and note that the probe's own
-`periodSeconds × failureThreshold` sets how long the outage has to last, which
-is usually longer than this window.
-
-```sh
-PARALLAX_READINESS_MAX_STALENESS_SECONDS=45     # default: 10
-```
-
-Raising it keeps a stale-but-correct snapshot serving for longer before the
-process reports itself unready. The age is reported to an authenticated caller
-of `/health/ready` as `desiredState` whether or not it is ready, so a deployment
-can alert on a snapshot going old rather than be withdrawn for it.
-
-⚠️ It is not a way to switch readiness off. The four startup refusals below stay
-fail-closed, because there "cannot answer" is true.
-
-Every path that stops the process is a **startup** path: an unusable stored
-setting, a non-loopback bind with no access token, a desired state that cannot be
-read at all, and a DNS port that cannot be bound. None of them can fire in a
-process that is already serving -- so the exposure is a restart, not an outage
-elsewhere.
-
-A change committed by this process is served as soon as it commits, because the
-repository the control plane writes through says so. The 5-second refresh stays
-for everything that cannot announce itself: a second instance sharing a
-database, or the command line writing to the same file.
-
-**Wildcards are expanded, not taken literally.** A record named `*` or `*.eu`
-answers for the names below it, the closest one wins, and neither answers over a
-name that exists. That is what Cloudflare does with the same
-desired state, and a listener that disagreed would resolve a name differently
-inside and outside.
-
-**Readiness counts the listener as serving the internal view.** A deployment
-that answers DNS itself and configures no provider at all is ready. Without
-that, its probe would never pass while it answered every query correctly.
-The public readiness route reads only a constant-size process cache; the full
-zone scan runs at most once at a time in the background. Zone or provider-route
-changes invalidate it immediately, and a failed or ten-second-stale refresh is
-not ready.
-
-### Pointing a resolver at the internal view
-
-Whatever answers the internal view is authoritative for the zone, so it replies
-NXDOMAIN for a name it does not hold -- an answer, not a failure, which a
-forwarder accepts and does not fall back from. That is why the internal view has
-to be complete before anything is pointed at it, and why [adoption](#adopting-records-that-already-exist)
-exists.
-
-Clients can be pointed at the listener directly, because it forwards what it is
-not authoritative for. A forwarder in front still works and is what an existing
-network usually has:
+Gauges are read at scrape time from whoever already owns the value, rather than
+copied into a registry where the copy can go stale.
 
 ```
-client → forwarder ──(example.com)──→ the internal view
-                   └─(everything else)──→ a recursive resolver
+parallax_ready                                  1 when this process would pass readiness
+parallax_desired_state_age_seconds              since the desired state was last read
+parallax_desired_state_max_age_seconds          how stale that may get before readiness fails
+parallax_dns_served_zones                       zones the listener answers for
+parallax_access_token_cache_ready               tokens fresh enough to authenticate with
+parallax_access_token_cache_age_seconds         since that cache last refreshed
+parallax_dns_zones_skipped_total                zones whose internal view would not compose
+parallax_dns_unservable_records_total           stored records that reached the wire and could not
+parallax_dns_unanswerable_replies_total         queries that could not be answered
+parallax_dns_notify_failures_total              NOTIFY sends that failed
+parallax_refresh_failures_total                 background refresh failures, by subsystem
+parallax_tls_certificate_reload_failures_total  certificate reloads that failed
 ```
 
-Handing clients that address directly leaves them with one zone and no internet.
+---
 
-**The built-in listener is the exception, and only with upstreams set.** It is
-both halves at once: authoritative for the managed zones, and a relay for
-everything else, which is what `PARALLAX_DNS_FORWARD_TO` configures.
+## 🐳 Deployment
 
-```
-client → PARALLAX_DNS_PORT ──(example.com)──→ answered from the desired state
-                           └─(everything else)──→ PARALLAX_DNS_FORWARD_TO
-```
-
-Both halves in one listener is the point. Split across two, something in front
-has to know which names are whose, and that knowledge then lives in a list on
-every resolver, maintained by hand, going stale the moment a zone is added. Here
-the list is the desired state. Without upstreams the listener refuses everything
-it is not authoritative for, and then it is a publisher's equal and belongs
-behind a forwarder like one.
-
-Two more things sit in front of it and answer first, and both look like Parallax
-serving the wrong value:
-
-**A forwarder may answer from `/etc/hosts` before it asks anything.** dnsmasq
-reads it by default, so a host whose own name is inside the zone answers itself
-as `127.0.0.1` no matter what the internal view says. `no-hosts` turns that off.
-Reported from a deployment where the gateway running dnsmasq was itself named
-inside the zone it was forwarding.
-
-**The resolver has to be reachable before clients are told to use it.** Handing
-out a resolver address by DHCP while a firewall still drops port 53 takes DNS
-away from every client that renews, and they have no way back. Open the port
-first, confirm a query from a client, and change the DHCP option after.
-
-### Reading the history
-
-Every audit entry carries `added`, `removed` and `changed`: how many records
-that revision brought into the desired state, took out of it, and rewrote under
-the same id. They are what separates a revision that emptied a zone from any
-other line in the list, which otherwise differ only by an actor and a time.
-
-The counts are worked out from the snapshots the entry already holds rather than
-recorded next to them, so entries written before the counts existed report them
-too. That is usually the history someone is reading: nobody asks what a revision
-did until after it has happened.
-
-The actor is the token's subject, so what the history can tell you about *who*
-depends on how many tokens exist. See [Access tokens](#access-tokens).
-
-Provider writes have their own write-ahead audit entries:
-`provider.apply.started`, `provider.apply.completed`, and
-`provider.apply.failed`. They record the target view and planned/completed
-operation counts, including partial apply or zone-purge progress. Provider
-errors are reduced to a safe category before persistence, so tokens or other
-provider response details do not enter the audit trail.
-
-### Restoring a revision
-
-Restoring does not undo the past. It makes that revision's intent the current
-desired state, and the next `apply` carries it out. Whether a restore is safe
-therefore does not turn on how old it is, but on whether what it says should
-happen now: a snapshot holding a record that was a demonstration at the time
-will be published for real the next time the view is applied.
-
-Read the snapshot before restoring it, and prefer the newest revision that says
-only what you still mean.
-
-### Retention
-
-Every desired-state change stores an immutable snapshot and an audit entry, so
-history grows with use. The `revisionRetention` setting keeps the newest
-snapshots per zone and `auditRetentionDays` ages out audit entries; both are
-enforced inside the same atomic commit as the change that triggered them, and
-`0` disables the bound. Restoring a revision that has aged out returns 404, so
-size the revision bound to the rollback window you actually need.
-
-For a PostgreSQL deployment, apply the schema before starting the service:
-
-```sh
-parallax migrate
-```
-
-It accepts only the release's fixed migration manifest and records every
-applied file with its SHA-256 checksum in `parallax_schema_migrations`. Missing,
-unexpected, or subsequently changed SQL is rejected before execution; a re-run
-skips matching ledger entries. Each schema change and its ledger row commit in
-the same transaction. Concurrent runs serialize on a migration-specific advisory
-lock, which is what makes the command usable as a Kubernetes init container or a
-pre-deploy job. The image keeps the trusted migration directory root-owned and
-non-writable by the serving UID.
-
-It is never applied implicitly at startup, and the serving runtime does not
-expose it through `POST /api/v1/cli`. A server that reshaped the store it depends
-on while booting would carry the schema forward under an image that had just
-been rolled back; instead it refuses to start and names the missing relation.
-Migrating is a deployment decision, so it is available only to the local CLI's
-separate migration runtime.
-
-## One surface, three ways in
-
-Every operation is defined once, as a command. Nothing else holds behaviour:
-
-```
-portal (GUI)  ──HTTP──▶  API  ──▶  command layer  ──▶  control plane
-terminal (CLI) ─────────────────▶  command layer  ──▶  control plane
-```
-
-The portal talks only to the API and reaches nothing else. Each API route is a
-translation: it turns a request into one command invocation and that command's
-result into a response. `parallax` parses argv into the same invocation. Because
-the API cannot do anything the command layer does not expose, and the CLI runs
-the very same commands, the two can never drift apart.
-
-`POST /api/v1/cli` takes the command line itself:
-
-```sh
-curl -X POST http://127.0.0.1:3000/api/v1/cli \
-  -H 'content-type: application/json' \
-  -d '{"argv":["zone","create","--zone","example.com"]}'
-```
-
-It runs the serving dispatcher's commands in-process -- no shell, no subprocess
--- and applies the caller's role to the command it names, so the endpoint is not
-a way around what a token cannot already do. `migrate` is deliberately absent:
-database DDL is a local CLI/deployment capability, not an HTTP administrator
-capability.
-
-## Command line
-
-```sh
-pnpm cli help                 # every command
-pnpm cli help record set      # one command's options
-pnpm cli migrate                # apply the schema; safe to re-run
-pnpm cli zone list
-pnpm cli zone create --zone example.com
-pnpm cli record set --zone example.com --view external --id www \
-  --record '{"name":"www","type":"A","content":"93.184.216.34","ttl":300}'
-pnpm cli zone adopt --zone example.com --view external
-pnpm cli preview --zone example.com
-pnpm cli apply --zone example.com
-pnpm cli settings set --values '{"allowLocalProvider":true}'
-pnpm cli token issue --subject deploy-bot --role editor
-```
-
-If a machine-specific stored value prevents the server from starting, serving
-remains fail-closed, but the local `settings set` command is still available as
-a recovery path. It initializes only the settings repository, merges the patch
-with the latest stored values, and verifies the complete repaired snapshot
-before writing; it does not start providers, tokens, or the control plane. For
-example, turn off a local provider whose directory this machine cannot write with
-`pnpm cli settings set --values '{"allowLocalProvider":false}'`. A patch that leaves
-any stored invariant invalid is rejected and writes nothing.
-
-The CLI reads the same store as the server, so a change made in one is visible
-in the other immediately. It records who ran it (`cli:<user>`) in the audit
-trail. Add `--json` for machine-readable output. Exit codes follow `sysexits`:
-`64` usage, `65` invalid input, `69` not found, `70` conflict, `77` permission,
-`78` unavailable.
-
-Because the command line reaches the store directly it acts with full rights;
-HTTP callers are limited to what their token's role allows.
-
-## Record types
-
-`content` holds the record's RDATA in presentation format -- the same text a
-zone file puts after the type:
-
-```
-MX     10 mail.example.com
-SRV    10 5 5060 sip.example.com
-CAA    0 issue "letsencrypt.org"
-HTTPS  1 . alpn=h2,h3
-TXT    v=spf1 -all
-```
-
-Each type's grammar is checked when the record is saved, not when it is applied:
-a record that a provider would reject is one an operator saved, walked away
-from, and finds broken later, possibly against a zone that is already half
-published.
-
-Every type in that list can also be put on the wire by the [built-in
-listener](#publishing-the-internal-view), and the compiler is what requires it:
-the encoder is a table over the same list the domain validates against, so a
-type added to one and not the other does not build. A record that validates,
-publishes, and then cannot be answered for is the failure that guards against.
-If a stored record still cannot be encoded, the whole RRset is answered
-SERVFAIL and the reason is logged -- never a partial RRset, which looks complete,
-gets cached, and silently loses whatever went missing.
-
-Two things are handled by the adapters rather than written into the content.
-Cloudflare keeps the leading number of `MX`, `SRV` and `URI` in a field of its
-own, and a zone file needs hostnames made absolute -- an `MX` target written as
-`mail.example.com` in `example.com`'s file otherwise resolves to
-`mail.example.com.example.com`. Both are put back the way they were written when
-the record is read again, so neither shows up as drift.
-
-`SOA` and the records a signer emits for the zone it is signing -- `RRSIG`,
-`NSEC`, `NSEC3` -- are not managed. They describe the zone's own authority, every
-provider generates them itself, and publishing ours would overwrite the
-provider's answer to a question we did not ask. `DS` and `DNSKEY` are managed
-despite being DNSSEC records, because they are not that: a `DS` sits in the
-*parent* and delegates to a signed child, which is a decision an operator makes
-about somebody else's zone.
-
-A `DS` whose digest length contradicts its digest type is refused when it is
-saved. Such a record publishes cleanly and then stops resolving -- a resolver
-reports the answer as malformed rather than reading it -- which is the failure
-this control plane exists to make visible rather than discover later. An apex `NS` record is also not inherited by the internal view: it
-names the servers that answer for the zone, which is a fact about each provider,
-and copying it inward would delegate the internal view away from itself.
-
-## Adopting records that already exist
-
-A zone usually has a history before Parallax arrives. Records made by hand at the
-provider are not in the desired state, so Parallax treats them as somebody else's:
-it will not touch them, and it cannot derive anything from them.
-
-That is a problem for the internal view, which is materialized from the external
-desired state. Whatever the desired state does not describe, the internal view
-does not answer for -- and an authoritative server does not say "I don't know",
-it says NXDOMAIN. A resolver takes that as an answer and stops. So an internal
-view of a zone that has other records has to be complete before it is wired up.
-
-`zone adopt` reads what the provider currently holds and writes it into the
-desired state:
-
-```sh
-pnpm cli zone adopt --zone example.com --view external
-# seen: what the provider listed. adopted: what is newly described.
-pnpm cli preview --zone example.com --view external   # expect no operations
-```
-
-The internal view is derived when it is reconciled, not stored, so `zone get`
-shows only the records adoption wrote to the external view. An internal view
-that reports no records is the normal state, not a failed adoption.
-
-Read `seen` before reading the preview. A preview with no operations means the
-desired state and the provider agree -- which is also true when the desired
-state is empty, so on its own it does not tell you that adoption put anything
-there. `seen` above zero with nothing adopted means the view was already
-complete. `seen` of zero means the provider offered nothing this control plane
-could read, which is the type limit below rather than an empty zone.
-
-### Client-side resolver overrides
-
-A device on the provider's own client asks the provider's resolver for
-everything, so a name this control plane answers privately does not exist for
-it. The provider's answer is a per-suffix override pointing at a local resolver,
-and Parallax keeps that list in step with the zones it holds:
-
-```sh
-pnpm cli settings set --patch '{"fallbackResolver":"10.0.0.53"}'
-pnpm cli fallback preview --profile production   # what would change
-pnpm cli fallback sync --profile production      # make it so
-```
-
-The suffix is the apex and covers every name beneath it. The address is
-configuration rather than inference: the listener binds `0.0.0.0`, which is not
-an address anything can be told to ask, and what a device must use is a fact
-about the network in front of this process.
-
-**The list is not yours.** It is one account-wide setting shared by every
-override an organization has, and the provider offers no way to add or remove a
-single entry -- every write replaces all of it. So Parallax reads before it
-writes, and it only changes an entry whose description carries a marker signed
-for that exact suffix, the same marker a published record carries. An entry it
-did not sign is reported and left alone. The exception is narrow: an unsigned
-entry for a zone you hold that already sends the name where Parallax would is
-claimed by stamping the marker on it, which changes nothing a device can see.
-
-Only zones this process actually answers for get an override. A zone whose
-internal view is empty is left out of the listener's snapshot, so it claims no
-authority and the query goes upstream; pointing devices here for it would buy
-nothing and cost a dependency. Both sides read that from the same function, so a
-zone that stops being served stops being pointed at in the same revision.
-
-**A change does not take effect at once.** The client refreshes its
-configuration on its own schedule, so the first lookup after a write may still
-answer the old way. Judge the change a few minutes later, and judge it on a name
-whose internal answer differs from its public one -- a name that resolves to the
-provider's edge either way cannot tell you whether the override is in force.
-
-**Adopting does not take the records over.** A desired record identical to an
-unmanaged one produces no operation, so the provider's copies stay exactly as
-they are, unmanaged, and whoever maintained them still does. What changes is
-that Parallax now knows they exist. If one of them later changes at the
-provider, the difference appears as a conflict in `preview` -- naming both
-values -- rather than being silently overwritten in either direction.
-
-**It does change what this process answers, though.** The internal view is
-materialized from the external one, so filling an empty external view fills the
-internal one -- and a zone with a non-empty internal view is one the built-in
-listener claims authority for. Adoption touches nothing at the provider and
-changes the answers given here, which are two different halves of the same
-operation and are easy to hold only one of.
-
-Two consequences follow immediately. A name nobody adopted answers NXDOMAIN
-inside, because an authority does not forward what it does not hold. And a
-record the provider proxies answers with its origin inside, because the origin
-is what the desired state holds -- the edge address was never ours to know.
-Adoption reports both the first time a zone crosses into being answered here.
-
-Re-running it is safe: records already described are skipped, so a second run
-adopts nothing and does not create a revision. Run it again whenever records
-are added at the provider by hand.
-
-`--dryRun` reports what adopting would describe, and what it would change about
-the answers given here, without writing any of it:
-
-```sh
-pnpm cli zone adopt --zone example.com --view external --dryRun
-```
-
-It exists because adopting is a write dressed as a question. Finding out that it
-would make this process the authority for a zone should not require making it
-so, and before this the only way to see the effect was to have it.
-
-Two limits worth knowing before you rely on it:
-
-- A provider may hold types Parallax does not manage -- `SOA` and the signer's
-  records, which every provider generates for itself. Those are skipped rather
-  than adopted. Compare `seen` against the provider's own record count to see
-  how many that is.
-- Adoption commits the view in one step, so a record that cannot be described
-  stops all of them and nothing is written. The error names the record.
-- A record that differs from the desired state by TTL alone is left as the
-  conflict it already was. Adoption describes what is there; it does not settle
-  disagreements.
-
-## HTTP API
-
-Every route is described by an OpenAPI 3.1 document the running process builds
-for itself, and there is a reference page that reads it:
-
-| | |
-| --- | --- |
-| `GET /docs` | A browsable reference. Linked from the portal's masthead. |
-| `GET /api/v1/openapi.json` | The document. Point a Swagger UI, a Redoc, or a client generator at it. |
-| `parallax openapi` | The same document from the command line, with no server and no configuration — for a pipeline that diffs it against a committed copy. |
-
-The document is derived rather than written down beside the code. Each
-operation's summary is read out of the command registry, so the API and the
-command line say the same sentence; `x-parallax-command` names the command each
-route runs; the enumerations come from the domain's own constants; and
-`x-parallax-role` is *computed* from the two gates that enforce it -- the
-command's declared minimum and the security layer -- so a spec that claims
-`editor` cannot outlive a route that quietly became admin-only. What is left,
-the shape of the routes, is walked by `test/http/openapi.test.ts`: every
-documented operation carries a concrete request that the real router has to
-resolve to the command the document names, and every command must be documented
-or explicitly excused. A documented path that nothing serves fails there rather
-than in somebody's generated client.
-
-The reference page is served from this origin like the rest of the portal --
-this server's content security policy allows scripts and styles from itself
-only, so nothing is fetched from a CDN. It does not offer to send the requests
-it documents: a "try it" button on a page served by the control plane it edits
-is one mis-click away from applying a zone somebody was reading about. Each
-operation instead carries the `curl` line for the request the test already
-proved reaches something. It is the one page here that is not translated, and
-deliberately: what it draws is written in English at its source.
-
-`/docs` itself is a static page, but what it draws is not. The document is
-behind the same authentication as the rest of the API, because it describes this
-deployment -- an unauthenticated visitor gets the frame and is asked to sign in.
-
-All control-plane routes are under `/api/v1`.
-
-- `GET|POST /zones` (`GET ?limit=&offset=`, `POST { "name": "example.com" }`)
-- `GET|PUT|DELETE /zones/:zone` (`DELETE ?abandonProviderRecords=true`)
-- `POST /zones/:zone/adopt?view=external`
-- `GET /zones/:zone/records` (`?view=&name=&type=&content=&proxied=&search=&limit=&offset=`)
-- `GET|POST /zones/:zone/views/:view/records` (the same filters; `POST` adds one record)
-- `POST /zones/:zone/views/:view/records/batch` (`{ deletes, patches, puts, posts }`)
-- `GET|PUT|PATCH|DELETE /zones/:zone/views/:view/records/:id`
-- `GET|POST /zones/:zone/preview`
-- `POST /zones/:zone/apply`
-- `GET /zones/:zone/status`
-- `GET /zones/:zone/history` (`?limit=&offset=`, newest first)
-- `GET /zones/:zone/revisions` (`?limit=&offset=`, newest window, ascending)
-- `GET /zones/:zone/revisions/:revision`
-- `POST /zones/:zone/revisions/:revision/restore`
-- `GET /credentials/profiles`
-- `GET|PUT|DELETE /credentials/profiles/:name`
-- `POST /credentials/profiles/:name/test` (needs a `{ zone }` to read through)
-- `GET /credentials/cloudflare`
-- `GET|PUT|DELETE /credentials/cloudflare/:zone`
-- `POST /credentials/cloudflare/:zone/test` (tests the stored binding, or an unsaved `{ profile }` or `{ token }`)
-- `POST /cli` (runs serving commands, never `migrate`; `{ "argv": ["zone", "list"] }`)
-- `GET /openapi.json` (this API, described)
-- `GET /health/live` and `GET /health/ready`
-- `GET /metrics` — Prometheus text format, behind the same authentication as
-  everything else. It counts the failures that are otherwise only a line on
-  stderr: a stored record the wire cannot carry, a reply that could not be
-  assembled, a zone left unanswered, a background refresh that failed, a
-  certificate reload that did not take. Each is present at zero before it ever
-  happens, so an alert can tell "never" from "no such series". No zone, record
-  or client names appear — the labels are a small fixed set.
-
-Supply `Authorization: Bearer <token>` when authentication is enabled. Desired
-state is stored before provider changes; preview never mutates a provider, and
-apply reports each view independently. Preview queries the live provider on every
-call, so it requires an editor or administrator token even though it changes
-nothing. A view whose provider cannot be read reports why instead of failing
-the whole preview, and carries that reason beside an empty plan so it is never
-read as nothing to do; when no view can be read at all, the request fails. Zone,
-history, and revision listings are paged: each accepts `limit` (up to 500,
-default 50) and `offset`, and returns `limit`, `offset`, and `hasMore` alongside
-the items.
-
-The only reconcilable views are `internal` and `external`; any other view name is
-rejected at write time so a zone can never hold desired state no provider can
-apply.
-
-### Managing records one at a time
-
-The record routes exist for a caller that is synchronising records from
-somewhere else -- an address manager, a certificate issuer, a cluster
-controller -- and does not want to read, edit and write back the whole zone to
-change one line.
-
-`GET /zones/:zone/records` reads across both views; `GET
-/zones/:zone/views/:view/records` reads one. Every filter is an AND: `name`
-matches the owner exactly as it is stored (`@` for the apex), `type` exactly,
-`content` as a case-insensitive substring, `search` as a substring of either the
-name or the content, and `proxied` as `true` or `false`. A `type` the control
-plane does not know is refused rather than answered with an empty page, because
-an empty page for a misspelt type reads as a fact about the zone. Listings are
-paged like every other listing here and also report `total`, the number of
-matches before paging. Each entry carries the `view` it came from, since a
-record id is unique only within one.
-
-`POST /zones/:zone/views/:view/records` adds a record and answers with the id it
-was given. Supply an `id` in the body to choose one -- it is refused with `409`
-if it is taken, because creating is not replacing -- or leave it out and it is
-derived from the name and type, so `api`/`A` becomes `api-a`. Repeating a create
-of a record the view already holds is refused: the derived id steps around the
-existing record, and the duplicate is then caught by the rule that one name and
-type cannot hold the same content twice.
-
-`PATCH /zones/:zone/views/:view/records/:id` changes only the fields the body
-names and leaves every other one as stored; `null` removes an optional field,
-which is the only way to say "stop proxying", since leaving a field out means
-leaving it alone. The merge happens under the same zone lock as the commit, so
-two callers editing different fields of one record cannot overwrite each other.
-The merged record is then validated whole -- a patch that would make the view
-illegal is refused even when the patch itself looks fine.
-
-`POST /zones/:zone/views/:view/records/batch` commits several changes as one
-revision, in the order `deletes`, `patches`, `puts`, `posts`, with at most 500
-operations. This is not the same as sending them one at a time: each single
-request is its own revision and its own provider apply, so moving a service
-between addresses publishes an intermediate state that was never desired. A
-batch is validated as a finished view before anything commits, and one refused
-operation leaves the zone exactly as it was. Deletes run first, so a batch may
-free a name and reuse it.
-
-Every one of these accepts `If-Match: "<revision>"` and answers with the zone's
-revision in an `ETag`, so a caller can carry the revision it read straight into
-the write that follows. `PUT` and `DELETE` on a record are unchanged.
-
-Deleting a zone withdraws every record Parallax published for it before removing
-the desired state, and responds with `removedProviderRecords` describing exactly
-what was taken out of the provider. Records without Parallax's ownership marker
-are never touched. Withdrawal happens first: if the provider rejects it or is
-unreachable the zone is kept so the deletion can be retried, rather than leaving
-published records nothing tracks. Pass `?abandonProviderRecords=true` only when
-one or more provider targets may be gone for good. Parallax still reads every
-target first and withdraws all reachable records; only targets that cannot be
-read are left live and returned explicitly as `abandonedProviderTargets`.
-
-## Container image
-
-The `Dockerfile` at the repository root builds a runtime image that carries all
-three surfaces: the API, the portal, and the command line.
-
-```sh
+```bash
 docker build -t parallax .
-docker run -p 3000:3000 \
-  -e DATABASE_URL='postgres://parallax:password@db:5432/parallax?sslmode=verify-full' \
-  -e PARALLAX_OWNERSHIP_SECRET='...' \
-  -e PARALLAX_CREDENTIAL_MASTER_KEY='...' \
-  -e PARALLAX_AUTH_TOKENS='[{"token":"<43-character-base64url-token>","subject":"deploy","role":"admin"}]' \
+docker run --rm -p 3000:3000 \
+  -e HOST=0.0.0.0 \
+  -e PARALLAX_AUTH_TOKENS='[…]' \
   parallax
 ```
 
-The image binds `0.0.0.0`, so `PARALLAX_AUTH_TOKENS` is required -- see
-[Access tokens](#access-tokens) for the shape and why.
+The image runs the API, the portal and the CLI from one process, as an
+unprivileged uid `10001`. `migrations/` stays root-owned and unwritable by that
+uid on purpose: compromising the service must not let it plant SQL for a later
+privileged `parallax migrate`.
 
-Apply the schema before the server starts, with the same image:
+| Store | When |
+|---|---|
+| **PostgreSQL** | `DATABASE_URL` is set. Seven tables, applied by `parallax migrate` |
+| **Files** | Otherwise. Atomic writes, `0600` files inside a `0700` directory |
 
-```sh
-docker run --rm \
-  -e DATABASE_URL='postgres://parallax:password@db:5432/parallax?sslmode=verify-full' \
-  parallax parallax migrate
+### Does this release change the schema?
+
+A deployment that replaces pods one at a time runs two versions at once for a
+few seconds. Whether that is safe comes down to one question, and it has a
+one-line answer:
+
+```bash
+git diff --name-only <deployed>..<new> -- migrations/ src/infrastructure/migrations.ts
 ```
 
-As a Kubernetes init container that is `command: ["parallax", "migrate"]`. It
-exits non-zero when it cannot reach or apply, so the pod does not go on to start
-a server against a schema that is not there.
+Empty output means the release changes no schema and the two versions may
+overlap. Anything listed means they may not.
 
-`parallax` is on the PATH inside the image, so every operation stays available
-without a token or a network round trip:
+> [!WARNING]
+> Those two paths **are** the answer, which is the dangerous part: move a
+> `CREATE TABLE` outside them and the command keeps returning nothing — and
+> nothing reads as "safe to overlap". It would not break; it would start lying,
+> on the one release where it mattered.
+>
+> So it is enforced rather than trusted. `test/infrastructure/schema-surface.test.ts`
+> scans `src/` and `cmd/` for DDL living outside the watched paths, and reads
+> those paths **out of the command above** rather than repeating them — a third
+> copy of a fact is what this class of failure is made of. It also asserts that
+> `README.md` and `README.ko.md` state the same paths, because a stale
+> translation is a stale check. CI runs it as its own job, from a bare checkout
+> with nothing installed, because that is how a deployment runs it.
 
-```sh
-docker exec <container> parallax zone list
-```
+---
 
-It runs as UID 10001 and the application directory is not writable. Runtime
-dependencies are installed separately from the build, so the toolchain that
-compiles the sources is not in the final image.
+## 🧪 Development
 
-With `DATABASE_URL` set the image needs no writable filesystem at all: it has
-been verified serving the portal, accepting API writes and running the CLI on a
-fully read-only root with nothing mounted. Without a database the file backend
-is used and its files live in `/var/lib/parallax`, which is then the path to
-mount. An ephemeral volume is enough -- nothing written there is authoritative
-while PostgreSQL is the store.
-
-## Verifying against real dependencies
-
-Unit and HTTP tests use in-memory fakes. These scripts exercise the real thing:
-
-```sh
-pnpm verify:postgres    # Docker PostgreSQL: migration, restart, locks, retention
-pnpm verify:proxy       # Docker nginx over TLS: origin, cookies, HSTS, readiness
-pnpm verify:dns         # dig against the built-in listener: every type, TC, relay
-pnpm verify:cloudflare  # opt-in; needs a real scoped token, skips without one
-pnpm audit              # dependency advisories
-```
-
-`verify:dns` needs neither Docker nor a network: the listener is in-process and
-the upstream it relays to is a stub, which is also what lets it prove the relay
-returned exactly what the upstream said. Its centre is that all twenty record
-types are asked for and rendered by `dig` -- an independent reader of the same
-bytes, which reports a malformed record instead of printing one. Types are asked
-for by number, because a `dig` that does not know a type's name quietly asks for
-`A` instead and answers nothing, which reads as the listener having no record.
-It also covers what only a running listener can show: truncation over UDP
-completing over TCP, a TCP query relayed to the upstream over TCP rather than
-downgraded, wildcard synthesis, a change served before the refresh timer could
-have run, and readiness passing with no provider configured at all.
-
-`verify:proxy` covers the one shape unit tests cannot stand in for: the server
-sees plain HTTP on loopback while the browser sees HTTPS. It first reproduces
-the misconfigured case, where the `https` Origin is refused, so the checks that
-follow cannot pass vacuously; then it proves `trustForwardedHeaders` and
-`publicOrigin` each repair it, and that a cross-site Origin is still refused.
-
-`verify:postgres` and `verify:proxy` need
-Docker and remove their containers on exit.
-
-A passing run is evidence about the commit it ran on and nothing else. The
-Cloudflare one first passed at `ef61201`, against a live zone, and the three
-runs before it each found a defect that the previous one had been hiding --
-including an ownership marker that exceeded Cloudflare's comment limit, so no
-record could be published to any zone with a name of more than about eleven
-characters. None of that is visible locally: a stubbed provider accepts
-whatever it is sent. `verify:cloudflare` writes to a live zone, so it refuses to run unless
-`CF_ZONE`, `CF_ZONE_ID`, `CF_API_TOKEN`, and `CF_VERIFY_ALLOW_WRITES=true` are
-all set; it confines itself to a `parallax-verify-*` name and asserts that
-records Parallax does not own are never scheduled for deletion.
-
-Set `CF_ACCOUNT_ID` as well to include the two account-scoped lookups that tell
-which names Workers and R2 publish for themselves. That part writes nothing: it
-asks the services, then requires every name they claim to be one the zone holds a
-proxied address record for -- which is what checks the hostname mapping against a
-real account, where an apex must come back as `@` and a bucket's domains in other
-zones must not come back at all. Without the variable it skips and says so, and a
-zone that has neither a Workers nor an R2 custom domain reports that the check
-proved nothing rather than passing quietly.
-
-## Development workflow
-
-The project uses Node's stable built-in test runner. Keep changes in the TDD
-cycle: add one failing behavior test, implement the smallest domain behavior,
-then run the whole suite and refactor.
-
-```sh
-pnpm test
-pnpm test:watch
-pnpm test:coverage
-pnpm check
+```bash
+pnpm check          # typecheck
+pnpm run check:portal
 pnpm build
+pnpm test           # node --test
 ```
 
-## License
+Five workflows run in CI, each answering a different question so a red result
+names its own cause: `check` (types, build, tests on Node 24 and 26), `scripts`
+(hook suites and shellcheck), `docker` (the image builds and stays
+unprivileged), `codeql`, and `dependency-review`.
 
-Apache License 2.0 — see [`LICENSE`](LICENSE).
+The `verify:*` scripts drive real infrastructure and are **not** run in CI:
+
+```bash
+pnpm verify:postgres    pnpm verify:dns
+pnpm verify:proxy       pnpm verify:cloudflare   # ⚠️ writes to a real zone
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and
+[SECURITY.md](.github/SECURITY.md) before reporting a vulnerability — privately,
+never as an issue.
+
+---
+
+## 📇 Record types
+
+23 types, validated by their RDATA in presentation format — the same text a zone
+file puts after the type:
+
+```
+A · AAAA · CAA · CERT · CNAME · DNAME · DNSKEY · DS · HINFO · HTTPS · LOC · MX
+NAPTR · NS · OPENPGPKEY · PTR · SMIMEA · SRV · SSHFP · SVCB · TLSA · TXT · URI
+```
+
+`SOA` is excluded, and so are the DNSSEC records a signer produces for the zone
+it signs — `RRSIG`, `NSEC`, `NSEC3`. Every provider generates those itself, and
+publishing our own would overwrite an answer we never asked for. `DS` and
+`DNSKEY` *are* here: a `DS` sits in the parent and delegates to a signed child,
+which is an operator's decision about somebody else's zone.
+
+> [!WARNING]
+> Publishing a non-global address in the **external** view requires setting
+> `acknowledgeNonGlobalIp` on that record. It is refused otherwise — putting
+> `10.0.0.11` on the public internet is usually a mistake, and when it isn't, it
+> should be one somebody made on purpose.
+
+---
+
+<div align="center">
+
+**Apache-2.0** · [LICENSE](LICENSE)
+
+</div>
