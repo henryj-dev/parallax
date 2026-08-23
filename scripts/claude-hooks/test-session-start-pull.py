@@ -143,6 +143,55 @@ try:
           open(os.path.join(work4, "A.md")).read().strip() == "v5")
     check("동시 실행을 실패로 보고하지 않는다", not [o for o in outs4 if "실패" in o])
 
+    # ⑤-1 「경합에서 졌나」 재확인의 두 창 — git 대역으로 **결정적으로** 잰다.
+    #
+    # ⚠️ 이 함수는 `session-end-cleanup.py` 에 일부러 복제돼 있고, 그쪽 스위트에 같은
+    #    검사가 있다. **양쪽에 다 두는 것이 요점이다** — 한쪽만 있으면 다른 쪽 사본이
+    #    조용히 옛 판정으로 되돌아가도 아무도 모른다. 그 복제가 이 코드의 전제다.
+    # ⚠️ ⑤의 동시 8개로는 이 둘을 못 잡는다. 재현이 기계 속도에 달려 있어서다 —
+    #    이 기계 32 스레드 20 라운드 0회, parallax CI 11회 중 1회.
+    import importlib.util
+    spec_ff = importlib.util.spec_from_file_location("sp_ff", SCRIPT)
+    sp = importlib.util.module_from_spec(spec_ff); spec_ff.loader.exec_module(sp)
+
+    def ff_with(second_read, module=None):
+        state = {"reads": 0}
+
+        def fake(cwd, *args):
+            if args[:2] == ("rev-parse", "--abbrev-ref"):
+                return 0, "origin/main"
+            if args[0] == "rev-parse":
+                state["reads"] += 1
+                if state["reads"] <= 2:
+                    return 0, ("aaaaaaa" if args[1] == "HEAD" else "bbbbbbb")
+                return second_read(args[1], state["reads"])
+            if args[0] == "merge":
+                return 1, "fatal: Unable to create '.../index.lock': File exists."
+            return 0, ""
+        return (module or sp).fast_forward_main(fake, "/x")
+
+    def late(ref, reads):
+        if reads <= 4:
+            return 0, ("aaaaaaa" if ref == "HEAD" else "bbbbbbb")
+        return 0, "bbbbbbb"
+    check("이긴 쪽의 ref 갱신이 늦어도 실패로 적지 않는다", ff_with(late)[0])
+    broken = lambda ref, reads: (128, "fatal: unable to read ref")
+    check("재확인을 못 하면 성공이라고 하지 않는다", not ff_with(broken)[0])
+    check("끝까지 다르면 실패로 적는다",
+          not ff_with(lambda ref, reads: (0, "aaaaaaa" if ref == "HEAD" else "bbbbbbb"))[0])
+
+    # 변이 — rc 확인을 지우면 「모르는 채로 성공」이 돌아와야 한다.
+    mut_rc = src.replace("        if rc_head or rc_target:\n            continue",
+                         "        if False:\n            continue")
+    assert mut_rc != src, "변이가 안 심겼다 — 이 검사는 무의미하다"
+    MUTRC = SCRIPT.replace(".py", "_mutrc.py")
+    open(MUTRC, "w", encoding="utf-8").write(mut_rc)
+    spec_rc = importlib.util.spec_from_file_location("sp_rc", MUTRC)
+    sp_rc = importlib.util.module_from_spec(spec_rc); spec_rc.loader.exec_module(sp_rc)
+    check("변이본(rc 무시)은 모르는 채로 성공을 보고한다(검사가 공허하지 않음)",
+          ff_with(broken, sp_rc)[0])
+    os.remove(MUTRC)
+
     # ⑥ 변이 — `git pull` 로 되돌리면 동시 실행이 정말 깨지는가.
     #    ⑤가 공허하지 않다는 증거이자, 이 수정이 고친 것이 무엇인지의 기록이다.
     mut_pull = src.replace('git(main_tree, "merge", "--ff-only", upstream)',
