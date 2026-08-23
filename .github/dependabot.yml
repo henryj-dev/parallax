@@ -23,12 +23,33 @@ updates:
       dev-dependencies:
         dependency-type: development
         update-types: [minor, patch]
-    # Majors are deliberately *not* ignored. The whole direct dependency list is
-    # three packages -- `pg`, `typescript`, `@types/node` -- so a major here
-    # arrives perhaps twice a year and each one is worth a human read: `pg` talks
-    # to the store, and a TypeScript major can change what typechecks. An
-    # `ignore` rule would also have applied to Dependabot's security updates,
-    # which is the one category that must never be silenced.
+    # Majors are otherwise deliberately *not* ignored. The whole direct
+    # dependency list is three packages -- `pg`, `typescript`, `@types/node` --
+    # so a major arrives perhaps twice a year and each is worth a human read:
+    # `pg` talks to the store, and a TypeScript major can change what
+    # typechecks. Both of those landed on the first Monday this file existed.
+    ignore:
+      # The one exception, and it is not about risk. `@types/node` describes the
+      # APIs of the runtime it is named for, so its major *is* the supported-Node
+      # floor wearing a different hat -- and this project's floor is stated once,
+      # in `engines.node`. Taking a 26 here while `engines` says `>=24` would let
+      # new code typecheck against APIs the floor does not have and fail at
+      # runtime instead of at build time, leaving the 24 leg of check.yml's
+      # matrix as the only thing standing between that and a release.
+      #
+      # So this does not stay pinned because 26 was hard: it was measured, and
+      # `@types/node` 26 needs only the two socket listeners in src/dns/server.ts
+      # annotated -- which is done, and compiles under both 24 and 26. It stays
+      # pinned because moving it is the *floor* decision, and that one moves
+      # `engines.node`, the check.yml matrix, and the Dockerfile base together.
+      # When that happens, delete this entry rather than bumping around it.
+      #
+      # ⚠️ Deliberately narrow. A blanket `dependency-name: "*"` would also have
+      # silenced Dependabot's security updates, which must never be silenced.
+      # `@types/node` ships type declarations and no code, so there is nothing
+      # here for an advisory to be about.
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
 
   - package-ecosystem: github-actions
     directory: /
@@ -52,3 +73,15 @@ updates:
       day: monday
     open-pull-requests-limit: 3
     labels: [dependencies, docker]
+    ignore:
+      # Same decision as `@types/node` above, from the other end: the base image
+      # major *is* the floor. Pinned to 24 until `engines.node` moves.
+      #
+      # ⚠️ This does not hold back security patches. `node:24-alpine` is a
+      # floating tag, so every build already picks up the current 24 image --
+      # what Dependabot proposes here is only the change of tag, 24 to 26.
+      #
+      # Bumping this tag alone also does not build -- the Dockerfile's own header
+      # records why and what the fix is, because that is the file the fix goes in.
+      - dependency-name: node
+        update-types: [version-update:semver-major]

@@ -152,7 +152,7 @@ function askOverTcp(port: number, message: Buffer, split = false, host = "127.0.
       }
     });
     let buffered = Buffer.alloc(0);
-    socket.on("data", (chunk) => {
+    socket.on("data", (chunk: Buffer) => {
       buffered = Buffer.concat([buffered, chunk]);
       if (buffered.length < 2) return;
       const size = buffered.readUInt16BE(0);
@@ -1044,7 +1044,7 @@ describe("DNS server", () => {
       udpUpstream.send(truncated, remote.port, remote.address);
     });
     const tcpUpstream = createServer((socket) => {
-      socket.on("data", (request) => {
+      socket.on("data", (request: Buffer) => {
         const querySize = request.readUInt16BE(0);
         const query = request.subarray(2, 2 + querySize);
         const reply = Buffer.alloc(1200, 0x41);

@@ -349,7 +349,15 @@ export function createDnsServer(options: DnsServerOptions): {
         clearIncompleteFrameTimer();
         tcpSockets.delete(socket);
       });
-      socket.on("data", (chunk) => {
+      // ⚠️ Annotated rather than inferred. From @types/node 26 the listener's
+      // parameter is `string | NonSharedBuffer`, because a socket that has had
+      // `setEncoding()` called on it delivers strings. Nothing here ever calls
+      // it -- this is a wire protocol with a two-byte length prefix, and
+      // decoding it as text would corrupt the frame before it was read -- so
+      // the buffer branch is the only one that occurs. The annotation says
+      // that out loud; the alternative was a cast at each of the five uses
+      // below, which would have hidden the assumption instead of stating it.
+      socket.on("data", (chunk: Buffer) => {
         let remaining = chunk;
         while (remaining.length > 0) {
           // Avoid accumulating a whole pipelined chunk. Complete frames go
@@ -860,7 +868,9 @@ function relayOverTcp(
     };
     const timer = setTimeout(() => done(undefined), timeoutMs);
     timer.unref();
-    socket.on("data", (chunk) => {
+    // Same reason as the listener above: no `setEncoding()` on this socket, so
+    // the string half of the parameter's type never arrives.
+    socket.on("data", (chunk: Buffer) => {
       buffered = Buffer.concat([buffered, chunk]);
       while (buffered.length >= 2) {
         const size = buffered.readUInt16BE(0);

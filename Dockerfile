@@ -6,6 +6,16 @@
 # The base tracks `engines.node` in package.json. If one moves, move the other:
 # a build that passes on an older runtime only proves nothing 24-only is in use
 # *yet*, and the day that changes it breaks at runtime, not at build time.
+#
+# ⚠️ Whoever moves it: changing these three tags alone does not build.
+# **Measured 2026-08-23** against `node:26-alpine` -- Node 25 dropped corepack
+# from the distribution, so all three `RUN corepack enable` lines below stop at
+# `corepack: not found`, exit 127. `RUN npm i -g corepack` immediately before
+# each is enough, and is the version that keeps `packageManager` in package.json
+# as the single place the pnpm version is declared -- installing pnpm directly
+# would make that two places. CI hit the same wall from the other side and
+# check.yml carries its own note about it; the fix there was
+# `pnpm/action-setup`, which reads the same field.
 FROM node:24-alpine AS build
 WORKDIR /app
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
