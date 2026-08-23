@@ -1,1090 +1,581 @@
-# Parallax
+<div align="center">
+
+<pre>
+██████╗  █████╗ ██████╗  █████╗ ██╗     ██╗      █████╗ ██╗  ██╗
+██╔══██╗██╔══██╗██╔══██╗██╔══██╗██║     ██║     ██╔══██╗╚██╗██╔╝
+██████╔╝███████║██████╔╝███████║██║     ██║     ███████║ ╚███╔╝
+██╔═══╝ ██╔══██║██╔══██╗██╔══██║██║     ██║     ██╔══██║ ██╔██╗
+██║     ██║  ██║██║  ██║██║  ██║███████╗███████╗██║  ██║██╔╝ ██╗
+╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
+</pre>
+
+### 하나의 이름, 두 개의 답.
+
+**split-horizon DNS 컨트롤 플레인이자 운영 포털.**
+
+내부 DNS와 외부 프로바이더 DNS의 목표 상태를 한곳에 두고, 바뀌기 전에 미리
+보여 주며, 자기가 소유한 레코드에만 적용합니다.
 
 [![check](https://github.com/henryj-dev/parallax/actions/workflows/check.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/check.yml)
 [![scripts](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml)
 [![docker](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml)
 [![codeql](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml)
 [![dependency-review](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml)
+
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2024-5FA04E)](package.json)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6)](tsconfig.json)
+[![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1-6BA539)](#-http-api)
 
-[English](README.md) | 한국어
+[English](README.md) · 한국어
 
-Parallax는 split-horizon DNS 컨트롤 플레인이자 운영 포털입니다. 내부 DNS와
-외부 Cloudflare DNS의 목표 상태를 한곳에서 관리하고, 적용될 변경을 미리
-확인한 뒤 Parallax가 명시적으로 관리하는 레코드만 반영합니다.
+</div>
 
+---
+
+## 문제를 그림 하나로
+
+같은 이름이 누가 묻느냐에 따라 다른 것을 가리켜야 합니다. 그걸 두 시스템에
+나눠 두면, 맞게 유지하는 일도 두 번 해야 합니다.
+
+```mermaid
+flowchart TD
+    D["하나의 목표 상태<br/>app.example.com"]
+
+    D --> I["내부 뷰"]
+    D --> E["외부 뷰"]
+
+    I --> IL["내장 DNS 리스너<br/>UDP · TCP"]
+    E --> CF["Cloudflare<br/>Parallax 가 소유한 레코드만"]
+
+    IL --> IA["10.0.0.11"]
+    CF --> EA["203.0.113.7"]
+
+    IA --> LAN(["사내망에서"])
+    EA --> NET(["그 밖의 모든 곳에서"])
 ```
-                          하나의 목표 상태
-                                 │
-            ┌────────────────────┴────────────────────┐
-            ▼                                         ▼
-       internal view                            external view
-      app.example.com                          app.example.com
-         10.0.0.11                               203.0.113.7
+
+Parallax는 목표 상태를 **하나만** 두고, 그것을 **두 뷰**로 투영한 뒤, 각 뷰를
+실제 상태와 맞춥니다 — 계획을 먼저 보여 준 다음에.
+
+---
+
+## ✨ 무엇을 해 주는가
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🎯 하나의 상태, 두 개의 뷰
+레코드는 한 번만 존재합니다. `internal`과 `external`은 그것의 투영이고, 모든
+프로바이더 대상은 `<zone>/<view>`로 지정됩니다.
+
+</td>
+<td width="50%" valign="top">
+
+### 🛡️ 자기 것만 건드림
+발행하는 모든 레코드에 **HMAC 서명된 소유권 마커**가 붙습니다. 자기가 쓰지
+않은 레코드는 세어서 보고할 뿐, 손대지 않습니다.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 👁️ 적용 전에 미리보기
+`preview`가 계획을 만듭니다 — 생성·수정·삭제·충돌, 그리고 **건드리지 않을**
+레코드의 수까지. 「할 일이 없다」와 「거기에 아무것도 없다」를 결코 혼동할 수
+없게 하기 위해서입니다.
+
+</td>
+<td valign="top">
+
+### 📡 DNS를 직접 응답
+내부 뷰를 UDP와 TCP로 직접 응답하는 권한 리스너입니다. EDNS(0), DNS 쿠키,
+AXFR(기본 거부), 아웃바운드 NOTIFY, 허용 목록 기반 포워딩, 클라이언트별
+레이트 리밋을 갖췄습니다.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### ⏪ 모든 변경이 리비전
+번호가 매겨진 리비전, 스냅샷 복원, 그리고 각 리비전이 레코드를 몇 개
+더하고 빼고 바꿨는지까지 보고하는 10종 감사 기록.
+
+</td>
+<td valign="top">
+
+### 🤝 빼앗지 않고 인수
+`zone adopt`는 프로바이더에 이미 있는 것을 *설명할* 뿐입니다. 넘겨받는 것은
+별도의 명시적 결정입니다.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 🔐 역할·토큰·SSO
+`viewer` · `editor` · `admin`. 발급형 액세스 토큰, 또는 프로토콜에 직접
+맞춰 구현한 OpenID Connect 로그인.
+
+</td>
+<td valign="top">
+
+### 🧭 하나의 머리, 세 개의 얼굴
+포털·HTTP API·CLI가 **같은 명령 계층**을 호출합니다 — 그래서 서로 갈라질 수가
+없습니다.
+
+</td>
+</tr>
+</table>
+
+---
+
+## 🚀 빠른 시작
+
+```bash
+git clone https://github.com/henryj-dev/parallax
+cd parallax
+corepack enable
+pnpm install --frozen-lockfile
 ```
 
-이름 하나에 답이 둘입니다. 내부 뷰는 내장 DNS 리스너가 UDP·TCP 로 직접 응답하고, 외부
-뷰는 Cloudflare 에 적용되며, 적용되는 것은 언제나 Parallax 가 관리하는 레코드뿐입니다.
+**실행합니다.** 아무것도 설정하지 않으면 루프백에 바인드하고 상태를 파일에
+둡니다 — 데이터베이스도, 토큰도, 준비 과정도 필요 없습니다:
+
+```bash
+pnpm dev                       # http://127.0.0.1:3000
+```
+
+**또는 명령줄로 다룹니다.** CLI는 저장소에 직접 닿습니다:
+
+```bash
+pnpm cli zone create --zone example.com
+pnpm cli record set --zone example.com --view internal \
+                    --id app --name app --type A --content 10.0.0.11 --ttl 300
+pnpm cli record set --zone example.com --view external \
+                    --id app --name app --type A --content 203.0.113.7 --ttl 300
+
+pnpm cli preview --zone example.com     # 무엇이 바뀌는지
+pnpm cli apply   --zone example.com     # 반영
+pnpm cli status  --zone example.com     # 각 뷰가 어디까지 적용됐는지
+```
+
+> [!IMPORTANT]
+> Parallax는 **액세스 토큰 없이 루프백이 아닌 주소로는 기동을 거부합니다.**
+> 루프백 세션에서 토큰을 발급하거나 `PARALLAX_AUTH_TOKENS`를 설정하십시오.
+> 경고가 아니라 기동 검사입니다.
+
+---
+
+## 🏗️ 어떻게 맞물리는가
+
+```mermaid
+flowchart LR
+    subgraph faces["세 개의 얼굴"]
+        P["🖥️ 포털"]
+        A["🔌 HTTP API"]
+        C["⌨️ CLI"]
+    end
+
+    faces --> CMD["명령 계층<br/>47개 명령"]
+    CMD --> CP["컨트롤 플레인<br/>존 · 리비전 · 감사"]
+
+    CP --> ST[("저장소")]
+    CP --> RT["프로바이더 라우터"]
+
+    ST --- PG[("PostgreSQL")]
+    ST --- FS[("단일 노드 파일")]
+
+    RT --> CFA["Cloudflare 어댑터"]
+    RT --> LOC["로컬 파일 프로바이더"]
+    CP --> DNS["DNS 리스너"]
+```
+
+들어가는 길은 명령 계층뿐입니다. HTTP API는 그 위의 얇은 사상이고 — OpenAPI
+문서의 각 오퍼레이션이 자기가 닿는 명령의 이름을 답니다 — CLI는 전권으로
+동작합니다. 그 박스의 셸을 쥐었다는 것이 곧 컨트롤 플레인 접근이기 때문입니다.
 
 <details>
-<summary><b>목차</b></summary>
+<summary><b>소스 트리</b></summary>
 
-- [제공 기능](#제공-기능)
-- [요구 사항](#요구-사항)
-- [로컬 실행](#로컬-실행)
-- [환경 설정](#환경-설정)
-  - [기존 배포를 업그레이드할 때](#기존-배포를-업그레이드할-때)
-  - [접근 토큰](#접근-토큰)
-  - [ID 프로바이더로 로그인하기](#id-프로바이더로-로그인하기)
-  - [프로세스에서 TLS 종단하기](#프로세스에서-tls-종단하기)
-  - [리버스 프록시 뒤에서 서비스하기](#리버스-프록시-뒤에서-서비스하기)
-  - [프로바이더 자격 증명](#프로바이더-자격-증명)
-  - [내부 뷰가 클라이언트에 닿는 방법](#내부-뷰가-클라이언트에-닿는-방법)
-  - [응답하는 것과 준비된 것은 다르다](#응답하는-것과-준비된-것은-다르다)
-  - [리졸버를 내부 뷰로 향하게 하기](#리졸버를-내부-뷰로-향하게-하기)
-  - [이력 읽기](#이력-읽기)
-  - [리비전 복원하기](#리비전-복원하기)
-  - [보관 정책](#보관-정책)
-- [하나의 표면, 세 가지 진입로](#하나의-표면-세-가지-진입로)
-- [명령줄](#명령줄)
-- [레코드 타입](#레코드-타입)
-- [이미 있는 레코드 입양하기](#이미-있는-레코드-입양하기)
-  - [클라이언트 쪽 리졸버 오버라이드](#클라이언트-쪽-리졸버-오버라이드)
-- [HTTP API](#http-api)
-  - [레코드를 하나씩 다루기](#레코드를-하나씩-다루기)
-- [컨테이너 이미지](#컨테이너-이미지)
-- [실제 의존성 대상 검증](#실제-의존성-대상-검증)
-- [개발 방식](#개발-방식)
-- [라이선스](#라이선스)
+| 디렉터리 | 무엇이 있는가 |
+|---|---|
+| `src/domain/` | 레코드 타입, 검증, 조정 계획 수립, 존 파일 |
+| `src/application/` | 컨트롤 플레인, 설정, 액세스 토큰, 자격 증명, fallback 도메인 |
+| `src/adapters/` | Cloudflare, 소유권 마커, 프로바이더 라우터 |
+| `src/dns/` | 와이어 포맷, RDATA, 쿠키, 권한 리스너, 스냅샷 |
+| `src/http/` | API, 신원 라우트, OpenAPI 생성, readiness, 포털 자산 |
+| `src/infrastructure/` | PostgreSQL, 파일 상태, 원자적 쓰기, 마이그레이션 |
+| `src/security/` | 인가, OIDC, 세션 토큰, 암호화된 자격 증명 저장소 |
+| `src/observability/` | Prometheus 메트릭과 시그널 |
+| `public/` | 포털 — 바닐라 JS, 번들러 없음 |
+| `cmd/parallax/` | 명령줄 진입점 |
 
 </details>
 
-## 제공 기능
+---
 
-- 존, 내부/외부 레코드, 미리보기, 적용, 상태, 감사 이력, 불변 리비전,
-  복원 및 존 삭제를 관리하는 웹 포털
-- Cloudflare 프록시 제약을 포함해, 흔히 쓰는 모든 레코드 타입을 RDATA 문법으로 검증
-  (`_dmarc`, `_acme-challenge` 같은 RFC 8552 언더스코어 이름 포함)
-- 외부 레코드를 보존하는 결정적 `managed-only` 동기화
-- 원자적 파일 쓰기를 사용하는 단일 노드 JSON 상태 및 프로바이더 상태 저장
-- 트랜잭션과 불변 리비전을 지원하는 선택적 PostgreSQL 기준 저장소
-- 선택적으로 사용하는 Cloudflare API 어댑터
-- 내부 뷰를 desired state에서 바로 UDP/TCP로 응답하고, 나머지 이름은 상위 리졸버로
-  넘기는 선택적 내장 DNS 리스너
-- 관리자 포털에서 관리하는 암호화된 쓰기 전용 Cloudflare 자격 증명
-- 선택적 admin/editor/viewer 역할 기반 토큰 인증과 감사 주체 기록
-- 상태 확인 엔드포인트와 보안 헤더
-- 스스로를 기술하는 API: 명령 레지스트리와 보안 계층에서 유도한 OpenAPI 3.1
-  문서와, 그것을 읽는 레퍼런스 페이지
-- 외부 의존성을 최소화한 Node.js HTTP 서버와 TypeScript 테스트 모음
+## 🛡️ 소유권 모델
 
-제품 및 아키텍처 결정의 배경은
-[`docs/product-design.md`](docs/product-design.md)에서 확인할 수 있습니다.
+Parallax가 사람·Terraform·인증서 봇과 한 존을 나눠 쓰면서도 서로 밟지 않게
+해 주는 부분입니다.
 
-## 요구 사항
-
-- Node.js 24 이상
-- pnpm 11 이상
-
-## 로컬 실행
-
-```sh
-pnpm install
-pnpm test
-pnpm check
-pnpm build
-pnpm start
-```
-
-브라우저에서 `http://127.0.0.1:3000`을 엽니다. 로컬 상태는 Git에서 제외되는
-`data/` 아래에 저장됩니다. 개발 중에는 `pnpm dev`를 사용합니다.
-
-## 환경 설정
-
-환경변수에는 저장소에서 읽어올 수 없는 것만 둡니다. 어디에 바인드할지, 저장소에
-어떻게 접속할지, 저장된 값을 보호하는 키가 전부입니다. `.env.example`을 `.env`로
-복사한 뒤 값을 조정하세요. `dev`와 `start` 스크립트는 파일이 존재할 때 `.env`를
-자동으로 읽고, 셸에서 직접 지정한 값이 우선합니다.
-
-| 변수 | 용도 |
-| --- | --- |
-| `HOST`, `PORT` | 서버 바인드 주소. 기본값 `127.0.0.1:3000` |
-| `DATABASE_URL` | PostgreSQL 원본 저장소. 루프백이 아닌 URL은 `sslmode=verify-full` 또는 `verify-ca`로 TLS를 검증해야 함 |
-| `PARALLAX_ALLOW_PLAINTEXT_POSTGRES` | 별도로 보호된 네트워크에서만, 검증된 TLS가 없는 비루프백 PostgreSQL URL을 명시적으로 허용하는 `true` 값 |
-| `PARALLAX_STATE_FILE` | 데이터베이스가 없을 때 존·리비전·상태·감사 기록 파일 |
-| `PARALLAX_CONFIG_FILE` | 데이터베이스가 없을 때 설정·자격 증명·접근 토큰 파일 |
-| `PARALLAX_PROVIDER_STATE_FILE` | 로컬 프로바이더가 켜져 있을 때만 사용하는 상태 파일 |
-| `PARALLAX_OWNERSHIP_SECRET` | 관리 레코드 소유권 마커에 서명하는 32바이트 이상 시크릿 |
-| `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장 자격 증명을 암호화하는 정확히 32바이트 키(base64 또는 64자 16진수) |
-| `PARALLAX_DNS_PORT` | 이 프로세스가 내부 뷰에 대해 직접 DNS로 응답한다. 설정하지 않으면 포트를 열지 않는다 |
-| `PARALLAX_DNS_HOST` | DNS 리스너가 바인드할 주소. 기본값은 `HOST`이고, 지정하지 않았다면 루프백이다 |
-| `PARALLAX_DNS_FORWARD_TO` | 관리 존 밖의 이름을 넘길 상위 리졸버 목록(`host` 또는 `host#port`, 쉼표 구분). 비어 있으면 넘기지 않고 `REFUSED`로 답한다 |
-| `PARALLAX_DNS_FORWARD_ALLOW` | 재귀 전달을 허용할 클라이언트 CIDR. 기본값은 루프백이며, 비루프백 리스너에서 전달하려면 명시해야 함 |
-| `PARALLAX_DNS_TRANSFER_ALLOW` | TCP AXFR을 허용할 클라이언트 CIDR. 비어 있으면 모든 전송을 거절 |
-| `PARALLAX_DNS_NOTIFY_TO` | 서비스 중인 존의 serial이 오를 때 NOTIFY를 받을 호스트(`host` 또는 `host:port`) |
-| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND`, `PARALLAX_DNS_RATE_LIMIT_BURST`, `PARALLAX_DNS_RATE_LIMIT_MAX_CLIENTS` | 클라이언트 하나가 쓸 수 있는 양과 추적하는 클라이언트 수. 기본 100, 200, 10000이며 버스트는 초당 속도보다 작을 수 없다 |
-| `PARALLAX_DNS_FORWARD_TIMEOUT_MS`, `PARALLAX_DNS_MAX_CONCURRENT_FORWARDS`, `PARALLAX_DNS_MAX_TCP_CONNECTIONS` | 전달과 열린 TCP 연결의 한도. 기본 4000, 256, 1024 |
-| `PARALLAX_DNS_REQUIRE_COOKIE` | EDNS 쿠키(RFC 7873)를 돌려주지 않은 UDP 클라이언트에게 잘린 응답을 보내 TCP로 다시 오게 한다. 기본은 꺼짐 — 쿠키는 항상 주고받고 검증하지만, 대부분의 리졸버는 쿠키를 보내지 않으므로 켜면 그 전부가 TCP를 거친다 |
-| `PARALLAX_DNS_SOA_PRIMARY`, `PARALLAX_DNS_SOA_MAILBOX` | 합성되는 SOA가 지목하는 이름. 기본값은 존에서 파생한 `ns.<zone>`·`hostmaster.<zone>`이고 이는 추측이지 존재가 확인된 호스트가 아니다. 세컨더리가 이 존을 전송받는다면 실재하는 이름을 지정할 것 — MNAME은 세컨더리가 갱신을 물으러 가는 곳이다 |
-| `PARALLAX_TLS_CERT_FILE`, `PARALLAX_TLS_KEY_FILE` | 이 프로세스가 직접 TLS를 종단할 인증서와 키. 둘 다 설정하거나 둘 다 비워야 함 |
-| `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP에 저장된 `publicOrigin`으로의 리다이렉트를 내는 포트. TLS와 해당 설정이 모두 필요 |
-| `PARALLAX_AUTH_TOKENS` | `{"token","subject","role"}` 객체의 JSON 배열. `role`은 `admin`, `editor`, `viewer` 중 하나이고, 토큰은 임의의 32바이트를 패딩 없는 canonical base64url로 인코딩한 43자 값. 루프백에서는 선택, **그 외 주소에 바인드하려면 필수** |
-
-파일 백엔드를 사용하는 배포에서는 설정한 각 데이터 파일의 상위 디렉터리를 서비스
-계정이 소유해야 하며, 모드는 **정확히 `0700`**이어야 합니다. 없는 디렉터리는 이 모드로
-만들지만, 기존 디렉터리에는 Parallax가 자동으로 `chmod`하지 않습니다. 설정 경로가
-`/tmp` 같은 공유 디렉터리를 가리킬 수 있어 권한을 자동으로 좁히면 다른 서비스를 망가뜨릴
-수 있기 때문입니다. 데이터 디렉터리가 흔히 `0755`인 기존 설치를 업그레이드할 때는 모든
-작성 프로세스를 멈추고 다음처럼 명시적으로 준비하세요. 파일별 상위 디렉터리가 다르면
-각 디렉터리에서 이 절차를 반복합니다.
-
-```sh
-# 소스 설치에서 기본 상대 경로를 사용할 때:
-chmod 0700 data
-
-# 시스템 서비스 경로 예시:
-sudo chown parallax:parallax /var/lib/parallax
-sudo chmod 0700 /var/lib/parallax
-```
-
-실제 배포의 서비스 계정과 경로를 사용하고, 모든 파일에 재귀적으로 `chmod`하지 마세요.
-이 권한 마이그레이션과 오래된 잠금 복구는 별개입니다. 모드 오류 때문에 잠금 파일을
-삭제하지 말고, 실제 작성자가 없음을 확인한 뒤 아래의 오류에 표시된 잠금 파일만 제거하는
-절차를 따르세요.
-
-### 기존 배포를 업그레이드할 때
-
-**교체당하는 쪽이 새 설정을 먼저 읽습니다.** 롤링 교체는 새 이미지가 도착하기 전에
-시크릿과 환경을 바꾸므로, 그 값을 처음 읽는 것은 지금 돌고 있는 이전 버전입니다.
-따라서 업그레이드를 위한 설정 변경은 **양쪽 버전이 모두 받아들일 수 있어야** 하고,
-새 버전만 이해하는 값은 새 버전이 도착할 때까지 서비스를 멈춥니다.
-
-위험한 방향은 **이전 버전이 더 느슨한 쪽**입니다. 이전 버전이 군말 없이 받는 값이
-새 버전이 거부하는 값일 수 있고, 그때 실패는 교체 시점이 아니라 그 뒤에 옵니다.
-`PARALLAX_AUTH_TOKENS`의 정규형 요구가 정확히 그렇습니다.
-
-이 버전이 없으면 거부하는 것 넷이며, 넷 다 재시작 전에는 아무 예고도 하지 않습니다:
-
-| | 거부 | 조치 |
-|---|---|---|
-| `PARALLAX_AUTH_TOKENS` | 기동 | 32바이트 난수의 정규형 base64url. 레코드의 `subject`와 `role`은 **두 버전 모두** 요구하므로 함께 유지 |
-| 데이터 디렉터리 모드 | 기동 | 위와 같이 각 상위 디렉터리에 `chmod 0700`. 파일 백엔드만 해당 |
-| TLS 없는 `DATABASE_URL` | 기동 | `sslmode=verify-full`, 또는 별도로 보호된 망이라면 `PARALLAX_ALLOW_PLAINTEXT_POSTGRES=true` |
-| 코드보다 오래된 스키마 | 쓰기 | `parallax migrate`. 실행 전까지 apply가 제약 조건 오류를 냅니다 |
-
-앞의 셋은 프로세스를 멈추므로 readiness 프로브에 잡힙니다. 넷째는 멀쩡히 뜬 뒤
-첫 쓰기에서 실패하므로 잡히지 않습니다.
-
-**릴리스가 스키마를 바꾸는지는 기계적으로 판정됩니다.** 파드를 하나씩 교체하는 배포는
-몇 초 동안 두 버전을 함께 돌리고, 그동안 옛 버전이 새 스키마를 견뎌야 하기 때문에
-중요합니다. 커밋 메시지를 읽어 알아채는 대신:
-
-```sh
-git diff --name-only <배포된>..<새것> -- migrations/ src/infrastructure/migrations.ts
-```
-
-출력이 비면 스키마가 그대로이고 두 버전이 겹쳐도 됩니다. 무엇이든 나오면 겹치면
-안 됩니다 — 그 릴리스만 겹치지 않게 배포한 뒤 되돌리십시오. 두 번째 경로가 들어간 것은
-어떤 마이그레이션이 실행됐는지 기록하는 테이블이 `.sql` 이 아니라 거기 있기 때문입니다.
-
-나머지는 전부 — 프로바이더 연결, 보관 정책, 프록시 origin, 접근 토큰, 프로바이더
-자격 증명 — 존과 같은 저장소에 보관되며 포털의 **프로바이더 설정** 화면에서
-관리합니다. 변경은 재배포 없이 즉시 반영되고, PostgreSQL을 쓰면 모든 인스턴스가
-같은 값을 읽습니다.
-
-| 설정 | 효과 |
-| --- | --- |
-| `allowLocalProvider` | 실제 프로바이더가 없을 때 로컬 파일에 게시. 기본값은 꺼짐이므로 라우팅되지 않는 대상은 성공으로 보고되지 않고 실패합니다 |
-| `publicOrigin` | 브라우저가 포털에 접속하는 HTTPS origin. 루프백에서만 HTTP 허용 |
-| `trustForwardedHeaders` | 리버스 프록시 헤더 신뢰. 전달된 호스트가 보안 origin을 정하지 못하도록 `publicOrigin`이 있어야 설정 가능 |
-| `revisionRetention` | 존별 보관 리비전 스냅샷 수. `0`은 전부 보관 |
-| `auditRetentionDays` | 존별 감사 기록 보관 일수. `0`은 전부 보관 |
-
-### 접근 토큰
-
-토큰은 포털에서 발급하며 SHA-256 다이제스트로만 저장됩니다. 제시된 토큰을 검증할
-수는 있지만 저장소가 토큰을 되만들 수는 없습니다. 새 토큰은 발급 시 한 번만
-표시됩니다. 토큰이 하나도 없으면 컨트롤 플레인은 열린 상태이며 이는 루프백 개발용
-동작입니다. 그 상태에서는 비루프백 주소 바인드를 거부하고, 프록시 전달 헤더가 붙은
-API 요청도 거부합니다. `PARALLAX_AUTH_TOKENS`는 스스로 잠긴 배포를 위한 비상
-경로로 남아 있으며, 해당 토큰은 관리형으로 표시되고 API로 폐기할 수 없습니다.
-마지막 관리자 토큰은 폐기되지 않습니다.
-
-서버는 시작할 때 토큰을 읽고 5초마다 다시 읽습니다. 따라서 CLI나 다른 replica에서
-발급하거나 폐기한 토큰도 재시작 없이 최대 5초 안에 반영됩니다.
-저장소를 잠깐 읽지 못하면 마지막으로 읽은 목록을 유지하지만, 실패가 60초 동안
-계속되면 저장된 토큰 인증을 fail-closed 방식으로 거부하고 `/health/ready`를 준비되지
-않은 상태로 전환합니다. 환경변수의 비상 토큰은 복구를 위해 계속 쓸 수 있습니다.
-프로세스가 토큰을 한 번이라도 관찰하면 저장소가 비거나 장애가 나도 인증 비활성화
-상태로 돌아가지 않는 sticky auth가 적용됩니다.
-
-루프백이 아닌 배포를 시작하는 유일한 방법이기도 합니다. 첫 토큰을 발급받을 루프백
-세션 자체가 없기 때문입니다. 컨테이너 이미지는 `0.0.0.0`에 바인드하므로 컨테이너
-배포에는 항상 필요합니다. 다음 명령으로 43자의 canonical base64url 토큰을 만들고
-JSON 배열에 넣습니다.
-
-```sh
-TOKEN="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
-printf '[{"token":"%s","subject":"deploy","role":"admin"}]\n' "$TOKEN"
-```
-
-그 외의 경우 서버가 바인드하기 전에 거부합니다:
+발행하는 모든 레코드는 프로바이더의 자유 텍스트 필드에 마커를 답니다 —
+Cloudflare의 레코드 코멘트, 존 파일의 후행 코멘트:
 
 ```
-parallax: refusing to serve a non-loopback address with no access token.
-Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.
+parallax-managed:v3:<record-id>:<hmac-signature>
 ```
 
-### ID 프로바이더로 로그인하기
-
-접근 토큰은 그대로 남습니다. 명령줄이 쓰고, 자동화가 쓰며, 스스로를 잠가 버린 배포가
-돌아오는 길이 `PARALLAX_AUTH_TOKENS` 입니다. 여기에 더해지는 것은 **사람이 자기 자신으로
-로그인하는 방법**입니다.
-
-```sh
-PARALLAX_OIDC_ISSUER=https://idp.example
-PARALLAX_OIDC_CLIENT_ID=parallax
-PARALLAX_OIDC_CLIENT_SECRET=…
-PARALLAX_OIDC_REDIRECT_URI=https://parallax.example/auth/callback
-PARALLAX_OIDC_SESSION_SECRET=…                # 32바이트 이상
-PARALLAX_OIDC_SCOPES="openid profile email"   # 선택
-PARALLAX_OIDC_SESSION_SECONDS=43200           # 선택, 60..604800
+```mermaid
+flowchart TD
+    R{"프로바이더에 있는 레코드"}
+    R -->|"마커가 검증됨"| M["managed<br/>수정 · 삭제 대상"]
+    R -->|"마커 없음"| U["untouched<br/>세어서 보고, 절대 쓰지 않음"]
+    R -->|"마커는 있으나 무효"| X["conflict<br/>드러냄, 조용히 덮어쓰지 않음"]
 ```
 
-필수인 다섯 개 중 일부만 설정하면 기동을 거부합니다. 일부만 설정된 배포는 이 기능을 쓰려던
-배포이고, 그대로 시작하면 **누군가 누르기 전에는 멀쩡해 보이는** 로그인 버튼이 남습니다.
+서명은 레코드 id뿐 아니라 **대상**까지 덮으므로, 마커를 다른 존에 복사하면
+거기서는 검증되지 않습니다. 마커가 대상 자체를 담지 *않는* 것은 의도적입니다.
+Cloudflare 코멘트는 100자로 제한되는데, 호출자가 이미 아는 값에 그 예산을
+쓰다가 이름이 긴 존에서는 모든 쓰기가 실패한 적이 있습니다.
 
-#### 모두를 프로바이더로 보내기
+> [!NOTE]
+> `PARALLAX_OWNERSHIP_SECRET`을 교체하면 이미 발행된 모든 레코드가 고아가
+> 됩니다 — 검증되지 않게 되어 *untouched*로 분류됩니다.
 
-```sh
-PARALLAX_PORTAL_SIGN_IN=idp     # 기본값: prompt
+---
+
+## 🖥️ 포털
+
+같은 프로세스가 **한국어와 영어로** 서빙합니다. 빌드 단계는 없습니다.
+
+- **Horizon 렌즈** — 레코드 하나, 두 개의 답을 나란히
+- **존 작업 공간** — 레코드, 뷰별 동기화 상태, 리비전 진행
+- **적용 계획 대화상자** — 계획을 검토하고 거기서 바로 적용
+- **리비전 이력** — 스냅샷을 훑고 하나를 복원
+- **자격 증명 설정** — 프로필, 존 바인딩, 리졸버 오버라이드, 토큰
+- **로그인** — 액세스 토큰 또는 신원 공급자
+
+---
+
+## ⌨️ CLI
+
+47개 명령. 어느 것에든 `--json`을 붙이면 기계가 읽는 출력이 나오고,
+`parallax help <command>`로 옵션을 봅니다.
+
+<details open>
+<summary><b>존과 레코드</b></summary>
+
+| 명령 | |
+|---|---|
+| `zone list` · `zone get` · `zone create` · `zone delete` | 기본 |
+| `zone replace` | 존의 목표 상태 전체를 교체 |
+| `zone adopt` | 프로바이더에 이미 있는 것을 넘겨받지 않고 설명 |
+| `zone export` · `zone import` | 뷰 단위 presentation-format 존 파일 |
+| `record list` · `get` · `set` · `create` · `patch` · `delete` | 레코드 하나씩 |
+| `record batch` | 삭제·패치·put·post를 **하나의 리비전**으로 |
+
+</details>
+
+<details>
+<summary><b>조정</b></summary>
+
+| 명령 | |
+|---|---|
+| `preview` | 목표와 실제를 비교하고 아무것도 바꾸지 않음 |
+| `apply` | 한 존의 프로바이더를 맞춤 |
+| `apply pending` | 대기 중인 모든 존에 적용, `--retryFailed`로 실패분 재시도 |
+| `status` | 각 뷰가 어디까지 적용됐는지 |
+
+</details>
+
+<details>
+<summary><b>이력</b></summary>
+
+| 명령 | |
+|---|---|
+| `history` | 감사 기록, 최신 순 |
+| `revision list` · `revision get` | 저장된 스냅샷 |
+| `revision restore` | 스냅샷을 **새 리비전으로** 복원 |
+
+</details>
+
+<details>
+<summary><b>자격 증명과 접근</b></summary>
+
+| 명령 | |
+|---|---|
+| `credential profile list` · `get` · `set` · `delete` · `test` | 재사용 가능한 계정 자격 증명 |
+| `credential zone list` · `get` · `set` · `delete` · `test` | apex 도메인을 프로필·존 id에 바인딩 |
+| `token list` · `token issue` · `token revoke` | 액세스 토큰 — 발급된 토큰은 딱 한 번만 반환됨 |
+| `settings get` · `settings set` | 저장된 운영 설정 |
+
+</details>
+
+<details>
+<summary><b>클라이언트 측 리졸버 오버라이드</b></summary>
+
+Cloudflare의 로컬 도메인 fallback 목록을, 프로필이 이미 쥔 자격 증명으로
+다룹니다 — 두 번째 토큰을 입력하는 사람은 없습니다.
+
+| 명령 | |
+|---|---|
+| `fallback list` | 오버라이드 목록 |
+| `fallback coverage` | 여기 있는 모든 존에 대해: 덮이는가, 아니라면 왜 아닌가 |
+| `fallback preview` · `fallback sync` | 이 프로필의 존들과 맞추면 무엇이 바뀌는지 보고, 맞춤 |
+| `fallback set` · `fallback delete` | 접미사 하나씩 |
+
+</details>
+
+<details>
+<summary><b>운영</b></summary>
+
+| 명령 | |
+|---|---|
+| `config check` | 이 프로세스의 기동을 막을 것을 **기동하지 않고** 보고 |
+| `migrate` | 데이터베이스 스키마 적용, 재실행해도 안전 |
+| `openapi` | 이 컨트롤 플레인 자신의 OpenAPI 기술을 출력 |
+
+</details>
+
+---
+
+## 🔌 HTTP API
+
+**40개 경로.** 프로세스가 자기 명령 표에서 생성하는 OpenAPI 3.1 문서가
+기술합니다 — 그래서 기술과 동작이 갈라질 수 없습니다.
+
+```
+GET /api/v1/openapi.json
 ```
 
-이렇게 하면 세션 없이 포털을 요청한 브라우저는 페이지와 토큰 입력란을 보는 대신 곧바로
-프로바이더로 리다이렉트됩니다. 계정을 디렉터리에서 관리하는 배포에서 접근 토큰은 기계의
-자격 증명이고, 그 입력란은 그것을 브라우저에 붙여 넣으라는 권유가 됩니다.
-
-바뀌는 것은 *페이지*가 하는 일뿐이고 나머지는 그대로입니다.
+<details>
+<summary><b>전체 라우트</b></summary>
 
 | | |
 |---|---|
-| 세션 없는 `GET /` | `/auth/login?next=…` 으로 `302` |
-| 자격 증명 없는 `GET /api/…` | 이전과 같이 `401` — 명령줄 클라이언트는 브라우저에서 로그인할 수 없고, 리다이렉트는 그쪽에 성공으로 읽힙니다 |
-| `GET /app.js` 등 | 이전과 같이 제공 — 그것들을 불러오는 페이지는 이미 리다이렉트됐습니다 |
-| 세션이나 토큰을 쥔 쪽 | 영향 없음 |
+| **존** | `GET POST /zones` · `GET PUT DELETE /zones/{zone}` |
+| **레코드** | `GET /zones/{zone}/records`<br/>`GET POST /zones/{zone}/views/{view}/records`<br/>`GET PUT PATCH DELETE …/records/{id}`<br/>`POST …/records/batch` |
+| **조정** | `GET POST /zones/{zone}/preview` · `POST /zones/{zone}/apply` · `POST /apply` · `POST /zones/{zone}/adopt` |
+| **상태** | `GET /status` · `GET /zones/{zone}/status` · `GET /zones/{zone}/export` · `POST /zones/{zone}/import` |
+| **이력** | `GET /history` · `GET /zones/{zone}/history` · `GET /zones/{zone}/audit`<br/>`GET /zones/{zone}/revisions` · `GET …/revisions/{revision}` · `POST …/restore` |
+| **관리** | `GET PUT /settings` · `GET POST /tokens` · `DELETE /tokens/{id}` |
+| **자격 증명** | `GET /credentials/profiles` · `GET PUT DELETE /credentials/profiles/{name}` · `POST …/test`<br/>`GET /credentials/cloudflare` · `GET PUT DELETE /credentials/cloudflare/{zone}` · `POST …/test` |
+| **Fallback** | `GET /fallback/{profile}` · `…/coverage` · `…/preview` · `POST …/sync` · `PUT DELETE …/domains/{suffix}` |
+| **메타** | `POST /cli` · `GET /openapi.json` · `POST DELETE /session` |
+| **프로브** | `GET /health/live` · `GET /health/ready` · `GET /metrics` |
 
-위 다섯 설정 없이 `idp` 만 주면 기동을 거부합니다. 그냥 넘어가면 이 설정이 없애려던 바로 그
-프롬프트가 남고, 증상은 없앤 줄 알았던 로그인 페이지가 보이는 것뿐입니다.
+</details>
 
-**돌아오는 길은 바뀌지 않습니다.** `POST /api/v1/session` 은 여전히 bearer 토큰을 세션
-쿠키로 교환하므로, 프로바이더 자체가 고장 난 상황에서 배포가 기대는 것은 계속
-`PARALLAX_AUTH_TOKENS` 입니다.
+**역할.** `viewer`는 읽고, `editor`는 레코드를 바꾸고, `admin`은 전부 합니다 —
+자격 증명·설정·토큰은 **읽기까지 admin 전용**입니다. 각각이 누가 무엇을 할 수
+있는지를 드러내거나 바꾸기 때문입니다.
 
-#### 롤아웃 전에 물어보기
+**낙관적 동시성.** 변경 오퍼레이션은 `expectedRevision`을 받고, 존이 그 사이
+움직였으면 거부합니다.
 
-```sh
-parallax config check          # 기계가 읽으려면 --json
-environment=ok portalSignIn=idp identityProvider=configured dns=0.0.0.0:5353 forward=2 …
-```
+---
 
-기동 검증은 fail-closed 입니다. 이 프로세스가 지킬 수 없는 설정은 조용히 다른 일을 하는
-대신 프로세스를 멈춥니다. 이 파드가 어떤 리졸버의 유일한 상위인 곳에서 그 거부는 파드 하나가
-아니라 그 뒤에 있는 모든 것의 이름 해석이고, 발견되는 시점은 대체된 파드가 이미 사라진
-뒤입니다.
+## ⚙️ 설정
 
-`config check` 는 같은 판정을 1분 먼저 줍니다. 환경 변수만 읽습니다 — 저장소를 열지 않고,
-포트를 바인드하지 않으며, 서버가 출력했을 메시지와 함께 `78` 로 종료합니다. 값이 아니라
-이름과 형태만 보고합니다. 프리플라이트의 출력은 배포의 출력이 가는 곳이면 어디로든 가기
-때문입니다.
+루프백에서 파일 상태로 띄우는 데는 아래 중 아무것도 필요하지 않습니다.
 
-⚠️ 저장소에 대해서는 답할 수 없습니다. 이 프로세스가 따를 수 없는 **저장된** 설정 역시
-기동을 fail-closed 로 막지만, 그건 이것이 보는 대상이 아닙니다.
+<details open>
+<summary><b>기본</b></summary>
 
-**역할은 여기가 아니라 프로바이더에서 옵니다.** Parallax 는 프로바이더가 이 클라이언트에
-대해 돌려주는 `entitlements` 클레임을 읽고 `admin`, `editor`, `viewer` 중 가장 높은 것을
-취합니다. 모르는 키는 무시합니다. 프로바이더가 아무것도 부여하지 않은 계정은 거부합니다 —
-인증은 그 사람이 누구인지를 증명할 뿐 여기의 누군가임을 증명하지 않고, 기본값을 두면
-디렉터리의 모든 계정이 이 컨트롤 플레인의 계정이 됩니다.
+| 변수 | |
+|---|---|
+| `HOST` · `PORT` | API와 포털이 바인드하는 곳. 기본값 `127.0.0.1:3000` |
+| `DATABASE_URL` | PostgreSQL 사용. 없으면 단일 노드 파일 |
+| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | 그 파일들의 위치 |
+| `PARALLAX_AUTH_TOKENS` | 비상용 토큰(JSON). 평소 토큰은 포털에서 발급 |
+| `PARALLAX_OWNERSHIP_SECRET` | 소유권 마커 서명 |
+| `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장된 프로바이더 자격 증명 암호화(AES-256-GCM) |
 
-⚠️ **`roles` 도 `groups` 도 아닌 `entitlements` 입니다.** 셋을 구분하는 프로바이더는 그
-구분을 의도한 것입니다. `roles` 는 그 사람이 *무엇인지*를 말하며 표시용이고, `groups` 는
-조직 어디에 속하는지를 말하며, 둘 다 권한 부여가 아닙니다. 어느 쪽이든 권한으로 읽으면
-라벨이 권위가 되고, 그 라벨은 대개 그런 일을 하고 있는 줄 모르는 사람이 관리합니다.
+</details>
 
-그래서 접근은 다른 서비스의 접근이 부여되는 곳에서 함께 부여됩니다. KeyStone 이라면
-클라이언트별 entitlement 이고, Parallax 가 알아보려면 그 키가 `admin`·`editor`·`viewer`
-여야 합니다.
+<details>
+<summary><b>TLS와 신원</b></summary>
 
-클라이언트는 `client_secret_post` 로 인증합니다 — 시크릿이 `Authorization` 헤더가 아니라
-토큰 요청 본문으로 갑니다 — 이 클라이언트를 어떻게 인증할지 묻는 프로바이더에는 그렇게
-알려 주어야 합니다.
+| 변수 | |
+|---|---|
+| `PARALLAX_TLS_CERT_FILE` · `PARALLAX_TLS_KEY_FILE` | 프록시 뒤가 아니라 프로세스가 직접 TLS 종단. 변경되면 재적재 |
+| `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP를 TLS origin으로 리다이렉트 |
+| `PARALLAX_OIDC_ISSUER` · `_CLIENT_ID` · `_CLIENT_SECRET` · `_REDIRECT_URI` · `_SCOPES` | OpenID Connect 로그인 |
+| `PARALLAX_OIDC_SESSION_SECRET` · `_SESSION_SECONDS` | 세션 서명과 수명 |
+| `PARALLAX_PORTAL_SIGN_IN` | 로그인하지 않은 방문자에게 포털이 무엇을 제시할지 |
 
-플로는 PKCE 를 쓰는 Authorization Code 입니다. `/auth/login` 이 브라우저를 프로바이더로
-보내고, `/auth/callback` 이 마무리하며, `/auth/logout` 이 양쪽 세션을 끝냅니다. 여기서
-설정하는 것 중 스크립트가 읽을 수 있는 것은 없고, state 와 PKCE 값은 로그인에 걸리는 10분
-동안만 존재합니다.
+</details>
 
-`PARALLAX_OIDC_SESSION_SECRET` 은 브라우저 세션에 서명합니다. 다른 두 시크릿과 달리
-**이것은 교체해도 안전합니다** — 모든 세션이 끝날 뿐 그 외에는 아무 일도 없습니다. 세션은
-자체 완결적이고, 그래서 만료 전에 취소할 수도 없습니다. 사람이 얼마나 자주 로그인하는지보다
-그게 더 중요하다면 `PARALLAX_OIDC_SESSION_SECONDS` 를 줄이십시오.
+<details>
+<summary><b>DNS 리스너</b></summary>
 
-### 프로세스에서 TLS 종단하기
+`PARALLAX_DNS_PORT`를 설정하는 것이 리스너를 켜는 스위치입니다. 나머지는 모두
+기본값이 있고, 그 기본값은 조심스러운 쪽입니다.
 
-앞단에 프록시가 없는 배포는 직접 TLS를 제공할 수 있습니다. 두 변수를 인증서와 키에
-맞추면 주 포트가 HTTPS를 제공합니다.
+| 변수 | |
+|---|---|
+| `PARALLAX_DNS_PORT` | **리스너를 켭니다.** 설정하지 않으면 포트를 열지 않음 |
+| `PARALLAX_DNS_HOST` | 기본값은 `HOST`, 그다음 `127.0.0.1` |
+| `PARALLAX_DNS_FORWARD_TO` | 모든 존 밖 이름의 상위. 비우면 `REFUSED`로 답함 |
+| `PARALLAX_DNS_FORWARD_ALLOW` | 재귀를 허용할 클라이언트 CIDR. 기본은 루프백이고, 리스너가 루프백이 아니면서 포워딩이 켜져 있으면 **필수** |
+| `PARALLAX_DNS_TRANSFER_ALLOW` | `AXFR`를 허용할 클라이언트 CIDR. **기본은 전부 거부** |
+| `PARALLAX_DNS_NOTIFY_TO` | 서빙 중인 존의 serial이 오를 때 NOTIFY를 받을 호스트 |
+| `PARALLAX_DNS_SOA_PRIMARY` · `_SOA_MAILBOX` | SOA 필드 |
+| `PARALLAX_DNS_REQUIRE_COOKIE` | RFC 7873 DNS 쿠키 요구 |
+| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND` · `_BURST` · `_MAX_CLIENTS` | 클라이언트별 레이트 리밋 |
+| `PARALLAX_DNS_MAX_TCP_CONNECTIONS` · `_MAX_CONCURRENT_FORWARDS` · `_FORWARD_TIMEOUT_MS` | 자원 상한 |
 
-```sh
-PARALLAX_TLS_CERT_FILE=/etc/tls/tls.crt \
-PARALLAX_TLS_KEY_FILE=/etc/tls/tls.key \
-HOST=0.0.0.0 PORT=443 parallax-server
-```
+</details>
 
-그 외에는 아무것도 달라지지 않습니다. 서버가 연결을 자기가 끝냈다는 것을 알기 때문에,
-프록시 뒤에서 `publicOrigin`이 공급하던 same-origin 증명이 설정 없이 유도되고 쿠키에
-`Secure`가 붙습니다. 리다이렉트 포트를 켜기 전에는 공개 HTTPS 주소를 `publicOrigin`에
-저장하십시오. 리다이렉트 리스너는 요청의 `Host`를 반영하지 않고 이 신뢰된 값만 사용하며,
-목적지가 아직 없거나 나중에 비워지면 리다이렉트 포트가 `503`으로 답합니다.
+<details>
+<summary><b>저장된 설정</b> — 환경변수가 아니라 저장소에 있습니다</summary>
 
-디스크에서 교체된 인증서는 재시작 없이 반영됩니다. 파일이 아니라 디렉터리를 감시합니다.
-쿠버네티스 시크릿 마운트는 심볼릭 링크를 바꿔치는 방식으로 갱신되기 때문입니다. 교체 도중의
-반쪽 상태는 쓰던 인증서를 그대로 두고 다음 이벤트에서 다시 시도합니다. 이것이 없으면 파드가
-무언가 재시작될 때까지 만료된 인증서를 계속 내밉니다.
+| 설정 | |
+|---|---|
+| `allowLocalProvider` | 대상에 실제 프로바이더가 없을 때 로컬 파일로 발행 |
+| `publicOrigin` | 브라우저가 포털에 닿는 절대 origin. 비우면 요청마다 유도 |
+| `trustForwardedHeaders` | `X-Forwarded-Proto` / `X-Forwarded-Host` 신뢰 |
+| `revisionRetention` | 존마다 보관할 최신 스냅샷 수. `0`이면 전부 보관 |
+| `auditRetentionDays` | 존마다 보관할 감사 이력 일수. `0`이면 전부 보관 |
+| `fallbackResolver` | 클라이언트 측 리졸버 오버라이드가 가리킬 주소 |
 
-두 변수를 모두 비우면 평문 HTTP입니다. 로컬 개발과 종단 프록시 뒤 배포가 모두 원하는
-동작입니다.
+</details>
 
-### 리버스 프록시 뒤에서 서비스하기
+---
 
-쿠키로 인증한 변경 요청은 same-origin을 증명해야 하며, 이때 브라우저가 실제로
-사용한 origin이 필요합니다. TLS 종단 프록시 뒤에서는 `publicOrigin`에 공개 HTTPS
-origin을 지정합니다. 신뢰하는 프록시가 이 프로세스에 도달하는 유일한 경로일 때만
-`trustForwardedHeaders`를 켜십시오. 이 설정은 `publicOrigin`이 없으면 거부되므로
-전달된 호스트나 프로토콜이 보안 origin을 결정할 수 없습니다.
+## 📊 관측
 
-인증은 환경 토큰과 저장 토큰이 모두 없을 때만 비활성화되며, 이는 루프백 개발 전용
-동작입니다. 인증이 비활성화되면 해당 포트에 도달한 모든 호출자가 관리자가 됩니다.
-인증이 비활성화된 상태에서 프록시 전달 헤더가 붙은 API 요청은 거부되고, 기동 시
-경고를 출력합니다. 앞단에 무언가를 두기 전에 반드시 토큰을 설정하세요. 환경 토큰은
-위에서 설명한 임의의 32바이트 canonical base64url 형식이어야 합니다. 인증
-실패가 반복되면 `429`와 `Retry-After` 헤더로 응답하고, 유효한 토큰은 다른
-클라이언트의 실패 때문에 지연되지 않습니다.
+| 엔드포인트 | |
+|---|---|
+| `GET /health/live` | 프로세스가 살아 있음 |
+| `GET /health/ready` | 올바르게 답할 수 있음 — 목표 상태가 낡으면 fail closed |
+| `GET /metrics` | Prometheus 텍스트 포맷 |
 
-포털은 토큰을 메모리에 들고 있지 않고 세션 쿠키로 교환합니다.
-`POST /api/v1/session`에 `{ "token": "..." }`을 보내면 `HttpOnly; SameSite=Strict;
-Path=/` 쿠키를 발급하고(HTTPS 요청이면 `Secure`도 포함), `DELETE /api/v1/session`으로
-지웁니다. 두 요청 모두 같은 origin에서 왔다는 증명을 요구하므로 포털만 세션을
-얻거나 버릴 수 있습니다. 쿠키가 `HttpOnly`이므로 페이지 스크립트는 자격 증명을
-볼 수 없습니다. API 클라이언트는 계속 `Authorization: Bearer`를 쓰면 됩니다.
-
-### 프로바이더 자격 증명
-
-Cloudflare 자격 증명은 계정 단위 토큰을 한 번만 입력하도록 분리되어 있습니다.
-**프로필**이 재사용 가능한 계정 ID와 API 토큰을 담고, 각 **apex 도메인**은
-프로필에 연결되며, Cloudflare 존 ID는 도메인으로 조회합니다 — 직접 입력하지
-않습니다. 프로필의 토큰을 교체하면 그
-프로필을 쓰는 모든 도메인의 라우팅이 즉시 갱신되며, 도메인이 연결된 프로필은
-삭제할 수 없습니다.
-
-관리자 포털의 **프로바이더 설정** 화면에서 둘 다 관리합니다. 한 탭은 저장된
-프로필과 각 프로필을 재사용하는 도메인 목록을, 다른 탭은 apex 도메인과 프로필의
-연결을 보여줍니다. 토큰은 쓰기 전용입니다. 암호화되어 저장되고 포털로 반환되지
-않으므로 교체할 값을 입력하기 전까지 입력란은 비어 있습니다.
-
-프로필 도입 이전에 만들어진 저장 파일은 처음 읽을 때 자동으로 변환됩니다. 서로
-다른 토큰마다 프로필 하나가 만들어지고 이름은 그 토큰을 처음 쓴 존에서 따오며,
-각 존은 자신의 존 ID를 그대로 유지합니다. 다시 입력할 것은 없습니다.
-
-토큰에는 관리할 도메인으로 범위를 좁힌 존 권한 두 개가 필요합니다.
-
-| 권한 | 이유 |
-| --- | --- |
-| `Zone` → `DNS` → `Edit` | 모든 레코드 읽기·쓰기. 런타임에 쓰는 전부입니다 |
-| `Zone` → `Zone` → `Read` | 도메인으로 존 ID를 찾을 때. 연결을 만들 때 한 번만 씁니다 |
-
-존 ID는 연결 시점에 조회해 저장하므로 apply 는 두 번째 권한을 쓰지 않습니다 —
-프로세스가 장악돼도 그 권한으로 할 수 있는 일이 늘지 않습니다.
-
-계정 권한 두 개는 선택이며 입양할 때만 씁니다. Cloudflare 서비스가 스스로 게시하는
-레코드를 그 서비스로 보여 주고 수정을 막는 데 쓰입니다 — Workers 커스텀 도메인은
-`Worker` 와 워커 이름으로, R2 커스텀 도메인은 `R2` 와 버킷 이름으로. DNS 레코드에는
-그런 정보가 없습니다. 레코드 API 로 보면 Workers 커스텀 도메인과 손으로 쓴 `CNAME` 은
-같은 객체라서, 바인딩을 들고 있는 서비스에 물어야 답이 나옵니다.
-
-| 권한 | 이유 |
-| --- | --- |
-| `Account` → `Workers Scripts` → `Read` | 이 존의 어느 이름이 Workers 커스텀 도메인이고 어느 워커의 것인지 |
-| `Account` → `Workers R2 Storage` → `Read` | 어느 이름이 R2 커스텀 도메인이고 어느 버킷의 것인지 |
-
-DNS 는 존 범위인데 이 엔드포인트들은 계정 범위라서, 둘 다 프로필에 계정 ID가 있어야
-합니다. 없을 때 — 계정 ID가 없거나, 토큰에 권한이 없거나, 그런 서비스를 쓰지 않는
-프로바이더일 때 — 존은 그대로 조정되고 모든 레코드가 그대로 게시됩니다. 입양은 누가
-소유했는지 읽지 못했다고 보고하고, 이미 서비스 소유로 표시된 레코드는 그대로 둡니다.
-실패한 조회를 근거로 잠금을 푸는 일은 없습니다.
-
-Cloudflare에는 최소 권한 API 토큰을 사용합니다. 인증이 설정되면 포털에서
-액세스 토큰을 요청하며 현재 브라우저 탭의 메모리에만 보관합니다. 자격 증명
-저장소 키는 `openssl rand -base64 32`로 생성할 수 있습니다. 프로바이더 설정
-화면과 자격 증명 API는 관리자 전용입니다. API 토큰은 쓰기 전용이며 목록과
-메타데이터 응답에는 존, 존 ID, 갱신 시각만 포함됩니다. 암호화 자격 증명은
-삭제하면 해당 존의 프로바이더 연결이 끊깁니다.
-
-각 서버는 자격 증명 작업마다 암호화 문서를 새로 읽고, 실행 중인 Cloudflare 라우팅도
-5초마다 갱신합니다. 따라서 다른 replica가 프로필을 회전하거나 바인딩을 제거해도 최대
-한 주기 안에 새 토큰 또는 연결 해제가 반영됩니다. 파일 백엔드는 변경할 때 프로세스 간
-잠금을 잡은 뒤 최신 문서를 다시 읽으므로, 두 프로세스가 오래된 복사본으로 서로의 변경을
-덮어쓰지 않습니다. 갱신을 읽지 못하면 오류를 기록하고 마지막으로 정상 동작한 라우팅을
-유지하며, 접근 토큰과 달리 60초 stale 상한은 없습니다. 따라서 저장소 장애 동안 다른
-replica에서 폐기하거나 회전한 자격 증명이 이 프로세스에 반영되는 시간도 장애가 복구될
-때까지 늘어납니다.
-
-봉인된 문서는 AES-256-GCM 인증과 단조 증가 revision을 사용합니다. 실행 중인 프로세스가
-더 높은 revision을 한 번 관찰한 뒤 오래된 유효 문서가 재생되면 이를 거부합니다. 다만 이
-롤백 방어에는 외부의 단조 증가 신뢰 기준이 없습니다. 재시작한 프로세스나 아직 새 revision을
-보지 못한 replica는 콜드 스타트 전에 복원된 과거의 정상 암호문을 최신 값과 구분할 수
-없습니다. 저장소 자체의 백업과 접근 통제는 여전히 필요합니다.
-
-Cloudflare [TTL](https://developers.cloudflare.com/dns/manage-dns-records/reference/ttl/)은
-[API 표현](https://developers.cloudflare.com/api/resources/dns/subresources/records/)에서
-`1`을 **Auto**로 사용합니다. 프록시가 적용된 A, AAAA, CNAME 레코드는 TTL을
-수정할 수 없으므로 항상 Auto로 정규화합니다. DNS-only 레코드는 Auto 또는
-60–86400초를 허용합니다. Cloudflare Enterprise 존은 최소 30초를 지원할 수
-있지만, Parallax는 프로바이더 요금제 기능을 명시적으로 설정하기 전까지
-일반 요금제의 하한인 60초를 적용합니다.
-
-
-기존 존 파일을 읽을 때는 일반적인 RFC 1035 표기를 모두 처리합니다. `$TTL`을
-상속하는 레코드, 앞 레코드의 소유자 이름을 상속하는 레코드, 선택적 `class` 필드,
-괄호로 여러 줄에 걸친 레코드가 포함됩니다. 중간의 `$ORIGIN`을 추적하고 새 관리
-레코드의 소유자 이름은 항상 절대 이름으로 기록합니다. `$TTL`과 `$ORIGIN` 외의
-`directive`, 지원하지 않는 레코드 타입, 중복된 관리 ID, 닫히지 않은 다중행 레코드는
-모두 fail-closed 오류입니다. 다중행 레코드의 `update`와 `delete`는 물리적 줄 전체를
-처리합니다. 읽을 수 없는 줄을 "레코드 없음"으로 간주하면 보지 못한 응답 옆에 두
-번째 응답을 게시할 수 있기 때문입니다. 저장 경계와 어댑터 양쪽에서 제어 문자,
-`zone-file` 구조 문자, `directive` 주입도 거부합니다.
-
-### 내부 뷰가 클라이언트에 닿는 방법
-
-이 프로세스가 목표 상태를 읽어 **직접 응답**합니다. 발행 단계가 없습니다 — 다른 DNS
-서버에 쓰지 않고, 소유권 마커를 남기지 않으며, 프로바이더와 비교하지도 않습니다.
-`apply` 가 관여하지 않는 이유이자, 변경이 조정 이후가 아니라 한 번의 갱신 안에 드러나는
-이유입니다.
-
-이전 버전은 CoreDNS 존 파일이나 PowerDNS 데이터베이스로 **발행**할 수도 있었고, 둘 다
-제거했습니다. 그것들은 이 프로세스가 스스로 답할 수 없었기 때문에 있었고, 이제 답합니다.
-함께 사라진 것은 **Parallax 가 죽어도 내부 뷰가 살아 있는 유일한 구성**입니다 — 그 성질이
-필요한 배포는 뒤에 발행할 곳이 아니라 앞에 둘 DNS 서버가 필요합니다.
-
-리스너는 `PARALLAX_DNS_PORT`가 포트를 지정할 때만 열리고, 그때 `PARALLAX_DNS_HOST`
-— 없으면 `HOST`, 그것도 지정하지 않았다면 루프백 — 에 바인드합니다. 포트를 하나
-설정했다는 이유로 네트워크 전체에 응답하기 시작하는 것은, 누구도 나중에 발견해야 할
-기본값이 아닙니다.
-
-상위 리졸버는 저장된 설정이 아니라 키들과 같은 자리, 환경 변수에 둡니다. 이유도
-같습니다. 이 프로세스가 권한을 갖지 않은 이름은 전부 그쪽으로 넘어가므로, 그 값을 바꿀
-수 있는 사람은 관리 존 밖의 모든 이름에 대해 조용히 대신 답할 수 있습니다. 그건 튜닝
-손잡이가 아닙니다.
-
-전달은 기본적으로 `127.0.0.0/8`과 `::1/128`에서 온 클라이언트에만 허용됩니다.
-비루프백 주소에 리스너를 바인드하면서 `PARALLAX_DNS_FORWARD_TO`를 설정하려면
-`PARALLAX_DNS_FORWARD_ALLOW`에 허용 CIDR을 명시해야 하며, 그 밖의 클라이언트에는
-`REFUSED`로 답합니다. 클라이언트별 응답률 제한(RRL)은 초당 100개, 순간 `burst`
-200개입니다.
-동시에 실행하는 상위 전달은 256개, TCP 연결은 1,024개로 제한하고, TCP 연결이 10초간
-유휴 상태이면 닫습니다. 이 값들은 현재 안전한 내장 기본값이며 환경 설정 항목은 아닙니다.
-
-상위 리졸버로 보내는 UDP 소켓은 목적지에 `connect`해 커널이 다른 출처의 데이터그램을
-버리게 합니다. 같은 출처에서 온 응답도 `QR`, `opcode`, transaction ID, question의 이름,
-타입, class가 원래 질의와 모두 일치할 때만 중계합니다. 일치하지 않는 응답은 타임아웃될 때까지
-무시하므로 먼저 도착한 위조 응답이 정상 응답을 밀어내지 못합니다.
-
-무엇을 이 리스너에 물리기 전에 알아둘 것이 둘 있습니다.
-
-**내부 뷰가 비어 있는 존은 응답 대상에서 빠집니다.** 존을 `adopt`한 직후의 정상 상태가
-바로 그것이고, 그 상태로 권한을 주장하면 존이 가진 모든 이름에 `NXDOMAIN`으로 답하게
-됩니다. 빼두면 그 이름들은 상위 리졸버로 넘어가, 오버라이드가 생길 때까지 공개된 값으로
-계속 해석됩니다.
-
-**리스너 스냅샷은 5초마다 갱신됩니다.** PostgreSQL과 파일 백엔드 모두 매번 최신
-상태를 읽으며, 파일 백엔드는 쓰기 전에 프로세스 간 잠금을 잡고 다시 읽습니다. 따라서
-터미널에서 실행한 `parallax record set`, 다른 replica, 포털과 API의 변경은 어느
-백엔드에서든 다음 갱신 주기 안에 포트를 쥔 서버에 반영됩니다.
-
-### 응답하는 것과 준비된 것은 다르다
-
-리스너가 한 번 올라오면 저장소의 어떤 사정도 응답을 멈추지 않습니다. 갱신 실패는 로그로
-남고 마지막으로 성공한 스냅샷이 계속 서빙합니다. readiness 는 그 반대입니다 —
-`/health/ready` 는 최근 **10초** 안의 성공한 읽기를 요구하므로, 그보다 오래 닿지 않는
-저장소는 503 을 보고하는 동안에도 모든 질의는 여전히 옳은 스냅샷에서 정확히 답합니다.
-
-⚠️ **그 분리는 바깥에서 다시 묶지 않을 때만 유지됩니다.** readiness probe 가 DNS 를 나르는
-서비스의 엔드포인트를 좌우하는 곳에서는, 저장소 장애가 멀쩡히 옳은 답을 쥐고 있는 리졸버를
-빼 버립니다. 이 리스너가 유일한 리졸버인 배포라면 probe 가 자유롭다고 판단하기 전에 어느
-쪽으로 배선돼 있는지 확인하십시오 — 그리고 장애가 얼마나 지속돼야 하는지는 probe 자신의
-`periodSeconds × failureThreshold` 가 정하며, 그 값은 보통 이 창보다 깁니다.
-
-```sh
-PARALLAX_READINESS_MAX_STALENESS_SECONDS=45     # 기본값: 10
-```
-
-올리면 오래됐지만 옳은 스냅샷이 더 오래 서빙한 뒤에야 프로세스가 스스로를 not ready 로
-보고합니다. 그 나이는 준비 여부와 무관하게 `/health/ready` 의 인증된 호출자에게
-`desiredState` 로 보고되므로, 배포는 스냅샷이 오래되는 것을 이유로 빠지는 대신 그것에
-알림을 걸 수 있습니다.
-
-⚠️ readiness 를 끄는 방법이 아닙니다. 아래 네 가지 기동 거부는 fail-closed 로 남습니다.
-그쪽은 「답할 수 없다」가 참이기 때문입니다.
-
-프로세스를 멈추는 모든 경로는 **기동** 경로입니다. 따를 수 없는 저장된 설정, 접근 토큰 없는
-비루프백 바인드, 아예 읽을 수 없는 목표 상태, 그리고 바인드할 수 없는 DNS 포트. 이미 서빙
-중인 프로세스에서는 어느 것도 발생할 수 없으므로, 노출되는 것은 재시작이지 다른 곳의
-장애가 아닙니다.
-
-이 프로세스가 커밋한 변경은 커밋되는 즉시 응답에 반영됩니다. 컨트롤 플레인이 거쳐 쓰는
-저장소가 알려주기 때문입니다. 5초 주기 재읽기는 스스로 알릴 수 없는 쪽 — 데이터베이스를
-공유하는 다른 인스턴스나 같은 파일에 쓰는 명령줄 — 을 위해 남아 있습니다.
-
-**와일드카드는 리터럴이 아니라 전개됩니다.** `*` 나 `*.eu` 로 된 레코드는 그 아래 이름들에
-응답하고, 가장 가까운 것이 이기며, 존재하는 이름 위로는 답하지 않습니다. 같은 desired
-state 를 두고 Cloudflare 가 그렇게 하므로, 여기서만 다르게 굴면
-같은 이름이 안과 밖에서 다르게 풀립니다.
-
-**readiness 는 리스너를 내부 뷰의 서비스 수단으로 인정합니다.** DNS 를 직접 응답하고
-프로바이더를 하나도 설정하지 않은 배포도 ready 입니다. 그러지 않으면 모든 질의에 정확히
-답하면서도 probe 는 영원히 통과하지 못합니다.
-공개 readiness 경로는 프로세스의 고정 크기 캐시만 읽고, 전체 존 스캔은 백그라운드에서
-한 번에 하나만 실행합니다. 존 또는 프로바이더 라우팅이 바뀌면 즉시 무효화하며, 갱신이
-실패하거나 10초 넘게 오래되면 준비되지 않은 상태로 답합니다.
-
-### 리졸버를 내부 뷰로 향하게 하기
-
-내부 뷰를 응답하는 쪽은 그 존에 대해 권위를 가지므로, 갖고 있지 않은 이름에는 NXDOMAIN 으로
-답합니다 — 실패가 아니라 응답이고, 포워더는 그것을 받아들이고 다른 곳으로 물러서지
-않습니다. 무언가를 그쪽으로 향하게 하기 전에 내부 뷰가 완전해야 하는 이유이자,
-[입양](#이미-있는-레코드-입양하기)이 있는 이유입니다.
-
-클라이언트를 리스너에 직접 물릴 수 있습니다. 권위를 갖지 않은 것은 전달하기 때문입니다.
-앞에 포워더를 두는 구성도 그대로 동작하고, 기존 네트워크는 대개 그쪽입니다.
+게이지는 선언 시점에 레지스트리로 복사하지 않고, 값을 이미 쥔 쪽에서 스크레이프
+시점에 읽습니다. 복사본이 낡는 경로를 만들지 않기 위해서입니다.
 
 ```
-클라이언트 → 포워더 ──(example.com)──→ 내부 뷰
-                   └─(그 외 전부)───→ 재귀 리졸버
+parallax_ready                                  readiness 를 통과할 상태면 1
+parallax_desired_state_age_seconds              목표 상태를 마지막으로 읽은 뒤 경과
+parallax_desired_state_max_age_seconds          readiness 가 실패하기까지 허용되는 낡음
+parallax_dns_served_zones                       리스너가 답하는 존의 수
+parallax_access_token_cache_ready               캐시된 토큰으로 인증할 수 있으면 1
+parallax_access_token_cache_age_seconds         그 캐시를 마지막으로 갱신한 뒤 경과
+parallax_dns_zones_skipped_total                내부 뷰를 구성할 수 없어 제외된 존
+parallax_dns_unservable_records_total           와이어에 닿았으나 쓸 수 없던 저장 레코드
+parallax_dns_unanswerable_replies_total         답할 수 없던 질의
+parallax_dns_notify_failures_total              실패한 NOTIFY 발송
+parallax_refresh_failures_total                 서브시스템별 백그라운드 갱신 실패
+parallax_tls_certificate_reload_failures_total  실패한 인증서 재적재
 ```
 
-클라이언트에게 그 주소를 직접 쥐여 주면 존 하나만 남고 인터넷이 사라집니다.
+---
 
-**내장 리스너는 예외이고, 상위 리졸버를 설정했을 때만 그렇습니다.** 그것은 두 역할을 동시에
-합니다. 관리 존에 대해서는 권위 서버이고, 나머지 전부에 대해서는 중계기이며, 후자가
-`PARALLAX_DNS_FORWARD_TO` 가 설정하는 것입니다.
+## 🐳 배포
 
-```
-클라이언트 → PARALLAX_DNS_PORT ──(example.com)──→ 목표 상태에서 응답
-                               └─(그 외 전부)───→ PARALLAX_DNS_FORWARD_TO
-```
-
-두 역할이 한 리스너에 있다는 것이 요점입니다. 둘로 쪼개면 앞의 무언가가 어느 이름이 누구
-것인지 알아야 하고, 그 지식은 곧 모든 리졸버 위의 목록으로 살면서 손으로 관리되다가 존이
-하나 추가되는 순간 낡습니다. 여기서는 그 목록이 목표 상태입니다. 상위 리졸버가 없으면
-리스너는 권위를 갖지 않은 것을 전부 거부하고, 그때는 발행 경로와 동등해져 그것처럼 포워더
-뒤에 있어야 합니다.
-
-앞에 서서 먼저 답하는 것이 둘 더 있고, 둘 다 Parallax 가 틀린 값을 서빙하는 것처럼
-보입니다.
-
-**포워더가 무엇을 묻기도 전에 `/etc/hosts` 에서 답할 수 있습니다.** dnsmasq 는 그것을
-기본으로 읽으므로, 자기 이름이 존 안에 있는 호스트는 내부 뷰가 무엇이라 하든 스스로를
-`127.0.0.1` 로 답합니다. `no-hosts` 가 그것을 끕니다. dnsmasq 를 돌리는 게이트웨이가
-자신이 전달하던 그 존 안에 이름을 갖고 있던 배포에서 보고된 것입니다.
-
-**클라이언트에게 쓰라고 알리기 전에 리졸버에 닿을 수 있어야 합니다.** 방화벽이 아직 53번
-포트를 막고 있는데 DHCP 로 리졸버 주소를 나눠 주면 갱신하는 모든 클라이언트에서 DNS 가
-사라지고, 그들에게는 돌아올 길이 없습니다. 포트를 먼저 열고, 클라이언트에서 질의를 확인한
-다음, DHCP 옵션을 바꾸십시오.
-
-### 이력 읽기
-
-모든 감사 기록은 `added`, `removed`, `changed` 를 함께 지닙니다. 그 리비전이 목표 상태로
-들여온 레코드, 빼낸 레코드, 같은 id 아래에서 다시 쓴 레코드가 각각 몇 건인지입니다. 존을
-비워 버린 리비전을 목록의 다른 줄과 구별해 주는 것이 그것이고, 그러지 않으면 주체와 시각만
-다른 줄들입니다.
-
-이 수치는 옆에 따로 기록해 둔 것이 아니라 기록이 이미 지닌 스냅샷에서 계산하므로, 수치가
-생기기 전에 쓰인 기록도 함께 보고합니다. 대개 누군가 읽는 이력이 바로 그쪽입니다. 리비전이
-무엇을 했는지는 이미 일어난 다음에야 묻게 되기 때문입니다.
-
-주체는 토큰의 subject 이므로, 이력이 *누구*에 대해 말해 줄 수 있는 것은 토큰이 몇 개
-있느냐에 달려 있습니다. [접근 토큰](#접근-토큰)을 보십시오.
-
-프로바이더 쓰기는 자체 선행 기록을 남깁니다. `provider.apply.started`,
-`provider.apply.completed`, `provider.apply.failed` 입니다. 대상 뷰와 계획·완료된 작업
-수를 기록하며, 부분 적용이나 존 purge 진행 상황도 포함합니다. 프로바이더 오류는 저장 전에
-안전한 범주로 축약하므로 토큰이나 프로바이더 응답의 세부가 감사 기록에 들어가지 않습니다.
-
-### 리비전 복원하기
-
-복원은 과거를 되돌리지 않습니다. 그 리비전의 의도를 현재 목표 상태로 만들고, 다음 `apply`
-가 그것을 수행합니다. 따라서 복원이 안전한지는 그것이 얼마나 오래됐느냐가 아니라 **지금**
-일어나야 할 일을 말하고 있느냐에 달려 있습니다. 당시에는 시연이었던 레코드를 지닌 스냅샷은
-그 뷰를 다음에 적용할 때 실제로 발행됩니다.
-
-복원하기 전에 스냅샷을 읽고, 여전히 의도하는 것만 말하는 가장 최근 리비전을 고르십시오.
-
-### 보관 정책
-
-목표 상태를 변경할 때마다 불변 스냅샷과 감사 기록이 쌓이므로 히스토리는 사용량에
-비례해 증가합니다. `revisionRetention` 설정은 존별 최신 스냅샷 수를,
-`auditRetentionDays`는 감사 기록 보관 기간을 제한합니다. 두 정책 모두
-변경을 기록하는 것과 같은 원자적 커밋 안에서 적용되며, `0`으로 두면 제한이
-없습니다. 보관 기간이 지나 삭제된 리비전을 복원하려 하면 404가 반환되므로,
-실제로 필요한 롤백 범위에 맞춰 리비전 수를 정하세요.
-
-PostgreSQL을 사용할 때는 서비스를 시작하기 전에 스키마를 적용합니다.
-
-```sh
-parallax migrate
-```
-
-실행할 파일은 코드의 target별 고정 manifest에 적혀 있습니다. 디렉터리에 예상하지 않은
-SQL 파일이 있거나 필요한 파일이 빠졌으면 데이터베이스 연결을 얻기 전에 거부합니다. 각
-파일의 SHA-256 checksum은 `parallax_schema_migrations` ledger에 target과 이름별로
-기록됩니다. 이미 기록된 같은 파일은 건너뛰고, 적용 후 내용이 바뀐 파일은 실패하므로 과거
-마이그레이션을 수정하는 대신 새 번호의 파일을 추가해야 합니다. 동시 실행은 advisory lock으로
-직렬화되므로 쿠버네티스 init 컨테이너나 배포 전 잡으로 쓸 수 있습니다.
-
-기동 시 자동으로 적용하지는 않습니다. 의존하는 저장소를 부팅하면서 재구성하는 서버는 방금
-롤백된 이미지에서도 스키마를 전진시켜 버립니다. 대신 기동을 거부하고 없는 릴레이션 이름을
-알려 줍니다. 마이그레이션 기능은 로컬 `parallax migrate` CLI용 runtime에만 있고 서빙
-runtime에는 없습니다. 따라서 `POST /api/v1/cli`로는 실행할 수 없으며, 상시 서버의
-HTTP 관리자 권한이 데이터베이스 DDL 권한으로 확대되지 않습니다. 컨테이너의 migration
-파일도 `root` 소유의 읽기 전용 파일이라 UID 10001인 서버가 바꿀 수 없습니다.
-
-## 하나의 표면, 세 가지 진입로
-
-모든 작업은 명령(command)으로 한 번만 정의됩니다. 동작을 가진 곳은 그곳뿐입니다.
-
-```
-포털(GUI)   ──HTTP──▶  API  ──▶  명령 계층  ──▶  컨트롤 플레인
-터미널(CLI) ────────────────▶  명령 계층  ──▶  컨트롤 플레인
-```
-
-포털은 API와만 통신하며 다른 어디에도 닿지 않습니다. API의 각 라우트는 번역기일
-뿐입니다. 요청을 명령 호출 하나로 바꾸고, 그 결과를 응답으로 바꿉니다. `parallax`는
-argv를 같은 호출로 파싱합니다. API는 서빙 runtime이 제공하는 명령만 실행하고 CLI는
-같은 명령 계층을 직접 사용하므로 동작 계약이 어긋나지 않습니다. 유일한 기능 차이는
-스키마 마이그레이션으로, 로컬 CLI runtime에만 있습니다.
-
-`POST /api/v1/cli`는 명령줄 자체를 받습니다.
-
-```sh
-curl -X POST http://127.0.0.1:3000/api/v1/cli \
-  -H 'content-type: application/json' \
-  -d '{"argv":["zone","create","--zone","example.com"]}'
-```
-
-셸이나 하위 프로세스 없이 같은 디스패처를 프로세스 안에서 실행하며, 호출자의 역할을
-해당 명령에 적용합니다. 따라서 이 엔드포인트로 토큰 권한을 우회할 수 없고, 서빙 runtime에
-없는 `migrate`도 실행할 수 없습니다.
-
-## 명령줄
-
-```sh
-pnpm cli help                 # 전체 명령
-pnpm cli help record set      # 특정 명령의 옵션
-pnpm cli migrate              # 고정 manifest의 미적용 스키마만 적용
-pnpm cli zone list
-pnpm cli zone create --zone example.com
-pnpm cli record set --zone example.com --view external --id www \
-  --record '{"name":"www","type":"A","content":"93.184.216.34","ttl":300}'
-pnpm cli preview --zone example.com
-pnpm cli apply --zone example.com
-pnpm cli settings set --values '{"allowLocalProvider":true}'
-pnpm cli token issue --subject deploy-bot --role editor
-```
-
-머신별 검증 조건에 맞지 않는 저장값 때문에 서버가 시작되지 않을 때도 서빙은
-fail-closed 상태를 유지하지만, 로컬 `settings set` 명령은 복구 경로로 사용할 수
-있습니다. 이 명령은 설정 저장소만 초기화하고, 최신 저장값에 패치를 합친 전체 후보를
-검증한 뒤 기록합니다. 프로바이더, 토큰, 컨트롤 플레인은 시작하지 않습니다. 예를 들어
-이 머신이 쓸 수 없는 디렉터리를 가리키는 로컬 프로바이더는
-`pnpm cli settings set --values '{"allowLocalProvider":false}'`로 끌 수 있습니다. 패치를
-합친 뒤에도 저장 불변식이 하나라도 유효하지 않으면 아무것도 기록하지 않고 거부합니다.
-
-CLI와 서버는 같은 저장소의 최신 값을 읽습니다. 파일 백엔드도 읽기마다 다시 열고 변경은
-프로세스 간 잠금 아래 병합하므로 오래된 메모리 상태로 다른 쪽의 변경을 덮어쓰지
-않습니다. 토큰과 내장 DNS 스냅샷처럼 주기적으로 갱신하는 런타임 상태에는 최대 5초가
-걸립니다. 감사 기록에는 실행자가 `cli:<user>`로 남습니다. 기계가 읽을 출력은 `--json`을
-붙이세요.
-
-파일 변경 중 프로세스가 강제 종료되면 숨김 잠금 파일이 남을 수 있습니다. 교체된 새
-작성자의 잠금을 경쟁 없이 구분할 수 없으므로 Parallax는 기존 잠금을 자동 삭제하지
-않습니다. 15초 뒤 오류에 표시된 잠금 파일은 해당 데이터 파일을 쓰는 Parallax
-프로세스가 없음을 확인한 다음, 표시된 그 파일만 수동으로 삭제하세요.
-종료 코드는 `sysexits`를 따릅니다. `64` 사용법, `65` 잘못된 입력, `69` 없음,
-`70` 충돌, `77` 권한, `78` 사용 불가.
-
-명령줄은 저장소에 직접 접근하므로 전체 권한으로 동작합니다. HTTP 호출자는 토큰의
-역할이 허용하는 범위로 제한됩니다.
-
-## 레코드 타입
-
-`content` 는 레코드의 RDATA 를 표현 형식으로 담습니다 — 존 파일이 타입 뒤에 적는 것과 같은
-텍스트입니다.
-
-```
-MX     10 mail.example.com
-SRV    10 5 5060 sip.example.com
-CAA    0 issue "letsencrypt.org"
-HTTPS  1 . alpn=h2,h3
-TXT    v=spf1 -all
-```
-
-각 타입의 문법은 적용할 때가 아니라 **저장할 때** 검사합니다. 프로바이더가 거부할 레코드는
-운영자가 저장하고 자리를 뜬 뒤 나중에 깨진 것을 발견하게 되는 레코드이고, 그때는 이미
-절반쯤 발행된 존을 상대로 그럴 수도 있습니다.
-
-그 목록의 모든 타입은 [내장 리스너](#내부-뷰가-클라이언트에-닿는-방법)로 와이어에 실을 수도
-있으며, 그것을 강제하는 것은 컴파일러입니다. 인코더는 도메인이 검증에 쓰는 것과 같은 목록
-위의 테이블이므로, 한쪽에만 추가된 타입은 빌드되지 않습니다. 검증되고 발행됐는데 응답할 수
-없는 레코드가 그것이 막는 실패입니다. 저장된 레코드를 끝내 인코딩할 수 없으면 RRset 전체를
-SERVFAIL 로 답하고 이유를 로그로 남깁니다 — 완전해 보이고, 캐시되고, 빠진 것을 조용히
-잃어버리는 부분 RRset 은 절대 내보내지 않습니다.
-
-두 가지는 content 에 적는 대신 어댑터가 처리합니다. Cloudflare 는 `MX`·`SRV`·`URI` 의 앞
-숫자를 자체 필드에 두고, 존 파일은 호스트명을 절대 이름으로 만들어야 합니다 —
-`example.com` 의 파일에 `mail.example.com` 이라 적힌 `MX` 대상은 그러지 않으면
-`mail.example.com.example.com` 으로 풀립니다. 둘 다 레코드를 다시 읽을 때 적힌 그대로
-되돌리므로 어느 쪽도 드리프트로 보이지 않습니다.
-
-`SOA` 와 서명자가 자신이 서명하는 존에 대해 만들어 내는 레코드 — `RRSIG`, `NSEC`, `NSEC3`
-— 는 관리하지 않습니다. 그것들은 존 자신의 권위를 기술하고, 모든 프로바이더가 스스로
-생성하며, 우리 것을 발행하면 묻지도 않은 질문에 대한 프로바이더의 답을 덮어씁니다. `DS` 와
-`DNSKEY` 는 DNSSEC 레코드인데도 관리합니다. 그건 그것이 아니기 때문입니다 — `DS` 는
-*부모*에 앉아 서명된 자식으로 위임하며, 그것은 운영자가 남의 존에 대해 내리는 결정입니다.
-
-digest 길이가 digest 타입과 어긋나는 `DS` 는 저장할 때 거부합니다. 그런 레코드는 깔끔하게
-발행된 다음 해석을 멈춥니다 — 리졸버가 그 답을 읽는 대신 형식 오류로 보고합니다 — 그리고
-그것이 이 컨트롤 플레인이 나중에 발견되는 대신 드러나게 하려고 존재하는 실패입니다. apex
-`NS` 레코드도 내부 뷰가 상속하지 않습니다. 그것은 그 존에 답하는 서버들을 지목하며 그건 각
-프로바이더에 대한 사실이고, 안쪽으로 복사하면 내부 뷰를 자기 자신에게서 위임해 버립니다.
-
-## 이미 있는 레코드 입양하기
-
-존에는 대개 Parallax 가 오기 전의 역사가 있습니다. 프로바이더에서 손으로 만든 레코드는 목표
-상태에 없으므로 Parallax 는 그것을 남의 것으로 취급합니다. 건드리지 않고, 그것으로부터
-아무것도 유도하지 않습니다.
-
-그것이 내부 뷰에는 문제가 됩니다. 내부 뷰는 외부 목표 상태에서 구체화되기 때문입니다. 목표
-상태가 기술하지 않은 것에 대해 내부 뷰는 응답하지 않고 — 권위 서버는 「모르겠다」고 하지
-않고 NXDOMAIN 이라고 합니다. 리졸버는 그것을 답으로 받고 멈춥니다. 그래서 다른 레코드를
-가진 존의 내부 뷰는 배선되기 전에 완전해야 합니다.
-
-`zone adopt` 는 프로바이더가 현재 쥐고 있는 것을 읽어 목표 상태에 씁니다.
-
-```sh
-pnpm cli zone adopt --zone example.com --view external
-# seen: 프로바이더가 나열한 것. adopted: 새로 기술된 것.
-pnpm cli preview --zone example.com --view external   # 작업이 없어야 정상
-```
-
-내부 뷰는 저장되는 것이 아니라 조정될 때 유도되므로, `zone get` 은 입양이 외부 뷰에 쓴
-레코드만 보여 줍니다. 내부 뷰가 레코드 없음으로 보고하는 것은 실패한 입양이 아니라 정상
-상태입니다.
-
-preview 를 읽기 전에 `seen` 을 읽으십시오. 작업이 없는 preview 는 목표 상태와 프로바이더가
-일치한다는 뜻인데, 목표 상태가 비어 있을 때도 그것은 참이므로 그것만으로는 입양이 무언가를
-넣었는지 알려 주지 못합니다. `seen` 이 0보다 큰데 입양된 것이 없다면 그 뷰는 이미
-완전했다는 뜻입니다. `seen` 이 0이면 프로바이더가 이 컨트롤 플레인이 읽을 수 있는 것을
-내놓지 않았다는 뜻이고, 그건 빈 존이 아니라 아래의 타입 한계 쪽입니다.
-
-### 클라이언트 쪽 리졸버 오버라이드
-
-프로바이더 자체 클라이언트를 쓰는 기기는 모든 것을 프로바이더 리졸버에 묻습니다. 그래서
-이 컨트롤 플레인이 사적으로 답하는 이름은 그 기기에 존재하지 않습니다. 프로바이더의
-해법은 접미사별로 로컬 리졸버를 지정하는 오버라이드이고, Parallax 는 그 목록을 보유한
-존들과 맞춥니다:
-
-```sh
-pnpm cli settings set --patch '{"fallbackResolver":"10.0.0.53"}'
-pnpm cli fallback preview --profile production   # 무엇이 바뀔지
-pnpm cli fallback sync --profile production      # 맞추기
-```
-
-접미사는 apex 이고 그 아래 모든 이름에 걸립니다. 주소는 추론이 아니라 설정입니다 —
-리스너는 `0.0.0.0` 에 바인드하는데 그건 누구에게도 「여기로 물어라」 할 수 있는 주소가
-아니고, 기기가 써야 할 주소는 이 프로세스 밖의 사실입니다.
-
-**그 목록은 당신 것이 아닙니다.** 조직의 모든 오버라이드가 함께 사는 계정 단위 설정
-하나이고, 프로바이더는 항목 하나를 더하거나 지우는 방법을 주지 않습니다 — 모든 쓰기가
-전체 교체입니다. 그래서 Parallax 는 반드시 먼저 읽고, **그 접미사로 서명된 표식**이
-설명란에 있는 항목만 바꿉니다. 발행된 레코드가 지니는 것과 같은 표식입니다. 서명하지
-않은 항목은 보고만 하고 그대로 둡니다. 예외는 좁습니다 — 보유한 존의 항목인데 표식이
-없고 **이미 Parallax 가 보낼 곳과 같은 곳을 가리키면** 표식만 찍어 인수합니다. 기기가
-관측할 수 있는 변화가 없기 때문입니다.
-
-**이 프로세스가 실제로 답하는 존만** 오버라이드를 받습니다. 내부 뷰가 빈 존은 리스너
-스냅샷에서 빠져 권위를 주장하지 않고 질의가 상위로 넘어가므로, 그런 존을 가리키게 하면
-얻는 것 없이 의존만 늘어납니다. 양쪽이 그 판단을 같은 함수에서 읽으므로, 존이 서빙되지
-않게 되면 같은 개정에서 가리킴도 사라집니다.
-
-**변경은 즉시 반영되지 않습니다.** 클라이언트는 자기 주기로 설정을 갱신하므로 쓰기
-직후의 첫 조회는 아직 옛 답일 수 있습니다. 몇 분 뒤에 판정하고, **내부 답이 공개 답과
-다른 이름**으로 판정하십시오 — 어느 쪽이든 프로바이더 엣지로 해석되는 이름은 오버라이드가
-걸렸는지 말해 주지 못합니다.
-
-## HTTP API
-
-모든 경로는 실행 중인 프로세스가 스스로 만들어 내는 OpenAPI 3.1 문서에
-기술되어 있고, 그것을 읽는 레퍼런스 페이지가 있습니다.
-
-| | |
-| --- | --- |
-| `GET /docs` | 브라우저에서 읽는 레퍼런스. 포털 상단에서 연결됩니다. |
-| `GET /api/v1/openapi.json` | 문서 자체. Swagger UI, Redoc, 클라이언트 제너레이터를 여기에 겨누면 됩니다. |
-| `parallax openapi` | 같은 문서를 명령줄에서. 서버도 설정도 필요 없으므로, 커밋된 사본과 diff 하는 파이프라인이 쓸 수 있습니다. |
-
-이 문서는 코드 옆에 따로 적어 둔 것이 아니라 **유도된** 것입니다. 각 오퍼레이션의
-요약은 명령 레지스트리에서 읽어 오므로 API 와 명령줄이 같은 문장을 말하고,
-`x-parallax-command` 는 그 경로가 실행하는 명령을 지목하며, 열거형은 도메인이
-이미 가진 상수에서 옵니다. `x-parallax-role` 은 적어 둔 값이 아니라 실제로
-강제하는 **두 게이트에서 계산**한 값입니다 -- 명령이 선언한 최소 권한과 보안
-계층 -- 따라서 `editor` 라고 적힌 스펙이 조용히 admin 전용이 된 경로보다 오래
-살아남을 수 없습니다. 남는 것은 경로의 모양이고, 그것은
-`test/http/openapi.test.ts` 가 걷습니다. 문서화된 모든 오퍼레이션은 구체적인
-요청 하나를 들고 있고, 실제 라우터가 그 요청을 문서가 지목한 명령으로 해석해야
-하며, 모든 명령은 문서화되었거나 명시적으로 면제되어야 합니다. 아무것도 서빙하지
-않는 경로를 문서화하면 남의 생성된 클라이언트가 아니라 여기서 깨집니다.
-
-레퍼런스 페이지는 나머지 포털과 마찬가지로 이 오리진에서 서빙됩니다. 이 서버의
-콘텐츠 보안 정책은 자기 자신에게서 오는 스크립트와 스타일만 허용하므로 CDN 에서
-가져오는 것은 없습니다. 문서화한 요청을 대신 보내 주지는 않습니다. 자기가 편집하는
-컨트롤 플레인이 서빙하는 페이지의 "try it" 버튼은, 읽고 있던 존을 잘못 눌러
-적용해 버리는 것과 클릭 한 번 거리입니다. 대신 각 오퍼레이션은 테스트가 이미
-"무언가에 도달한다"고 증명한 그 요청의 `curl` 줄을 싣고 있습니다. 이 페이지는
-여기서 유일하게 번역하지 않는 페이지이며, 의도한 것입니다. 페이지가 그리는 내용은
-그 출처에서 이미 영어로 쓰여 있습니다.
-
-`/docs` 자체는 정적 페이지지만 그것이 그리는 내용은 아닙니다. 문서는 이 배포에
-대해 말하므로 나머지 API 와 같은 인증 뒤에 있습니다. 인증하지 않은 방문자는 틀만
-받고 로그인을 안내받습니다.
-
-모든 컨트롤 플레인 경로는 `/api/v1` 아래에 있습니다.
-
-- `GET|POST /zones` (`GET ?limit=&offset=`, `POST { "name": "example.com" }`)
-- `GET|PUT|DELETE /zones/:zone` (`DELETE ?abandonProviderRecords=true`)
-- `GET /zones/:zone/records` (`?view=&name=&type=&content=&proxied=&search=&limit=&offset=`)
-- `GET|POST /zones/:zone/views/:view/records` (같은 필터. `POST`는 레코드 하나를 추가)
-- `POST /zones/:zone/views/:view/records/batch` (`{ deletes, patches, puts, posts }`)
-- `GET|PUT|PATCH|DELETE /zones/:zone/views/:view/records/:id`
-- `GET|POST /zones/:zone/preview`
-- `POST /zones/:zone/apply`
-- `GET /zones/:zone/status`
-- `GET /zones/:zone/history` (`?limit=&offset=`, 최신순)
-- `GET /zones/:zone/revisions` (`?limit=&offset=`, 최신 구간을 오름차순으로)
-- `GET /zones/:zone/revisions/:revision`
-- `POST /zones/:zone/revisions/:revision/restore`
-- `GET /credentials/profiles`
-- `GET|PUT|DELETE /credentials/profiles/:name`
-- `POST /credentials/profiles/:name/test` — 읽어볼 `{ zone }` 필요
-- `GET /credentials/cloudflare`
-- `GET|PUT|DELETE /credentials/cloudflare/:zone`
-- `POST /credentials/cloudflare/:zone/test` — 저장된 연결, 또는 아직 저장하지 않은 `{ profile }`·`{ token }` 테스트
-- `POST /cli` (서빙 runtime의 명령 실행. `migrate`는 제외. `{ "argv": ["zone", "list"] }`)
-- `GET /openapi.json` (이 API 자신에 대한 기술)
-- `GET /health/live`, `GET /health/ready`
-- `GET /metrics` — Prometheus 텍스트 형식, 나머지와 같은 인증 뒤에 있다. 지금까지
-  stderr 한 줄로만 나가던 실패들을 센다: 와이어가 담을 수 없는 저장된 레코드,
-  조립되지 못한 응답, 답하지 못하게 된 존, 실패한 백그라운드 갱신, 적용되지 않은
-  인증서 재적재. 각각 일어나기 전에도 0으로 존재하므로, 알림이 "한 번도 없음"과
-  "그런 시계열 없음"을 구분할 수 있다. 존·레코드·클라이언트 이름은 나오지 않으며
-  레이블은 고정된 작은 집합이다
-
-인증을 활성화한 경우 `Authorization: Bearer <token>`을 전달합니다. 목표 상태는
-프로바이더 변경보다 먼저 저장됩니다. 미리보기는 프로바이더를 변경하지 않으며,
-적용 결과는 뷰별로 독립적으로 보고됩니다. 미리보기는 호출할 때마다 실제
-프로바이더를 조회하므로 아무것도 변경하지 않더라도 editor 이상 권한이
-필요합니다. 존, 히스토리와 리비전 목록은 페이지 단위로 반환합니다. 모두 `limit`
-(최대 500, 기본 50)과 `offset`을 받고 항목과 함께 `limit`, `offset`, `hasMore`를
-돌려줍니다. 존 목록은 이름 오름차순입니다.
-
-프로바이더를 바꾸는 `apply`와 존 삭제 회수는 목표 상태 감사와 별도로
-`provider.apply.started`, `provider.apply.completed`, `provider.apply.failed`를 남깁니다.
-시작 이벤트는 첫 프로바이더 변경 전에 기록되며 `actor`, `view`, `target`, 계획한 작업 수를
-포함합니다. 완료와 실패 이벤트에는 끝낸 작업 수가 기록되고, 실패 원인은 자격 증명이나
-시크릿을 포함하지 않는 안전한 오류로 정리됩니다. 중간에 실패해 일부만 반영된 작업도 감사
-이력에서 진행 정도를 확인할 수 있습니다.
-
-동기화 가능한 뷰는 `internal`과 `external`뿐입니다. 다른 뷰 이름은 쓰기 시점에
-거부되므로, 어떤 프로바이더도 적용할 수 없는 목표 상태가 존에 저장되는 일은
-발생하지 않습니다.
-
-### 레코드를 하나씩 다루기
-
-레코드 경로는 다른 곳에서 레코드를 동기화해 오는 호출자 -- 주소 관리 시스템,
-인증서 발급기, 클러스터 컨트롤러 -- 를 위한 것입니다. 한 줄을 바꾸려고 존 전체를
-읽고 고쳐 다시 쓰는 일을 하지 않아도 됩니다.
-
-`GET /zones/:zone/records`는 두 뷰를 함께 읽고, `GET
-/zones/:zone/views/:view/records`는 한 뷰만 읽습니다. 필터는 모두 AND입니다.
-`name`은 저장된 그대로의 소유자 이름과 정확히 일치해야 하고(apex 는 `@`),
-`type`도 정확히, `content`는 대소문자를 가리지 않는 부분 문자열, `search`는 이름
-또는 내용의 부분 문자열, `proxied`는 `true`나 `false`입니다. 컨트롤 플레인이 모르는
-`type`은 빈 페이지 대신 거부합니다. 오타 난 타입에 대한 빈 페이지는 그 존에 대한
-사실처럼 읽히기 때문입니다. 목록은 다른 목록과 같은 방식으로 페이지를 나누며,
-페이지를 나누기 전의 일치 개수를 `total`로 함께 보고합니다. 각 항목은 자신이 나온
-`view`를 함께 싣습니다. 레코드 id 는 한 뷰 안에서만 유일하기 때문입니다.
-
-`POST /zones/:zone/views/:view/records`는 레코드를 추가하고 부여된 id 를
-응답합니다. 본문에 `id`를 넣어 직접 고를 수 있으며, 이미 쓰이는 id 라면 `409`로
-거부됩니다 -- 생성은 교체가 아니기 때문입니다. 생략하면 이름과 타입에서
-유도되어 `api`/`A`는 `api-a`가 됩니다. 이미 가진 레코드를 그대로 다시 생성하면
-거부됩니다. 유도된 id 는 기존 레코드를 비켜 가고, 그 중복은 같은 이름과 타입이
-같은 내용을 두 번 가질 수 없다는 규칙에 걸립니다.
-
-`PATCH /zones/:zone/views/:view/records/:id`는 본문이 지명한 필드만 바꾸고 나머지는
-저장된 그대로 둡니다. `null`은 선택 필드를 제거하며, 이것이 "프록시를 끈다"고
-말하는 유일한 방법입니다. 필드를 생략하는 것은 그대로 두라는 뜻이기 때문입니다.
-병합은 커밋과 같은 존 잠금 안에서 일어나므로, 한 레코드의 서로 다른 필드를 고치는
-두 호출자가 서로를 덮어쓸 수 없습니다. 병합된 레코드는 전체로 검증됩니다. 패치
-자체는 멀쩡해 보여도 뷰를 불법으로 만드는 패치는 거부됩니다.
-
-`POST /zones/:zone/views/:view/records/batch`는 여러 변경을 하나의 리비전으로
-커밋합니다. 순서는 `deletes`, `patches`, `puts`, `posts`이고 최대 500개입니다. 하나씩
-보내는 것과 같지 않습니다. 요청 하나가 각각 리비전 하나이자 프로바이더 적용
-하나이므로, 서비스를 다른 주소로 옮기는 동안 의도한 적 없는 중간 상태가
-게시됩니다. 배치는 완성된 뷰로 검증한 뒤에야 커밋하며, 한 작업이 거부되면 존은
-그대로 남습니다. 삭제가 먼저 실행되므로 배치 안에서 이름을 비우고 다시 쓸 수
-있습니다.
-
-이 모두가 `If-Match: "<revision>"`을 받고 `ETag`로 존의 리비전을 돌려주므로,
-호출자가 읽은 리비전을 바로 다음 쓰기에 실을 수 있습니다. 레코드의 `PUT`과
-`DELETE`는 그대로입니다.
-
-존을 삭제하면 목표 상태를 제거하기 전에 Parallax가 게시한 모든 레코드를
-프로바이더에서 회수하고, 무엇을 제거했는지 `removedProviderRecords`로
-응답합니다. Parallax 소유권 마커가 없는 레코드는 건드리지 않습니다. 회수를 먼저
-수행하므로, 프로바이더가 거부하거나 응답하지 않으면 존을 그대로 두어 삭제를 다시
-시도할 수 있습니다. 추적되지 않는 게시 레코드를 남기지 않기 위한 순서입니다.
-`?abandonProviderRecords=true`는 전체 회수를 건너뛰는 옵션이 아닙니다. 먼저 모든
-`target`을 읽고, 접근 가능한 `target`의 관리 레코드는 정상적으로 회수합니다. 읽을 수 없는
-`target`만 의도적으로 남기고 `abandonedProviderTargets`로 명시해 반환합니다. 사라진
-프로바이더가 있는 삭제에서만 사용하십시오.
-
-## 컨테이너 이미지
-
-리포지토리 루트의 `Dockerfile`은 세 표면 -- API, 포털, 명령줄 -- 을 모두 담은 런타임
-이미지를 만듭니다.
-
-```sh
-BOOTSTRAP_TOKEN="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
-OWNERSHIP_SECRET="$(openssl rand -base64 32)"
-CREDENTIAL_KEY="$(openssl rand -base64 32)"
-
+```bash
 docker build -t parallax .
-docker run --read-only -p 443:3443 \
-  -v "$PWD/tls.crt:/run/secrets/parallax-tls.crt:ro" \
-  -v "$PWD/tls.key:/run/secrets/parallax-tls.key:ro" \
-  -e DATABASE_URL='postgresql://parallax:secret@db/parallax?sslmode=verify-full' \
-  -e HOST=0.0.0.0 -e PORT=3443 \
-  -e PARALLAX_TLS_CERT_FILE=/run/secrets/parallax-tls.crt \
-  -e PARALLAX_TLS_KEY_FILE=/run/secrets/parallax-tls.key \
-  -e PARALLAX_OWNERSHIP_SECRET="$OWNERSHIP_SECRET" \
-  -e PARALLAX_CREDENTIAL_MASTER_KEY="$CREDENTIAL_KEY" \
-  -e PARALLAX_AUTH_TOKENS="[{\"token\":\"$BOOTSTRAP_TOKEN\",\"subject\":\"deploy\",\"role\":\"admin\"}]" \
+docker run --rm -p 3000:3000 \
+  -e HOST=0.0.0.0 \
+  -e PARALLAX_AUTH_TOKENS='[…]' \
   parallax
 ```
 
-컨테이너 내부에서는 비특권 포트 3443을 사용하고 호스트의 443에 게시합니다. 인증서와
-개인 키는 읽기 전용으로 마운트하며, 이미지가 `0.0.0.0`에 바인드하므로 canonical 토큰을
-담은 `PARALLAX_AUTH_TOKENS`가 필요합니다. 형식과 이유는 [접근 토큰](#접근-토큰)을
-보십시오. HTTP 리다이렉트도 필요하면 먼저 `publicOrigin`을 저장한 뒤 별도의 비특권
-컨테이너 포트를 `PARALLAX_HTTP_REDIRECT_PORT`로 지정해 호스트의 80에 게시합니다.
+이미지는 API·포털·CLI를 한 프로세스로, 권한 없는 uid `10001`로 돌립니다.
+`migrations/`는 의도적으로 root 소유이며 그 uid가 쓸 수 없습니다. 서비스가
+털렸을 때 나중의 특권 `parallax migrate`를 노린 SQL을 심을 수 없게 하기
+위해서입니다.
 
-서버가 뜨기 전에 같은 이미지로 스키마를 적용합니다:
+| 저장소 | 언제 |
+|---|---|
+| **PostgreSQL** | `DATABASE_URL`이 설정됐을 때. 7개 테이블, `parallax migrate`가 적용 |
+| **파일** | 그 밖의 경우. 원자적 쓰기, `0700` 디렉터리 안의 `0600` 파일 |
 
-```sh
-docker run --rm \
-  -e DATABASE_URL='postgresql://parallax:secret@db/parallax?sslmode=verify-full' \
-  parallax parallax migrate
+### 이 릴리스가 스키마를 바꾸는가?
+
+파드를 하나씩 교체하는 배포는 몇 초 동안 두 버전을 동시에 돌립니다. 그것이
+안전한지는 질문 하나로 정해지고, 그 답은 한 줄입니다:
+
+```bash
+git diff --name-only <배포된>..<새것> -- migrations/ src/infrastructure/migrations.ts
 ```
 
-쿠버네티스에서는 `command: ["parallax", "migrate"]`인 init 컨테이너가 됩니다. 닿지 못하거나
-적용하지 못하면 0이 아닌 코드로 끝나므로, 스키마가 없는 채로 서버가 뜨는 일이 없습니다.
+출력이 비면 이 릴리스는 스키마를 바꾸지 않으므로 두 버전이 겹쳐도 됩니다.
+무언가 나열되면 겹치면 안 됩니다.
 
-이미지 안에서 `parallax`가 PATH에 있으므로, 토큰이나 네트워크 왕복 없이 모든 조작을
-그대로 할 수 있습니다:
+> [!WARNING]
+> 저 두 경로가 답 **전체**이고, 그게 위험한 지점입니다. `CREATE TABLE`이 그
+> 밖으로 옮겨 가면 이 명령은 계속 아무것도 내놓지 않고 — 아무것도 없음은
+> 「겹쳐도 안전」으로 읽힙니다. 깨지는 게 아니라, 하필 중요한 그 릴리스에서
+> 거짓말을 시작합니다.
+>
+> 그래서 믿는 대신 강제합니다. `test/infrastructure/schema-surface.test.ts`가
+> `src/`와 `cmd/`를 훑어 감시 경로 밖의 DDL을 찾고, 그 경로를 여기 반복해 적는
+> 대신 **위 명령에서 읽어 냅니다** — 같은 사실의 세 번째 사본이 바로 이 부류의
+> 실패를 만드는 재료이기 때문입니다. 또한 `README.md`와 `README.ko.md`가 같은
+> 경로를 대는지도 검사합니다. 낡은 번역본은 곧 낡은 검사이기 때문입니다. CI는
+> 이것을 별도 잡으로, 아무것도 설치하지 않은 맨 체크아웃에서 돌립니다 —
+> 배포가 실제로 그렇게 돌리기 때문입니다.
 
-```sh
-docker exec <컨테이너> parallax zone list
-```
+---
 
-UID 10001로 실행되며 애플리케이션 디렉터리에는 쓸 수 없습니다. 런타임 의존성은 빌드와
-분리해 설치하므로 소스를 컴파일한 도구 사슬은 최종 이미지에 들어가지 않습니다.
+## 🧪 개발
 
-`DATABASE_URL`을 주면 쓰기 가능한 파일시스템이 전혀 필요 없습니다. 완전 읽기 전용 루트에
-아무것도 마운트하지 않은 상태에서 포털 서빙·API 쓰기·CLI 실행까지 확인했습니다. 데이터베이스
-없이 파일 백엔드를 쓸 때만 그 파일이 `/var/lib/parallax`에 놓이며, 그때 이 경로를 마운트합니다.
-휘발성 볼륨으로 충분합니다 — PostgreSQL이 저장소인 한 거기 쓰이는 것 중 정본은 없습니다.
-
-## 실제 의존성 대상 검증
-
-단위 테스트와 HTTP 테스트는 인메모리 페이크를 사용합니다. 아래 스크립트는 실제
-구성요소를 대상으로 실행합니다.
-
-```sh
-pnpm verify:postgres    # Docker PostgreSQL: 마이그레이션, 재시작, 잠금, 보관 정책
-pnpm verify:proxy       # Docker nginx TLS 종단: Origin, 쿠키, HSTS, readiness
-pnpm verify:dns         # 내장 리스너에 dig 로 질의: 전 타입, TC, 릴레이
-pnpm verify:cloudflare  # 옵트인. 실제 토큰이 필요하며 없으면 건너뜀
-pnpm audit              # 의존성 취약점 점검
-```
-
-`verify:dns`는 Docker도 네트워크도 필요 없습니다. 리스너가 프로세스 안에 있고, 릴레이할
-상위 리졸버는 스텁이라서 — 그 덕분에 릴레이가 상위가 말한 것을 그대로 돌려줬는지까지
-확인할 수 있습니다. 핵심은 **20개 레코드 타입 전부**를 넣고 `dig`로 되읽는 것입니다.
-같은 바이트를 독립적으로 파싱하는 쪽이고, 망가진 레코드는 출력하는 대신 오류로 보고합니다.
-타입은 이름이 아니라 **번호로** 묻습니다. 타입 이름을 모르는 `dig`는 조용히 `A`를 대신
-묻고 아무 답도 얻지 못해서, 리스너에 레코드가 없는 것처럼 읽히기 때문입니다.
-
-`verify:proxy`는 단위 테스트가 대신할 수 없는 형태를 다룹니다. 서버는 루프백에서
-평문 HTTP를 보는데 브라우저는 HTTPS를 봅니다. 먼저 설정이 없을 때 `https` Origin이
-거부되는 잘못된 상태를 재현해 이후 검사가 공허하게 통과할 수 없게 만든 뒤,
-`trustForwardedHeaders`와 `publicOrigin`이 각각 이를 복구하는지, 그리고 교차 사이트
-Origin은 여전히 거부되는지 확인합니다.
-
-`verify:postgres`, `verify:proxy`는 Docker가
-필요하며 종료 시 컨테이너를 제거합니다.
-
-통과한 실행은 그 실행이 돈 커밋에 대한 증거일 뿐입니다. Cloudflare 검증은 `ef61201`에서
-실제 존을 대상으로 처음 통과했고, 그 앞의 세 번은 각각 결함을 하나씩 찾았습니다 — 앞의 것이
-뒤의 것을 가리고 있었습니다. 그중에는 소유권 마커가 Cloudflare 주석 상한을 넘어 이름이 열한
-자를 넘는 존에는 레코드를 하나도 발행할 수 없던 것도 있습니다. 이런 것은 로컬에서 보이지
-않습니다 — 스텁 프로바이더는 보내는 것을 그대로 받습니다. `verify:cloudflare`는 실제 존에 쓰기를 하므로 `CF_ZONE`,
-`CF_ZONE_ID`, `CF_API_TOKEN`, `CF_VERIFY_ALLOW_WRITES=true`가 모두 설정되지
-않으면 실행을 거부합니다. 작업은 `parallax-verify-*` 이름으로 제한되며, Parallax가
-소유하지 않은 레코드가 삭제 대상이 되지 않는지도 함께 확인합니다.
-
-`CF_ACCOUNT_ID`까지 설정하면 Workers와 R2가 스스로 게시하는 이름을 알아내는 계정 스코프
-조회 두 개도 함께 확인합니다. 이 부분은 아무것도 쓰지 않습니다. 서비스에 물어본 뒤, 서비스가
-주장하는 모든 이름이 그 존이 실제로 프록시된 주소 레코드를 갖고 있는 이름인지 요구합니다 —
-실계정에서 호스트네임 매핑을 검사하는 부분으로, apex는 `@`로 돌아와야 하고 다른 존에 속한
-버킷 도메인은 아예 돌아오지 않아야 합니다. 변수가 없으면 건너뛰면서 그렇게 말하고, Workers·R2
-커스텀 도메인이 없는 존이면 조용히 통과하는 대신 아무것도 증명하지 못했다고 보고합니다.
-
-## 개발 방식
-
-Node.js의 안정적인 내장 테스트 실행기를 사용합니다. 동작을 정의하는 실패 테스트를
-먼저 추가하고, 테스트를 통과하는 최소 구현을 작성한 뒤 전체 테스트 모음이 통과하는
-상태에서 리팩터링합니다.
-
-```sh
-pnpm test
-pnpm test:watch
-pnpm test:coverage
-pnpm check
+```bash
+pnpm check          # 타입 검사
+pnpm run check:portal
 pnpm build
+pnpm test           # node --test
 ```
 
-## 라이선스
+CI에서 다섯 워크플로가 돌고, 각각 다른 질문에 답하므로 빨간 결과가 스스로
+원인을 말합니다: `check`(타입·빌드·테스트, Node 24와 26), `scripts`(훅 스위트와
+shellcheck), `docker`(이미지가 빌드되고 권한 없이 도는지), `codeql`,
+`dependency-review`.
 
-Apache License 2.0 — [`LICENSE`](LICENSE) 를 보십시오.
+`verify:*` 스크립트는 실제 인프라를 대상으로 하며 CI에서 **돌지 않습니다**:
+
+```bash
+pnpm verify:postgres    pnpm verify:dns
+pnpm verify:proxy       pnpm verify:cloudflare   # ⚠️ 실제 존에 씁니다
+```
+
+풀 리퀘스트를 열기 전에 [CONTRIBUTING.md](CONTRIBUTING.md)를, 취약점을 신고하기
+전에 [SECURITY.md](.github/SECURITY.md)를 보십시오 — 신고는 이슈가 아니라
+비공개로 합니다.
+
+---
+
+## 📇 레코드 타입
+
+23종. presentation format의 RDATA로 검증합니다 — 존 파일이 타입 뒤에 적는 바로
+그 텍스트입니다:
+
+```
+A · AAAA · CAA · CERT · CNAME · DNAME · DNSKEY · DS · HINFO · HTTPS · LOC · MX
+NAPTR · NS · OPENPGPKEY · PTR · SMIMEA · SRV · SSHFP · SVCB · TLSA · TXT · URI
+```
+
+`SOA`는 제외했고, 서명자가 자기가 서명하는 존에 대해 만들어 내는 DNSSEC
+레코드 — `RRSIG`, `NSEC`, `NSEC3` — 도 제외했습니다. 모든 프로바이더가 그것들을
+스스로 만들고, 우리 것을 발행하면 묻지도 않은 답을 덮어쓰게 됩니다. `DS`와
+`DNSKEY`는 **넣었습니다**. `DS`는 부모에 놓여 서명된 자식으로 위임하는 것이고,
+그것은 남의 존에 대한 운영자의 결정이기 때문입니다.
+
+> [!WARNING]
+> **외부** 뷰에 비공개 주소를 발행하려면 해당 레코드에 `acknowledgeNonGlobalIp`를
+> 설정해야 합니다. 그러지 않으면 거부됩니다 — `10.0.0.11`을 공개 인터넷에 올리는
+> 것은 대개 실수이고, 실수가 아닐 때는 누군가 일부러 한 것이어야 합니다.
+
+---
+
+<div align="center">
+
+**Apache-2.0** · [LICENSE](LICENSE)
+
+</div>

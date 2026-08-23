@@ -1,6 +1,6 @@
 # Parallax 작업 핸드오프
 
-마지막 갱신: 2026-08-15 (Asia/Seoul) · 대상 커밋 `1608288`
+마지막 갱신: 2026-08-23 (Asia/Seoul) · 대상 커밋 `1303d46`
 
 ## 현재 상태
 
@@ -8,20 +8,26 @@ Parallax는 내부 DNS와 Cloudflare DNS의 desired state를 한곳에서 관리
 애플리케이션이다. **구현이 끝났고, 실제 클러스터에 배포되어 돌고 있다.**
 
 ```
-테스트          314/314 · tsc 통과 · build 통과 · 포털 타입 검사 통과 · 의존성 취약점 0건
-실제 의존성      PostgreSQL 17 · CoreDNS 1.12 · nginx TLS 종단 · Cloudflare 실계정
+테스트          770/770 · tsc 통과 · build 통과 · 포털 타입 검사 통과
+CI              check · scripts · docker · codeql · dependency-review (전부 통과)
+실제 의존성      PostgreSQL 17 · nginx TLS 종단 · Cloudflare 실계정
 배포            컨테이너 이미지, read-only 루트, uid 10001, initContainer 로 스키마 적용
 ```
 
-⚠️ **첫 줄만 `1608288` 에서 돌린 것이다.** 둘째 줄의 실제 의존성 대상 검증은 그보다 앞선
-시점의 통과이고, 그중 어느 커밋이었는지를 기록해 둔 것은 Cloudflare 한 건뿐이다 —
-나머지 셋은 통과했다는 사실만 남아 있고 어느 시점인지는 남아 있지 않다. 이 문서는 한때
-`verify:coredns` 의 옛 통과를 현재의 주장으로 재사용하고 있었고, 그 사이 그 스크립트는
-설정 이관으로 **깨져 있었다**.
+⚠️ **첫 줄과 둘째 줄만 `1303d46` 에서 돌린 것이다.** 셋째 줄의 실제 의존성 대상 검증은
+그보다 앞선 시점의 통과이고, 그중 어느 커밋이었는지를 기록해 둔 것은 Cloudflare 한
+건뿐이다 — 나머지는 통과했다는 사실만 남아 있고 어느 시점인지는 남아 있지 않다. 이
+문서는 한때 `verify:coredns` 의 옛 통과를 현재의 주장으로 재사용하고 있었고, 그 사이
+그 스크립트는 설정 이관으로 **깨져 있었다**. 그 뒤 CoreDNS 자체가 빠졌다 — 아래 참조.
 
-`1608288` 에서 내장 DNS 리스너가 추가됐다. 프로바이더 경로는 건드리지 않았지만
-`src/config.ts` 와 `src/index.ts` 는 바뀌었으므로, 배포 전에 `verify:proxy` 와
-`verify:postgres` 는 다시 돌리는 것이 맞다.
+**2026-08-16, `1db6f25`: CoreDNS 와 PowerDNS 퍼블리셔가 제거됐다.** 내부 뷰는 이제
+내장 DNS 리스너가 desired state 에서 바로 응답한다. `scripts/verify-coredns.sh` 와
+`pnpm verify:coredns` 도 같이 사라졌다. 이 문서는 그 뒤로 일주일간 없는 어댑터와 없는
+스크립트를 현재형으로 적고 있었다 — 지워진 것을 지우는 일이 남은 것을 고치는 일보다
+늦게 눈에 띈다는 예시로 남긴다.
+
+**2026-08-23: 저장소가 공개됐다.** `henryj-dev/parallax`. CI 다섯 워크플로,
+Dependabot, CodeQL, secret scanning 이 붙었고 커뮤니티 문서가 생겼다.
 
 `1608288` 에서 내장 DNS 리스너가 추가됐다. 프로바이더 경로는 건드리지 않았지만
 `src/config.ts` 와 `src/index.ts` 는 바뀌었으므로, 배포 전에 `verify:proxy` 와
@@ -49,12 +55,16 @@ Parallax는 내부 DNS와 Cloudflare DNS의 desired state를 한곳에서 관리
 
 ## 구현된 기능
 
-- zone 및 internal/external view 관리, A·AAAA·CNAME·TXT 정규화와 검증
+- zone 및 internal/external view 관리, 레코드 타입 23종의 정규화와 검증
+  (`8b774a6` 에서 넷에서 전부로 넓혔다)
 - 공개 레코드를 기준으로 internal override 를 합성하는 split-horizon 모델
 - desired revision, ETag/If-Match 낙관적 동시성, preview, 정확한 revision apply
 - provider 별 적용 상태, 변경 이력, 감사 로그, revision restore, 보관 정책
 - managed-only reconciliation 과 서명된 ownership marker (v3, v2 도 읽는다)
-- Cloudflare REST · CoreDNS zone-file 어댑터, 로컬 파일 fallback
+- Cloudflare REST 어댑터와 로컬 파일 프로바이더 (CoreDNS·PowerDNS 퍼블리셔는 `1db6f25`
+  에서 제거)
+- Cloudflare 클라이언트 측 리졸버 오버라이드 관리 — 프로필이 이미 쥔 자격 증명으로
+  다루므로 두 번째 토큰이 없다
 - 내부 뷰를 desired state 에서 바로 응답하는 내장 DNS 리스너 (UDP·TCP, 존 밖 이름은 포워딩)
 - 원자적 JSON 저장소와 PostgreSQL 저장소 — `parallax migrate` 로 스키마 적용
 - 암호화된 Cloudflare credential, 프로필 단위 재사용, 관리자 포털
@@ -133,8 +143,10 @@ parallax migrate
 - [x] **PostgreSQL** — `pnpm verify:postgres`. 마이그레이션 멱등성과 동시 3회 실행,
       트랜잭션 커밋, 재시작 후 상태 복원, 동시 apply 6건 직렬화, 보관 정책 pruning,
       FK cascade
-- [x] **CoreDNS** — `pnpm verify:coredns`. 손으로 관리하던 `$TTL` 상속 레코드와의 충돌
-      탐지, 언더스코어 TXT 응답, serial 증가 후 reload 관측, 외부 레코드 보존, 파일 모드
+- ~~**CoreDNS** — `pnpm verify:coredns`~~. **더 이상 없다.** 퍼블리셔가 `1db6f25` 에서
+      빠지면서 스크립트도 함께 사라졌다. 이 줄을 지우지 않고 남기는 이유는, 없어진 검증을
+      「돌았다」로 기억하는 것이 이 문서에서 실제로 일어난 실패이기 때문이다 — 위 §현재
+      상태 참조. 내부 뷰가 답하는지는 이제 `pnpm verify:dns` 가 본다
 - [x] **리버스 프록시와 자체 TLS** — `pnpm verify:proxy`. 설정 없이는 https Origin 이
       거부되는 것(=감사에서 찾은 결함 자체)을 **먼저 재현한 뒤** `trustForwardedHeaders` 와
       `publicOrigin` 이 각각 이를 복구함을 확인한다. 쿠키 속성, HSTS, 미인증 readiness
@@ -156,14 +168,30 @@ parallax migrate
 ⚠️ 로컬 mock 결과를 실제 provider 통합 성공으로 표현하지 않는다. 그리고 **통과한 실행은
 그 실행이 돈 커밋에 대한 증거일 뿐이다.**
 
-## 열린 결정
+## 닫힌 결정 (2026-08-23)
 
-코드에 남은 항목은 없다. 사람이 정할 것만 남았다 — **정본을 공개할 것인가**, 그리고
-공개한다면 다음 셋을 어떻게 할 것인가:
+이 절은 「열린 결정」이었다. **공개했다** — `henryj-dev/parallax`. 딸린 셋도 그때 함께
+정해졌으므로, 무엇을 골랐는지와 왜 골랐는지를 남긴다.
 
-1. `product-design.md` §2 가 형제 프로젝트 `stardust`·`heliopause` 를 이름으로 노출한다
-2. 같은 문서 §8 의 저장소 가시성 표기
-3. `security-audits/` 의 감사 리포트를 함께 공개할 것인가
+| 그때의 질문 | 결정 | 이유 |
+| --- | --- | --- |
+| `product-design.md` §2 의 형제 프로젝트 이름 | **남긴다** | 이름만으로는 아무 곳에도 닿지 않는다. 지우면 그 문서가 기록인 이유가 함께 지워진다 |
+| 같은 문서 §8 의 가시성 표기 | **고쳤다** | 「검토 중」은 이제 사실이 아니다 |
+| `security-audits/` 공개 | **남긴다** | DNS 를 맡아 달라는 컨트롤 플레인이면 자기 숙제를 보여야 한다. 실제 존 이름 한 건은 가렸고 그 리포트 머리에 가렸다고 적었다. 남은 주소는 전부 지어낸 것이다 |
 
-히스토리 스캔은 통과했다(사설 IP·실도메인·고엔트로피 문자열 0건). 막는 것은 없고
-결정만 남았다.
+⚠️ **감사 리포트는 지우기 어렵다.** `what-ships.test.ts` 가
+`security-audits/2026-08-15-security-audit.md` 를 경로로 지목하고, stardust 의 릴리스
+게이트도 같은 디렉터리를 픽스처로 쓴다. `git rm` 은 이쪽 검사와 저쪽 게이트를 동시에
+깬다 — 자세한 것은 [`../AGENTS.md`](../AGENTS.md).
+
+히스토리 스캔은 그때 통과했다(사설 IP·실도메인·고엔트로피 문자열 0건).
+
+## 지금 열린 것
+
+하나뿐이고, 급하지 않다. **Node 하한선을 24 에 둘 것인가 26 으로 올릴 것인가.**
+`engines.node` 가 `>=24` 이고 이미지도 24 다. 올린다면 `engines.node`,
+`check.yml` 매트릭스, `Dockerfile` 베이스, `@types/node` 를 한 커밋에 움직여야 하고,
+`.github/dependabot.yml` 의 `ignore` 두 줄을 지운다. 조사는 끝나 있다 —
+`node:26-alpine` 은 Node 25 가 corepack 을 배포에서 빼서 그대로는 빌드되지 않고
+(`npm i -g corepack` 이면 된다), `@types/node` 26 은 소켓 리스너 타입 명시가 필요한데
+그건 `0024c09` 에서 이미 했다. 각 파일에 근거가 적혀 있다.

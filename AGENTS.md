@@ -11,6 +11,24 @@
 merge step.** A worktree left with commits but no push has not landed on main
 yet; the cycle isn't finished until `HEAD` is on `origin/main`.
 
+**2026-08-23 부터는 거기서 한 걸음 더 간다: 푸시하고 CI 가 초록이어야 끝이다.**
+그 전까지 이 저장소에는 워크플로가 `check` 하나뿐이었고, 그래서 이 문단은 푸시를
+종점으로 적을 수 있었다. 지금은 다섯이 돌고 각자 다른 질문에 답한다 —
+`check`(타입·빌드·테스트, Node 24 와 26), `scripts`(파이썬 훅 스위트와 shellcheck),
+`docker`(이미지 빌드와 uid·권한), `codeql`, `dependency-review`(PR 전용). 빨간 결과를
+남기고 떠난 사이클은 끝난 것이 아니라 남에게 넘긴 것이다.
+
+에이전트에게 특히 걸리는 지점 둘:
+
+- `scripts/claude-hooks/**` 와 `scripts/git-hooks/**` 의 검사가 **이제 CI 에서 돈다.**
+  전에는 `pnpm test`(`node --test`)가 `.py` 를 보지 못해 아무도 돌리지 않았다. 그 스냅샷을
+  건드리면 이제 결과가 나온다.
+- `check.yml` 의 `deployment-gate` 잡은 `test/infrastructure/schema-surface.test.ts` 를
+  **아무것도 설치하지 않은 맨 체크아웃에서** 돌린다. 그 검사는 두 README 에 적힌
+  `git diff --name-only ... -- <경로>` 를 파싱해 감시 경로를 읽고, 양쪽 README 가 같은
+  경로를 대는지까지 본다. README 를 다시 쓰면서 그 문단을 지우면 이 잡이 빨개진다 —
+  실제로 한 번 그렇게 됐다.
+
 Raw `git worktree add` remains blocked for agents. The checked-in creator is
 the harness-neutral fallback and records ownership for cleanup.
 

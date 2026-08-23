@@ -97,6 +97,15 @@ one that does not exist.
   named by `test/scripts/what-ships.test.ts` and by that same external gate.
   Moving or deleting either breaks a check whose cause is not visible from your
   diff.
+- **DDL lives in exactly two places, and a test enforces that.** A deployment
+  decides whether two versions may overlap during a rolling update by diffing
+  `migrations/` and `src/infrastructure/migrations.ts` — nothing else. Put a
+  `CREATE TABLE` anywhere else in `src/` or `cmd/` and that check keeps
+  answering "no schema change", which reads as *safe*.
+  `test/infrastructure/schema-surface.test.ts` fails your pull request for it,
+  and it reads the watched paths out of the command documented in both READMEs
+  rather than repeating them — so if you change where schema lives, the READMEs
+  are what you edit. Both of them, identically.
 - **The hook scripts are a snapshot.** Everything under `scripts/claude-hooks/`
   and `scripts/git-hooks/` is copied from another repository and kept
   byte-identical on purpose, so that drift is checkable with one `cmp`. A fix
