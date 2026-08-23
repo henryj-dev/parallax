@@ -41,7 +41,7 @@ jobs:
       actions: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # This job never pushes. Leaving the token in `.git/config` would
           # hand it to anything the analysis subsequently runs.
