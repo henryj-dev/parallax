@@ -290,7 +290,7 @@ export function createDnsServer(options: DnsServerOptions): {
     if (query.question.name !== zone.name) return undefined;
     const soa = soaRecord(zone, negativeTtl, soaSettings);
     const upToDate: ReplyParts = { query, rcode: RCODE.NOERROR, authoritative: true, answers: [soa] };
-    const clientSerial = readTransferSerial(message);
+    const clientSerial = readTransferSerial(message, zone.name);
     if (clientSerial === undefined) return undefined;
     // Equal, or ahead of us: there is nothing to send, and the SOA is how that
     // is said. Over UDP the same answer is what asks the client to come back
@@ -440,7 +440,14 @@ export function createDnsServer(options: DnsServerOptions): {
       ...(incremental ?? answerFromZone(query, zone, negativeTtl, options.onUnservable, soaSettings)),
       ...(cookie ? { cookie } : {}),
     };
-    const budget = overTcp ? Number.MAX_SAFE_INTEGER : Math.max(MIN_UDP_PAYLOAD, query.udpPayloadSize - reserved);
+    // ⚠️ The floor is applied first and the reservation taken off it, not the
+    // other way round. `max(MIN_UDP_PAYLOAD, size - reserved)` handed back the
+    // floor whenever the subtraction went under it, so a signed reply to a
+    // 512-byte client left ~582 bytes on the wire -- past what the client said
+    // it could take, which is the one number this budget exists to respect.
+    const budget = overTcp
+      ? Number.MAX_SAFE_INTEGER
+      : Math.max(MIN_UDP_PAYLOAD, query.udpPayloadSize) - reserved;
     try {
       const reply = writeReply(parts, budget);
       // A DNS-over-TCP message is length-prefixed with a uint16, so this is a
@@ -563,12 +570,18 @@ export function createDnsServer(options: DnsServerOptions): {
       const handleMessage = (message: Buffer): void => {
         const clientAddress = socket.remoteAddress;
         if (!clientAddress || !rateLimiter.allow(clientAddress)) return;
-        void respond(message, true, clientAddress).then(counted).then((replies) => {
+        void respond(message, true, clientAddress).then(counted).then(async (replies) => {
           for (const reply of replies) {
             const framed = Buffer.alloc(2 + reply.length);
             framed.writeUInt16BE(reply.length, 0);
             reply.copy(framed, 2);
-            socket.write(framed);
+            // ⚠️ The return value is the backpressure signal, and a transfer is
+            // the one answer large enough for it to matter: a slow secondary
+            // made this process hold the whole zone in the socket's write queue,
+            // in memory, with nothing bounding it.
+            if (!socket.write(framed)) {
+              await new Promise<void>((resolve) => socket.once("drain", resolve));
+            }
           }
         }).catch(() => socket.destroy());
       };

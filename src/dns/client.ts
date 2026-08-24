@@ -3,7 +3,7 @@ import type { RecordType } from "../domain/dns.ts";
 import { decodeRdata, UnrepresentableRdata } from "./rdata-decode.ts";
 import { readTsig, verifyTsig, type TsigKey } from "./tsig.ts";
 import {
-  CLASS_IN, RCODE, TYPE, WireFormatError, readName, typeName, writeName,
+  CLASS_IN, RCODE, TYPE, WireFormatError, isResponseToQuery, readName, readQuery, typeName, writeName,
 } from "./wire.ts";
 
 /**
@@ -69,6 +69,16 @@ export async function exchange(
   verify?: TsigVerification,
 ): Promise<Buffer[]> {
   const replies = await receive(endpoint, message, expect);
+  // An answer to a question nobody asked is not an answer. `isResponseToQuery`
+  // already implements this and only the forwarder used it -- so the client
+  // read whatever arrived on the connection as though it were the reply, and
+  // a peer that answered twice had its second answer believed.
+  const asked = readQuery(message);
+  for (const reply of replies) {
+    if (!isResponseToQuery(reply, asked)) {
+      throw new WireFormatError(`${endpoint.host}:${endpoint.port} answered something other than what was asked`);
+    }
+  }
   return verify ? verifyReplies(replies, verify) : replies;
 }
 
@@ -213,8 +223,17 @@ export function writeQuestion(name: string, type: number, id: number): Buffer {
  */
 export function assertAnswered(reply: Buffer, what: string): void {
   if (reply.length < 12) throw new WireFormatError(`${what} came back too short to be a DNS message`);
-  const rcode = reply.readUInt16BE(2) & 0xf;
+  // The header's four bits, plus the eight the OPT record carries above them
+  // (RFC 6891 §6.1.3). Reading only the low four made BADVERS -- 16, whose low
+  // four bits are zero -- indistinguishable from NOERROR.
+  const rcode = (reply.readUInt16BE(2) & 0xf) | (extendedRcode(reply) << 4);
   if (rcode !== RCODE.NOERROR) throw new Error(`${what} was refused: ${rcodeName(rcode)}`);
+}
+
+/** The upper eight bits of the rcode, which live in the OPT record's TTL. */
+function extendedRcode(reply: Buffer): number {
+  const opt = findOpt(reply);
+  return opt === undefined ? 0 : opt;
 }
 
 /**
@@ -285,6 +304,32 @@ const STORED_TYPES: ReadonlySet<string> = new Set(
     .filter(([name]) => name !== "SOA" && name !== "OPT" && name !== "ANY" && name !== "AXFR" && name !== "IXFR" && name !== "TSIG")
     .map(([name]) => name),
 );
+
+/**
+ * The OPT record's upper rcode byte, where there is one.
+ *
+ * Walked here rather than borrowed from `wire.ts`: that reader is for a query's
+ * additional section and answers a different question about a different
+ * message. This one only needs the one byte.
+ */
+function findOpt(message: Buffer): number | undefined {
+  try {
+    const counts = [message.readUInt16BE(4), message.readUInt16BE(6), message.readUInt16BE(8), message.readUInt16BE(10)];
+    let offset = 12;
+    for (let index = 0; index < (counts[0] as number); index += 1) offset = readName(message, offset).offset + 4;
+    const records = (counts[1] as number) + (counts[2] as number) + (counts[3] as number);
+    for (let index = 0; index < records; index += 1) {
+      const owner = readName(message, offset);
+      offset = owner.offset;
+      const type = message.readUInt16BE(offset);
+      if (type === TYPE.OPT) return message.readUInt8(offset + 4);
+      offset += 10 + message.readUInt16BE(offset + 8);
+    }
+  } catch {
+    // A message this build cannot walk carries no extended rcode it can trust.
+  }
+  return undefined;
+}
 
 function countSoa(message: Buffer): number {
   let seen = 0;

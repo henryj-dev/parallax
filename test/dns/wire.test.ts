@@ -317,25 +317,33 @@ describe("the serial an IXFR query carries", () => {
   }
 
   it("reads it past both names, compressed or not", () => {
-    assert.equal(readTransferSerial(ixfrQuery({ serial: 12 })), 12);
-    assert.equal(readTransferSerial(ixfrQuery({ serial: 12, compressed: true })), 12);
-    assert.equal(readTransferSerial(ixfrQuery({ serial: 0 })), 0);
-    assert.equal(readTransferSerial(ixfrQuery({ serial: 0xffffffff })), 0xffffffff);
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 12 }), "example.com"), 12);
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 12, compressed: true }), "example.com"), 12);
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 0 }), "example.com"), 0);
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 0xffffffff }), "example.com"), 0xffffffff);
+  });
+
+  it("refuses a serial presented under a name that is not the zone's", () => {
+    // The SOA carries a serial and the message asks about a zone; a serial
+    // filed under some other owner is a claim about a zone this query is not
+    // transferring.
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 12 }), "other.example"), undefined);
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 12 }), "example.com"), 12);
   });
 
   it("says nothing rather than guessing", () => {
     // No authority section at all -- an AXFR-shaped query.
     const bare = ixfrQuery();
     bare.writeUInt16BE(0, 8);
-    assert.equal(readTransferSerial(bare), undefined);
+    assert.equal(readTransferSerial(bare, "example.com"), undefined);
     // An authority record that is not an SOA.
-    assert.equal(readTransferSerial(ixfrQuery({ type: TYPE.A })), undefined);
+    assert.equal(readTransferSerial(ixfrQuery({ type: TYPE.A }), "example.com"), undefined);
     // Rdata that stops before the serial does.
-    assert.equal(readTransferSerial(ixfrQuery({ rdataLength: 4 })), undefined);
-    assert.equal(readTransferSerial(Buffer.alloc(6)), undefined);
+    assert.equal(readTransferSerial(ixfrQuery({ rdataLength: 4 }), "example.com"), undefined);
+    assert.equal(readTransferSerial(Buffer.alloc(6), "example.com"), undefined);
     // Truncated mid-record: read past the end rather than throwing at a caller
     // that has no answer for it.
     const truncated = ixfrQuery();
-    assert.equal(readTransferSerial(truncated.subarray(0, truncated.length - 8)), undefined);
+    assert.equal(readTransferSerial(truncated.subarray(0, truncated.length - 8), "example.com"), undefined);
   });
 });

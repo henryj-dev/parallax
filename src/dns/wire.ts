@@ -300,7 +300,7 @@ export function readName(message: Buffer, start: number): { name: string; offset
  * something that is not an SOA: the answer to that is a full transfer, which
  * the specification allows for any IXFR at all.
  */
-export function readTransferSerial(message: Buffer): number | undefined {
+export function readTransferSerial(message: Buffer, zone: string): number | undefined {
   try {
     if (message.length < 12) return undefined;
     const questions = message.readUInt16BE(4);
@@ -312,8 +312,13 @@ export function readTransferSerial(message: Buffer): number | undefined {
       const afterName = readName(message, offset).offset;
       offset = afterName + 10 + message.readUInt16BE(afterName + 8);
     }
-    const afterName = readName(message, offset).offset;
+    const owner = readName(message, offset);
+    const afterName = owner.offset;
     if (afterName + 10 > message.length || message.readUInt16BE(afterName) !== TYPE.SOA) return undefined;
+    // The SOA must be the zone's own. A serial presented under some other name
+    // is a claim about a zone this message is not asking to transfer, and
+    // reading it would let a client name a serial it has no business naming.
+    if (owner.name !== zone) return undefined;
     const rdataStart = afterName + 10;
     const rdataEnd = rdataStart + message.readUInt16BE(afterName + 8);
     if (rdataEnd > message.length) return undefined;

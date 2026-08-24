@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, open, readFile, rename, stat, unlink } from "node:fs/promises";
+import { chmod, open, readdir, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { mergeApplyStatus, RevisionConflictError, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type DesiredChange, type PageRequest, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import { assertPersistedDesiredViewsValid } from "../application/control-plane.ts";
@@ -357,7 +357,14 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
     await ensurePrivateDirectory(dirname(this.#path));
     let source: string;
     try {
-      await chmod(this.#path, 0o600);
+      // Best effort. The file is created 0600 and this only repairs a mode
+      // somebody else changed -- so a file owned by another user answers EPERM
+      // here, and rethrowing it turned "the permissions are surprising" into
+      // "this store cannot be read at all", on a path that was only reading.
+      await chmod(this.#path, 0o600).catch((error: unknown) => {
+        if (isNodeError(error) && (error.code === "ENOENT" || error.code === "EPERM")) return;
+        throw error;
+      });
       source = await readFile(this.#path, "utf8");
     } catch (error) {
       if (isNodeError(error) && error.code === "ENOENT") return { state: emptyState() };
@@ -537,6 +544,47 @@ function oldestAt(...groups: readonly (readonly AuditEntry[])[]): string | undef
   return oldest;
 }
 
+let sweptDirectories = new Set<string>();
+
+/**
+ * How old a temporary has to be before it is certainly nobody's.
+ *
+ * ⚠️ Age, not pid. Matching on this process's own pid gets it wrong in both
+ * directions: another process may be writing its temporary right now, and
+ * removing it turns that writer's `rename` into ENOENT -- worse than the leak
+ * this sweeps. And a reused pid would make a process skip its own predecessor's
+ * file, which is the one it most wants to remove.
+ *
+ * A write is one `writeFile` and two `fsync`s, so an hour is several orders of
+ * magnitude past any of them.
+ */
+const ABANDONED_TEMPORARY_MS = 60 * 60 * 1000;
+
+async function sweepAbandonedTemporaries(directory: string): Promise<void> {
+  // Once per directory per process. What it removes was left by a run that has
+  // already ended, so re-reading the directory on every write would be a scan
+  // that never finds anything.
+  if (sweptDirectories.has(directory)) return;
+  sweptDirectories.add(directory);
+  try {
+    const cutoff = Date.now() - ABANDONED_TEMPORARY_MS;
+    for (const name of await readdir(directory)) {
+      if (!name.startsWith(".") || !name.endsWith(".tmp")) continue;
+      const temporary = join(directory, name);
+      const age = await stat(temporary).catch(() => undefined);
+      if (!age || age.mtimeMs > cutoff) continue;
+      await unlink(temporary).catch(() => undefined);
+    }
+  } catch {
+    // A directory that cannot be listed is not a reason to refuse a write.
+  }
+}
+
+/** Test-only: forgets which directories have been swept. */
+export function resetTemporarySweep(): void {
+  sweptDirectories = new Set<string>();
+}
+
 async function syncDirectory(directory: string): Promise<void> {
   const handle = await open(directory, "r");
   try {
@@ -549,6 +597,10 @@ async function syncDirectory(directory: string): Promise<void> {
 async function writeFileAtomically(path: string, contents: string): Promise<void> {
   const directory = dirname(path);
   await ensurePrivateDirectory(directory);
+  // A hard crash between `open` and `rename` leaves the temporary behind, and
+  // nothing ever swept them -- one file per crash, forever. Only this process's
+  // own are removed: another pid's may belong to a writer that is still running.
+  await sweepAbandonedTemporaries(directory);
   const temporaryPath = join(directory, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
   try {
     // Flush the replacement and the directory entry so a crash after this
