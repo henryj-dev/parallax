@@ -298,15 +298,31 @@ export class InMemoryProvider implements ProviderAdapter {
     if (operation.kind === "create") {
       records.push({ ...operation.desired, providerId: `managed-${this.#nextId++}`, managed: true });
     } else if (operation.kind === "update") {
-      const index = records.findIndex((record) => record.providerId === operation.providerId);
-      if (index < 0) throw new Error(`provider record ${operation.providerId} does not exist`);
+      const index = this.#ownedIndex(records, operation.providerId);
       records[index] = { ...operation.desired, providerId: operation.providerId, managed: true };
     } else {
-      const index = records.findIndex((record) => record.providerId === operation.providerId);
-      if (index < 0) throw new Error(`provider record ${operation.providerId} does not exist`);
+      const index = this.#ownedIndex(records, operation.providerId);
       records.splice(index, 1);
     }
     this.#records.set(target, records);
+  }
+
+  /**
+   * Refuses a record this control plane does not own, the way both real
+   * adapters do.
+   *
+   * It did not, and that was a hole in the safety net rather than a bug in the
+   * product: reconciliation emits `conflict` rather than `update` for an
+   * unowned record, so nothing reached it -- but a control plane that started
+   * emitting one would have had no test to fail. The provider contract asks
+   * every implementation this, and a double that answers differently from the
+   * things it stands in for is not standing in for them.
+   */
+  #ownedIndex(records: readonly ProviderRecord[], providerId: string): number {
+    const index = records.findIndex((record) => record.providerId === providerId);
+    if (index < 0) throw new Error(`provider record ${providerId} does not exist`);
+    if (!records[index]?.managed) throw new Error(`refusing to write to unmanaged provider record ${providerId}`);
+    return index;
   }
 
   /**

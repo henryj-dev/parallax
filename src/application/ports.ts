@@ -184,6 +184,13 @@ export interface ProviderAdapter {
    * `undefined` means this provider cannot say, which is not the same answer as
    * an empty list. An empty list is a provider reporting that its services own
    * none of these names, and that unlocks records; silence must not.
+   *
+   * **Throwing is the same answer as `undefined`**, and usually the better one:
+   * the control plane catches it and carries the reason to the operator as a
+   * warning, which `undefined` has no room for. Cloudflare throws when no
+   * account id is configured, because "add an account id and these two token
+   * permissions" is repairable and "cannot say" is not. What no implementation
+   * may do is answer `[]` when it does not know.
    */
   serviceOwnership?(target: string): Promise<ServiceOwnedHostname[] | undefined>;
 }
