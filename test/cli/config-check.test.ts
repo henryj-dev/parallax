@@ -163,4 +163,32 @@ describe("what the preflight must not touch", () => {
     const unexpected = specifiers.filter((specifier) => !specifier.startsWith("node:") && specifier !== "../config.ts");
     assert.deepEqual(unexpected, [], "this file may reach node builtins and the configuration reader only");
   });
+
+  /**
+   * The two keys, as presence and nothing else.
+   *
+   * `ownershipSecret` is the one worth reporting: without it a Cloudflare
+   * binding fails, and it fails inside the credential store where the message
+   * used to point at the other key. A preflight that cannot say which of the
+   * two is missing leaves the operator to find that out at the first bind.
+   */
+  it("reports whether each key is present, without its value or its length", () => {
+    const absent = checkConfig({});
+    assert.equal(absent.credentialKey, "absent");
+    assert.equal(absent.ownershipSecret, "absent");
+
+    const set = checkConfig({
+      PARALLAX_CREDENTIAL_MASTER_KEY: Buffer.alloc(32, 3).toString("base64"),
+      PARALLAX_OWNERSHIP_SECRET: "o".repeat(40),
+    });
+    assert.equal(set.credentialKey, "set");
+    assert.equal(set.ownershipSecret, "set");
+
+    // The combination that starts and then cannot reach a provider.
+    const half = checkConfig({ PARALLAX_CREDENTIAL_MASTER_KEY: Buffer.alloc(32, 3).toString("base64") });
+    assert.equal(half.credentialKey, "set");
+    assert.equal(half.ownershipSecret, "absent");
+
+    assert.equal(JSON.stringify(set).includes("o".repeat(40)), false, "no value leaks into the report");
+  });
 });

@@ -8,6 +8,7 @@ import { ControlPlane } from "./application/control-plane.ts";
 import { SettingsService, type ParallaxSettings } from "./application/settings.ts";
 import { DomainValidationError } from "./domain/dns.ts";
 import { watchingZones } from "./dns/zone-changes.ts";
+import { OwnershipSecretError } from "./adapters/ownership.ts";
 import { RoutingProviderAdapter } from "./adapters/router.ts";
 import type { ProviderAdapter, SettingsRepository } from "./application/ports.ts";
 import type { CommandRuntime } from "./cli/commands.ts";
@@ -115,8 +116,7 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     await credentials?.initialize();
   } catch (error) {
     await pool?.end().catch(() => undefined);
-    // A credential store that cannot be decrypted is usually a mismatched key.
-    throw new RuntimeStartupError(`${message(error)}. Check PARALLAX_CREDENTIAL_MASTER_KEY matches the key that sealed the stored credentials.`);
+    throw new RuntimeStartupError(startupHint(error));
   }
 
   // Wrapped rather than announced by the control plane itself: a change cannot
@@ -232,4 +232,20 @@ export function createMigrationRuntime(config: ParallaxConfig, target: Migration
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
+}
+
+/**
+ * Which variable to send somebody to, decided by what actually failed.
+ *
+ * Both of these surface from the same call, and they are not interchangeable.
+ * A mismatched master key is the usual cause and the advice was written for it;
+ * a missing ownership secret arrived wearing the same sentence, which sent the
+ * reader at the one variable they must not regenerate -- doing so makes every
+ * stored credential unreadable. So the cause is asked rather than assumed.
+ */
+function startupHint(error: unknown): string {
+  if (error instanceof OwnershipSecretError) {
+    return `${message(error)}. Set PARALLAX_OWNERSHIP_SECRET: it signs the marker that tells this control plane's provider records from everybody else's, and a Cloudflare binding cannot be used without it.`;
+  }
+  return `${message(error)}. Check PARALLAX_CREDENTIAL_MASTER_KEY matches the key that sealed the stored credentials.`;
 }

@@ -112,8 +112,21 @@ function sign(target: string, recordId: string, secret: string): string {
   return createHmac("sha256", secret).update(target).update("\0").update(recordId).digest("base64url");
 }
 
+/**
+ * Named, so a caller can tell this apart from every other reason opening the
+ * credential store fails. The one that matters is startup: the message used to
+ * arrive wrapped in advice about `PARALLAX_CREDENTIAL_MASTER_KEY`, which is a
+ * different variable, and regenerating that one makes the stored credentials
+ * unreadable -- so following the advice made it worse.
+ */
+export class OwnershipSecretError extends Error {
+  override readonly name = "OwnershipSecretError";
+}
+
 function assertSecret(secret: string): void {
-  if (Buffer.byteLength(secret, "utf8") < 32) throw new Error("ownership secret must contain at least 32 bytes");
+  if (Buffer.byteLength(secret, "utf8") < 32) {
+    throw new OwnershipSecretError("ownership secret must contain at least 32 bytes");
+  }
 }
 
 function decode(value: string): string {

@@ -17,6 +17,71 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Which key the operator is sent to when the credential store will not open.
+ *
+ * Two very different causes arrive from the same call. The advice was written
+ * for one of them and given for both, and the one it was wrong for is the
+ * dangerous direction: regenerating `PARALLAX_CREDENTIAL_MASTER_KEY` makes
+ * every stored credential unreadable, so an operator who followed the sentence
+ * would have destroyed what they were trying to reach.
+ */
+describe("what startup says when the credential store will not open", () => {
+  const MASTER_KEY = Buffer.alloc(32, 7);
+
+  async function configuredAt(directory: string, ownershipSecret: string): Promise<ParallaxConfig> {
+    const { readConfig } = await import("../src/config.ts");
+    return readConfig({
+      PARALLAX_CREDENTIAL_MASTER_KEY: MASTER_KEY.toString("base64"),
+      PARALLAX_OWNERSHIP_SECRET: ownershipSecret,
+      PARALLAX_STATE_FILE: join(directory, "state.json"),
+      PARALLAX_CONFIG_FILE: join(directory, "configuration.json"),
+      PARALLAX_PROVIDER_STATE_FILE: join(directory, "provider.json"),
+    });
+  }
+
+  it("names the ownership secret, and not the master key, when that is what is missing", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "parallax-ownership-hint-"));
+    try {
+      // A binding is what makes a provider adapter get built, which is where
+      // the ownership secret is first required.
+      const { EncryptedCredentialStore } = await import("../src/security/credential-store.ts");
+      const files = new FileConfigurationStore(join(temporary, "configuration.json"));
+      const store = new EncryptedCredentialStore({ repository: files.credentials, masterKey: MASTER_KEY });
+      await store.upsertProfile("cloudflare", { token: "t".repeat(40) });
+      await store.bindZone("example.com", { zoneId: "zone-1", profile: "cloudflare" });
+
+      await assert.rejects(
+        createRuntime(await configuredAt(temporary, "")),
+        (error: unknown) => {
+          assert.ok(error instanceof RuntimeStartupError);
+          assert.match(error.message, /PARALLAX_OWNERSHIP_SECRET/u);
+          assert.doesNotMatch(error.message, /PARALLAX_CREDENTIAL_MASTER_KEY/u,
+            "the key that must not be regenerated is not the one to name here");
+          return true;
+        },
+      );
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  });
+
+  it("still starts with a master key and no ownership secret while nothing is bound", async () => {
+    // The plan for this item proposed refusing the combination outright. It is
+    // wrong: this is the documented setup order -- set the key, then add
+    // credentials through the portal -- and refusing would break it. The
+    // warning at startup is what covers the gap, so this pins the decision.
+    const temporary = await mkdtemp(join(tmpdir(), "parallax-ownership-allowed-"));
+    try {
+      const runtime = await createRuntime(await configuredAt(temporary, ""));
+      await runtime.controlPlane.createZone("example.com", "test");
+      await runtime.close();
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("runtime filesystem policy", () => {
   it("rejects a setting this process cannot act on before the file store is changed", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "parallax-runtime-setting-"));

@@ -541,6 +541,14 @@ server.listen(config.port, config.host, () => {
   if (!config.credentialMasterKey) {
     console.warn("parallax: PARALLAX_CREDENTIAL_MASTER_KEY is not set, so provider credentials cannot be stored. Generate one with: openssl rand -base64 32");
   }
+  // Said here rather than refused at startup, because this combination works
+  // until the moment somebody binds a zone -- and it is the documented order:
+  // set the key, then add credentials through the portal. Refusing would break
+  // the setup path. What it cannot do is reach a provider, and finding that out
+  // at the first bind is later than it needs to be.
+  if (config.credentialMasterKey && !config.ownershipSecret) {
+    console.warn("parallax: PARALLAX_OWNERSHIP_SECRET is not set, so a Cloudflare binding will fail the moment one is added. Generate one with: openssl rand -base64 32");
+  }
   if (config.databaseUrl && usesPlaintextPostgres(config.databaseUrl)) {
     console.warn("parallax: DATABASE_URL does not request TLS; zone data and audit history cross the network in cleartext. Append ?sslmode=verify-full unless PostgreSQL is reached over a trusted local socket.");
   }

@@ -35,6 +35,16 @@ export interface ConfigCheck {
    * place nobody looked.
    */
   readonly bootstrapTokens: number;
+  /**
+   * Whether the two keys are present -- never their value, and never their
+   * length, which is the rule the rest of this interface follows.
+   *
+   * `ownership` earns its place because its absence is invisible until a
+   * Cloudflare binding is added, and then it fails inside the credential store
+   * where the message used to point at the other key entirely.
+   */
+  readonly credentialKey: "set" | "absent";
+  readonly ownershipSecret: "set" | "absent";
 }
 
 /**
@@ -52,5 +62,7 @@ export function checkConfig(environment: NodeJS.ProcessEnv = process.env): Confi
     tls: config.tls ? "on" : "off",
     storage: config.databaseUrl ? "postgresql" : "file",
     bootstrapTokens: config.bootstrapTokens.length,
+    credentialKey: config.credentialMasterKey ? "set" : "absent",
+    ownershipSecret: config.ownershipSecret ? "set" : "absent",
   };
 }
