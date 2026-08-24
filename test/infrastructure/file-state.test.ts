@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -70,7 +71,7 @@ describe("FileStateRepository", () => {
       at: "2026-08-08T00:02:00.000Z",
       detail: {},
     })).id, 2);
-    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 1);
+    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 2);
   });
 
   it("persists immutable revision snapshots and removes them with a deleted zone", async () => {
@@ -396,6 +397,172 @@ describe("state written before a rule existed", () => {
     assert.equal(zone?.views[0]?.records[1]?.id, "oversized");
   });
 });
+
+describe("the split layout", () => {
+  /**
+   * The measurement this split exists for, reduced to a shape a test can hold.
+   *
+   * Back to back on this Mac at ten zones of two hundred records with fifty
+   * retained revisions: the state file went 19.9 MiB to 0.4 MiB, one record
+   * change 1778 ms to 124 ms, and `list()` 421.9 ms to 19.4 ms. What is pinned
+   * here is the reason -- that a change to one zone stops rewriting the others'
+   * history -- because a timing assertion on a shared runner is not evidence.
+   */
+  it("leaves the other zones' history untouched when one zone changes", async () => {
+    const path = await statePath();
+    const repository = new FileStateRepository(path);
+    for (const name of ["alpha.example", "bravo.example"]) {
+      await repository.commitDesiredChange({
+        snapshot: zoneFixture(name, 1),
+        audit: auditFixture(name, 1),
+        statuses: [],
+      });
+    }
+    const untouched = await stat(revisionPath(path, "bravo.example"));
+
+    await repository.commitDesiredChange({
+      snapshot: { ...zoneFixture("alpha.example", 2), updatedAt: "2026-08-08T00:05:00.000Z" },
+      audit: auditFixture("alpha.example", 2),
+      statuses: [],
+    });
+
+    const after = await stat(revisionPath(path, "bravo.example"));
+    assert.equal(after.mtimeMs, untouched.mtimeMs, "the other zone's history was rewritten");
+    // The state file holds current snapshots and statuses, and nothing that
+    // grows with history.
+    const document = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(document).sort(), ["auditOldestAt", "nextAuditId", "statuses", "version", "zones"]);
+    assert.equal(await revisionCount(path, "alpha.example"), 2);
+  });
+
+  it("splits a version 1 document apart on the first write and loses nothing", async () => {
+    const path = await statePath();
+    const legacy = new FileStateRepository(path);
+    await legacy.commitDesiredChange({ snapshot: zoneFixture("alpha.example", 1), audit: auditFixture("alpha.example", 1), statuses: [] });
+    await legacy.commitDesiredChange({
+      snapshot: { ...zoneFixture("alpha.example", 2), updatedAt: "2026-08-08T00:01:00.000Z" },
+      audit: auditFixture("alpha.example", 2),
+      statuses: [],
+    });
+    // Fold it back into the shape version 1 wrote, which is what an existing
+    // deployment has on disk.
+    const split = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+    const before = { revisions: await legacy.listRevisions("alpha.example"), audit: await legacy.audit() };
+    await writeFile(path, `${JSON.stringify({
+      version: 1,
+      zones: split.zones,
+      statuses: split.statuses,
+      nextAuditId: split.nextAuditId,
+      audit: before.audit,
+      revisions: { "alpha.example": Object.fromEntries(before.revisions.map((one) => [String(one.revision), one])) },
+    }, null, 2)}\n`);
+    await rm(`${path}.d`, { recursive: true, force: true });
+
+    // Readable before anything writes, and unchanged on disk by reading it.
+    const reopened = new FileStateRepository(path);
+    assert.deepEqual(await reopened.listRevisions("alpha.example"), before.revisions);
+    assert.deepEqual(await reopened.audit(), before.audit);
+    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 1, "a reader must not rewrite the store");
+
+    // The first write splits it, under the lock.
+    await reopened.appendAudit(auditFixture("alpha.example", 2));
+    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 2);
+    const migrated = new FileStateRepository(path);
+    assert.deepEqual(await migrated.listRevisions("alpha.example"), before.revisions);
+    assert.deepEqual((await migrated.audit()).slice(1), before.audit);
+    assert.deepEqual(await migrated.get("alpha.example"), await legacy.get("alpha.example"));
+  });
+
+  /**
+   * The window the design creates, and the reason the state file is the commit
+   * point rather than one of three renames.
+   *
+   * A crash between a side-file write and that rename leaves a revision the
+   * state file does not name, or an audit id it has not reached. Neither is
+   * served, and the next write replaces both -- so what a crash leaves is
+   * invisible rather than wrong.
+   */
+  it("ignores side-file writes the state file never committed", async () => {
+    const path = await statePath();
+    const repository = new FileStateRepository(path);
+    await repository.commitDesiredChange({ snapshot: zoneFixture("alpha.example", 1), audit: auditFixture("alpha.example", 1), statuses: [] });
+
+    // A revision written by a commit that never reached the state file.
+    const revisionFile = revisionPath(path, "alpha.example");
+    const document = JSON.parse(await readFile(revisionFile, "utf8")) as { zone: string; revisions: Record<string, unknown> };
+    document.revisions["2"] = { ...zoneFixture("alpha.example", 2), updatedAt: "2026-08-08T00:09:00.000Z" };
+    await writeFile(revisionFile, JSON.stringify(document));
+    // ...and an audit line from the same interrupted commit.
+    const auditFile = join(`${path}.d`, "audit.jsonl");
+    const orphan = { ...auditFixture("alpha.example", 2), id: 2 };
+    await writeFile(auditFile, `${await readFile(auditFile, "utf8")}${JSON.stringify(orphan)}\n`);
+
+    const reopened = new FileStateRepository(path);
+    assert.deepEqual((await reopened.listRevisions("alpha.example")).map((one) => one.revision), [1]);
+    assert.deepEqual((await reopened.audit()).map((one) => one.id), [1]);
+
+    // The next commit reuses the id, and the later line is the one that counts.
+    await reopened.appendAudit({ ...auditFixture("alpha.example", 1), actor: "the-real-one" });
+    const entries = await new FileStateRepository(path).audit();
+    assert.deepEqual(entries.map((one) => one.id), [2, 1]);
+    assert.equal(entries[0]?.actor, "the-real-one");
+  });
+
+  it("takes a deleted zone's history with it", async () => {
+    const path = await statePath();
+    const repository = new FileStateRepository(path);
+    await repository.commitDesiredChange({ snapshot: zoneFixture("alpha.example", 1), audit: auditFixture("alpha.example", 1), statuses: [] });
+    assert.equal(await revisionCount(path, "alpha.example"), 1);
+
+    await repository.commitZoneDeletion({
+      zone: "alpha.example",
+      expectedRevision: 1,
+      audit: { ...auditFixture("alpha.example", 1), action: "zone.deleted" },
+    });
+    await assert.rejects(stat(revisionPath(path, "alpha.example")), /ENOENT/u);
+    assert.deepEqual(await repository.listRevisions("alpha.example"), []);
+  });
+
+  it("rewrites the audit log only when retention has something to remove", async () => {
+    const path = await statePath();
+    const repository = new FileStateRepository(path);
+    const auditFile = join(`${path}.d`, "audit.jsonl");
+    await repository.appendAudit({ ...auditFixture("alpha.example", 1), at: "2026-01-01T00:00:00.000Z" });
+    await repository.appendAudit({ ...auditFixture("alpha.example", 1), at: "2026-08-08T00:00:00.000Z" });
+
+    // Nothing is older than the cutoff, so this is an append and the two lines
+    // that were there stay byte-for-byte where they were.
+    const before = await readFile(auditFile, "utf8");
+    await repository.appendAudit(
+      { ...auditFixture("alpha.example", 1), at: "2026-08-09T00:00:00.000Z" },
+      { deleteAuditBefore: "2025-01-01T00:00:00.000Z" },
+    );
+    assert.ok((await readFile(auditFile, "utf8")).startsWith(before), "an append rewrote the log");
+
+    await repository.appendAudit(
+      { ...auditFixture("alpha.example", 1), at: "2026-08-10T00:00:00.000Z" },
+      { deleteAuditBefore: "2026-08-01T00:00:00.000Z" },
+    );
+    assert.deepEqual((await repository.audit()).map((one) => one.at), [
+      "2026-08-10T00:00:00.000Z", "2026-08-09T00:00:00.000Z", "2026-08-08T00:00:00.000Z",
+    ]);
+    // The skip hint moved with the log; a stale one would skip a real prune.
+    assert.equal(JSON.parse(await readFile(path, "utf8")).auditOldestAt, "2026-08-08T00:00:00.000Z");
+  });
+});
+
+function revisionPath(statePath: string, zone: string): string {
+  return join(`${statePath}.d`, `rev-${createHash("sha256").update(zone, "utf8").digest("hex")}.json`);
+}
+
+async function revisionCount(statePath: string, zone: string): Promise<number> {
+  const document = JSON.parse(await readFile(revisionPath(statePath, zone), "utf8")) as { revisions: Record<string, unknown> };
+  return Object.keys(document.revisions).length;
+}
+
+function auditFixture(zone: string, revision: number) {
+  return { zone, revision, action: "record.upserted" as const, actor: "alice", at: "2026-08-08T00:00:00.000Z", detail: {} };
+}
 
 async function statePath(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "parallax-file-state-"));

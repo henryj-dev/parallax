@@ -391,7 +391,7 @@ GET /api/v1/openapi.json
 |---|---|
 | `HOST` · `PORT` | API와 포털이 바인드하는 곳. 기본값 `127.0.0.1:3000` |
 | `DATABASE_URL` | PostgreSQL 사용. 없으면 단일 노드 파일 |
-| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | 그 파일들의 위치 |
+| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | 그 파일들의 위치. 상태 파일은 히스토리를 옆의 `<상태 파일>.d/` 에 둔다 — 백업은 파일 하나가 아니라 디렉터리 단위로 |
 | `PARALLAX_AUTH_TOKENS` | 비상용 토큰(JSON). 평소 토큰은 포털에서 발급 |
 | `PARALLAX_OWNERSHIP_SECRET` | 소유권 마커 서명 |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장된 프로바이더 자격 증명 암호화(AES-256-GCM) |

@@ -393,7 +393,7 @@ Nothing below is required to start on loopback with file state.
 |---|---|
 | `HOST` · `PORT` | Where the API and portal bind. Defaults `127.0.0.1:3000` |
 | `DATABASE_URL` | Use PostgreSQL. Absent means single-node files |
-| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | Where those files live |
+| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | Where those files live. The state file keeps its history beside it in `<state file>.d/` — back up the directory, not the one file |
 | `PARALLAX_AUTH_TOKENS` | Break-glass tokens, as JSON. Normal tokens are issued through the portal |
 | `PARALLAX_OWNERSHIP_SECRET` | Signs ownership markers |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | Encrypts stored provider credentials (AES-256-GCM) |
