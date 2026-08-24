@@ -1,4 +1,5 @@
 import { ApiError } from "./api-client.js";
+import { pluralKey } from "./i18n.js";
 import { effectiveExternalTtl } from "./ttl.js";
 
 /**
@@ -291,8 +292,22 @@ export function createStore(client) {
         state.activeZone = null;
         state.records = [];
         const withdrawn = result?.removedProviderRecords?.length ?? 0;
-        if (withdrawn > 0) notice("zone.deletedRecords", { name, count: withdrawn });
+        // `pluralKey`, because a notice goes straight to `translate()` with no
+        // pluralization on the way. Without it the catalog has only `.one` and
+        // `.other`, the lookup misses, and the toast prints the key itself --
+        // which is what it had been doing.
+        if (withdrawn > 0) notice(pluralKey("zone.deletedRecords", withdrawn), { name, count: withdrawn });
         else notice("zone.deleted", { name });
+        // The delete is always sent with `abandonProviderRecords`, so a target
+        // the provider could not be read for does not block it -- the confirm
+        // text says so. What it did not say is which targets, and the server
+        // returns exactly that so the blast radius can be seen. Dropping it
+        // meant a broken token left live records nobody tracks, under a notice
+        // that said "deleted".
+        const abandoned = (result?.abandonedProviderTargets ?? []).map((entry) => String(entry?.target ?? entry?.view ?? ""));
+        if (abandoned.length > 0) {
+          notice(pluralKey("zone.deletedAbandoned", abandoned.length), { count: abandoned.length, targets: abandoned.join(", ") }, "warning");
+        }
         await this.loadZones();
         return true;
       } catch (error) {

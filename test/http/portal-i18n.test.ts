@@ -159,6 +159,38 @@ describe("portal internationalization", () => {
   });
 });
 
+/**
+ * Every notice the store can raise, read out of its own source.
+ *
+ * A notice goes straight to `translate(key, values)` -- nothing pluralizes it
+ * on the way -- so a key the catalog only holds as `.one`/`.other` misses the
+ * lookup and the toast prints the key. `zone.deletedRecords` had been doing
+ * exactly that: a zone deletion that withdrew records showed the literal string
+ * `zone.deletedRecords` to whoever deleted it.
+ *
+ * Enumerating by hand would have missed it, since the key looks correct at the
+ * call site and correct in the catalog -- it is only the pair that is wrong.
+ * So the call sites are read from the file instead.
+ */
+describe("every notice the store raises resolves to a sentence", () => {
+  it("finds no key that would print itself", async () => {
+    const source = await readFile(new URL("../../public/store.js", import.meta.url), "utf8");
+    const keys = [...source.matchAll(/notice\(\s*(?:pluralKey\(\s*)?"([^"]+)"/gu)].map((match) => match[1] as string);
+    assert.ok(keys.length > 5, `expected to find the call sites, found ${keys.length}`);
+
+    const pluralized = new Set([...source.matchAll(/notice\(\s*pluralKey\(\s*"([^"]+)"/gu)].map((match) => match[1] as string));
+    for (const locale of Object.keys(messages)) {
+      const catalog = messages[locale as keyof typeof messages] as Record<string, string>;
+      for (const key of new Set(keys)) {
+        const resolves = pluralized.has(key)
+          ? Object.hasOwn(catalog, `${key}.one`) && Object.hasOwn(catalog, `${key}.other`)
+          : Object.hasOwn(catalog, key);
+        assert.ok(resolves, `${locale}: ${key} would render as its own key`);
+      }
+    }
+  });
+});
+
 describe("portal store", () => {
   it("carries a settings warning to whoever made the change", async () => {
     const store = createStore({
@@ -253,6 +285,61 @@ describe("portal store", () => {
     const reported = notices.find((notice) => notice.key.startsWith("apply."));
     assert.equal(reported?.key, "apply.startedRevision");
     assert.notEqual(reported?.level, "error");
+  });
+
+  /**
+   * The portal always sends `abandonProviderRecords`, and the confirm text says
+   * so. What it did not say afterwards is which targets were abandoned -- the
+   * server returns them precisely so the blast radius can be seen. A broken
+   * token therefore left live records nobody tracks, under a notice reading
+   * "deleted".
+   */
+  it("says which provider targets a deletion abandoned", async () => {
+    const store = createStore({
+      deleteZone: async () => ({
+        zone: "example.com",
+        removedProviderRecords: [],
+        abandonedProviderTargets: [{ view: "external", target: "example.com/external" }],
+      }),
+      listZones: async () => ({ zones: [] }),
+      statusOverview: async () => ({ zones: [] }),
+    });
+    const notices: StoreNotice[] = [];
+    store.onNotice((notice) => { notices.push(notice); });
+    await store.loadZones();
+    await store.selectZone("example.com");
+    notices.length = 0;
+
+    await store.deleteActiveZone();
+
+    const abandoned = notices.find((notice) => notice.key.startsWith("zone.deletedAbandoned"));
+    assert.ok(abandoned, "the abandoned targets are reported at all");
+    assert.equal(abandoned.level, "warning", "not a failure -- the deletion did happen");
+    assert.equal(abandoned.values.targets, "example.com/external");
+
+    for (const locale of Object.keys(messages)) {
+      const translated = createTranslator(locale)(abandoned.key, abandoned.values);
+      assert.notEqual(translated, abandoned.key, locale);
+      assert.match(translated, /example\.com\/external/u, locale);
+    }
+  });
+
+  it("stays quiet about abandoned targets when there were none", async () => {
+    const store = createStore({
+      deleteZone: async () => ({ zone: "example.com", removedProviderRecords: [], abandonedProviderTargets: [] }),
+      listZones: async () => ({ zones: [] }),
+      statusOverview: async () => ({ zones: [] }),
+    });
+    const notices: StoreNotice[] = [];
+    store.onNotice((notice) => { notices.push(notice); });
+    await store.loadZones();
+    await store.selectZone("example.com");
+    notices.length = 0;
+
+    await store.deleteActiveZone();
+
+    assert.equal(notices.some((notice) => notice.key.startsWith("zone.deletedAbandoned")), false);
+    assert.equal(notices.some((notice) => notice.key === "zone.deleted"), true);
   });
 
   it("carries what adopting could not read to whoever adopted", async () => {
