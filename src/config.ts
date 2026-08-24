@@ -342,14 +342,6 @@ function readOidc(environment: NodeJS.ProcessEnv): OidcSettings | undefined {
 }
 
 /**
- * Refuses `idp` without an identity provider rather than falling back.
- *
- * The fallback would be the prompt -- the very screen this setting exists to
- * take away -- so a deployment that asked for one thing would quietly get the
- * other, and the only symptom would be a login page somebody thought they had
- * removed.
- */
-/**
  * Seconds, because the operator thinking about this is reading a probe's
  * `periodSeconds` and `failureThreshold` beside it.
  */
@@ -363,6 +355,14 @@ function readStaleness(value: string | undefined): number | undefined {
   return seconds * 1000;
 }
 
+/**
+ * Refuses `idp` without an identity provider rather than falling back.
+ *
+ * The fallback would be the prompt -- the very screen this setting exists to
+ * take away -- so a deployment that asked for one thing would quietly get the
+ * other, and the only symptom would be a login page somebody thought they had
+ * removed.
+ */
 function readPortalSignIn(environment: NodeJS.ProcessEnv, hasIdentityProvider: boolean): PortalSignIn {
   const value = environment.PARALLAX_PORTAL_SIGN_IN?.trim();
   if (!value) return "prompt";

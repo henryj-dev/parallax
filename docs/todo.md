@@ -20,7 +20,7 @@
       <br>⚠️ 고친 뒤 이벤트 루프가 정말 비는지 실제 실행으로 확인할 것
 - [x] **T2** · `XS` · Postgres 풀에 `max` · `connectionTimeoutMillis` — `src/infrastructure/postgres.ts:48`
       <br>⚠️ `pnpm verify:postgres`(Docker 필요)를 돌릴 수 있는 자리에서 할 것
-- [ ] **T3** · `XS` · `readPortalSignIn` 주석을 제 함수 위로 — `src/config.ts:344`
+- [x] **T3** · `XS` · `readPortalSignIn` 주석을 제 함수 위로 — `src/config.ts:344`
 
 ## 2단계 — 침묵을 없앤다
 
