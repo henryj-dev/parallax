@@ -24,6 +24,36 @@ import { authenticate, createAuthorizedHandler, resolvedPrincipal, setTrustedCli
 const MAX_REQUEST_BODY_BYTES = 1_048_576;
 
 /**
+ * What a route that exists to carry a document may take instead.
+ *
+ * A zone file's size is the zone's, not the request's. At 1 MiB, and with the
+ * newlines escaped into a JSON string, an import stopped somewhere around
+ * fifteen thousand records -- a large zone, but a real one, and the failure
+ * arrived as a flat 413 that said nothing about zones.
+ *
+ * Streaming the parse was the alternative and it buys nothing here: an import
+ * replaces a whole view in one revision, so the parsed document has to be
+ * complete in memory before anything can be committed either way. All
+ * streaming would avoid is holding the transport bytes, which is the smaller
+ * half of the same allocation.
+ */
+const MAX_DOCUMENT_BODY_BYTES = 8 * 1_048_576;
+
+/**
+ * The two routes that carry one.
+ *
+ * `/cli` is here because it dispatches `zone import` among everything else, and
+ * an operation whose limit depends on which door it came through is the drift
+ * this API is arranged to prevent.
+ */
+const DOCUMENT_ROUTES = [/^\/api\/v1\/zones\/[^/]+\/import\/?$/u, /^\/api\/v1\/cli\/?$/u];
+
+function bodyLimitFor(request: IncomingMessage): number {
+  const path = (request.url ?? "/").split("?")[0] ?? "/";
+  return DOCUMENT_ROUTES.some((route) => route.test(path)) ? MAX_DOCUMENT_BODY_BYTES : MAX_REQUEST_BODY_BYTES;
+}
+
+/**
  * Every route is a translation: it turns an HTTP request into one command
  * invocation and that command's result into a response. The command layer holds
  * the behaviour, so the API and the command line cannot drift apart.
@@ -82,12 +112,19 @@ export function createNodeHandler(
   return async (request, response) => {
     const origin = requestOrigin(request, options);
     let body: Buffer;
+    const bodyLimit = bodyLimitFor(request);
     try {
-      body = request.method === "GET" || request.method === "HEAD" ? Buffer.alloc(0) : await readBody(request);
+      body = request.method === "GET" || request.method === "HEAD" ? Buffer.alloc(0) : await readBody(request, bodyLimit);
     } catch (error) {
       if (!(error instanceof RequestBodyTooLargeError)) throw error;
       response.writeHead(413, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-      response.end(JSON.stringify({ error: "payload_too_large", message: "request body exceeds 1 MiB" }));
+      // The number this route actually applied, not the one most routes use: a
+      // 413 quoting a limit the caller was not held to sends them to the wrong
+      // place.
+      response.end(JSON.stringify({
+        error: "payload_too_large",
+        message: `request body exceeds ${bodyLimit / 1_048_576} MiB`,
+      }));
       return;
     }
     const headers = new Headers();
@@ -705,15 +742,15 @@ function readExpectedRevision(request: Request): number | undefined {
   return revision;
 }
 
-async function readBody(request: IncomingMessage): Promise<Buffer> {
+async function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
   const declaredLength = Number(request.headers["content-length"]);
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BODY_BYTES) throw new RequestBodyTooLargeError();
+  if (Number.isFinite(declaredLength) && declaredLength > limit) throw new RequestBodyTooLargeError();
   const chunks: Buffer[] = [];
   let length = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     length += buffer.length;
-    if (length > MAX_REQUEST_BODY_BYTES) throw new RequestBodyTooLargeError();
+    if (length > limit) throw new RequestBodyTooLargeError();
     chunks.push(buffer);
   }
   return Buffer.concat(chunks);

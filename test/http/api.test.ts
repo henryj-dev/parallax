@@ -373,6 +373,50 @@ describe("HTTP API", () => {
     await handler(incoming, response);
     assert.equal(status, 413);
     assert.match(responseBody, /payload_too_large/);
+    assert.match(responseBody, /exceeds 1 MiB/, "the refusal should quote the limit this route applied");
+  });
+
+  /**
+   * A zone file's size is the zone's, not the request's, and at 1 MiB an import
+   * stopped around fifteen thousand records with a 413 that said nothing about
+   * zones. `/cli` is here too because it dispatches `zone import`: an operation
+   * whose limit depends on which door it came through is the drift this API is
+   * arranged to prevent.
+   */
+  it("lets the routes that carry a zone file take a larger body, and says which limit it used", async () => {
+    const adapters = createInMemoryAdapters();
+    const handler = createNodeHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) });
+    const attempt = async (url: string, length: number): Promise<{ status: number; body: string }> => {
+      const incoming = Readable.from([]) as IncomingMessage;
+      incoming.method = "POST";
+      incoming.url = url;
+      incoming.headers = { host: "localhost", "content-length": String(length) };
+      let status = 0;
+      let body = "";
+      // Enough of a response for the request to get past the size check and be
+      // answered normally, which is what "not refused for its size" means.
+      const response = {
+        statusCode: 200,
+        writeHead(code: number) { status = code; return this; },
+        setHeader() { return this; },
+        end(value?: string) { status = status || (this as { statusCode: number }).statusCode; body = value ?? ""; return this; },
+      } as unknown as ServerResponse;
+      await handler(incoming, response);
+      return { status, body };
+    };
+
+    for (const url of ["/api/v1/zones/example.com/import", "/api/v1/cli", "/api/v1/cli?pretty=1"]) {
+      // Past what every other route allows, and not refused for its size.
+      assert.notEqual((await attempt(url, 2 * 1_048_576)).status, 413, `${url} refused a zone-file-sized body`);
+      const tooLarge = await attempt(url, 8 * 1_048_576 + 1);
+      assert.equal(tooLarge.status, 413, `${url} has no ceiling at all`);
+      assert.match(tooLarge.body, /exceeds 8 MiB/u);
+    }
+    // The allowance belongs to those routes and does not leak to their
+    // neighbours -- including a path that merely starts the same way.
+    for (const url of ["/api/v1/zones", "/api/v1/zones/example.com", "/api/v1/zones/example.com/import/extra"]) {
+      assert.equal((await attempt(url, 2 * 1_048_576)).status, 413, `${url} took a body it should not have`);
+    }
   });
 
   it("returns the non-global publication acknowledgement contract through the API", async () => {
