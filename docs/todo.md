@@ -24,7 +24,7 @@
 
 ## 2단계 — 침묵을 없앤다
 
-- [ ] **T5** · `S` · `resetMetrics()` 가 카운터를 고아로 만드는 것 — `src/observability/metrics.ts:84`
+- [x] **T5** · `S` · `resetMetrics()` 가 카운터를 고아로 만드는 것 — `src/observability/metrics.ts:84`
       <br>📌 **T4 보다 먼저.** T4 의 회귀 테스트가 카운터를 본다
 - [ ] **T4** · `S` · AXFR 프레이밍 실패를 `onUnanswerable` 로 보고 — `src/dns/server.ts:343`
       <br>📌 AXFR 자체는 고치지 않는다(T18). 실패가 보이게만 한다

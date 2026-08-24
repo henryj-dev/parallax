@@ -33,14 +33,37 @@ interface Gauge {
 const counters = new Map<string, Counter>();
 const gauges = new Map<string, Gauge>();
 
-/** Declares a counter. Repeated declarations are the same counter. */
+/**
+ * Declares a counter. Repeated declarations are the same counter.
+ *
+ * The returned function finds its counter by name on every call rather than
+ * closing over the object. That looks like the more expensive spelling and it
+ * is the only correct one: `signals.ts` declares its counters once, when the
+ * module loads, so a closure that held the object kept pointing at it after
+ * `resetMetrics()` had dropped it from the registry -- the increments landed
+ * somewhere `render()` could no longer see, and the counter never reappeared
+ * for the rest of the process. Measured: visible before the reset, gone after.
+ *
+ * Nothing in production calls `resetMetrics()`, so the defect only ever showed
+ * up in tests -- as a counter that would not move. A helper that quietly
+ * reports the wrong thing is worse than no helper, because the test it breaks
+ * looks like a finding.
+ */
 export function counter(name: string, help: string): (labels?: Record<string, string>) => void {
-  const existing = counters.get(name) ?? { help, values: new Map<string, number>() };
-  counters.set(name, existing);
+  register(name, help);
   return (labels) => {
+    const metric = register(name, help);
     const key = labelKey(labels);
-    existing.values.set(key, (existing.values.get(key) ?? 0) + 1);
+    metric.values.set(key, (metric.values.get(key) ?? 0) + 1);
   };
+}
+
+function register(name: string, help: string): Counter {
+  const existing = counters.get(name);
+  if (existing) return existing;
+  const created = { help, values: new Map<string, number>() };
+  counters.set(name, created);
+  return created;
 }
 
 /**

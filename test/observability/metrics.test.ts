@@ -63,4 +63,27 @@ describe("the metrics a deployment can alert on", () => {
     odd({ reason: 'a"b\\c' });
     assert.match(render(), /\{reason="a\\"b\\\\c"\}/u);
   });
+
+  /**
+   * The helper every other case in this file leans on, which was itself wrong.
+   *
+   * `signals.ts` declares its counters when the module loads -- once per
+   * process, before any test runs. The increment function used to hold the
+   * counter object, so `resetMetrics()` dropping it from the registry left the
+   * two disconnected: the calls still landed, `render()` no longer saw them,
+   * and no later reset could bring the counter back. Nothing in production
+   * calls `resetMetrics()`, so this could only ever surface as a test that
+   * would not move -- which reads as a finding about the code under test.
+   */
+  it("keeps a counter declared before the reset usable after it", () => {
+    const bump = counter("parallax_test_survivor_total", "Survivor.");
+    bump();
+    assert.match(render(), /^parallax_test_survivor_total 1$/mu);
+
+    resetMetrics();
+    assert.doesNotMatch(render(), /parallax_test_survivor_total/u, "the reset forgot it, as it says it does");
+
+    bump();
+    assert.match(render(), /^parallax_test_survivor_total 1$/mu, "and the same function re-declares it");
+  });
 });
