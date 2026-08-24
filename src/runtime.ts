@@ -11,6 +11,7 @@ import { watchingZones } from "./dns/zone-changes.ts";
 import { OwnershipSecretError } from "./adapters/ownership.ts";
 import { RoutingProviderAdapter } from "./adapters/router.ts";
 import type { SettingsRepository } from "./application/ports.ts";
+import type { BackupStores } from "./application/backup.ts";
 import type { CommandRuntime } from "./cli/commands.ts";
 import type { ParallaxConfig } from "./config.ts";
 import { createFileStateAdapters } from "./infrastructure/file-state.ts";
@@ -39,6 +40,8 @@ export interface ParallaxRuntime extends CommandRuntime {
   readonly credentials?: CloudflareCredentialManager;
   readonly fallbackDomains?: FallbackDomainService;
   readonly provider: RoutingProviderAdapter;
+  /** Present only where `exposeStores` was asked for -- the command line. */
+  readonly stores?: BackupStores;
   /**
    * Called after this process commits a zone change. Only this process's own
    * writes are seen; anything that needs to observe another instance has to
@@ -63,7 +66,21 @@ export class RuntimeStartupError extends Error {
   override readonly name = "RuntimeStartupError";
 }
 
-export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRuntime> {
+export interface RuntimeOptions {
+  /**
+   * Hand back the repositories themselves, not just the services over them.
+   *
+   * Off by default, and the reason is the same one that keeps `migrate` off
+   * this object: the HTTP handler is given this runtime, and these reach past
+   * every rule the control plane enforces -- writing revisions and audit
+   * entries directly, and reading the credential store's document as stored.
+   * The command line already acts with full rights against the store, so it
+   * asks for them; nothing reachable over a port does.
+   */
+  readonly exposeStores?: boolean;
+}
+
+export async function createRuntime(config: ParallaxConfig, options: RuntimeOptions = {}): Promise<ParallaxRuntime> {
   // One decision picks every backend: a database when DATABASE_URL is set,
   // files otherwise. Settings, credentials and tokens follow the zones.
   const pool: CloseablePgPool | undefined = config.databaseUrl ? createPostgresPool(config.databaseUrl) : undefined;
@@ -150,6 +167,17 @@ export async function createRuntime(config: ParallaxConfig): Promise<ParallaxRun
     ...(credentials ? { credentials } : {}),
     ...(fallbackDomains ? { fallbackDomains } : {}),
     provider,
+    ...(options.exposeStores
+      ? {
+        stores: {
+          zones: persisted.zones,
+          statuses: persisted.statuses,
+          settings: settingsRepository,
+          accessTokens: accessTokenRepository,
+          credentials: credentialRepository,
+        },
+      }
+      : {}),
     onZoneChange: (listener) => { zoneChangeListeners.push(listener); },
     close: async () => {
       await pool?.end().catch(() => undefined);

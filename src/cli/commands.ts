@@ -1,4 +1,5 @@
 import { TOKEN_REFRESH_INTERVAL_MS, type AccessTokenService } from "../application/access-tokens.ts";
+import { exportBackup, importBackup, readBackupDocument, type BackupStores } from "../application/backup.ts";
 import type { CloudflareCredentialManager } from "../application/cloudflare-credentials.ts";
 import { fallbackCoverage, overridableZones, type FallbackDomainService } from "../application/fallback-domains.ts";
 import { NotFoundError, type ControlPlane, type RecordQuery } from "../application/control-plane.ts";
@@ -15,6 +16,8 @@ import { ROLES, type Role } from "../security/http-authorization.ts";
 export interface CommandRuntime {
   /** Absent only while bootstrapping a store that does not exist yet. */
   readonly controlPlane?: ControlPlane;
+  /** Present only on a runtime the command line built. See `requireStores`. */
+  readonly stores?: BackupStores;
   readonly settings?: SettingsService;
   readonly accessTokens?: AccessTokenService;
   readonly credentials?: CloudflareCredentialManager;
@@ -200,6 +203,21 @@ function unsavedCredentialFor(input: Record<string, unknown>): { profile: string
     token: String(input.token),
     ...(input.accountId === undefined ? {} : { accountId: String(input.accountId) }),
   };
+}
+
+/**
+ * The repositories, which only the command line is given.
+ *
+ * `createRuntime` withholds them unless asked, so this is not a role check that
+ * could be got round -- over HTTP the field is simply not there.
+ */
+function requireStores(runtime: CommandRuntime): BackupStores {
+  if (!runtime.stores) {
+    throw new CommandUnavailableError(
+      "backup and restore run on the command line only; they reach the store directly, past every rule the API enforces",
+    );
+  }
+  return runtime.stores;
 }
 
 function requireControlPlane(runtime: CommandRuntime): ControlPlane {
@@ -805,6 +823,25 @@ const COMMANDS: readonly Command[] = [
     ],
     run: async (context, input) => await requireFallbackDomains(context)
       .remove(String(input.profile), String(input.suffix), optionalText(input.policy)),
+  },
+  {
+    name: "backup",
+    summary: "Write everything this store holds as one document",
+    role: "admin",
+    options: [],
+    run: ({ runtime }) => exportBackup(requireStores(runtime)),
+  },
+  {
+    name: "restore",
+    summary: "Load a backup document into an empty store, from another backend or the same one",
+    role: "admin",
+    options: [{
+      name: "document",
+      summary: "The backup document as JSON. Omit on the command line to read it from stdin",
+      type: "json",
+      required: true,
+    }],
+    run: ({ runtime }, input) => importBackup(requireStores(runtime), readBackupDocument(input.document)),
   },
   {
     name: "credential zone test",

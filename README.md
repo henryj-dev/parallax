@@ -340,9 +340,30 @@ already holds — nobody types a second token.
 |---|---|
 | `config check` | Report what would stop this process from starting — **without starting it** |
 | `migrate` | Apply the database schema; safe to re-run |
+| `backup` | Write everything this store holds as one document |
+| `restore` | Load such a document into an **empty** store, from either backend |
 | `openapi` | Print this control plane's own OpenAPI description |
 
 </details>
+
+`backup` and `restore` have no HTTP route and cannot get one: the serving
+runtime is not given the repositories they use, so neither the credential
+document nor a direct write to the revision history is reachable through a
+port. They are also how you move between backends — the two stores implement
+the same interfaces, and the document only ever speaks to those:
+
+```bash
+PARALLAX_STATE_FILE=./data/state.json parallax backup --json > parallax-backup.json
+DATABASE_URL=postgres://… parallax migrate
+DATABASE_URL=postgres://… parallax restore < parallax-backup.json
+```
+
+⚠️ The document is **as sensitive as the state file**, because it is a copy of
+it: it carries the credential store's ciphertext, which is useless without
+`PARALLAX_CREDENTIAL_MASTER_KEY` and is still not something to leave where the
+state file would not be left. `restore` refuses a store that already holds
+zones or tokens — it is not a merge. Audit ids are assigned by the store, so a
+restored log is renumbered from 1; the order and the content survive.
 
 ---
 

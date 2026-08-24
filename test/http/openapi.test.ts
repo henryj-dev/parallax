@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ControlPlane, NotFoundError } from "../../src/application/control-plane.ts";
-import { findCommand, listCommands, satisfiesRole } from "../../src/cli/commands.ts";
+import { findCommand, listCommands, runCommand, satisfiesRole } from "../../src/cli/commands.ts";
 import { createApiHandler, resolveRoute } from "../../src/http/api.ts";
 import { buildOpenApiDocument, listOperations, minimumRole, type DocumentedOperation } from "../../src/http/openapi.ts";
 import { createInMemoryAdapters } from "../../src/infrastructure/in-memory.ts";
@@ -16,6 +16,8 @@ import { authorize, ROLES } from "../../src/security/http-authorization.ts";
  */
 const NOT_OVER_HTTP: Readonly<Record<string, string>> = {
   migrate: "the serving runtime has no migrate capability on purpose, so an HTTP administrator cannot turn this process's database role into a schema-changing one",
+  backup: "the serving runtime is not given the repositories, so this cannot read the credential store's document out through a port",
+  restore: "the same, in the other direction: it writes revisions and audit entries past every rule the control plane enforces",
 };
 
 const document = buildOpenApiDocument();
@@ -96,9 +98,17 @@ describe("the OpenAPI document describes the routes that exist", () => {
     for (const name of Object.keys(NOT_OVER_HTTP)) {
       assert.ok(findCommand(name), `${name} is excused from the document but is not a command`);
     }
-    // `migrate` is excused because the serving runtime cannot run it. If a route
-    // ever appears for it, the excuse stops being true and this says so.
-    await assert.rejects(resolveRoute("POST", "/api/v1/migrate", {}), NotFoundError);
+    // Each is excused because the serving runtime cannot run it. If a route
+    // ever appears for one, the excuse stops being true and this says so.
+    for (const path of ["/api/v1/migrate", "/api/v1/backup", "/api/v1/restore"]) {
+      await assert.rejects(resolveRoute("POST", path, {}), NotFoundError, `${path} now has a route`);
+    }
+    // And the excuse itself: a runtime built the way the server builds one has
+    // no repositories, so the command refuses rather than relying on the role.
+    await assert.rejects(
+      runCommand({ runtime: {}, actor: "test", role: "admin" }, "backup", {}),
+      /command line only/u,
+    );
   });
 });
 

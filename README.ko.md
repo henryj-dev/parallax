@@ -338,9 +338,27 @@ Cloudflare의 로컬 도메인 fallback 목록을, 프로필이 이미 쥔 자�
 |---|---|
 | `config check` | 이 프로세스의 기동을 막을 것을 **기동하지 않고** 보고 |
 | `migrate` | 데이터베이스 스키마 적용, 재실행해도 안전 |
+| `backup` | 이 저장소가 가진 전부를 문서 하나로 내보낸다 |
+| `restore` | 그 문서를 **빈** 저장소로 읽어 들인다. 백엔드는 어느 쪽이든 |
 | `openapi` | 이 컨트롤 플레인 자신의 OpenAPI 기술을 출력 |
 
 </details>
+
+`backup` 과 `restore` 에는 HTTP 경로가 없고 생길 수도 없다 — 서빙 런타임에는 이
+둘이 쓰는 리포지터리 자체가 주어지지 않는다. 백엔드 사이를 옮기는 방법이기도
+하다. 두 저장소가 같은 인터페이스를 구현하고, 문서는 그 인터페이스만 말한다:
+
+```bash
+PARALLAX_STATE_FILE=./data/state.json parallax backup --json > parallax-backup.json
+DATABASE_URL=postgres://… parallax migrate
+DATABASE_URL=postgres://… parallax restore < parallax-backup.json
+```
+
+⚠️ 이 문서는 **상태 파일만큼 민감하다** — 상태 파일의 사본이기 때문이다. 자격증명
+저장소의 암호문이 그대로 들어간다. `PARALLAX_CREDENTIAL_MASTER_KEY` 없이는 쓸모가
+없지만, 그렇다고 상태 파일을 두지 않을 곳에 둬도 되는 것은 아니다. `restore` 는 존
+이나 토큰이 이미 있는 저장소를 거부한다 — 병합이 아니다. 감사 id 는 저장소가
+매기므로 복원된 로그는 1부터 다시 매겨진다. 순서와 내용은 그대로다.
 
 ---
 

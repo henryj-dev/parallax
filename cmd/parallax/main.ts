@@ -71,7 +71,7 @@ async function main(): Promise<number> {
   let exitCode = 0;
   let runtime;
   try {
-    const invocation = parseInvocation(invocationArgv);
+    const invocation = await withStdinDocument(parseInvocation(invocationArgv));
     // Migrating is the one command that runs against a store it cannot read yet,
     // so it gets a connection and nothing that would read through it.
     const config = readConfig();
@@ -81,7 +81,10 @@ async function main(): Promise<number> {
       // closed. Keep a deliberately narrow local-CLI path available to repair it.
       : invocation.name === "settings set"
         ? createSettingsRecoveryRuntime(config)
-        : await createRuntime(config);
+        // The command line already acts with full rights against the store, so
+        // it is the one caller that may hold the repositories themselves. See
+        // `RuntimeOptions.exposeStores`.
+        : await createRuntime(config, { exposeStores: true });
     // The command line reaches the store directly, so it acts with full rights;
     // HTTP callers are restricted by the role their token carries.
     const result = await runCommand({ runtime, actor: actorName(), role: "admin" }, invocation.name, invocation.input);
@@ -112,6 +115,23 @@ function migrationTarget(input: Record<string, unknown>): MigrationTarget {
 }
 
 /** Records who ran the command so the audit trail is not just "system". */
+/**
+ * Lets `parallax restore < backup.json` work.
+ *
+ * A whole store does not belong on a command line -- argv has a length limit
+ * and a shell history does not need a copy of the credential document. Only
+ * this one command reads stdin, and only when the option was not given.
+ */
+async function withStdinDocument(invocation: { name: string; input: Record<string, unknown> }): Promise<{ name: string; input: Record<string, unknown> }> {
+  if (invocation.name !== "restore" || invocation.input.document !== undefined) return invocation;
+  if (process.stdin.isTTY) return invocation;
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk as Buffer));
+  const source = Buffer.concat(chunks).toString("utf8").trim();
+  if (source.length === 0) return invocation;
+  return { ...invocation, input: { ...invocation.input, document: JSON.parse(source) } };
+}
+
 function actorName(): string {
   const user = process.env.SUDO_USER || process.env.USER || process.env.USERNAME;
   return user ? `cli:${user}` : "cli";
