@@ -1,7 +1,7 @@
 import type { OidcSettings } from "../config.ts";
 import { readCookie as readCookieValue } from "../security/cookies.ts";
 import { hasSameOrigin, IDENTITY_COOKIE } from "../security/http-authorization.ts";
-import { beginAuthorization, endSessionUrl, exchangeCode, readIdentity, OidcError, type OidcConfig } from "../security/oidc.ts";
+import { beginAuthorization, createEndpointResolver, endSessionUrl, exchangeCode, readIdentity, OidcError, type OidcConfig } from "../security/oidc.ts";
 import { randomUrlSafe, signSession } from "../security/session-token.ts";
 
 /** Where the browser is sent to start and finish a sign-in. */
@@ -39,7 +39,14 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
     clientSecret: settings.clientSecret,
     redirectUri: settings.redirectUri,
     scopes: settings.scopes,
+    ...(settings.roleClaim ? { roleClaim: settings.roleClaim } : {}),
   };
+  // Asked once, on the first sign-in rather than at startup: a provider that is
+  // briefly down must not stop this process from booting, and nothing before
+  // the first login needs the answer.
+  const endpointsOf = createEndpointResolver(settings.issuer, fetchImpl, (reason) => {
+    console.warn(`parallax: the identity provider published no usable discovery document (${reason}); falling back to the {issuer}/oidc/... layout. Confirm PARALLAX_OIDC_ISSUER points at the issuer itself.`);
+  });
 
   return async (request: Request): Promise<Response | undefined> => {
     const url = new URL(request.url);
@@ -63,8 +70,8 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
     return undefined;
   };
 
-  function startLogin(url: URL): Response {
-    const { url: authorize, state, verifier } = beginAuthorization(config);
+  async function startLogin(url: URL): Promise<Response> {
+    const { url: authorize, state, verifier } = beginAuthorization(config, await endpointsOf());
     const returnTo = safeReturnPath(url.searchParams.get("next"));
     return redirect(authorize, [
       handshakeCookie(handshakeName(STATE_COOKIE, url), state, url),
@@ -98,8 +105,9 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
     }
 
     try {
-      const tokens = await exchangeCode(config, code, verifier, fetchImpl);
-      const identity = await readIdentity(config, tokens, fetchImpl);
+      const endpoints = await endpointsOf();
+      const tokens = await exchangeCode(config, endpoints, code, verifier, fetchImpl);
+      const identity = await readIdentity(config, endpoints, tokens, fetchImpl);
       const expiresAt = Math.floor(now() / 1000) + settings.sessionMaxAgeSeconds;
       const session = signSession({ subject: identity.subject, role: identity.role, expiresAt }, settings.sessionSecret);
       return redirect(returnTo, [
@@ -118,11 +126,11 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
     }
   }
 
-  function logout(request: Request, url: URL): Response {
+  async function logout(request: Request, url: URL): Promise<Response> {
     const idToken = readCookie(request.headers.get("cookie"), ID_TOKEN_COOKIE);
     const cleared = [clearedCookie(IDENTITY_COOKIE, url), clearedCookie(ID_TOKEN_COOKIE, url)];
     const returnTo = new URL("/", url).toString();
-    return redirect(endSessionUrl(config, idToken, returnTo), cleared);
+    return redirect(endSessionUrl(await endpointsOf(), idToken, returnTo), cleared);
   }
 }
 

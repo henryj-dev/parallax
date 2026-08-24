@@ -95,7 +95,7 @@ T18-b · T19 · T20 · T21 은 2026-08-24 에 「한다」로 결정되어 아�
 | 8 | T18-b | 증분 전송은 변경 저널이 필요하고, 그 저널은 T19 가 옮기는 감사와 같은 자리다 |
 | 9 | D3 | 백업 형식은 T19 가 정한 구조를 그대로 쓴다 |
 
-- [ ] **D1** · `L` · OIDC discovery — `/.well-known/openid-configuration` 에서
+- [x] **D1** · `L` · OIDC discovery — `/.well-known/openid-configuration` 에서
       엔드포인트를 읽고, 역할 클레임 이름을 환경변수로 연다
 - [ ] **T20** · `L` · EDNS 쿠키에 타임스탬프와 허용 창
 - [ ] **T21** · `L` · CNAME 체인 추적

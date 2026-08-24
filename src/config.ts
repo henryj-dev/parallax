@@ -126,6 +126,11 @@ export interface OidcSettings {
   readonly clientSecret: string;
   readonly redirectUri: string;
   readonly scopes: string;
+  /**
+   * Which claim carries a person's role here. No standard claim does, so this
+   * defaults to the one the provider it was written against uses.
+   */
+  readonly roleClaim?: string;
   /** Signs the browser session. Rotating it ends every session and nothing else. */
   readonly sessionSecret: string;
   readonly sessionMaxAgeSeconds: number;
@@ -330,6 +335,12 @@ function readOidc(environment: NodeJS.ProcessEnv): OidcSettings | undefined {
   if (Buffer.byteLength(fields.sessionSecret as string, "utf8") < 32) {
     throw new Error("PARALLAX_OIDC_SESSION_SECRET must contain at least 32 bytes");
   }
+  // A claim name, not a value: it indexes the userinfo response, so it has to
+  // be a plain identifier rather than anything that could reach a prototype.
+  const roleClaim = environment.PARALLAX_OIDC_ROLE_CLAIM?.trim();
+  if (roleClaim !== undefined && roleClaim !== "" && !/^[A-Za-z][A-Za-z0-9_:.-]{0,63}$/u.test(roleClaim)) {
+    throw new Error("PARALLAX_OIDC_ROLE_CLAIM must be a claim name: a letter followed by letters, digits, _ : . or -");
+  }
   return {
     issuer,
     clientId: fields.clientId as string,
@@ -337,6 +348,7 @@ function readOidc(environment: NodeJS.ProcessEnv): OidcSettings | undefined {
     redirectUri: fields.redirectUri as string,
     sessionSecret: fields.sessionSecret as string,
     scopes: environment.PARALLAX_OIDC_SCOPES?.trim() || "openid profile email",
+    ...(roleClaim ? { roleClaim } : {}),
     sessionMaxAgeSeconds: readSessionMaxAge(environment.PARALLAX_OIDC_SESSION_SECONDS),
   };
 }

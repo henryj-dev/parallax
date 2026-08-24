@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createIdentityHandler } from "../../src/http/identity-routes.ts";
 import { authenticate, IDENTITY_COOKIE, withIdentityProvider } from "../../src/security/http-authorization.ts";
-import { readIdentity, type OidcConfig } from "../../src/security/oidc.ts";
+import { assumedEndpoints, beginAuthorization, createEndpointResolver, discoverEndpoints, endSessionUrl, readIdentity, type OidcConfig } from "../../src/security/oidc.ts";
 import { readSession, signSession } from "../../src/security/session-token.ts";
 
 const SECRET = "identity-session-secret-at-least-32-bytes";
@@ -132,11 +132,11 @@ describe("identity sign-in", () => {
 
   it("refuses an account the provider grants no role for", async () => {
     await assert.rejects(
-      readIdentity(CONFIG, { accessToken: "t", expiresIn: 300 }, provider({ sub: "stranger" })),
+      readIdentity(CONFIG, assumedEndpoints(CONFIG.issuer), { accessToken: "t", expiresIn: 300 }, provider({ sub: "stranger" })),
       (error: Error) => {
         // Anyone in the directory can authenticate; that is not the same as
         // being someone here, and defaulting would make it the same.
-        assert.match(error.message, /no entitlement for Parallax/);
+        assert.match(error.message, /no `entitlements` granting it a role in Parallax/u);
         return true;
       },
     );
@@ -147,10 +147,10 @@ describe("identity sign-in", () => {
     // and says in its own console that neither is for authorization. A holder
     // of both and no entitlement is somebody with a job title, not a grant.
     await assert.rejects(
-      readIdentity(CONFIG, { accessToken: "t", expiresIn: 300 },
+      readIdentity(CONFIG, assumedEndpoints(CONFIG.issuer), { accessToken: "t", expiresIn: 300 },
         provider({ sub: "labelled", roles: ["admin"], groups: ["platform"], roles_label: "Administrator" })),
       (error: Error) => {
-        assert.match(error.message, /no entitlement for Parallax/);
+        assert.match(error.message, /no `entitlements` granting it a role in Parallax/u);
         return true;
       },
     );
@@ -265,5 +265,123 @@ describe("identity sign-in", () => {
       },
     }));
     assert.equal((done as Response).headers.get("location"), next);
+  });
+});
+
+/**
+ * The four endpoints, asked of the provider instead of assumed.
+ *
+ * They used to be `${issuer}/oidc/...`, which is one provider's layout and
+ * nobody else's: Keycloak, Google, Okta and Entra all differ, so configuring
+ * any of them meant filling in five variables and meeting a 404 at the first
+ * redirect. The 2026-08-22 audit reported this and the decision to fix it was
+ * taken on 2026-08-24.
+ */
+describe("OIDC discovery", () => {
+  const ISSUER = "https://idp.example.com";
+
+  function serving(document: unknown, status = 200): typeof fetch {
+    return (async (input: string | URL | Request) => {
+      assert.equal(String(input), `${ISSUER}/.well-known/openid-configuration`);
+      return new Response(JSON.stringify(document), { status, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+  }
+
+  it("takes the endpoints the provider publishes, wherever it puts them", async () => {
+    // Google is the everyday case: it issues as one host and hands its token
+    // endpoint to another, so the endpoints are not required to share an origin.
+    const endpoints = await discoverEndpoints(ISSUER, serving({
+      issuer: ISSUER,
+      authorization_endpoint: "https://idp.example.com/realms/main/protocol/openid-connect/auth",
+      token_endpoint: "https://tokens.example.net/oauth2/token",
+      userinfo_endpoint: "https://idp.example.com/realms/main/protocol/openid-connect/userinfo",
+      end_session_endpoint: "https://idp.example.com/realms/main/protocol/openid-connect/logout",
+    }));
+
+    assert.equal(endpoints.token, "https://tokens.example.net/oauth2/token");
+    const { url } = beginAuthorization(
+      { issuer: ISSUER, clientId: "c", clientSecret: "s", redirectUri: "https://p.example/cb", scopes: "openid" },
+      endpoints,
+    );
+    assert.ok(url.startsWith("https://idp.example.com/realms/main/protocol/openid-connect/auth?"), url);
+  });
+
+  it("keeps a query string the provider already put on its authorize URL", async () => {
+    const endpoints = await discoverEndpoints(ISSUER, serving({
+      authorization_endpoint: "https://idp.example.com/authorize?tenant=main",
+      token_endpoint: `${ISSUER}/token`,
+      userinfo_endpoint: `${ISSUER}/userinfo`,
+    }));
+    const { url } = beginAuthorization(
+      { issuer: ISSUER, clientId: "c", clientSecret: "s", redirectUri: "https://p.example/cb", scopes: "openid" },
+      endpoints,
+    );
+    assert.match(url, /\?tenant=main&response_type=code/u);
+  });
+
+  it("refuses an endpoint it would not have been willing to talk to", async () => {
+    await assert.rejects(discoverEndpoints(ISSUER, serving({
+      authorization_endpoint: "http://idp.example.com/authorize",
+      token_endpoint: `${ISSUER}/token`,
+      userinfo_endpoint: `${ISSUER}/userinfo`,
+    })), /not an https URL/u);
+  });
+
+  it("sends the browser home when the provider offers no way to end its session", async () => {
+    const endpoints = await discoverEndpoints(ISSUER, serving({
+      authorization_endpoint: `${ISSUER}/authorize`,
+      token_endpoint: `${ISSUER}/token`,
+      userinfo_endpoint: `${ISSUER}/userinfo`,
+    }));
+    assert.equal(endpoints.endSession, undefined);
+    // A 404 on the way out of a logout that did clear the local cookie is worse
+    // than simply landing where the redirect was going.
+    assert.equal(endSessionUrl(endpoints, "id-token", "https://portal.example/"), "https://portal.example/");
+  });
+
+  /**
+   * ⚠️ The fallback is not a shim for a hypothetical. It is the layout the
+   * deployment running today is configured against, and removing it in the same
+   * change that adds discovery would turn a compatibility fix into an outage.
+   */
+  it("falls back to the layout it used to assume, and says that it did", async () => {
+    const reasons: string[] = [];
+    const resolve = createEndpointResolver(ISSUER, serving({}, 404), (reason) => reasons.push(reason));
+
+    assert.deepEqual(await resolve(), assumedEndpoints(ISSUER));
+    assert.equal(reasons.length, 1);
+    assert.match(reasons[0] ?? "", /no discovery document \(404\)/u);
+  });
+
+  it("asks once when it succeeds, and again after it fails", async () => {
+    let asked = 0;
+    const flaky = (async () => {
+      asked += 1;
+      if (asked === 1) return new Response("nope", { status: 503 });
+      return new Response(JSON.stringify({
+        authorization_endpoint: `${ISSUER}/a`, token_endpoint: `${ISSUER}/t`, userinfo_endpoint: `${ISSUER}/u`,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const resolve = createEndpointResolver(ISSUER, flaky);
+
+    assert.deepEqual(await resolve(), assumedEndpoints(ISSUER), "the first attempt fell back");
+    assert.equal((await resolve()).authorization, `${ISSUER}/a`, "and the next one asked again");
+    await resolve();
+    assert.equal(asked, 2, "once it has an answer it stops asking");
+  });
+
+  it("reads the role from the claim the deployment names", async () => {
+    const userinfo = (async () => new Response(
+      JSON.stringify({ sub: "person", "parallax/role": ["editor"], entitlements: ["admin"] }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )) as unknown as typeof fetch;
+    const config: OidcConfig = {
+      issuer: ISSUER, clientId: "c", clientSecret: "s", redirectUri: "https://p.example/cb",
+      scopes: "openid", roleClaim: "parallax/role",
+    };
+
+    const identity = await readIdentity(config, assumedEndpoints(ISSUER), { accessToken: "t", expiresIn: 300 }, userinfo);
+
+    assert.equal(identity.role, "editor", "the named claim, not the default one beside it");
   });
 });
