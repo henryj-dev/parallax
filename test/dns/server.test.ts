@@ -165,6 +165,45 @@ function askOverTcp(port: number, message: Buffer, split = false, host = "127.0.
 }
 
 /**
+ * Every message the server sends for one query, not just the first.
+ *
+ * A transfer spans messages, so a reader that stops at the first frame sees a
+ * zone with a SOA and nothing else -- which is indistinguishable from a working
+ * transfer of an empty zone. The connection close is what ends the sequence.
+ */
+function askAllOverTcp(port: number, message: Buffer, host = "127.0.0.1"): Promise<Buffer[]> {
+  const framed = Buffer.concat([Buffer.alloc(2), message]);
+  framed.writeUInt16BE(message.length, 0);
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, host, () => socket.write(framed));
+    const messages: Buffer[] = [];
+    let buffered = Buffer.alloc(0);
+    socket.on("data", (chunk: Buffer) => {
+      buffered = Buffer.concat([buffered, chunk]);
+      for (;;) {
+        if (buffered.length < 2) return;
+        const size = buffered.readUInt16BE(0);
+        if (buffered.length < size + 2) return;
+        messages.push(Buffer.from(buffered.subarray(2, size + 2)));
+        buffered = buffered.subarray(size + 2);
+      }
+    });
+    // The server keeps the connection open for more queries, so the reader
+    // decides when a transfer is done: the last message repeats the SOA.
+    const finished = setInterval(() => {
+      const last = messages.at(-1);
+      if (messages.length > 0 && last && readAnswers(last).at(-1)?.type === TYPE.SOA) {
+        clearInterval(finished);
+        socket.destroy();
+        resolve(messages);
+      }
+    }, 5);
+    finished.unref?.();
+    socket.on("error", (error) => { clearInterval(finished); reject(error); });
+  });
+}
+
+/**
  * A datagram socket already holding its port, and the port it took.
  *
  * Asking for a free port and then binding it is two steps with a gap, and the
@@ -373,21 +412,23 @@ describe("DNS server", () => {
    * A zone whose wire form outgrows the frame that has to carry it.
    *
    * DNS-over-TCP prefixes each message with a uint16 length, so 65535 bytes is
-   * the ceiling the transport imposes -- and AXFR here puts the whole zone in
-   * one message. The framing used to write that length unconditionally,
-   * `writeUInt16BE` threw, and the `.catch()` beside it destroyed the socket:
+   * the ceiling the transport imposes. This listener used to put the whole zone
+   * in one message: the framing wrote that length unconditionally,
+   * `writeUInt16BE` threw, and the `.catch()` beside it destroyed the socket --
    * the secondary received **zero bytes** and nothing was logged or counted.
    *
-   * ⚠️ This asserts the failure is *reported*, not that the transfer works.
-   * Splitting AXFR across messages is T18; until then a zone this size cannot
-   * be transferred, and the point of this test is that it says so out loud.
+   * ⚠️ This test asserted SERVFAIL when the interim fix only made the failure
+   * audible. It now asserts the transfer, because AXFR is defined to span
+   * messages and does. The SERVFAIL path still exists for a reply that is *not*
+   * a transfer and does not fit, which the case below covers.
    */
-  it("answers SERVFAIL and reports it when a zone will not fit one TCP message", async () => {
+  it("carries a zone too large for one message across several", async () => {
     const unanswerable: { zone: string; name: string; reason: string }[] = [];
+    const size = 2_500;
     const huge: ServedZone = {
       name: "example.com",
       serial: 1,
-      records: Array.from({ length: 2_500 }, (_unused, index) => ({
+      records: Array.from({ length: size }, (_unused, index) => ({
         name: `host-with-a-longish-label-${index}`, type: "A" as const, content: "203.0.113.5", ttl: 300,
       })),
     };
@@ -397,11 +438,40 @@ describe("DNS server", () => {
       onUnanswerable: (detail) => unanswerable.push(detail),
     });
 
-    const reply = await askOverTcp(port, buildQuery("example.com", TYPE.AXFR));
+    const messages = await askAllOverTcp(port, buildQuery("example.com", TYPE.AXFR));
 
-    assert.equal(rcodeOf(reply), RCODE.SERVFAIL, "an answer, rather than a dropped connection");
-    assert.equal(unanswerable.length, 1, "and the reason exists somewhere");
-    assert.equal(unanswerable[0]?.zone, "example.com");
+    assert.ok(messages.length > 1, `a zone this size needs more than one message, got ${messages.length}`);
+    assert.deepEqual(unanswerable, [], "nothing failed");
+    for (const reply of messages) {
+      assert.equal(rcodeOf(reply), RCODE.NOERROR);
+      assert.ok(reply.length <= 65_535, "every message fits the frame that carries it");
+    }
+
+    // The shape a receiver relies on: SOA first, SOA last, every record once.
+    const answers = messages.flatMap((reply) => readAnswers(reply));
+    assert.equal(answers[0]?.type, TYPE.SOA);
+    assert.equal(answers.at(-1)?.type, TYPE.SOA);
+    assert.equal(answers.filter((record) => record.type === TYPE.A).length, size, "no record lost or repeated");
+    assert.equal(new Set(answers.filter((record) => record.type === TYPE.A).map((record) => record.name)).size, size);
+  });
+
+  it("still answers SERVFAIL for an oversized reply that is not a transfer", async () => {
+    // Only a transfer may span messages. Anything else that will not fit has
+    // to say so rather than being silently cut in half.
+    const unanswerable: { zone: string; name: string; reason: string }[] = [];
+    const wide: ServedZone = {
+      name: "example.com",
+      serial: 1,
+      records: Array.from({ length: 2_000 }, (_unused, index) => ({
+        name: "big", type: "TXT" as const, content: `${index}`.padStart(200, "x"), ttl: 300,
+      })),
+    };
+    const { port } = await start({ zones: () => [wide], onUnanswerable: (detail) => unanswerable.push(detail) });
+
+    const reply = await askOverTcp(port, buildQuery("big.example.com", TYPE.TXT));
+
+    assert.equal(rcodeOf(reply), RCODE.SERVFAIL);
+    assert.equal(unanswerable.length, 1);
     assert.match(unanswerable[0]?.reason ?? "", /cannot exceed 65535/u);
   });
 

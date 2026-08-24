@@ -8,7 +8,7 @@ import { DEFAULT_SOA_TIMERS, encodeRdata, encodeSoa, rrType, type SoaTimers } fr
 import {
   CLASS_ANY, CLASS_IN, MAX_EDNS_VERSION, MAX_RDATA_BYTES, MAX_TCP_MESSAGE_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
   isResponseToQuery, opcodeOf, readQuery, writeName, writeReply, writeTruncatedReply,
-  type ParsedQuery, type ResourceRecord,
+  type ParsedQuery, type ReplyParts, type ResourceRecord,
 } from "./wire.ts";
 
 /** One zone's answers, as the control plane computed them. */
@@ -170,13 +170,17 @@ export function createDnsServer(options: DnsServerOptions): {
   const tcpSockets = new Set<TcpSocket>();
   let activeForwards = 0;
 
-  async function respond(message: Buffer, overTcp: boolean, clientAddress: string): Promise<Buffer | undefined> {
+  /**
+   * The messages to send back, in order. Almost always one -- AXFR is the
+   * exception, and the reason this is a list rather than a buffer.
+   */
+  async function respond(message: Buffer, overTcp: boolean, clientAddress: string): Promise<Buffer[]> {
     let query;
     try {
       query = readQuery(message);
     } catch (error) {
       // Not answerable and not worth a reply that quotes it back.
-      if (error instanceof WireFormatError) return undefined;
+      if (error instanceof WireFormatError) return [];
       throw error;
     }
     const verdict = cookies.evaluate(query.cookie, clientAddress);
@@ -184,12 +188,12 @@ export function createDnsServer(options: DnsServerOptions): {
     // client that is unproven now becomes proven on its next query.
     const cookie = verdict.kind === "absent" || verdict.kind === "malformed" ? undefined : verdict.reply;
     /** A reply with no records in it, carrying whatever cookie is owed. */
-    const answer = (rcode: number): Buffer => writeReply(
+    const answer = (rcode: number): Buffer[] => [writeReply(
       { query, rcode, authoritative: false, ...(cookie ? { cookie } : {}) },
       Number.MAX_SAFE_INTEGER,
-    );
+    )];
 
-    const relay = async (): Promise<Buffer> => {
+    const relay = async (): Promise<Buffer[]> => {
       if (activeForwards >= maxConcurrentForwards) return answer(RCODE.SERVFAIL);
       activeForwards += 1;
       let forwarded: Buffer | undefined;
@@ -200,7 +204,7 @@ export function createDnsServer(options: DnsServerOptions): {
       }
       // A relayed answer is the upstream's bytes, cookie and all. Ours would be
       // about a conversation the client is not having with us.
-      return forwarded ?? answer(RCODE.SERVFAIL);
+      return forwarded ? [forwarded] : answer(RCODE.SERVFAIL);
     };
 
     // Anything that is not a standard query. UPDATE, NOTIFY and STATUS all
@@ -220,7 +224,7 @@ export function createDnsServer(options: DnsServerOptions): {
     // shown it can receive an answer does not get a large one. TC costs the
     // client one TCP retry and costs a spoofed victim nothing.
     if (requireCookie && !overTcp && verdict.kind !== "proven") {
-      return writeTruncatedReply({ query, rcode: RCODE.NOERROR, authoritative: false, ...(cookie ? { cookie } : {}) });
+      return [writeTruncatedReply({ query, rcode: RCODE.NOERROR, authoritative: false, ...(cookie ? { cookie } : {}) })];
     }
     if (query.question.type === TYPE.AXFR
       && (!overTcp || !cidrsContain(transferAllow, clientAddress))) {
@@ -276,19 +280,23 @@ export function createDnsServer(options: DnsServerOptions): {
       // received **zero bytes** and nothing here said why. SERVFAIL is an
       // answer, and it is small.
       //
-      // ⚠️ This does not make a large zone transferable. AXFR is meant to span
-      // several messages (RFC 5936) and this build puts the whole zone in one;
-      // until that changes, a zone past this size cannot be transferred at all.
-      // The difference this makes is that it now says so.
       if (overTcp && reply.length > MAX_TCP_MESSAGE_BYTES) {
+        // A transfer is allowed to span messages, and is the only thing here
+        // that is (RFC 5936 §2.2). Everything else has to fit one, so a reply
+        // that does not is answered SERVFAIL and reported -- loudly, because
+        // the alternative is a query that vanishes.
+        if (query.question.type === TYPE.AXFR) {
+          const split = splitTransfer(parts, MAX_TCP_MESSAGE_BYTES);
+          if (split) return split;
+        }
         options.onUnanswerable?.({
           zone: zone.name,
           name: query.question.name,
           reason: `reply is ${reply.length} bytes and a DNS-over-TCP message cannot exceed ${MAX_TCP_MESSAGE_BYTES}`,
         });
-        return writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: true, ...(cookie ? { cookie } : {}) }, budget);
+        return [writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: true, ...(cookie ? { cookie } : {}) }, budget)];
       }
-      return reply;
+      return [reply];
     } catch (error) {
       // Everything that knows which record it was has already run. Whatever is
       // left -- a name that will not re-encode, a type this build cannot write
@@ -302,9 +310,9 @@ export function createDnsServer(options: DnsServerOptions): {
         reason: error instanceof Error ? error.message : "unknown error",
       });
       try {
-        return writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: true, ...(cookie ? { cookie } : {}) }, budget);
+        return [writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: true, ...(cookie ? { cookie } : {}) }, budget)];
       } catch {
-        return undefined;
+        return [];
       }
     }
   }
@@ -336,7 +344,9 @@ export function createDnsServer(options: DnsServerOptions): {
   function attachUdp(udp: Socket): void {
     udp.on("message", (message, remote) => {
       if (!rateLimiter.allow(remote.address)) return;
-      void respond(message, false, remote.address).then((reply) => {
+      void respond(message, false, remote.address).then(([reply]) => {
+        // Only a transfer ever produces more than one, and a transfer never
+        // reaches here: AXFR over UDP is refused before an answer is built.
         if (reply) udp.send(reply, remote.port, remote.address);
       }).catch(() => undefined);
     });
@@ -362,12 +372,13 @@ export function createDnsServer(options: DnsServerOptions): {
       const handleMessage = (message: Buffer): void => {
         const clientAddress = socket.remoteAddress;
         if (!clientAddress || !rateLimiter.allow(clientAddress)) return;
-        void respond(message, true, clientAddress).then((reply) => {
-          if (!reply) return;
-          const framed = Buffer.alloc(2 + reply.length);
-          framed.writeUInt16BE(reply.length, 0);
-          reply.copy(framed, 2);
-          socket.write(framed);
+        void respond(message, true, clientAddress).then((replies) => {
+          for (const reply of replies) {
+            const framed = Buffer.alloc(2 + reply.length);
+            framed.writeUInt16BE(reply.length, 0);
+            reply.copy(framed, 2);
+            socket.write(framed);
+          }
         }).catch(() => socket.destroy());
       };
       socket.on("close", () => {
@@ -697,6 +708,54 @@ function answerFromZone(
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
+}
+
+/**
+ * A zone transfer spread across as many messages as it takes.
+ *
+ * AXFR is defined to span messages (RFC 5936 §2.2) and this listener used to
+ * put the whole zone in one. Past 65535 bytes the TCP length prefix cannot
+ * describe it, so a large zone could not be transferred at all -- measured at
+ * 2,500 A records, the secondary received zero bytes.
+ *
+ * The rules a receiver relies on are that the first message opens with the
+ * zone's SOA and the last closes with it, and that every record arrives exactly
+ * once in between. `answerFromZone` already produced the sequence in that
+ * shape, so this only decides where to cut: greedily, by the size each record
+ * takes on the wire, which is the same arithmetic `writeRecord` performs.
+ *
+ * Returns `undefined` when even one record will not fit a message on its own.
+ * Nothing can carry that, and the caller says so rather than emitting a frame
+ * the transport will reject.
+ */
+function splitTransfer(parts: ReplyParts, budget: number): Buffer[] | undefined {
+  const answers = parts.answers ?? [];
+  if (answers.length === 0) return undefined;
+  // What a message costs before any answer goes into it: header, question and
+  // -- when the client sent one -- the OPT record.
+  const overhead = writeReply({ ...parts, answers: [], authority: [] }, Number.MAX_SAFE_INTEGER).length;
+
+  const messages: Buffer[] = [];
+  let batch: ResourceRecord[] = [];
+  let size = overhead;
+  const flush = (): void => {
+    if (batch.length === 0) return;
+    messages.push(writeReply({ ...parts, answers: batch, authority: [] }, Number.MAX_SAFE_INTEGER));
+    batch = [];
+    size = overhead;
+  };
+  for (const record of answers) {
+    const cost = writeName(record.name).length + 10 + record.data.length;
+    if (overhead + cost > budget) return undefined;
+    if (batch.length > 0 && size + cost > budget) flush();
+    batch.push(record);
+    size += cost;
+  }
+  flush();
+  // Belt and braces: the arithmetic above should make this impossible, and a
+  // frame over the limit would throw at the length prefix rather than fail
+  // visibly here.
+  return messages.every((entry) => entry.length <= budget) ? messages : undefined;
 }
 
 /**
