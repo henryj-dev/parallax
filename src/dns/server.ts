@@ -3,6 +3,7 @@ import { lookup } from "node:dns/promises";
 import { connect, createServer, isIP, type Server, type Socket as TcpSocket } from "node:net";
 import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
+import { dnsAnswered, dnsForwardSeconds } from "../observability/signals.ts";
 import { createDnsCookies } from "./cookies.ts";
 import { DEFAULT_SOA_TIMERS, encodeRdata, encodeSoa, rrType, type SoaTimers } from "./rdata.ts";
 import {
@@ -201,10 +202,15 @@ export function createDnsServer(options: DnsServerOptions): {
       if (activeForwards >= maxConcurrentForwards) return answer(RCODE.SERVFAIL);
       activeForwards += 1;
       let forwarded: Buffer | undefined;
+      const startedAt = performance.now();
       try {
         forwarded = await forward(message, query, forwardTo, forwardTimeoutMs, overTcp, resolveForwardHost);
       } finally {
         activeForwards -= 1;
+        // Timed whether or not an upstream answered: a run of timeouts is
+        // exactly the shape this is here to make visible, and leaving the
+        // failures out would flatter the number.
+        dnsForwardSeconds((performance.now() - startedAt) / 1000, { outcome: forwarded ? "answered" : "failed" });
       }
       // A relayed answer is the upstream's bytes, cookie and all. Ours would be
       // about a conversation the client is not having with us.
@@ -345,10 +351,25 @@ export function createDnsServer(options: DnsServerOptions): {
     ]);
   };
 
+  /**
+   * The rcode of a reply, counted as it leaves.
+   *
+   * Read back off the assembled bytes rather than threaded down from wherever
+   * the decision was made: there are a dozen places that decide an rcode and
+   * exactly two that send one, so this counts where it cannot be forgotten.
+   */
+  const counted = (replies: Buffer[]): Buffer[] => {
+    // A transfer is one answer spread over several messages; counting each
+    // frame would make one AXFR look like a hundred queries.
+    const first = replies[0];
+    if (first && first.length >= 12) dnsAnswered({ rcode: rcodeName(first.readUInt16BE(2) & 0xf) });
+    return replies;
+  };
+
   function attachUdp(udp: Socket): void {
     udp.on("message", (message, remote) => {
       if (!rateLimiter.allow(remote.address)) return;
-      void respond(message, false, remote.address).then(([reply]) => {
+      void respond(message, false, remote.address).then(counted).then(([reply]) => {
         // Only a transfer ever produces more than one, and a transfer never
         // reaches here: AXFR over UDP is refused before an answer is built.
         if (reply) udp.send(reply, remote.port, remote.address);
@@ -376,7 +397,7 @@ export function createDnsServer(options: DnsServerOptions): {
       const handleMessage = (message: Buffer): void => {
         const clientAddress = socket.remoteAddress;
         if (!clientAddress || !rateLimiter.allow(clientAddress)) return;
-        void respond(message, true, clientAddress).then((replies) => {
+        void respond(message, true, clientAddress).then(counted).then((replies) => {
           for (const reply of replies) {
             const framed = Buffer.alloc(2 + reply.length);
             framed.writeUInt16BE(reply.length, 0);
@@ -769,6 +790,12 @@ function chaseAlias(
     target = next.content.replace(/\.$/u, "").toLowerCase();
   }
   return chased;
+}
+
+/** A small fixed label set, so the counter cannot grow a series per query. */
+function rcodeName(rcode: number): string {
+  for (const [name, value] of Object.entries(RCODE)) if (value === rcode) return name.toLowerCase();
+  return `rcode${rcode}`;
 }
 
 function message(error: unknown): string {

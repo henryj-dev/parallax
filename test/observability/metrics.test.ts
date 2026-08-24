@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { counter, gauge, render, resetMetrics } from "../../src/observability/metrics.ts";
+import { counter, gauge, histogram, render, resetMetrics } from "../../src/observability/metrics.ts";
 
 afterEach(() => { resetMetrics(); });
 
@@ -85,5 +85,57 @@ describe("the metrics a deployment can alert on", () => {
 
     bump();
     assert.match(render(), /^parallax_test_survivor_total 1$/mu, "and the same function re-declares it");
+  });
+});
+
+/**
+ * A counter says how often and a gauge says what it is now. Neither answers
+ * "is this slower than it was", which is the question a latency has -- and it
+ * is the question nobody could ask of this deployment at all.
+ */
+describe("histograms", () => {
+  it("reports cumulative buckets, a sum and a count", () => {
+    const observe = histogram("parallax_test_seconds", "Test.", [0.1, 1]);
+    observe(0.05);
+    observe(0.5);
+    observe(5);
+
+    const text = render();
+    assert.match(text, /^# TYPE parallax_test_seconds histogram$/mu);
+    assert.match(text, /^parallax_test_seconds_bucket\{le="0.1"\} 1$/mu);
+    assert.match(text, /^parallax_test_seconds_bucket\{le="1"\} 2$/mu, "cumulative, so 0.05 counts here too");
+    assert.match(text, /^parallax_test_seconds_bucket\{le="\+Inf"\} 3$/mu);
+    assert.match(text, /^parallax_test_seconds_sum 5.55$/mu);
+    assert.match(text, /^parallax_test_seconds_count 3$/mu);
+  });
+
+  it("keeps a label set apart and puts `le` beside it, not over it", () => {
+    const observe = histogram("parallax_test_labelled_seconds", "Test.", [1]);
+    observe(0.5, { outcome: "answered" });
+    observe(2, { outcome: "failed" });
+
+    const text = render();
+    assert.match(text, /^parallax_test_labelled_seconds_bucket\{outcome="answered",le="1"\} 1$/mu);
+    assert.match(text, /^parallax_test_labelled_seconds_bucket\{outcome="failed",le="1"\} 0$/mu);
+    assert.match(text, /^parallax_test_labelled_seconds_count\{outcome="failed"\} 1$/mu);
+  });
+
+  it("sorts the buckets it was given, so the output is monotonic either way", () => {
+    const observe = histogram("parallax_test_unsorted_seconds", "Test.", [1, 0.1]);
+    observe(0.5);
+    const lines = render().split("\n").filter((line) => line.startsWith("parallax_test_unsorted_seconds_bucket"));
+    assert.deepEqual(lines, [
+      'parallax_test_unsorted_seconds_bucket{le="0.1"} 0',
+      'parallax_test_unsorted_seconds_bucket{le="1"} 1',
+      'parallax_test_unsorted_seconds_bucket{le="+Inf"} 1',
+    ]);
+  });
+
+  it("survives a reset the same way a counter does", () => {
+    const observe = histogram("parallax_test_reset_seconds", "Test.", [1]);
+    observe(0.5);
+    resetMetrics();
+    observe(0.5);
+    assert.match(render(), /^parallax_test_reset_seconds_count 1$/mu);
   });
 });

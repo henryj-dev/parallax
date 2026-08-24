@@ -30,8 +30,16 @@ interface Gauge {
   readonly read: () => number | undefined;
 }
 
+interface Histogram {
+  readonly help: string;
+  readonly buckets: readonly number[];
+  /** Label set to per-bucket counts, the total, and how many were observed. */
+  readonly values: Map<string, { counts: number[]; sum: number; count: number }>;
+}
+
 const counters = new Map<string, Counter>();
 const gauges = new Map<string, Gauge>();
+const histograms = new Map<string, Histogram>();
 
 /**
  * Declares a counter. Repeated declarations are the same counter.
@@ -82,6 +90,50 @@ export function gauge(name: string, help: string, read: () => number | undefined
   gauges.set(name, { help, read });
 }
 
+/**
+ * Declares a histogram: how long something took, in buckets.
+ *
+ * A counter says how often and a gauge says what it is now; neither answers
+ * "is this slower than it was", which is the question a latency has. The
+ * buckets are given rather than derived, because the useful boundaries are a
+ * fact about the thing being measured -- a forwarded DNS query and an HTTP
+ * request do not share a scale.
+ *
+ * The rule above still holds: a small fixed label set, and no zone names,
+ * record names or client addresses.
+ */
+export function histogram(
+  name: string,
+  help: string,
+  buckets: readonly number[],
+): (value: number, labels?: Record<string, string>) => void {
+  registerHistogram(name, help, buckets);
+  return (value, labels) => {
+    const metric = registerHistogram(name, help, buckets);
+    const key = labelKey(labels);
+    const observed = metric.values.get(key)
+      ?? { counts: Array.from({ length: metric.buckets.length }, () => 0), sum: 0, count: 0 };
+    for (const [index, bound] of metric.buckets.entries()) {
+      if (value <= bound) observed.counts[index] = (observed.counts[index] ?? 0) + 1;
+    }
+    observed.sum += value;
+    observed.count += 1;
+    metric.values.set(key, observed);
+  };
+}
+
+function registerHistogram(name: string, help: string, buckets: readonly number[]): Histogram {
+  const existing = histograms.get(name);
+  if (existing) return existing;
+  const created: Histogram = {
+    help,
+    buckets: [...buckets].sort((left, right) => left - right),
+    values: new Map(),
+  };
+  histograms.set(name, created);
+  return created;
+}
+
 /** The Prometheus text exposition format, version 0.0.4. */
 export function render(): string {
   const lines: string[] = [];
@@ -100,13 +152,32 @@ export function render(): string {
     if (value === undefined) continue;
     lines.push(`# HELP ${name} ${metric.help}`, `# TYPE ${name} gauge`, `${name} ${value}`);
   }
+  for (const [name, metric] of [...histograms].sort(([left], [right]) => left.localeCompare(right))) {
+    lines.push(`# HELP ${name} ${metric.help}`, `# TYPE ${name} histogram`);
+    for (const [labels, observed] of [...metric.values].sort(([left], [right]) => left.localeCompare(right))) {
+      // Prometheus buckets are cumulative and `+Inf` must equal the count.
+      for (const [index, bound] of metric.buckets.entries()) {
+        lines.push(`${name}_bucket${withLabel(labels, "le", String(bound))} ${observed.counts[index] ?? 0}`);
+      }
+      lines.push(`${name}_bucket${withLabel(labels, "le", "+Inf")} ${observed.count}`);
+      lines.push(`${name}_sum${labels} ${observed.sum}`);
+      lines.push(`${name}_count${labels} ${observed.count}`);
+    }
+  }
   return `${lines.join("\n")}\n`;
+}
+
+/** Adds one label to an already-rendered label set, keeping the format valid. */
+function withLabel(labels: string, name: string, value: string): string {
+  const pair = `${name}="${escapeLabel(value)}"`;
+  return labels === "" ? `{${pair}}` : `${labels.slice(0, -1)},${pair}}`;
 }
 
 /** Test-only: forget every declared metric so one case cannot see another's. */
 export function resetMetrics(): void {
   counters.clear();
   gauges.clear();
+  histograms.clear();
 }
 
 function labelKey(labels: Record<string, string> | undefined): string {

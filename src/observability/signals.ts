@@ -1,4 +1,4 @@
-import { counter } from "./metrics.ts";
+import { counter, histogram } from "./metrics.ts";
 
 /**
  * The counters this process keeps, declared in one place.
@@ -69,4 +69,43 @@ export const notifyFailed = counter(
 export const certificateReloadFailed = counter(
   "parallax_tls_certificate_reload_failures_total",
   "Certificate reloads that failed, leaving the previous certificate in use.",
+);
+
+/**
+ * What the listener answered, by rcode.
+ *
+ * The counters above are failure-only by design, and that rule earns its keep:
+ * each one is the sole warning of something. This is the one number they
+ * cannot supply between them -- without a denominator, "three SERVFAILs" is
+ * either a catastrophe or a rounding error and nothing says which. The rcode
+ * label is a small fixed set, and it carries no name and no address.
+ */
+export const dnsAnswered = counter(
+  "parallax_dns_answers_total",
+  "Replies the DNS listener sent, by response code.",
+);
+
+/**
+ * How long a relayed query took, including the upstream that answered it.
+ *
+ * Buckets in seconds, chosen around the 4s default forward timeout: a resolver
+ * is fast or it is a problem, and the interesting boundaries are all below it.
+ */
+export const dnsForwardSeconds = histogram(
+  "parallax_dns_forward_seconds",
+  "Time to relay one query to an upstream and read its answer.",
+  [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4],
+);
+
+/** Answers the API sent, by status. A bounded set: this code chooses them all. */
+export const httpAnswered = counter(
+  "parallax_http_responses_total",
+  "HTTP responses the API sent, by status code.",
+);
+
+/** Buckets around what a control-plane call should cost, provider calls aside. */
+export const httpSeconds = histogram(
+  "parallax_http_request_seconds",
+  "Time to answer one API request.",
+  [0.005, 0.025, 0.1, 0.5, 1, 2.5, 5, 10, 30],
 );

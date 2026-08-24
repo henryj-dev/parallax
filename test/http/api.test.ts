@@ -633,3 +633,90 @@ describe("HTTP API", () => {
     assert.equal((await api(request("/api/v1/zones/example.com/revisions/99"))).status, 404);
   });
 });
+
+/**
+ * One line per request, and a name to find it by.
+ *
+ * The audit trail records who changed what, and there was no way to get from an
+ * entry back to the call that produced it -- or to see a call that changed
+ * nothing at all. Failures reached `console.error("request failed")` and that
+ * was the whole of it.
+ */
+describe("the access log and the request id", () => {
+  function call(headers: Record<string, string>, token?: string): Promise<{
+    logged: Record<string, unknown> | undefined;
+    responseHeaders: Record<string, string>;
+  }> {
+    const adapters = createInMemoryAdapters();
+    const handler = createNodeHandler(
+      { controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) },
+      token ? { enabled: true, tokens: [{ token, role: "admin", subject: "alice" }] } : undefined,
+    );
+    const incoming = Readable.from([]) as IncomingMessage;
+    incoming.method = "GET";
+    incoming.url = "/api/v1/zones";
+    incoming.headers = { host: "localhost", ...headers };
+
+    const responseHeaders: Record<string, string> = {};
+    const response = {
+      set statusCode(_code: number) { /* not under test here */ },
+      setHeader(name: string, value: string) { responseHeaders[name] = value; return this; },
+      end() { return this; },
+    } as unknown as ServerResponse;
+
+    const printed: string[] = [];
+    const original = console.log;
+    console.log = (line: string) => { printed.push(line); };
+    return handler(incoming, response).then(() => {
+      console.log = original;
+      const last = printed.at(-1);
+      return { logged: last ? JSON.parse(last) as Record<string, unknown> : undefined, responseHeaders };
+    }, (error: unknown) => {
+      console.log = original;
+      throw error;
+    });
+  }
+
+  it("names every request and echoes a name the caller already had", async () => {
+    const generated = await call({});
+    assert.match(String(generated.responseHeaders["x-request-id"]), /^[0-9a-f-]{36}$/u);
+    assert.equal(generated.logged?.requestId, generated.responseHeaders["x-request-id"]);
+
+    // A proxy that already correlates across services keeps its own name.
+    const supplied = await call({ "x-request-id": "edge-7f3a.2" });
+    assert.equal(supplied.responseHeaders["x-request-id"], "edge-7f3a.2");
+    assert.equal(supplied.logged?.requestId, "edge-7f3a.2");
+  });
+
+  it("refuses a request id that would not be safe to write down", async () => {
+    // It lands in a log line and a response header, so anything outside a plain
+    // token is replaced rather than sanitized. A newline cannot get this far --
+    // Node refuses it at the header itself -- but quotes and spaces are legal
+    // in a header value and would still end up in somebody's log field.
+    const quoted = await call({ "x-request-id": 'a" {"status":200}' });
+    assert.match(String(quoted.responseHeaders["x-request-id"]), /^[0-9a-f-]{36}$/u);
+
+    // And an unbounded one, which is a log line nobody can read.
+    const long = await call({ "x-request-id": "x".repeat(400) });
+    assert.match(String(long.responseHeaders["x-request-id"]), /^[0-9a-f-]{36}$/u);
+  });
+
+  it("records the method, path, status and how long it took", async () => {
+    const { logged } = await call({});
+    assert.equal(logged?.method, "GET");
+    assert.equal(logged?.path, "/api/v1/zones");
+    assert.equal(logged?.status, 200);
+    assert.equal(typeof logged?.durationMs, "number");
+  });
+
+  it("names the actor the security layer proved, and never the one a client claims", async () => {
+    const token = "a".repeat(43);
+    const authenticated = await call({ authorization: `Bearer ${token}` }, token);
+    assert.equal(authenticated.logged?.actor, "alice");
+
+    // The header exists on the way in and is replaced on the way through. If
+    // this line read it from the request, a caller could write any name here.
+    const forged = await call({ authorization: `Bearer ${token}`, "x-parallax-actor": "somebody-else" }, token);
+    assert.equal(forged.logged?.actor, "alice");
+  });
+});

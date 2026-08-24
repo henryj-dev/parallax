@@ -250,6 +250,11 @@ export function createAuthorizedHandler(
       return authenticationError(403);
     }
     if (!authorize(principal, request)) return authenticationError(403);
+    // Recorded against the request the transport still holds, as well as the
+    // one handed onward. The transport needs it to name the actor in its access
+    // log, and the header it would otherwise read is client-supplied on the way
+    // in -- reading that would let a caller write anybody's name into the log.
+    resolvedPrincipals.set(request, principal);
     return next(withActor(request, principal.subject, principal));
   };
 }

@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { performance } from "node:perf_hooks";
 import { ConflictError, NotFoundError, ProviderManagedRecordError } from "../application/control-plane.ts";
 import { CredentialNotFoundError, CredentialTestError } from "../application/cloudflare-credentials.ts";
 import { ZoneLookupForbiddenError, ZoneNotFoundError } from "../adapters/cloudflare.ts";
@@ -15,6 +17,7 @@ import {
   type CommandRuntime,
 } from "../cli/commands.ts";
 import { DomainValidationError } from "../domain/dns.ts";
+import { httpAnswered, httpSeconds } from "../observability/signals.ts";
 import { CredentialInUseError, CredentialValidationError } from "../security/credential-store.ts";
 import { authenticate, createAuthorizedHandler, resolvedPrincipal, setTrustedClientKey, type Role, type SecurityConfig } from "../security/http-authorization.ts";
 
@@ -41,6 +44,24 @@ export function createApiHandler(
   // audit actor, so a client can never choose the identity of its own changes.
   const authorized = createAuthorizedHandler(security ?? { enabled: false, tokens: [] }, handler);
   return async (request) => authorized(request);
+}
+
+/**
+ * A name for one request, so a line in a log and an entry in the audit trail
+ * can be tied to the same call.
+ *
+ * A caller may supply its own -- a proxy or a client that already correlates
+ * across services -- and it is echoed rather than replaced, because the point
+ * is to agree with whatever is upstream. It is also untrusted input that ends
+ * up in a log line and a response header, so it is accepted only in a shape
+ * that can do neither of those any harm, and generated otherwise.
+ */
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/u;
+
+function requestIdFor(request: IncomingMessage): string {
+  const supplied = request.headers["x-request-id"];
+  const value = Array.isArray(supplied) ? supplied[0] : supplied;
+  return value !== undefined && REQUEST_ID_PATTERN.test(value) ? value : randomUUID();
 }
 
 export interface NodeHandlerOptions {
@@ -83,9 +104,34 @@ export function createNodeHandler(
     // layer. The transport attaches out-of-band metadata to this Request; only
     // a configured trusted proxy may supply the forwarded client address.
     setTrustedClientKey(fetchRequest, requestClientKey(request, options));
+    const requestId = requestIdFor(request);
+    const startedAt = performance.now();
     const result = await handler(fetchRequest);
+    const seconds = (performance.now() - startedAt) / 1000;
     response.statusCode = result.status;
     result.headers.forEach((value, name) => response.setHeader(name, value));
+    response.setHeader("x-request-id", requestId);
+    httpAnswered({ status: String(result.status) });
+    httpSeconds(seconds);
+    // One line per request, on stdout, as JSON.
+    //
+    // The audit trail records who changed what, and until now there was no way
+    // to get from an entry back to the call that produced it -- or to see a
+    // call that changed nothing at all. The actor is the principal the security
+    // layer proved, never the header a client can send -- that one arrives on
+    // the way in and would let a caller write anybody's name into this log.
+    //
+    // Only the path: a query string can carry a filter somebody typed, and this
+    // line is going to a log aggregator.
+    console.log(JSON.stringify({
+      at: new Date().toISOString(),
+      requestId,
+      method: request.method ?? "",
+      path: new URL(fetchRequest.url).pathname,
+      status: result.status,
+      durationMs: Math.round(seconds * 1000),
+      actor: resolvedPrincipal(fetchRequest)?.subject,
+    }));
     const payload = Buffer.from(await result.arrayBuffer());
     if (request.method === "HEAD") {
       response.setHeader("content-length", String(payload.byteLength));
