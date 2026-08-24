@@ -17,69 +17,91 @@ import {
 } from "../../src/runtime.ts";
 import { MIGRATION_TARGETS, type MigrationTarget } from "../../src/infrastructure/migrations.ts";
 
-const argv = process.argv.slice(2);
+/**
+ * Every path returns its exit code rather than calling `process.exit()`.
+ *
+ * `process.exit()` discards whatever stdout has not flushed, and stdout is
+ * only synchronous when it is a file. Piped -- `| jq`, `| tee`, a CI step --
+ * it is asynchronous, so exiting truncated the output at the pipe buffer:
+ * measured at exactly 65536 bytes of a 219142-byte `openapi --json`, with the
+ * exit code still 0. A parser downstream reported a broken document; anything
+ * that did not parse simply used half the data.
+ *
+ * Setting `process.exitCode` instead lets the process leave when the event
+ * loop empties, which is after the write drains. Nothing here keeps the loop
+ * alive on purpose: the runtime's pool is closed in the `finally`, and the
+ * refresh timers belong to the server, not to this.
+ *
+ * The exits also carried control flow -- this is a module body, so `return`
+ * was not available at the top level. That is why there is a function now.
+ */
+process.exitCode = await main();
 
-if (argv.length === 0 || argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h") {
-  process.stdout.write(`${usage(argv.slice(1).join(" ") || undefined)}\n`);
-  process.exit(0);
-}
+async function main(): Promise<number> {
+  const argv = process.argv.slice(2);
 
-// Answered before anything is built, because that is the point: it reports
-// what would stop the serving process from starting, without starting it and
-// without opening the store. A deployment that only finds out at rollout finds
-// out when the pod it replaced is already gone.
-if (argv[0] === "config" && argv[1] === "check") {
+  if (argv.length === 0 || argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h") {
+    process.stdout.write(`${usage(argv.slice(1).join(" ") || undefined)}\n`);
+    return 0;
+  }
+
+  // Answered before anything is built, because that is the point: it reports
+  // what would stop the serving process from starting, without starting it and
+  // without opening the store. A deployment that only finds out at rollout finds
+  // out when the pod it replaced is already gone.
+  if (argv[0] === "config" && argv[1] === "check") {
+    try {
+      const checked = checkConfig();
+      const wantsJsonHere = argv.includes("--json");
+      process.stdout.write(wantsJsonHere
+        ? `${JSON.stringify(checked, null, 2)}\n`
+        : `${Object.entries(checked).map(([key, value]) => `${key}=${String(value)}`).join(" ")}\n`);
+      return 0;
+    } catch (error) {
+      process.stderr.write(`parallax: ${error instanceof Error ? error.message : String(error)}\n`);
+      return 78;
+    }
+  }
+
+  // `--json` is a presentation choice, not a command option, so it is removed
+  // before the invocation is parsed.
+  const wantsJson = argv.includes("--json");
+  const invocationArgv = argv.filter((token) => token !== "--json");
+
+  let exitCode = 0;
+  let runtime;
   try {
-    const checked = checkConfig();
-    const wantsJsonHere = argv.includes("--json");
-    process.stdout.write(wantsJsonHere
-      ? `${JSON.stringify(checked, null, 2)}\n`
-      : `${Object.entries(checked).map(([key, value]) => `${key}=${String(value)}`).join(" ")}\n`);
-    process.exit(0);
+    const invocation = parseInvocation(invocationArgv);
+    // Migrating is the one command that runs against a store it cannot read yet,
+    // so it gets a connection and nothing that would read through it.
+    const config = readConfig();
+    runtime = invocation.name === "migrate"
+      ? createMigrationRuntime(config, migrationTarget(invocation.input))
+      // A machine-specific stored setting can make the serving runtime fail
+      // closed. Keep a deliberately narrow local-CLI path available to repair it.
+      : invocation.name === "settings set"
+        ? createSettingsRecoveryRuntime(config)
+        : await createRuntime(config);
+    // The command line reaches the store directly, so it acts with full rights;
+    // HTTP callers are restricted by the role their token carries.
+    const result = await runCommand({ runtime, actor: actorName(), role: "admin" }, invocation.name, invocation.input);
+    // Warnings go to stderr and the result to stdout, so a caveat is visible even
+    // when the output is being piped somewhere -- and, more to the point, so it is
+    // not a line buried in the middle of the data it is a caveat about.
+    for (const warning of warningsOf(result)) process.stderr.write(`parallax: warning: ${warning}\n`);
+    process.stdout.write(wantsJson ? `${JSON.stringify(result, null, 2)}\n` : `${format(result)}\n`);
   } catch (error) {
-    process.stderr.write(`parallax: ${error instanceof Error ? error.message : String(error)}\n`);
-    process.exit(78);
+    exitCode = exitCodeFor(error);
+    process.stderr.write(`${describe(error)}\n`);
+    if (error instanceof UsageError || error instanceof UnknownCommandError) {
+      process.stderr.write(`\n${usage()}\n`);
+    }
+  } finally {
+    await runtime?.close();
   }
+
+  return exitCode;
 }
-
-// `--json` is a presentation choice, not a command option, so it is removed
-// before the invocation is parsed.
-const wantsJson = argv.includes("--json");
-const invocationArgv = argv.filter((token) => token !== "--json");
-
-let exitCode = 0;
-let runtime;
-try {
-  const invocation = parseInvocation(invocationArgv);
-  // Migrating is the one command that runs against a store it cannot read yet,
-  // so it gets a connection and nothing that would read through it.
-  const config = readConfig();
-  runtime = invocation.name === "migrate"
-    ? createMigrationRuntime(config, migrationTarget(invocation.input))
-    // A machine-specific stored setting can make the serving runtime fail
-    // closed. Keep a deliberately narrow local-CLI path available to repair it.
-    : invocation.name === "settings set"
-      ? createSettingsRecoveryRuntime(config)
-      : await createRuntime(config);
-  // The command line reaches the store directly, so it acts with full rights;
-  // HTTP callers are restricted by the role their token carries.
-  const result = await runCommand({ runtime, actor: actorName(), role: "admin" }, invocation.name, invocation.input);
-  // Warnings go to stderr and the result to stdout, so a caveat is visible even
-  // when the output is being piped somewhere -- and, more to the point, so it is
-  // not a line buried in the middle of the data it is a caveat about.
-  for (const warning of warningsOf(result)) process.stderr.write(`parallax: warning: ${warning}\n`);
-  process.stdout.write(wantsJson ? `${JSON.stringify(result, null, 2)}\n` : `${format(result)}\n`);
-} catch (error) {
-  exitCode = exitCodeFor(error);
-  process.stderr.write(`${describe(error)}\n`);
-  if (error instanceof UsageError || error instanceof UnknownCommandError) {
-    process.stderr.write(`\n${usage()}\n`);
-  }
-} finally {
-  await runtime?.close();
-}
-
-process.exit(exitCode);
 
 function migrationTarget(input: Record<string, unknown>): MigrationTarget {
   const target = input.target === undefined ? "parallax" : String(input.target);

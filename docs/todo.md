@@ -16,7 +16,7 @@
 
 ## 1단계 — 값싼 셋
 
-- [ ] **T1** · `XS` · CLI 출력이 파이프에서 64 KiB 에 잘리는 것 — `cmd/parallax/main.ts:82`
+- [x] **T1** · `XS` · CLI 출력이 파이프에서 64 KiB 에 잘리는 것 — `cmd/parallax/main.ts:82`
       <br>⚠️ 고친 뒤 이벤트 루프가 정말 비는지 실제 실행으로 확인할 것
 - [ ] **T2** · `XS` · Postgres 풀에 `max` · `connectionTimeoutMillis` — `src/infrastructure/postgres.ts:48`
       <br>⚠️ `pnpm verify:postgres`(Docker 필요)를 돌릴 수 있는 자리에서 할 것
