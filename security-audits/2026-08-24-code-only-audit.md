@@ -210,11 +210,18 @@ sandbox의 `EPERM`은 코드 실패가 아니라 테스트 프로세스가 `127.
   주장하는지**를 검사(`src/security/oidc.ts:96`)한 뒤에 쓰는 값이고, 실패하면
   구성된 issuer 자신의 오리진으로 되돌아간다.
 
-📌 **그래서 실제로 남는 규범적 이득은 하나다:** userinfo 응답의 `sub` 가 ID token 의
-`sub` 와 같은지 대조하는 것(OIDC Core §5.3.2, **MUST**). `readIdentity`
-(`src/security/oidc.ts:244`)는 userinfo 의 `sub` 만 읽고 대조하지 않는다. 권고 문장은
-「ID token 을 전면 검증하라」가 아니라 **「nonce 를 발행하고, `sub` 를 대조하라」**로
-바뀌어야 한다.
+📌 **따라서 권고는 두 층으로 나뉘어야 한다.** UserInfo 응답의 `sub` 가 ID token 의
+`sub` 와 같은지 대조하는 것은 OIDC Core §5.3.2의 **MUST** 이며, `readIdentity`
+(`src/security/oidc.ts:244`)는 userinfo 의 `sub` 만 읽고 대조하지 않는다. 동시에
+Token Endpoint 응답의 ID token에 대한 `iss`, `aud`, `exp` 및 서명/TLS 검증도 별도
+검증 절차로 남는다. Token Endpoint에서 직접 TLS로 받은 경우 TLS 서버 검증으로
+서명 검증을 대체할 수 있다는 예외가, `iss`·`aud`·만료 검증까지 없애 주는 것은
+아니다([OIDC Core §3.1.3.5–§3.1.3.7](https://openid.net/specs/openid-connect-core-1_0-18.html)).
+
+권고 문장은 **「ID token의 필수 claim을 검증하고, `sub`를 UserInfo와 대조한다.
+`nonce`를 사용할 경우에는 authorization request에서 먼저 발행하고 callback에서
+검증한다」**로 바뀌어야 한다. 현재 구현은 `nonce`를 발행하지 않으므로 nonce만
+검증할 수는 없다.
 
 ## 정정 3 · 실패 제한 우회는 얻는 것이 없다
 
@@ -288,7 +295,7 @@ OIDC 세션의 즉시 폐기 불가는 **2026-08-22 리포트 L6 의 절반**이
 (`src/security/http-authorization.ts:327`)는 그것을 그대로 `parallax_session=` 에
 넣는다. 따라서:
 
-- **쿠키 유출 = 장기 API 자격증명 유출이다.** 세션 값이 아니라 토큰이므로
+- **`parallax_session` 쿠키 유출 = 장기 API 자격증명 유출이다.** 세션 값이 아니라 토큰이므로
   `Authorization: Bearer` 로 그대로 재사용된다.
 - `DELETE` 세션은 쿠키만 지우고(`:296`) **토큰을 폐기하지 않는다.** 로그아웃이
   자격증명을 회수하지 않는다.
@@ -300,6 +307,12 @@ OIDC 세션의 즉시 폐기 불가는 **2026-08-22 리포트 L6 의 절반**이
 `HttpOnly` · `SameSite=Strict` · (https 일 때) `Secure` 가 붙으므로 스크립트로는
 읽히지 않는다 — 그래서 High 가 아니라 이 자리에 있다. 이것은 2026-08-22 L6 의
 나머지 절반이며 `docs/todo.md` 「여전히 남은 것」에 **열린 채로** 있다.
+
+⚠️ 여기서 OIDC의 `parallax_identity` 쿠키와 혼동하면 안 된다. `parallax_identity`는
+raw bearer token이 아니라 HMAC으로 서명된 자체 포함 세션이고, `parallax_oidc_id`는
+IdP logout에 사용할 raw ID token을 별도 쿠키에 보관한다. 후자는 Parallax API
+자격증명은 아니지만 민감한 인증 결과이며, logout 시 IdP endpoint로 전달되므로
+별도 취급이 필요하다(`src/http/identity-routes.ts:115-118`, `:129-133`).
 
 ## 추가 2 · 세션 쿠키에 `__Host-` 접두사가 없다
 
@@ -321,8 +334,10 @@ OIDC 세션의 즉시 폐기 불가는 **2026-08-22 리포트 L6 의 절반**이
 그게 그 규칙의 목적이다 — **피해자는 자기가 지울 수 없는 쿠키 때문에 영구 로그아웃**
 된다. 가용성 쪽으로 넘어간 것이지 사라진 것이 아니다.
 
-**고치는 값은 싸다:** `handshakeName` 과 똑같은 조건부(https 일 때만)를 두 세션
-쿠키에도 적용하면, 브라우저가 애초에 그 쿠키를 받지 않는다.
+**고치는 값은 싸다:** `handshakeName` 과 똑같은 조건부(https 일 때만)를
+`parallax_identity`, `parallax_session`, `parallax_oidc_id` 및 그 삭제 쿠키에도
+일관되게 적용하면, 브라우저가 애초에 Domain cookie를 받지 않는다. 단, plain-HTTP
+loopback 배포에서는 `__Host-`를 사용할 수 없다는 기존 조건은 유지된다.
 
 ## 추가 3 · 존별(zone-level) RBAC 이 없다
 
@@ -346,6 +361,12 @@ OIDC 세션의 즉시 폐기 불가는 **2026-08-22 리포트 L6 의 절반**이
 `rateLimiter.allow()` 가 UDP·TCP 양쪽 입구에 있고(`:543` · `:572`),
 `maxConcurrentForwards`(기본 256)를 넘으면 SERVFAIL 로 떨어진다(`:356`).
 
+다만 이를 단순한 open resolver로 부르면 안 된다. 릴레이 대상은 이 서버가 제공하는
+존 안의 provider-placeholder 이름으로 제한된다. 반대로 `forwardTo`가 내부 DNS를
+가리키는 배포에서는 이 예외 경로가 외부 클라이언트에게 제한적인 내부 DNS 질의 및
+응답 관측면을 제공할 수 있으므로, 내부 이름 노출·SSRF 유사 위협 모델과 허용할
+placeholder 범위를 배포 보안 가정에 명시해야 한다.
+
 ## 추가 5 · 저장소의 열린 대장을 참조하지 않았다
 
 `docs/todo.md` 「여전히 남은 것」이 **미검증 둘**을 명시한다:
@@ -362,6 +383,11 @@ OIDC 세션의 즉시 폐기 불가는 **2026-08-22 리포트 L6 의 절반**이
 `setLiveMessage`(`public/app.js:64`)의 **`textContent`** 로 들어가므로 sink 가 아니다.
 바뀌는 것은 결론이 아니라 **그 결론이 정적 읽기로 내려졌다는 표시**다.
 
+또한 `parallax_oidc_id`에 저장되는 raw ID token은 `parallax_session`과 달리 API
+Bearer credential은 아니지만, 인증 결과를 담은 민감한 값이다. 쿠키 탈취 시 직접적인
+API 권한 상승으로 단정할 수는 없으나, ID token claim 노출과 logout 흐름 악용 가능성을
+별도로 평가해야 한다.
+
 ## 추가 6 · 본문이 저평가한 방어들
 
 정정의 반대 방향이다. 아래는 실재하는데 §확인된 방어 상태에서 빠졌다.
@@ -373,6 +399,7 @@ OIDC 세션의 즉시 폐기 불가는 **2026-08-22 리포트 L6 의 절반**이
 | `src/dns/wire.ts:266` | 압축 포인터가 **엄격히 뒤로만** 이동하도록 강제 | 낯선 사람이 보낸 이름 하나로 무한 루프가 나는 고전적 자리 |
 | `src/index.ts:408` | **HSTS** `max-age=31536000; includeSubDomains` | §포털 XSS 가 헤더 넷만 세고 이건 뺐다 |
 | `src/http/api.ts:745` | 본문 상한이 `content-length` **와** 스트리밍 누적 양쪽에서 강제 | 선언 길이만 믿는 구현과 다르다 |
+| `src/http/identity-routes.ts:115-118` | OIDC identity session과 raw ID token cookie가 별도 값으로 발행됨 | bearer cookie, 서명 세션, IdP logout token을 같은 “세션 쿠키”로 묶으면 영향이 과장되거나 누락된다 |
 
 ## 추가 7 · 점검 축 자체가 빠진 것
 
@@ -399,13 +426,15 @@ OIDC 세션의 즉시 폐기 불가는 **2026-08-22 리포트 L6 의 절반**이
 | --- | --- | --- | --- |
 | 1 | **세션 쿠키의 평문 bearer 토큰** (§추가 1) | 없음 | 쿠키 유출이 곧 자격증명 유출이고, 로그아웃이 회수하지 않는다 |
 | 2 | **세션 쿠키 `__Host-` 접두사** (§추가 2) | 없음 | 값이 싸고, 코드가 이미 다른 쿠키에 그 논거를 적어 놨다 |
-| 3 | OIDC **nonce 발행 + `sub` 대조** | 1위 (「ID token 전면 검증」) | 검증 항목이 틀렸다. §정정 2 |
+| 3 | OIDC **ID token claim 검증 + `sub` 대조**, nonce는 발행 후 검증 | 1위 (「ID token 전면 검증」) | 전면 검증을 축소할 수는 없고, 현재 빠진 검증 항목을 정확히 나눈다. §정정 2 |
 | 4 | DNS forwarding **upstream 별 관측성** | 4위 | 근거만 「간헐 실패」에서 「관측 불가」로 교체 |
-| 5 | 존별 RBAC — **사람의 결정 대기** (§추가 3) | 없음 | 결함이 아니라 미결 설계. 열린 채로 둔다 |
+| 5 | 존별 RBAC — **사람의 결정 대기** (§추가 3) | 없음 | 결함이라기보다 미결 설계. 열린 채로 둔다 |
+| 6 | provider-placeholder forwarding의 **내부 DNS 노출 가정** | 없음 | 의도된 릴레이지만 `forwardTo`가 내부망일 때 별도 위협 모델이 필요하다 |
 | — | OIDC 세션 즉시 폐기 | 3위 | 보류 결정이 유효하다. §정정 4 |
 | — | 인증 실패 제한 분산화 | 2위 | 보안 항목이 아니라 관측성 항목. §정정 3 |
 
 그리고 **결론에 한정이 붙어야 한다:** 여기서 말하는 「Critical/High 없음」은
 `src/` · `public/` · `test/` 를 **정적으로 읽은 범위**에 대한 것이고, 의존성
 (`pnpm audit` 미실행) · 포털 실조작 · Cloudflare 실경로 · §추가 7 의 네 축은
-**점검되지 않았다.**
+**점검되지 않았다.** OIDC ID token의 표준 claim 검증도 현재 구현에 없으므로,
+그 권고를 반영하기 전까지 OIDC 보안 결론에는 이 제한을 함께 붙여야 한다.
