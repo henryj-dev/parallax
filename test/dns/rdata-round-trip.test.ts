@@ -26,8 +26,14 @@ const CANONICAL: Readonly<Record<RecordType, readonly string[]>> = {
     "::1",
     "::",
     "2001:db8:0:1:1:1:1:1",
-    // The longest run collapses, and only one run does (RFC 5952).
-    "2001:0:0:1::1".replace("0:0:", "0:0:"),
+    // Two runs of zeros, and only the longer one collapses (RFC 5952 §4.2.3):
+    // `2001:0:0:1:0:0:0:1` keeps its pair written out and hides its triple.
+    "2001:0:0:1::1",
+    // ⚠️ Two runs of the *same* length, where the rule is that the first one
+    // is shortened. A mutation check found nothing covering this -- with every
+    // other sample, picking the last equal-length run gives the same answer.
+    "2001::1:0:0:1:1",
+    "1::2:0:0:3:4",
     "fe80::1234:5678:9abc:def0",
   ],
   CNAME: ["origin.example.net", "a.very.long.name.example.com"],

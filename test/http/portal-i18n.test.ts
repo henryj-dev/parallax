@@ -320,7 +320,11 @@ describe("portal store", () => {
     for (const locale of Object.keys(messages)) {
       const translated = createTranslator(locale)(abandoned.key, abandoned.values);
       assert.notEqual(translated, abandoned.key, locale);
-      assert.match(translated, /example\.com\/external/u, locale);
+      // The value itself, not a pattern that looks like it: this is what the
+      // notice is for, and asserting the actual value means a change to the
+      // fixture cannot leave the check passing against a stale string.
+      assert.ok(translated.includes(abandoned.values.targets as string),
+        `${locale} does not name the abandoned target`);
     }
   });
 

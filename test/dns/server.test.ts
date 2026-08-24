@@ -863,8 +863,11 @@ describe("DNS server", () => {
       assert.deepEqual(serialsAndNames(reply), [
         "SOA:2", "SOA:1", "gone.example.com", "SOA:2", "added.example.com", "SOA:2",
       ]);
-      // The record that did not change is not in it -- which is the point.
-      assert.ok(!serialsAndNames(reply).includes("keep.example.com"));
+      // The record that did not change is not in it -- which is the point, and
+      // the reason the answer above is shorter than the zone.
+      const answered = readAnswers(reply).map((record) => record.name);
+      assert.equal(answered.filter((name) => name === "keep.example.com").length, 0,
+        "the unchanged record was sent, so this was a full transfer wearing a difference's shape");
     });
 
     /**
