@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { decodeRdata } from "../../src/dns/rdata-decode.ts";
+import { decodeRdata, UnrepresentableRdata } from "../../src/dns/rdata-decode.ts";
 import { encodeRdata } from "../../src/dns/rdata.ts";
 import { RECORD_TYPES, type RecordType } from "../../src/domain/dns.ts";
 
@@ -127,6 +127,101 @@ describe("presentation format survives the wire and back", () => {
   });
 
   /**
+   * Bytes this encoder would never have produced.
+   *
+   * 🔑 The round-trip table above **cannot** catch any of these, and not by
+   * accident: every sample there starts life in `encodeRdata`, so the table
+   * enforces exactly the assumption the decoder was making -- that the bytes
+   * came from us. Each case below was a silent content change against a real
+   * foreign zone, and every one of them passed the round-trip suite.
+   *
+   * The rule they all serve: emit only text `encodeRdata` takes back to the
+   * same bytes, and where that is impossible say so rather than emit something
+   * that looks like content.
+   */
+  describe("rdata this encoder would never have written", () => {
+    const framed = (rdata: Buffer): { message: Buffer; length: number } =>
+      ({ message: Buffer.concat([Buffer.alloc(12), rdata]), length: rdata.length });
+    const decode = (type: RecordType, rdata: Buffer): string => {
+      const { message, length } = framed(rdata);
+      return decodeRdata(type, message, 12, length);
+    };
+    const refuses = (type: RecordType, rdata: Buffer, pattern: RegExp, what: string): void => {
+      assert.throws(() => decode(type, rdata), (error: Error) => {
+        assert.ok(error instanceof UnrepresentableRdata, `${what} should be unrepresentable, not malformed: ${error.name}`);
+        assert.match(error.message, pattern);
+        return true;
+      }, what);
+    };
+
+    it("keeps two TXT strings from becoming one", () => {
+      // RFC 6763 §6.1 gives each string its own meaning, so joining them read a
+      // DNS-SD record's two keys as one.
+      refuses("TXT", Buffer.from([3, 97, 98, 99, 3, 100, 101, 102]), /several strings/u, "two short TXT strings");
+      // ...while the encoder's own 255-byte split still joins, because that is
+      // one value the wire had to cut.
+      const long = encodeRdata("TXT", "d".repeat(300));
+      assert.equal(decode("TXT", long), "d".repeat(300));
+    });
+
+    it("refuses octets that are not text rather than replacing them", () => {
+      // `toString("utf8")` turns an invalid byte into U+FFFD, and one byte into
+      // three -- so the content changed and a 255-byte string grew past what
+      // the encoder can write.
+      refuses("TXT", Buffer.from([3, 0x61, 0xff, 0x62]), /not text/u, "a TXT with a raw octet");
+      refuses("HINFO", Buffer.from([2, 0x61, 0xff, 2, 0x62, 0x63]), /not text/u, "a HINFO with a raw octet");
+      refuses("URI", Buffer.from([0, 10, 0, 1, 0xff]), /not text/u, "a URI with a raw octet");
+    });
+
+    it("refuses a CAA tag that is not letters and digits", () => {
+      // A tag with a space decoded to text the encoder read as two fields and
+      // silently shortened by a byte.
+      refuses("CAA", Buffer.concat([Buffer.of(0, 6), Buffer.from("issue "), Buffer.from("x")]), /letters and digits/u, "a CAA tag with a space");
+      refuses("CAA", Buffer.concat([Buffer.of(0, 0), Buffer.from("v")]), /letters and digits/u, "an empty CAA tag");
+    });
+
+    it("refuses a comma inside one SVCB value, which would split it in two", () => {
+      // RFC 9460 Appendix A.1 escapes it as `\,`; this encoder splits on commas
+      // without reading escapes, so one alpn-id `h2,3` became two.
+      const alpn = Buffer.concat([Buffer.of(0, 1, 0), Buffer.of(0, 1, 0, 5), Buffer.of(4, 0x68, 0x32, 0x2c, 0x33)]);
+      refuses("SVCB", alpn, /comma inside/u, "an alpn-id containing a comma");
+    });
+
+    it("ignores parameters on the alias form instead of failing the transfer", () => {
+      // RFC 9460 §2.4.2: "recipients MUST ignore any SvcParams that are
+      // present". Refusing them failed a whole zone transfer over one record in
+      // somebody else's zone.
+      const alias = Buffer.concat([Buffer.of(0, 0, 0), Buffer.of(0, 1, 0, 3), Buffer.of(2, 0x68, 0x32)]);
+      assert.equal(decode("SVCB", alias), "0 .");
+    });
+
+    it("writes an IPv4-mapped address the way the encoder reads it back", () => {
+      // Bytes round-trip either way; text did not. An operator who wrote
+      // `::ffff:192.0.2.1` read `::ffff:c000:201` off the wire, and
+      // reconciliation saw drift on every cycle forever.
+      const mapped = Buffer.concat([Buffer.alloc(10), Buffer.of(0xff, 0xff), Buffer.of(192, 0, 2, 1)]);
+      assert.equal(decode("AAAA", mapped), "::ffff:192.0.2.1");
+      assert.deepEqual(encodeRdata("AAAA", decode("AAAA", mapped)), mapped);
+    });
+
+    it("refuses a field the encoder requires and this record leaves empty", () => {
+      refuses("SSHFP", Buffer.of(1, 1), /no data/u, "an SSHFP with no fingerprint");
+      refuses("CERT", Buffer.of(0, 1, 0, 0, 5), /no data/u, "a CERT with no certificate");
+      refuses("OPENPGPKEY", Buffer.alloc(0), /no data/u, "an empty OPENPGPKEY");
+      refuses("DS", Buffer.of(0, 1, 8, 2), /no data/u, "a DS with no digest");
+    });
+
+    it("refuses LOC values outside the ranges the format defines", () => {
+      const loc = (bytes: readonly number[]): Buffer => Buffer.concat([Buffer.from(bytes), Buffer.alloc(16 - bytes.length)]);
+      // RFC 1876 §2: each nibble is zero to nine. The encoder clamps the
+      // mantissa at 9, so anything above came back a different size.
+      refuses("LOC", loc([0, 0x1f, 0x16, 0x13]), /size outside/u, "a LOC size with a nibble above nine");
+      const far = Buffer.concat([Buffer.of(0, 0x12, 0x16, 0x13), Buffer.of(0xff, 0xff, 0xff, 0xff), Buffer.alloc(8)]);
+      refuses("LOC", far, /latitude outside/u, "a LOC latitude past the pole");
+    });
+  });
+
+  /**
    * The rules that only fire on bytes this build did not write.
    *
    * ⚠️ Added after a mutation check found them unreachable: every sample above
@@ -173,12 +268,6 @@ describe("presentation format survives the wire and back", () => {
       // it looks at anything -- so this value cannot survive the round trip.
       const { message, length } = svcb([{ key: 7, value: Buffer.from("/dns query") }]);
       assert.throws(() => decodeRdata("SVCB", message, 12, length), /whitespace/u);
-    });
-
-    it("refuses parameters on the alias form", () => {
-      const rdata = Buffer.concat([Buffer.of(0, 0), Buffer.of(0), Buffer.of(0, 1, 0, 3), Buffer.of(2), Buffer.from("h2")]);
-      const message = Buffer.concat([Buffer.alloc(12), rdata]);
-      assert.throws(() => decodeRdata("SVCB", message, 12, rdata.length), /alias form/u);
     });
 
     it("refuses a LOC version it does not understand", () => {

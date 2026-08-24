@@ -21,6 +21,18 @@ import { readName, WireFormatError } from "./wire.ts";
  * type, which is what makes the pair safe to trust.
  */
 
+/**
+ * The rdata is well formed and this control plane cannot hold it.
+ *
+ * Separate from `WireFormatError`, which says the bytes are wrong. A zone is
+ * allowed to contain records Parallax has no way to store, and the difference
+ * decides what the caller does: refuse the whole transfer, or carry on and
+ * report the one record.
+ */
+export class UnrepresentableRdata extends Error {
+  override readonly name = "UnrepresentableRdata";
+}
+
 type Decoder = (view: RdataView) => string;
 
 /** The rdata, plus the message around it, because a name in here may be a pointer. */
@@ -55,48 +67,62 @@ const DECODERS: Record<RecordType, Decoder> = {
   PTR: (view) => name(view),
   DNAME: (view) => name(view),
   TXT: (view) => {
-    // Joined, not separated: the encoder splits one value at 255 bytes, so the
-    // pieces are one string and a 420-byte DKIM record arrives in two.
+    // Joined only where the encoder would have split. It splits one value at
+    // exactly 255 bytes, so a 420-byte DKIM record arrives in two pieces and is
+    // one string -- but two *short* strings are two strings, and RFC 6763 §6.1
+    // gives each of them its own meaning. Concatenating them read a DNS-SD
+    // record's `path=/x` `port=8080` as the single key `path=/xport=8080`, and
+    // writing that back would have changed the record the zone serves.
     const parts: Buffer[] = [];
-    while (view.offset < view.end) parts.push(characterString(view));
-    return Buffer.concat(parts).toString("utf8");
+    while (view.offset < view.end) {
+      const part = characterString(view);
+      const more = view.offset < view.end;
+      if (more && part.length !== 255) {
+        throw new UnrepresentableRdata("TXT carries several strings, which this control plane stores as one value");
+      }
+      parts.push(part);
+    }
+    return text(Buffer.concat(parts), "TXT");
   },
   MX: (view) => `${uint16(view)} ${name(view)}`,
   SRV: (view) => `${uint16(view)} ${uint16(view)} ${uint16(view)} ${name(view)}`,
   CAA: (view) => {
     const flag = uint8(view);
     const tag = characterString(view).toString("ascii");
-    const value = rest(view).toString("utf8");
-    return `${flag} ${tag} ${quote(value, "CAA")}`;
+    // RFC 8659 §4.1.1: a non-zero sequence of US-ASCII letters and digits. A
+    // tag with a space in it decoded into text the encoder read as two fields
+    // and silently shortened; an empty one made it read one field too few.
+    if (!/^[A-Za-z0-9]+$/u.test(tag)) throw new UnrepresentableRdata("CAA carries a tag that is not letters and digits");
+    return `${flag} ${tag} ${quote(text(rest(view), "CAA"), "CAA")}`;
   },
   TLSA: (view) => certificateAssociation(view),
   SMIMEA: (view) => certificateAssociation(view),
-  SSHFP: (view) => `${uint8(view)} ${uint8(view)} ${rest(view).toString("hex")}`,
+  SSHFP: (view) => `${uint8(view)} ${uint8(view)} ${hex(view, "SSHFP")}`,
   URI: (view) => {
     const priority = uint16(view);
     const weight = uint16(view);
-    return `${priority} ${weight} ${quote(rest(view).toString("utf8"), "URI")}`;
+    return `${priority} ${weight} ${quote(text(rest(view), "URI"), "URI")}`;
   },
-  CERT: (view) => `${uint16(view)} ${uint16(view)} ${uint8(view)} ${rest(view).toString("base64")}`,
-  OPENPGPKEY: (view) => rest(view).toString("base64"),
+  CERT: (view) => `${uint16(view)} ${uint16(view)} ${uint8(view)} ${base64(view, "CERT")}`,
+  OPENPGPKEY: (view) => base64(view, "OPENPGPKEY"),
   HINFO: (view) => {
-    const cpu = characterString(view).toString("utf8");
-    const os = characterString(view).toString("utf8");
+    const cpu = text(characterString(view), "HINFO");
+    const os = text(characterString(view), "HINFO");
     return `${quote(cpu, "HINFO")} ${quote(os, "HINFO")}`;
   },
   NAPTR: (view) => {
     const order = uint16(view);
     const preference = uint16(view);
-    const flags = characterString(view).toString("utf8");
-    const service = characterString(view).toString("utf8");
-    const regexp = characterString(view).toString("utf8");
+    const flags = text(characterString(view), "NAPTR");
+    const service = text(characterString(view), "NAPTR");
+    const regexp = text(characterString(view), "NAPTR");
     // Quoted even when empty, because the encoder's pattern requires all three.
     return `${order} ${preference} ${quote(flags, "NAPTR")} ${quote(service, "NAPTR")} ${quote(regexp, "NAPTR")} ${name(view)}`;
   },
   SVCB: (view) => serviceBinding(view, "SVCB"),
   HTTPS: (view) => serviceBinding(view, "HTTPS"),
-  DS: (view) => `${uint16(view)} ${uint8(view)} ${uint8(view)} ${rest(view).toString("hex")}`,
-  DNSKEY: (view) => `${uint16(view)} ${uint8(view)} ${uint8(view)} ${rest(view).toString("base64")}`,
+  DS: (view) => `${uint16(view)} ${uint8(view)} ${uint8(view)} ${hex(view, "DS")}`,
+  DNSKEY: (view) => `${uint16(view)} ${uint8(view)} ${uint8(view)} ${base64(view, "DNSKEY")}`,
   LOC: (view) => location(view),
 };
 
@@ -149,7 +175,43 @@ function characterString(view: RdataView): Buffer {
 }
 
 function certificateAssociation(view: RdataView): string {
-  return `${uint8(view)} ${uint8(view)} ${uint8(view)} ${rest(view).toString("hex")}`;
+  return `${uint8(view)} ${uint8(view)} ${uint8(view)} ${hex(view, "certificate association")}`;
+}
+
+/**
+ * A trailing field the encoder requires to be there.
+ *
+ * An empty digest or key decoded to text ending in a space, which the encoder
+ * then refused for having one field too few -- so the failure arrived from the
+ * wrong layer, naming the wrong record.
+ */
+function hex(view: RdataView, type: string): string {
+  const bytes = rest(view);
+  if (bytes.length === 0) throw new UnrepresentableRdata(`${type} carries no data where the format requires some`);
+  return bytes.toString("hex");
+}
+
+function base64(view: RdataView, type: string): string {
+  const bytes = rest(view);
+  if (bytes.length === 0) throw new UnrepresentableRdata(`${type} carries no data where the format requires some`);
+  return bytes.toString("base64");
+}
+
+/**
+ * Bytes as text, only where they are text.
+ *
+ * `toString("utf8")` replaces every invalid byte with U+FFFD, and one byte
+ * becomes three -- so a character-string carrying arbitrary octets came back
+ * changed, and a 255-byte one came back too long for the encoder to write.
+ * RFC 1035 §3.3 makes these octets, not characters; the escape that would carry
+ * them (`\DDD`, §5.1) is not one this build's encoder reads.
+ */
+function text(bytes: Buffer, type: string): string {
+  const decoded = bytes.toString("utf8");
+  if (!Buffer.from(decoded, "utf8").equals(bytes)) {
+    throw new UnrepresentableRdata(`${type} carries bytes that are not text this control plane can store`);
+  }
+  return decoded;
 }
 
 // ----------------------------------------------------------------- shaping --
@@ -163,7 +225,7 @@ function certificateAssociation(view: RdataView): string {
  */
 function quote(value: string, type: string): string {
   if (/[\u0000-\u001f\u007f]/u.test(value)) {
-    throw new WireFormatError(`${type} carries a control character that presentation format cannot hold`);
+    throw new UnrepresentableRdata(`${type} carries a control character that presentation format cannot hold`);
   }
   return `"${value.replace(/(["\\])/gu, "\\$1")}"`;
 }
@@ -197,10 +259,17 @@ function formatIpv6(bytes: Buffer): string {
       runStart = -1;
     }
   }
-  const text = groups.map((group) => group.toString(16));
-  if (bestLength < 2) return text.join(":");
-  const head = text.slice(0, bestStart).join(":");
-  const tail = text.slice(bestStart + bestLength).join(":");
+  // RFC 5952 §5: an IPv4-mapped address is written with the dotted tail. The
+  // encoder accepts and expands that form, so without this an operator who
+  // wrote `::ffff:192.0.2.1` read `::ffff:c000:201` back off the wire and
+  // reconciliation saw drift on every single cycle, forever.
+  if (bytes.subarray(0, 10).every((byte) => byte === 0) && bytes.readUInt16BE(10) === 0xffff) {
+    return `::ffff:${Array.from(bytes.subarray(12)).join(".")}`;
+  }
+  const parts = groups.map((group) => group.toString(16));
+  if (bestLength < 2) return parts.join(":");
+  const head = parts.slice(0, bestStart).join(":");
+  const tail = parts.slice(bestStart + bestLength).join(":");
   return `${head}::${tail}`;
 }
 
@@ -217,10 +286,12 @@ function svcParamName(key: number): string {
 function serviceBinding(view: RdataView, type: string): string {
   const priority = uint16(view);
   const target = name(view);
-  if (priority === 0 && view.offset < view.end) {
-    // The encoder refuses parameters on the alias form, so emitting them would
-    // produce content that cannot be written back.
-    throw new WireFormatError(`${type} priority 0 is the alias form and this answer carries parameters`);
+  if (priority === 0) {
+    // RFC 9460 §2.4.2: in AliasMode "recipients MUST ignore any SvcParams that
+    // are present". Refusing them failed the whole transfer over one record in
+    // somebody else's zone, which is the opposite of what a reader should do.
+    view.offset = view.end;
+    return `${priority} ${target}`;
   }
   const parameters: string[] = [];
   let previousKey = -1;
@@ -228,7 +299,7 @@ function serviceBinding(view: RdataView, type: string): string {
     const key = uint16(view);
     // The encoder always writes them in ascending key order and refuses a
     // repeat, so an answer that is not sorted could not be written back.
-    if (key <= previousKey) throw new WireFormatError(`${type} parameters are not in ascending key order`);
+    if (key <= previousKey) throw new UnrepresentableRdata(`${type} parameters are not in ascending key order`);
     previousKey = key;
     const value = take(view, uint16(view));
     parameters.push(svcParam(key, value, type));
@@ -258,7 +329,7 @@ function svcParam(key: number, value: Buffer, type: string): string {
       entries.push(entry.toString("utf8"));
       offset += 1 + length;
     }
-    return `${label}=${unspaced(entries.join(","), label, type)}`;
+    return `${label}=${listed(entries, label, type)}`;
   }
   if (key === 3) {
     if (value.length !== 2) throw new WireFormatError(`${type} parameter ${label} is not a port`);
@@ -276,27 +347,45 @@ function svcParam(key: number, value: Buffer, type: string): string {
   }
   if (key === 5) return `${label}=${value.toString("base64")}`;
   // `dohpath` and anything written as `keyNNNNN`: the value is its bytes.
-  return `${label}=${unspaced(value.toString("utf8"), label, type)}`;
+  return `${label}=${unspaced(text(value, `${type} parameter ${label}`), label, type)}`;
 }
 
 /** The encoder splits on whitespace before it sees quotes, so this cannot hold any. */
 function unspaced(value: string, label: string, type: string): string {
   if (/\s/u.test(value)) {
-    throw new WireFormatError(`${type} parameter ${label} carries whitespace, which presentation format cannot express here`);
+    throw new UnrepresentableRdata(`${type} parameter ${label} carries whitespace, which this presentation format cannot express`);
   }
   return value;
+}
+
+/**
+ * A comma-separated list, refused when an item contains the separator.
+ *
+ * RFC 9460 Appendix A.1 escapes a comma inside an item as `\,`; this build's
+ * encoder splits on commas without reading escapes, so a single alpn-id of
+ * `h2,3` came back as the two ids `h2` and `3` -- a different record, silently.
+ */
+function listed(entries: readonly string[], label: string, type: string): string {
+  for (const entry of entries) {
+    if (entry.includes(",")) {
+      throw new UnrepresentableRdata(`${type} parameter ${label} carries a comma inside one of its values`);
+    }
+  }
+  return unspaced(entries.join(","), label, type);
 }
 
 // -------------------------------------------------------------------- LOC --
 
 function location(view: RdataView): string {
   const version = uint8(view);
-  if (version !== 0) throw new WireFormatError(`LOC version ${version} is not one this build understands`);
+  if (version !== 0) throw new UnrepresentableRdata(`LOC version ${version} is not one this build understands`);
   const size = centimetres(uint8(view));
   const horizontal = centimetres(uint8(view));
   const vertical = centimetres(uint8(view));
-  const latitude = arc(uint32(view));
-  const longitude = arc(uint32(view));
+  // RFC 1876 §3 bounds these; outside them `sexagesimal` produces degrees no
+  // reader would accept and the value is not a location.
+  const latitude = bounded(arc(uint32(view)), 90 * 3_600_000, "latitude");
+  const longitude = bounded(arc(uint32(view)), 180 * 3_600_000, "longitude");
   const altitude = (uint32(view) - 10_000_000) / 100;
   return [
     sexagesimal(latitude, "N", "S"),
@@ -305,13 +394,24 @@ function location(view: RdataView): string {
   ].join(" ");
 }
 
+function bounded(thousandths: number, limit: number, what: string): number {
+  if (Math.abs(thousandths) > limit) throw new UnrepresentableRdata(`LOC carries a ${what} outside the range the format defines`);
+  return thousandths;
+}
+
 function uint32(view: RdataView): number {
   return take(view, 4).readUInt32BE(0);
 }
 
 /** A mantissa in the high nibble, a power of ten in the low one, counting centimetres. */
 function centimetres(byte: number): number {
-  return ((byte >> 4) * 10 ** (byte & 0x0f)) / 100;
+  const mantissa = byte >> 4;
+  const exponent = byte & 0x0f;
+  // RFC 1876 §2: "a pair of four-bit unsigned integers, each ranging from zero
+  // to nine". Above nine the encoder cannot write the value back -- it clamps
+  // the mantissa at 9 -- so the record would come back a different size.
+  if (mantissa > 9 || exponent > 9) throw new UnrepresentableRdata("LOC carries a size outside the range the format defines");
+  return (mantissa * 10 ** exponent) / 100;
 }
 
 /** Thousandths of an arcsecond, offset from the midpoint the format counts from. */

@@ -32,6 +32,14 @@ export interface Rfc2136AdapterOptions {
   readonly key: TsigKey;
   readonly ownershipSecret: string;
   readonly now?: () => number;
+  /**
+   * A record in the zone this build has no way to describe.
+   *
+   * It is left alone -- never listed, so never planned against -- and said out
+   * loud, because an operator looking at a zone Parallax reports on is entitled
+   * to know which of its records Parallax cannot see.
+   */
+  readonly onUnreadable?: (detail: { zone: string; name: string; reason: string }) => void;
 }
 
 /**
@@ -52,6 +60,7 @@ export class Rfc2136ProviderAdapter implements ProviderAdapter {
   readonly #key: TsigKey;
   readonly #ownershipSecret: string;
   readonly #now: () => number;
+  readonly #onUnreadable: Rfc2136AdapterOptions["onUnreadable"];
   #nextId = 1;
 
   constructor(options: Rfc2136AdapterOptions) {
@@ -59,6 +68,7 @@ export class Rfc2136ProviderAdapter implements ProviderAdapter {
     this.#key = options.key;
     this.#ownershipSecret = options.ownershipSecret;
     this.#now = options.now ?? Date.now;
+    this.#onUnreadable = options.onUnreadable;
     // Fails here rather than at the first apply, the way the other adapters do.
     ownershipComment("validation/target", "validation", this.#ownershipSecret);
   }
@@ -71,10 +81,18 @@ export class Rfc2136ProviderAdapter implements ProviderAdapter {
     const records: ProviderRecord[] = [];
     for (const answer of answers) {
       const type = storedType(answer.type);
-      // The zone's own SOA and NS, and anything this build does not store.
-      if (type === undefined || answer.content === undefined) continue;
       const name = relativeName(answer.name, zone);
       if (name === undefined) continue;
+      // The zone's own SOA, and anything this build cannot hold. Reported
+      // rather than dropped: a listing an operator reads as complete must not
+      // quietly omit records, and a record we cannot describe is one we must
+      // never plan a change against.
+      if (type === undefined || answer.content === undefined) {
+        if (answer.unreadable !== undefined && answer.type !== TYPE.SOA && !isMarkerName(name)) {
+          this.#onUnreadable?.({ zone, name, reason: answer.unreadable });
+        }
+        continue;
+      }
       // Our own bookkeeping is not zone content, the same way Cloudflare's
       // comment field is not a record.
       if (isMarkerName(name)) continue;

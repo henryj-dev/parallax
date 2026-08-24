@@ -1,6 +1,6 @@
 import { connect } from "node:net";
 import type { RecordType } from "../domain/dns.ts";
-import { decodeRdata } from "./rdata-decode.ts";
+import { decodeRdata, UnrepresentableRdata } from "./rdata-decode.ts";
 import { readTsig, verifyTsig, type TsigKey } from "./tsig.ts";
 import {
   CLASS_IN, RCODE, TYPE, WireFormatError, readName, typeName, writeName,
@@ -32,8 +32,19 @@ export interface AnsweredRecord {
   readonly name: string;
   readonly type: number;
   readonly ttl: number;
-  /** Absent for a type this build does not store, which is not an error here. */
+  /** Absent for a record this build cannot store. `unreadable` says why. */
   readonly content?: string;
+  /**
+   * Why the rdata could not be carried, where it could not.
+   *
+   * A zone holds records Parallax has no way to store -- a type it does not
+   * know, a TXT of several strings, a character-string of raw octets. Failing
+   * the whole transfer over one of them would make this unusable against any
+   * real server; dropping it silently would make records disappear from a
+   * listing an operator reads as complete. So it is carried, empty, with the
+   * reason attached.
+   */
+  readonly unreadable?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -232,16 +243,35 @@ export function readAnswers(replies: readonly Buffer[]): AnsweredRecord[] {
       const rdataStart = offset + 10;
       if (rdataStart + length > message.length) throw new WireFormatError("a record's rdata runs past the end of the reply");
       const stored = storedType(type);
-      records.push({
-        name: owner.name,
-        type,
-        ttl,
-        ...(stored === undefined ? {} : { content: decodeRdata(stored, message, rdataStart, length) }),
-      });
+      records.push({ name: owner.name, type, ttl, ...readContent(stored, message, rdataStart, length) });
       offset = rdataStart + length;
     }
   }
   return records;
+}
+
+/**
+ * The rdata, or the reason it could not be read.
+ *
+ * ⚠️ Only `UnrepresentableRdata` is caught. That one means the bytes are fine
+ * and this control plane has nowhere to put them. A `WireFormatError` means the
+ * bytes are wrong, and swallowing it would turn a malformed answer into a
+ * shorter zone -- which is the difference between "I cannot store this" and
+ * "this is not a zone".
+ */
+function readContent(
+  stored: RecordType | undefined,
+  message: Buffer,
+  rdataStart: number,
+  length: number,
+): { content?: string; unreadable?: string } {
+  if (stored === undefined) return { unreadable: `${typeName(message.readUInt16BE(rdataStart - 10))} is not a type this control plane stores` };
+  try {
+    return { content: decodeRdata(stored, message, rdataStart, length) };
+  } catch (error) {
+    if (error instanceof UnrepresentableRdata) return { unreadable: error.message };
+    throw error;
+  }
 }
 
 /** The name this build stores a type under, or nothing where it stores none. */
