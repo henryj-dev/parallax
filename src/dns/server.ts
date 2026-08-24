@@ -536,6 +536,56 @@ async function sendNotifyDatagram(packet: Buffer, address: string, port: number)
   });
 }
 
+/**
+ * A zone's records arranged the way a query asks for them.
+ *
+ * Every lookup on the answer path was a full scan of `zone.records`, and there
+ * were three or four of them per query -- the records at the name, whether
+ * anything sits below it, the wildcard walk, and the placeholder check. Cost
+ * grew with the zone: measured over UDP, a hit went 0.104 ms at 1,000 records
+ * to 0.571 ms at 10,000, and a wildcard miss 0.187 ms to 1.638 ms.
+ *
+ * Built once per snapshot rather than per query, which is the right way round:
+ * the snapshot is rebuilt when the desired state changes, and queries arrive
+ * far more often than that. Keyed on the snapshot object, so a new snapshot
+ * simply gets a new index and the old one is collected with it -- no
+ * invalidation to get wrong.
+ */
+interface ZoneIndex {
+  /** Absolute owner name to the records at it. */
+  readonly byName: ReadonlyMap<string, ServedZone["records"]>;
+  /**
+   * Names that exist without holding anything: every ancestor of a record's
+   * owner. DNS calls these empty non-terminals, and both the negative answers
+   * and the wildcard rule turn on them.
+   */
+  readonly parents: ReadonlySet<string>;
+}
+
+const zoneIndexes = new WeakMap<ServedZone, ZoneIndex>();
+
+function indexOf(zone: ServedZone): ZoneIndex {
+  const cached = zoneIndexes.get(zone);
+  if (cached) return cached;
+  const byName = new Map<string, ServedZone["records"][number][]>();
+  const parents = new Set<string>();
+  for (const record of zone.records) {
+    const owner = absolute(record.name, zone.name);
+    const group = byName.get(owner);
+    if (group) group.push(record);
+    else byName.set(owner, [record]);
+    // Walk to the apex, marking each ancestor as a name that exists.
+    let ancestor = owner;
+    while (ancestor !== zone.name && ancestor.includes(".")) {
+      ancestor = ancestor.slice(ancestor.indexOf(".") + 1);
+      parents.add(ancestor);
+    }
+  }
+  const index: ZoneIndex = { byName, parents };
+  zoneIndexes.set(zone, index);
+  return index;
+}
+
 /** The longest zone whose apex the name sits at or under. */
 /**
  * Whether an address query for this name must be answered by the upstream.
@@ -549,9 +599,8 @@ async function sendNotifyDatagram(packet: Buffer, address: string, port: number)
  */
 function servedByProvider(zone: ServedZone, name: string, type: number): boolean {
   if (type !== TYPE.A && type !== TYPE.AAAA) return false;
-  return zone.records.some((record) => (record.type === "A" || record.type === "AAAA")
-    && absolute(record.name, zone.name) === name
-    && providerManagement(record)?.originless === true);
+  return (indexOf(zone).byName.get(name) ?? []).some((record) =>
+    (record.type === "A" || record.type === "AAAA") && providerManagement(record)?.originless === true);
 }
 
 function matchZone(zones: readonly ServedZone[], name: string): ServedZone | undefined {
@@ -605,14 +654,13 @@ function answerFromZone(
     answers.push(soa);
     return { query, rcode: RCODE.NOERROR, authoritative: true, answers };
   }
-  let atName: ServedZone["records"] = zone.records.filter((record) => absolute(record.name, zone.name) === name);
+  let atName: ServedZone["records"] = indexOf(zone).byName.get(name) ?? [];
 
   if (atName.length === 0) {
     // The name exists without holding anything of its own when something sits
     // below it, and the apex always exists. Either way the answer is empty
     // rather than NXDOMAIN, and no wildcard may cover a name that exists.
-    const exists = name === zone.name
-      || zone.records.some((record) => absolute(record.name, zone.name).endsWith(`.${name}`));
+    const exists = nameExists(zone, name);
     if (exists) return { query, rcode: RCODE.NOERROR, authoritative: true, authority: [soa] };
     const substitution = dnameSubstitution(zone, name);
     if (substitution) {
@@ -679,11 +727,8 @@ function servableRdata(type: RecordType, content: string): Buffer {
  */
 function nameExists(zone: ServedZone, name: string): boolean {
   if (name === zone.name) return true;
-  const suffix = `.${name}`;
-  return zone.records.some((record) => {
-    const owner = absolute(record.name, zone.name);
-    return owner === name || owner.endsWith(suffix);
-  });
+  const index = indexOf(zone);
+  return index.byName.has(name) || index.parents.has(name);
 }
 
 /**
@@ -710,10 +755,7 @@ function nameExists(zone: ServedZone, name: string): boolean {
 function wildcardMatch(zone: ServedZone, name: string): ServedZone["records"] {
   let parent = name.slice(name.indexOf(".") + 1);
   for (;;) {
-    if (nameExists(zone, parent)) {
-      const covering = `*.${parent}`;
-      return zone.records.filter((record) => absolute(record.name, zone.name) === covering);
-    }
+    if (nameExists(zone, parent)) return indexOf(zone).byName.get(`*.${parent}`) ?? [];
     // The apex always exists, so this is a floor rather than a guess.
     if (parent === zone.name || !parent.includes(".")) return [];
     parent = parent.slice(parent.indexOf(".") + 1);
@@ -728,7 +770,7 @@ function wildcardMatch(zone: ServedZone, name: string): ServedZone["records"] {
 function dnameSubstitution(zone: ServedZone, name: string): ResourceRecord[] | undefined {
   let parent = name.includes(".") ? name.slice(name.indexOf(".") + 1) : "";
   while (parent.length > 0) {
-    const records = zone.records.filter((record) => record.type === "DNAME" && absolute(record.name, zone.name) === parent);
+    const records = (indexOf(zone).byName.get(parent) ?? []).filter((record) => record.type === "DNAME");
     if (records.length > 0) {
       const record = records[0] as ServedZone["records"][number];
       const prefix = name.slice(0, name.length - parent.length);
