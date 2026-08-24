@@ -47,7 +47,7 @@ jobs:
           # hand it to anything the analysis subsequently runs.
           persist-credentials: false
 
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           # One language. `javascript-typescript` covers both the `src/` server
           # and the browser code under `public/`.
@@ -61,6 +61,6 @@ jobs:
       # `check.yml` already proves the project builds -- running `pnpm build`
       # again here would only add a way for this workflow to fail for a reason
       # that has nothing to do with security.
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:javascript-typescript"
