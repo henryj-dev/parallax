@@ -976,14 +976,24 @@ function chaseAlias(
     const step = matches.length > 0 ? matches : next ? [next] : [];
     if (step.length === 0) return chased;
 
+    // ⚠️ Assembled whole, then added. Pushing one at a time and returning on
+    // the first failure left half an RRset in the answer -- a three-address
+    // target whose second record would not encode answered with one address,
+    // and the resolver cached that as the whole set. The direct path already
+    // treats this as SERVFAIL for exactly that reason; the chase did not.
+    const encoded: ResourceRecord[] = [];
     for (const record of step) {
       try {
-        chased.push({ name: target, type: rrType(record.type), ttl: record.ttl, data: servableRdata(record.type, record.content) });
+        encoded.push({ name: target, type: rrType(record.type), ttl: record.ttl, data: servableRdata(record.type, record.content) });
       } catch (error) {
         onUnservable?.({ zone: zone.name, name: record.name, type: record.type, reason: message(error) });
+        // Nothing from this step, so the answer stops at the CNAME already in
+        // it -- true, and a resolver will ask again rather than believe a set
+        // that is missing a member.
         return chased;
       }
     }
+    chased.push(...encoded);
     if (matches.length > 0 || !next) return chased;
     target = next.content.replace(/\.$/u, "").toLowerCase();
   }

@@ -211,6 +211,24 @@ describe("presentation format survives the wire and back", () => {
       refuses("DS", Buffer.of(0, 1, 8, 2), /no data/u, "a DS with no digest");
     });
 
+    it("refuses a mandatory list that a receiver is entitled to reject", () => {
+      const mandatory = (bytes: readonly number[]): Buffer =>
+        Buffer.concat([Buffer.of(0, 1, 0), Buffer.of(0, 0, 0, bytes.length), Buffer.from(bytes)]);
+      // RFC 9460 §8: sorted, distinct, and never naming `mandatory` itself.
+      refuses("SVCB", mandatory([0, 3, 0, 1]), /sorted list of distinct/u, "an unsorted mandatory list");
+      refuses("SVCB", mandatory([0, 1, 0, 1]), /sorted list of distinct/u, "a repeated key");
+      refuses("SVCB", mandatory([0, 0]), /names itself/u, "mandatory naming itself");
+      refuses("SVCB", mandatory([]), /names nothing/u, "an empty mandatory list");
+    });
+
+    it("refuses a name carrying whitespace, which would shift every field after it", () => {
+      // The encoder splits on whitespace before it reads anything: loud for MX,
+      // and silent for SVCB, where it moves the parameter list along by one.
+      const label = Buffer.from("mail server");
+      const target = Buffer.concat([Buffer.of(label.length), label, Buffer.of(7), Buffer.from("example"), Buffer.of(3), Buffer.from("com"), Buffer.of(0)]);
+      refuses("MX", Buffer.concat([Buffer.of(0, 10), target]), /whitespace/u, "an MX target with a space in a label");
+    });
+
     it("refuses LOC values outside the ranges the format defines", () => {
       const loc = (bytes: readonly number[]): Buffer => Buffer.concat([Buffer.from(bytes), Buffer.alloc(16 - bytes.length)]);
       // RFC 1876 §2: each nibble is zero to nine. The encoder clamps the

@@ -708,6 +708,35 @@ describe("DNS server", () => {
      * Saying NXDOMAIN there would deny a name some other server is authoritative
      * for, on our authority — and resolvers would cache it.
      */
+    /**
+     * Half an RRset is the dangerous answer: a resolver caches it as the whole
+     * set. The direct path already answers SERVFAIL for this and says why; the
+     * chase pushed records one at a time and returned on the first failure.
+     */
+    it("never answers with part of the target's record set", async () => {
+      const unservable: UnservableRecord[] = [];
+      const partial: ServedZone = {
+        name: "example.com",
+        serial: 5,
+        records: [
+          { name: "alias", type: "CNAME", content: "target.example.com", ttl: 60 },
+          { name: "target", type: "A", content: "192.0.2.1", ttl: 60 },
+          // Stored, and not something the wire can carry -- the shape the
+          // domain accepted before a rule tightened.
+          { name: "target", type: "A", content: "not-an-address", ttl: 60 },
+          { name: "target", type: "A", content: "192.0.2.3", ttl: 60 },
+        ],
+      };
+      const { port } = await start({ zones: () => [partial], onUnservable: (record) => unservable.push(record) });
+      const reply = await ask(port, buildQuery("alias.example.com"));
+      assert.ok(reply);
+      const answers = readAnswers(reply);
+      // The CNAME alone. One address out of three would have been cached as
+      // the whole set.
+      assert.deepEqual(answers.map((answer) => answer.type), [TYPE.CNAME]);
+      assert.equal(unservable.length, 1, "and the record that could not be written is reported");
+    });
+
     it("never calls a name outside the zone nonexistent", async () => {
       const outward: ServedZone = {
         name: "example.com",

@@ -161,6 +161,12 @@ function name(view: RdataView): string {
     throw new WireFormatError("a name in this rdata does not fit inside it");
   }
   view.offset = read.offset;
+  // The encoder splits content on whitespace before it reads anything, so a
+  // label carrying a space shifts every field after it -- loud for MX, silent
+  // for SVCB, where it moves the parameter list.
+  if (/[\s]/u.test(read.name)) {
+    throw new UnrepresentableRdata("a name in this rdata carries whitespace, which this presentation format cannot express");
+  }
   // `readName` gives the root as an empty string, and presentation format
   // spells it `.` -- the null MX target, an SVCB target meaning the owner. The
   // empty string is not merely unconventional here: it would collapse into the
@@ -315,8 +321,20 @@ function svcParam(key: number, value: Buffer, type: string): string {
   }
   if (key === 0) {
     const keys: string[] = [];
-    for (let offset = 0; offset + 2 <= value.length; offset += 2) keys.push(svcParamName(value.readUInt16BE(offset)));
+    let previous = -1;
+    for (let offset = 0; offset + 2 <= value.length; offset += 2) {
+      const named = value.readUInt16BE(offset);
+      // RFC 9460 §8: the list is sorted, has no duplicates, and does not name
+      // `mandatory` itself. A receiver is entitled to reject a record that
+      // breaks any of the three, so carrying one through would put a record
+      // into the desired state that some resolvers refuse.
+      if (named <= previous) throw new UnrepresentableRdata(`${type} parameter ${label} is not a sorted list of distinct keys`);
+      if (named === 0) throw new UnrepresentableRdata(`${type} parameter ${label} names itself`);
+      previous = named;
+      keys.push(svcParamName(named));
+    }
     if (keys.length * 2 !== value.length) throw new WireFormatError(`${type} parameter ${label} is not a list of keys`);
+    if (keys.length === 0) throw new UnrepresentableRdata(`${type} parameter ${label} names nothing`);
     return `${label}=${keys.join(",")}`;
   }
   if (key === 1) {
