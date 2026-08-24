@@ -139,6 +139,7 @@ export interface Store {
 export function createStore(client: unknown): Store;
 export function readRecords(zone: unknown): RecordRow[];
 export function providerManagedReason(record: unknown): string;
+export function applyVerdict(statuses: unknown): string;
 export function desiredState(state: unknown): unknown;
 export function isNonGlobalAddress(value: string): boolean;
 export const ERROR_SCOPES: readonly string[];

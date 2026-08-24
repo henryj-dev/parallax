@@ -425,10 +425,29 @@ export function createStore(client) {
         state.plan = null;
         state.planError = "";
         state.previewRevision = null;
-        notice(result?.revision ? "apply.startedRevision" : "apply.started", result?.revision ? { revision: result.revision } : {});
+        // `apply` does not throw when a provider refuses. It answers 200 with
+        // the failure inside `statuses`, which is right -- one view failing is
+        // not a reason to hide another view's result -- and it means the caller
+        // has to look. This one did not, so every apply reported success in
+        // green and the only correction was the status dot redrawing later.
+        const failed = (result?.statuses ?? []).filter((status) => status?.state === "failed");
+        if (applyVerdict(result?.statuses) === "failed") {
+          const views = failed.map((status) => String(status.view)).join(", ");
+          const first = failed[0] ?? {};
+          // How far it got is the value that decides what to do next: a view
+          // left part-applied is answering for part of the change already.
+          const partial = Number.isFinite(first.completedOperations) && Number.isFinite(first.plannedOperations);
+          notice(partial ? "apply.viewsFailedPartial" : "apply.viewsFailed", {
+            views,
+            error: String(first.error ?? ""),
+            ...(partial ? { completed: String(first.completedOperations), planned: String(first.plannedOperations) } : {}),
+          }, "error");
+        } else {
+          notice(result?.revision ? "apply.startedRevision" : "apply.started", result?.revision ? { revision: result.revision } : {});
+        }
         await this.selectZone(activeName());
         await this.loadZones({ preserveSelection: true });
-        return true;
+        return failed.length === 0;
       } catch (error) {
         handleUnauthorized(error);
         notice("apply.failed", { error: error.message }, "error");
@@ -827,6 +846,22 @@ function absentAsEmpty(fallback) {
     if (error instanceof ApiError && error.status === 404) return fallback;
     throw error;
   };
+}
+
+/**
+ * One verdict for a zone from its views' statuses.
+ *
+ * Mirrors `overallApplyState` in `src/application/control-plane.ts`, which is
+ * the same rule the server uses to colour the dot beside a zone. Duplicated
+ * rather than imported because the portal is a static page with no build step
+ * -- the same reason `providerManagedReason` is duplicated -- and kept honest
+ * by a test that runs both over one table.
+ */
+export function applyVerdict(statuses) {
+  const rows = Array.isArray(statuses) ? statuses : [];
+  if (rows.length === 0) return "";
+  if (rows.some((status) => status?.state === "failed")) return "failed";
+  return rows.every((status) => status?.state === "applied") ? "applied" : "pending";
 }
 
 /**

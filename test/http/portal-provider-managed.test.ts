@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { providerManagement, type RecordType } from "../../src/domain/dns.ts";
-import { desiredState, providerManagedReason, readRecords } from "../../public/store.js";
+import { overallApplyState } from "../../src/application/control-plane.ts";
+import type { ApplyStatus } from "../../src/application/ports.ts";
+import { applyVerdict, desiredState, providerManagedReason, readRecords } from "../../public/store.js";
 
 /**
  * The portal decides whether to offer a delete button, and the server decides
@@ -119,5 +121,64 @@ describe("portal and domain agree on which records the provider owns", () => {
       views: [{ name: "internal", records: [{ id: "apex", name: "@", type: "AAAA", content: "100::", ttl: 60 }] }],
     });
     assert.equal(rows[0]?.views.external.managed, "");
+  });
+});
+
+/**
+ * The portal decides what colour to report an apply in, and the server decides
+ * what colour to paint the zone's dot. Two copies of one rule again -- and this
+ * pair matters more than most, because the disagreement is silent in exactly
+ * one direction: the portal saying "applied" over a failure is a green notice
+ * nobody questions.
+ */
+const APPLY_CASES: readonly { label: string; statuses: ApplyStatus[]; expected: string }[] = [
+  { label: "nothing to reconcile", statuses: [], expected: "" },
+  {
+    label: "every view applied",
+    statuses: [
+      { zone: "z", view: "internal", desiredRevision: 2, appliedRevision: 2, state: "applied" },
+      { zone: "z", view: "external", desiredRevision: 2, appliedRevision: 2, state: "applied" },
+    ],
+    expected: "applied",
+  },
+  {
+    label: "one view failed among applied ones",
+    statuses: [
+      { zone: "z", view: "internal", desiredRevision: 2, appliedRevision: 2, state: "applied" },
+      { zone: "z", view: "external", desiredRevision: 2, appliedRevision: 0, state: "failed" },
+    ],
+    expected: "failed",
+  },
+  {
+    label: "a failure outranks a pending",
+    statuses: [
+      { zone: "z", view: "internal", desiredRevision: 2, appliedRevision: 0, state: "pending" },
+      { zone: "z", view: "external", desiredRevision: 2, appliedRevision: 0, state: "failed" },
+    ],
+    expected: "failed",
+  },
+  {
+    label: "one pending is enough to not be applied",
+    statuses: [
+      { zone: "z", view: "internal", desiredRevision: 2, appliedRevision: 2, state: "applied" },
+      { zone: "z", view: "external", desiredRevision: 2, appliedRevision: 0, state: "pending" },
+    ],
+    expected: "pending",
+  },
+];
+
+describe("portal and control plane agree on how an apply turned out", () => {
+  it("reaches the same verdict from the same statuses", () => {
+    for (const testCase of APPLY_CASES) {
+      assert.equal(overallApplyState(testCase.statuses), testCase.expected, `server: ${testCase.label}`);
+      assert.equal(applyVerdict(testCase.statuses), testCase.expected, `portal: ${testCase.label}`);
+    }
+  });
+
+  it("does not read a missing or malformed answer as success", () => {
+    // The portal receives this over HTTP, so it can be handed anything.
+    for (const input of [undefined, null, "statuses", {}, [null], [{ view: "external" }]]) {
+      assert.notEqual(applyVerdict(input), "applied", JSON.stringify(input) ?? "undefined");
+    }
   });
 });

@@ -186,6 +186,75 @@ describe("portal store", () => {
     }
   });
 
+  /**
+   * `apply` answers 200 with the failure inside `statuses`, which is the right
+   * shape -- one view failing must not hide another view's result -- and it
+   * means the caller has to read them. The portal did not, so every apply
+   * reported success in green and the only correction was the status dot
+   * redrawing a moment later.
+   */
+  it("reports an apply the provider refused as a failure, not a green notice", async () => {
+    const store = createStore({
+      apply: async () => ({
+        zone: "example.com",
+        revision: 4,
+        statuses: [
+          { zone: "example.com", view: "internal", desiredRevision: 4, appliedRevision: 4, state: "applied" },
+          {
+            zone: "example.com", view: "external", desiredRevision: 4, appliedRevision: 0, state: "failed",
+            error: "provider operation failed", completedOperations: 3, plannedOperations: 7,
+          },
+        ],
+      }),
+      getZone: async () => ({ name: "example.com", revision: 4, views: [] }),
+      zoneStatus: async () => ({ statuses: [] }),
+      history: async () => ({ entries: [] }),
+      listZones: async () => ({ zones: [] }),
+      statusOverview: async () => ({ zones: [] }),
+    });
+    const notices: StoreNotice[] = [];
+    store.onNotice((notice) => { notices.push(notice); });
+
+    assert.equal(await store.apply(), false, "the flow reports it did not succeed");
+
+    const reported = notices.find((notice) => notice.key.startsWith("apply."));
+    assert.equal(reported?.level, "error");
+    assert.equal(reported?.key, "apply.viewsFailedPartial");
+    assert.equal(reported?.values.views, "external");
+    // How far it got decides what to do next: the view is answering for part
+    // of the change already.
+    assert.equal(reported?.values.completed, "3");
+    assert.equal(reported?.values.planned, "7");
+
+    for (const locale of Object.keys(messages)) {
+      const translated = createTranslator(locale)(reported!.key, reported!.values);
+      assert.notEqual(translated, reported!.key, locale);
+      assert.match(translated, /external/u, locale);
+    }
+  });
+
+  it("still reports an apply every view accepted as a success", async () => {
+    const store = createStore({
+      apply: async () => ({
+        zone: "example.com",
+        revision: 4,
+        statuses: [{ zone: "example.com", view: "internal", desiredRevision: 4, appliedRevision: 4, state: "applied" }],
+      }),
+      getZone: async () => ({ name: "example.com", revision: 4, views: [] }),
+      zoneStatus: async () => ({ statuses: [] }),
+      history: async () => ({ entries: [] }),
+      listZones: async () => ({ zones: [] }),
+      statusOverview: async () => ({ zones: [] }),
+    });
+    const notices: StoreNotice[] = [];
+    store.onNotice((notice) => { notices.push(notice); });
+
+    assert.equal(await store.apply(), true);
+    const reported = notices.find((notice) => notice.key.startsWith("apply."));
+    assert.equal(reported?.key, "apply.startedRevision");
+    assert.notEqual(reported?.level, "error");
+  });
+
   it("carries what adopting could not read to whoever adopted", async () => {
     // The count cannot say this. A zone whose service lookups were refused
     // gains no `Worker` or `R2` label, and nothing else on the page explains
