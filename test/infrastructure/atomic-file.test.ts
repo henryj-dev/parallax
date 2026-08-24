@@ -138,6 +138,62 @@ describe("private file directories", () => {
   });
 });
 
+/**
+ * What the timeout says, which is the half an operator acts on.
+ *
+ * The old sentence always ended "if no writer is active, remove stale lock" --
+ * and following that while a provider apply holds its zone lock lets a second
+ * writer in beside the first. Since T14 reclaims a provably dead lock on its
+ * own, a timeout now usually means the holder is alive, so the message has to
+ * separate the two cases instead of offering one instruction for both.
+ */
+describe("what a lock timeout tells the operator", () => {
+  it("names a live holder on this host and says to wait", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "parallax-live-message-"));
+    try {
+      await chmod(parent, 0o700);
+      const target = join(parent, "state.json");
+      const owner = { hostname: hostname(), pid: process.pid, nonce: "alive" };
+      await writeFile(join(parent, ".state.json.lock"), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+
+      await assert.rejects(
+        withFileLock(target, async () => undefined, { timeoutMs: 40, retryMs: 5 }),
+        (error: unknown) => {
+          const message = (error as Error).message;
+          assert.match(message, new RegExp(`pid ${process.pid} on this host`, "u"));
+          assert.match(message, /still running/u);
+          assert.doesNotMatch(message, /remove/u, "never suggest removing a lock somebody is holding");
+          return true;
+        },
+      );
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("still offers removal when the holder is on another host", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "parallax-remote-message-"));
+    try {
+      await chmod(parent, 0o700);
+      const target = join(parent, "state.json");
+      const owner = { hostname: `${hostname()}-elsewhere`, pid: 4242, nonce: "remote" };
+      await writeFile(join(parent, ".state.json.lock"), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+
+      await assert.rejects(
+        withFileLock(target, async () => undefined, { timeoutMs: 40, retryMs: 5 }),
+        (error: unknown) => {
+          const message = (error as Error).message;
+          assert.match(message, /pid 4242 on .*-elsewhere/u);
+          assert.match(message, /remove/u, "nothing here can prove that one dead");
+          return true;
+        },
+      );
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+});
+
 /** The kernel's start time for this process, in the units the lock records. */
 function selfStartedAt(): string {
   const stat = readFileSync("/proc/self/stat", "utf8");

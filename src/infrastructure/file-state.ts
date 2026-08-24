@@ -243,13 +243,32 @@ export function createFileStateAdapters(path: string): {
 }
 
 /** Holds a per-zone lock file across provider work and the following state commit. */
+/**
+ * How long a second process waits for a zone that is already being applied.
+ *
+ * The default is sized for a file write, and this lock is not one: it is held
+ * across the whole of a provider apply, which is one network round trip per
+ * record, in sequence. A large zone runs well past fifteen seconds, so a CLI
+ * that arrived during one was told the lock had timed out -- and the message
+ * then suggested removing it, which is the one thing that must not happen while
+ * the holder is alive.
+ *
+ * Two minutes is still bounded. It is long enough that waiting for an ordinary
+ * apply succeeds, and short enough that a genuinely wedged lock is reported
+ * rather than waited on forever.
+ */
+const ZONE_LOCK_TIMEOUT_MS = 120_000;
+
 class FileApplyLock implements ApplyLock {
   readonly #statePath: string;
   constructor(statePath: string) { this.#statePath = statePath; }
 
   withZoneLock<T>(zone: string, operation: () => Promise<T>): Promise<T> {
+    // A lock of its own, beside the state file rather than on it: the state
+    // file is locked only for the moment a change is committed, so provider
+    // traffic never holds it.
     const key = createHash("sha256").update(zone, "utf8").digest("hex");
-    return withFileLock(`${this.#statePath}.zone-${key}`, operation);
+    return withFileLock(`${this.#statePath}.zone-${key}`, operation, { timeoutMs: ZONE_LOCK_TIMEOUT_MS });
   }
 }
 

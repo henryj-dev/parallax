@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { lstat, mkdir, open, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, join, parse, resolve } from "node:path";
 
@@ -95,9 +95,7 @@ export async function withFileLock<T>(
       // not unlinked. A lock without a pid, or one held by a live process, is
       // left until the waiter times out.
       if (await reclaimDeadLock(lockPath)) continue;
-      if (Date.now() >= deadline) {
-        throw new Error(`timed out acquiring file lock for ${path}; if no writer is active, remove stale lock ${lockPath}`);
-      }
+      if (Date.now() >= deadline) throw new Error(await timeoutMessage(path, lockPath));
       await new Promise<void>((resolve) => setTimeout(resolve, retryMs));
       continue;
     }
@@ -114,6 +112,40 @@ export async function withFileLock<T>(
         await handle.close();
       }
     }
+  }
+}
+
+/**
+ * Why the wait ended, said as precisely as the lock file allows.
+ *
+ * The old sentence always advised removing the lock "if no writer is active",
+ * which reads as an instruction and is wrong exactly when it is followed: a
+ * long apply holds its zone lock for the whole of its provider traffic, and
+ * deleting that lock lets a second writer in beside it. A dead lock is now
+ * reclaimed automatically where the kernel can prove it is dead, so a timeout
+ * means a live holder far more often than it used to.
+ */
+async function timeoutMessage(path: string, lockPath: string): Promise<string> {
+  const holder = await readLockOwner(lockPath);
+  if (holder && holder.hostname === hostname() && pidAlive(holder.pid)) {
+    return `timed out acquiring file lock for ${path}: pid ${holder.pid} on this host is holding it and is still running.`
+      + " A long provider apply holds its zone for the whole run; wait for it rather than removing the lock.";
+  }
+  if (holder) {
+    return `timed out acquiring file lock for ${path}: it is held by pid ${holder.pid} on ${holder.hostname}.`
+      + ` If nothing is writing there, remove ${lockPath}.`;
+  }
+  return `timed out acquiring file lock for ${path}; if no writer is active, remove stale lock ${lockPath}`;
+}
+
+async function readLockOwner(lockPath: string): Promise<LockOwner | undefined> {
+  try {
+    const parsed: unknown = JSON.parse((await readFile(lockPath, "utf8")).trim());
+    if (parsed === null || typeof parsed !== "object") return undefined;
+    const owner = parsed as LockOwner;
+    return typeof owner.hostname === "string" && typeof owner.pid === "number" ? owner : undefined;
+  } catch {
+    return undefined;
   }
 }
 
