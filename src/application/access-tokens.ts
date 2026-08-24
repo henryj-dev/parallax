@@ -11,6 +11,12 @@ export interface AccessTokenMetadata {
   readonly createdAt: string;
   /** True for a token supplied by the environment, which the API cannot revoke. */
   readonly managed: boolean;
+  /** When it stops authenticating. Absent means never. */
+  readonly expiresAt?: string;
+  /** When it was last accepted, to within one refresh interval. */
+  readonly lastUsedAt?: string;
+  /** True once `expiresAt` has passed; the token is listed but no longer works. */
+  readonly expired?: boolean;
 }
 
 export interface IssuedAccessToken {
@@ -37,6 +43,10 @@ export interface AccessTokenReadiness {
 
 const SUBJECT_PATTERN = /^[^\u0000-\u001f\u007f]{1,128}$/u;
 
+/** A minute is the shortest lifetime worth issuing; ten years is the ceiling. */
+export const MIN_TOKEN_LIFETIME_SECONDS = 60;
+export const MAX_TOKEN_LIFETIME_SECONDS = 315_360_000;
+
 /**
  * Owns who may call the control plane. Tokens are generated here and stored
  * only as digests, so the store can verify a presented token but never produce
@@ -55,6 +65,13 @@ export class AccessTokenService {
   readonly #readTimeoutMs: number;
   /** Replaced on every change so the security layer can cache by identity. */
   #security: SecurityConfig;
+  /**
+   * The moment at which the current security view stops being correct, because
+   * a token in it expires then. Undefined when nothing in it expires.
+   */
+  #nextExpiryAt: number | undefined;
+  /** Uses observed since the last flush, newest wins. */
+  readonly #pendingUses = new Map<string, string>();
   #securityIsStale = false;
   /** Serializes repository I/O and publication of the resulting local view. */
   #operationTail: Promise<void> = Promise.resolve();
@@ -97,6 +114,9 @@ export class AccessTokenService {
   }
 
   async #loadFromRepository(): Promise<void> {
+    // Before the read, so what is written back is not immediately overwritten
+    // by a snapshot that predates it.
+    await this.#flushUses();
     try {
       this.#stored = await this.#readFromRepository();
     } catch (error) {
@@ -191,7 +211,11 @@ export class AccessTokenService {
   security(): SecurityConfig {
     // Crossing the staleness deadline does not require a timer callback at the
     // exact millisecond. The next request observes it and drops stored digests.
-    if (this.#securityIsStale !== this.#isStale()) this.#refreshSecurity();
+    // An expiry works the same way: the view is rebuilt the first time somebody
+    // asks after the earliest one has passed, so a token stops authenticating
+    // on its own rather than at the next store read.
+    const expired = this.#nextExpiryAt !== undefined && this.#nextExpiryAt <= this.#now().valueOf();
+    if (this.#securityIsStale !== this.#isStale() || expired) this.#refreshSecurity();
     return this.#security;
   }
 
@@ -210,12 +234,14 @@ export class AccessTokenService {
         role: token.role,
         createdAt: token.createdAt,
         managed: false,
+        ...(token.expiresAt ? { expiresAt: token.expiresAt, expired: this.#hasExpired(token) } : {}),
+        ...(token.lastUsedAt ? { lastUsedAt: token.lastUsedAt } : {}),
       })),
     ];
   }
 
   /** Returns the token exactly once; only its digest is persisted. */
-  async issue(subject: unknown, role: unknown): Promise<IssuedAccessToken> {
+  async issue(subject: unknown, role: unknown, expiresInSeconds?: unknown): Promise<IssuedAccessToken> {
     const issues: string[] = [];
     if (typeof subject !== "string" || !SUBJECT_PATTERN.test(subject.trim()) || subject.trim().length === 0) {
       issues.push("subject must be a non-empty single-line string");
@@ -223,15 +249,26 @@ export class AccessTokenService {
     if (role !== "admin" && role !== "editor" && role !== "viewer") {
       issues.push("role must be admin, editor or viewer");
     }
+    // Absent means no expiry, which is what every token issued before this
+    // existed means. A deployment that wants them bounded says how long.
+    let lifetime: number | undefined;
+    if (expiresInSeconds !== undefined && expiresInSeconds !== null) {
+      const seconds = typeof expiresInSeconds === "number" ? expiresInSeconds : Number(expiresInSeconds);
+      if (!Number.isSafeInteger(seconds) || seconds < MIN_TOKEN_LIFETIME_SECONDS || seconds > MAX_TOKEN_LIFETIME_SECONDS) {
+        issues.push(`expiresIn must be an integer between ${MIN_TOKEN_LIFETIME_SECONDS} and ${MAX_TOKEN_LIFETIME_SECONDS} seconds`);
+      } else lifetime = seconds;
+    }
     if (issues.length > 0) throw new DomainValidationError(issues);
 
     const token = randomBytes(32).toString("base64url");
+    const createdAt = this.#now();
     const record: StoredAccessToken = {
       id: randomUUID(),
       subject: (subject as string).trim(),
       role: role as Role,
       digest: tokenDigest(token),
-      createdAt: this.#now().toISOString(),
+      createdAt: createdAt.toISOString(),
+      ...(lifetime === undefined ? {} : { expiresAt: new Date(createdAt.getTime() + lifetime * 1000).toISOString() }),
     };
     return this.#enqueue(async () => {
       await this.#repository.create(record);
@@ -245,7 +282,10 @@ export class AccessTokenService {
       await this.#loadFromRepository().catch(() => undefined);
       return {
         token,
-        metadata: { id: record.id, subject: record.subject, role: record.role, createdAt: record.createdAt, managed: false },
+        metadata: {
+          id: record.id, subject: record.subject, role: record.role, createdAt: record.createdAt, managed: false,
+          ...(record.expiresAt ? { expiresAt: record.expiresAt, expired: false } : {}),
+        },
       };
     });
   }
@@ -276,12 +316,49 @@ export class AccessTokenService {
     return result;
   }
 
+  #hasExpired(token: StoredAccessToken): boolean {
+    return token.expiresAt !== undefined && Date.parse(token.expiresAt) <= this.#now().valueOf();
+  }
+
+  /**
+   * Records that these tokens authenticated something, without touching the
+   * store on the request path.
+   *
+   * Handed to the security layer, which calls it after a digest matches. The
+   * map keeps only the newest moment per token, so a busy token costs one row
+   * per flush rather than one write per request.
+   */
+  #noteUse(id: string): void {
+    this.#pendingUses.set(id, this.#now().toISOString());
+  }
+
+  /** Best effort, and deliberately: a failed flush must not fail anything else. */
+  async #flushUses(): Promise<void> {
+    if (this.#pendingUses.size === 0) return;
+    const uses = [...this.#pendingUses].map(([id, at]) => ({ id, at }));
+    this.#pendingUses.clear();
+    try {
+      await this.#repository.touch(uses);
+    } catch {
+      // The next authenticated request records it again. Losing an
+      // approximate timestamp is not worth reporting as a failure.
+    }
+  }
+
   #buildSecurity(): SecurityConfig {
     const stale = this.#isStale();
-    const digests: TokenDigestRecord[] = (stale ? [] : this.#stored).map((token) => ({
+    const usable = stale ? [] : this.#stored.filter((token) => !this.#hasExpired(token));
+    // When the earliest expiry passes, this view stops being correct. Noted so
+    // `security()` can notice without a timer firing at the exact millisecond.
+    const expiries = usable
+      .map((token) => (token.expiresAt === undefined ? undefined : Date.parse(token.expiresAt)))
+      .filter((at): at is number => at !== undefined && Number.isFinite(at));
+    this.#nextExpiryAt = expiries.length > 0 ? Math.min(...expiries) : undefined;
+    const digests: TokenDigestRecord[] = usable.map((token) => ({
       digest: token.digest,
       role: token.role,
       subject: token.subject,
+      id: token.id,
     }));
     return {
       // Open mode is a startup decision. Once this process has observed any
@@ -290,6 +367,7 @@ export class AccessTokenService {
       enabled: this.#authenticationRequired,
       tokens: this.#bootstrap,
       digests,
+      onTokenUse: (id) => { this.#noteUse(id); },
     };
   }
 

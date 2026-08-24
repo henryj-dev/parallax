@@ -97,6 +97,20 @@ export interface StoredAccessToken {
   /** Base64url SHA-256 of the token; the token itself is never stored. */
   readonly digest: string;
   readonly createdAt: string;
+  /**
+   * When this token stops authenticating. Absent means never, which is what
+   * every token issued before this existed means -- and why the safe action
+   * and the discoverable one used to be different.
+   */
+  readonly expiresAt?: string;
+  /**
+   * When it was last accepted, as far as any process has observed.
+   *
+   * Approximate on purpose: recording it on the request path would be a write
+   * per authenticated call. It is buffered and flushed on the refresh tick, so
+   * it lags by at most that interval and never blocks a request.
+   */
+  readonly lastUsedAt?: string;
 }
 
 export type AccessTokenRevocationResult = "deleted" | "not-found" | "last-admin";
@@ -104,6 +118,13 @@ export type AccessTokenRevocationResult = "deleted" | "not-found" | "last-admin"
 export interface AccessTokenRepository {
   list(): Promise<StoredAccessToken[]>;
   create(token: StoredAccessToken): Promise<void>;
+  /**
+   * Records that these tokens were accepted, never moving a timestamp
+   * backwards. Best effort: a token that has since been revoked is simply not
+   * there, and that is not a failure worth reporting to a request that already
+   * succeeded.
+   */
+  touch(uses: readonly { readonly id: string; readonly at: string }[]): Promise<void>;
   /**
    * Atomically enforces the last-administrator invariant and removes the token.
    * `retainedAdministratorCount` counts administrators outside this repository,

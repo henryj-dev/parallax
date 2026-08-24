@@ -577,9 +577,10 @@ const COMMANDS: readonly Command[] = [
     options: [
       { name: "subject", summary: "Who the token is for", required: true },
       { name: "role", summary: "admin, editor or viewer", required: true },
+      { name: "expiresIn", summary: "Seconds until it stops working; omitted means never", type: "number" },
     ],
     run: async (context, input) => {
-      const issued = await requireAccessTokens(context).issue(input.subject, input.role);
+      const issued = await requireAccessTokens(context).issue(input.subject, input.role, input.expiresIn);
       // A server that is already running loaded its tokens at startup and
       // refreshes on an interval, so this one does not work the instant the
       // command returns. Saying so here is cheaper than reading a 401 as a

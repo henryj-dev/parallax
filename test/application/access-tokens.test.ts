@@ -12,6 +12,9 @@ import { authenticate, createAuthorizedHandler } from "../../src/security/http-a
 
 class MemoryAccessTokenRepository implements AccessTokenRepository {
   tokens: StoredAccessToken[] = [];
+  /** Every batch the service flushed, so the buffering can be observed. */
+  touched: { id: string; at: string }[][] = [];
+  touchFails = false;
   async list(): Promise<StoredAccessToken[]> { return this.tokens.map((token) => ({ ...token })); }
   async create(token: StoredAccessToken): Promise<void> { this.tokens.push({ ...token }); }
   async revoke(id: string, retainedAdministratorCount: number): Promise<"deleted" | "not-found" | "last-admin"> {
@@ -23,6 +26,16 @@ class MemoryAccessTokenRepository implements AccessTokenRepository {
     }
     this.tokens.splice(index, 1);
     return "deleted";
+  }
+
+  async touch(uses: readonly { readonly id: string; readonly at: string }[]): Promise<void> {
+    if (this.touchFails) throw new Error("last-use flush failed");
+    this.touched.push(uses.map((use) => ({ ...use })));
+    for (const use of uses) {
+      const index = this.tokens.findIndex((token) => token.id === use.id);
+      const existing = this.tokens[index];
+      if (existing) this.tokens[index] = { ...existing, lastUsedAt: use.at };
+    }
   }
 }
 
@@ -458,5 +471,103 @@ describe("AccessTokenService", () => {
     assert.equal(isStrongBootstrapToken("A".repeat(32)), false);
     assert.equal(isStrongBootstrapToken("aGVsbG8td29ybGQ"), false);
     assert.equal(isStrongBootstrapToken(Buffer.alloc(32, 7).toString("base64url")), true);
+  });
+});
+
+/**
+ * A token used to be valid until somebody remembered to revoke it, and nothing
+ * said whether anybody still used it -- so the safe action and the
+ * discoverable one were different, which is how unused credentials survive.
+ */
+describe("access tokens end, and say when they were last used", () => {
+  function serviceAt(clock: { now: number }) {
+    const repository = new MemoryAccessTokenRepository();
+    const service = new AccessTokenService(repository, [], () => new Date(clock.now));
+    return { repository, service };
+  }
+
+  it("refuses a lifetime outside the bounds, and takes one inside them", async () => {
+    const clock = { now: Date.UTC(2026, 0, 1) };
+    const { service } = serviceAt(clock);
+    await service.load();
+
+    await assert.rejects(service.issue("bot", "viewer", 30), /expiresIn must be an integer/u);
+    await assert.rejects(service.issue("bot", "viewer", 1.5), /expiresIn must be an integer/u);
+
+    const issued = await service.issue("bot", "viewer", 3600);
+    assert.equal(issued.metadata.expiresAt, new Date(clock.now + 3_600_000).toISOString());
+    assert.equal(issued.metadata.expired, false);
+  });
+
+  it("keeps authenticating until the moment it does not", async () => {
+    const clock = { now: Date.UTC(2026, 0, 1) };
+    const { service } = serviceAt(clock);
+    await service.load();
+    const issued = await service.issue("bot", "editor", 3600);
+
+    const digestOf = (config: ReturnType<typeof service.security>) =>
+      (config.digests ?? []).map((record) => record.subject);
+    assert.deepEqual(digestOf(service.security()), ["bot"]);
+
+    clock.now += 3_600_001;
+    // No store read in between: the view notices on its own, which is what
+    // stops an expiry from waiting on the next refresh tick.
+    assert.deepEqual(digestOf(service.security()), [], "expired tokens leave the security view");
+
+    const listed = service.list().find((token) => token.id === issued.metadata.id);
+    assert.equal(listed?.expired, true, "still listed, so it can be seen and revoked");
+  });
+
+  it("leaves a token with no expiry alone", async () => {
+    const clock = { now: Date.UTC(2026, 0, 1) };
+    const { service } = serviceAt(clock);
+    await service.load();
+    await service.issue("forever", "viewer");
+
+    clock.now += 10 * 365 * 86_400_000;
+    // Reload first: ten years also crosses the cache's staleness deadline, and
+    // that is a different rule doing its own job. What is asserted here is that
+    // no expiry means no expiry.
+    await service.load();
+    assert.deepEqual((service.security().digests ?? []).map((record) => record.subject), ["forever"]);
+    assert.equal(service.list().find((token) => token.subject === "forever")?.expiresAt, undefined);
+  });
+
+  it("records a use once per flush rather than once per request", async () => {
+    const clock = { now: Date.UTC(2026, 0, 1) };
+    const { repository, service } = serviceAt(clock);
+    await service.load();
+    const issued = await service.issue("busy", "viewer");
+
+    const config = service.security();
+    const id = (config.digests ?? [])[0]?.id;
+    assert.equal(id, issued.metadata.id, "the security view names which token each digest is");
+
+    // What the authorization layer does on a successful match.
+    clock.now += 1000;
+    config.onTokenUse?.(id as string);
+    config.onTokenUse?.(id as string);
+    config.onTokenUse?.(id as string);
+    assert.equal(repository.touched.length, 0, "nothing is written on the request path");
+
+    await service.load();
+    assert.deepEqual(repository.touched, [[{ id, at: new Date(clock.now).toISOString() }]],
+      "one row for three uses, carrying the newest moment");
+    assert.equal(service.list().find((token) => token.id === id)?.lastUsedAt, new Date(clock.now).toISOString());
+  });
+
+  it("does not let a failed flush disturb anything else", async () => {
+    const clock = { now: Date.UTC(2026, 0, 1) };
+    const { repository, service } = serviceAt(clock);
+    await service.load();
+    await service.issue("busy", "viewer");
+    const id = (service.security().digests ?? [])[0]?.id as string;
+
+    repository.touchFails = true;
+    service.security().onTokenUse?.(id);
+    await service.load();
+
+    assert.equal(service.readiness().ready, true, "the read still succeeded");
+    assert.equal(service.list().length, 1);
   });
 });

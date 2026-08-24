@@ -537,16 +537,31 @@ export class PostgresAccessTokenRepository implements AccessTokenRepository {
 
   async list(): Promise<StoredAccessToken[]> {
     const result = await this.#pool.query<AccessTokenRow>(
-      "SELECT id, subject, role, token_digest, created_at FROM parallax_access_tokens ORDER BY created_at, id",
+      "SELECT id, subject, role, token_digest, created_at, expires_at, last_used_at FROM parallax_access_tokens ORDER BY created_at, id",
     );
     return result.rows.map(readAccessToken);
   }
 
   async create(token: StoredAccessToken): Promise<void> {
     await this.#pool.query(
-      `INSERT INTO parallax_access_tokens (id, subject, role, token_digest, created_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [token.id, token.subject, token.role, token.digest, token.createdAt],
+      `INSERT INTO parallax_access_tokens (id, subject, role, token_digest, created_at, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [token.id, token.subject, token.role, token.digest, token.createdAt, token.expiresAt ?? null],
+    );
+  }
+
+  /**
+   * One statement for the whole batch, and `GREATEST` so a slow flush from one
+   * replica cannot move another's newer observation backwards.
+   */
+  async touch(uses: readonly { readonly id: string; readonly at: string }[]): Promise<void> {
+    if (uses.length === 0) return;
+    await this.#pool.query(
+      `UPDATE parallax_access_tokens AS token
+         SET last_used_at = GREATEST(COALESCE(token.last_used_at, use.at), use.at)
+         FROM (SELECT unnest($1::text[]) AS id, unnest($2::timestamptz[]) AS at) AS use
+        WHERE token.id = use.id`,
+      [uses.map((use) => use.id), uses.map((use) => use.at)],
     );
   }
 
@@ -618,6 +633,8 @@ interface AccessTokenRow {
   role: unknown;
   token_digest: unknown;
   created_at: unknown;
+  expires_at?: unknown;
+  last_used_at?: unknown;
 }
 
 function readAccessToken(row: AccessTokenRow): StoredAccessToken {
@@ -631,6 +648,12 @@ function readAccessToken(row: AccessTokenRow): StoredAccessToken {
     role,
     digest: readString(row.token_digest, "access token digest"),
     createdAt: readTimestamp(row.created_at, "access token timestamp"),
+    ...(row.expires_at === null || row.expires_at === undefined
+      ? {}
+      : { expiresAt: readTimestamp(row.expires_at, "access token expiry") }),
+    ...(row.last_used_at === null || row.last_used_at === undefined
+      ? {}
+      : { lastUsedAt: readTimestamp(row.last_used_at, "access token last use") }),
   };
 }
 

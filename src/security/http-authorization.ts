@@ -26,6 +26,8 @@ export interface TokenDigestRecord {
   readonly digest: string;
   readonly role: Role;
   readonly subject: string;
+  /** Which stored token this is, so a use can be attributed to it. */
+  readonly id?: string;
 }
 
 export interface SecurityConfig {
@@ -46,6 +48,14 @@ export interface SecurityConfig {
    * such login is offered, and only tokens authenticate.
    */
   readonly identitySessionSecret?: string;
+  /**
+   * Told which stored token authenticated a request.
+   *
+   * Out here rather than written where it is observed: the request path must
+   * not wait on a store. Whoever supplies this buffers and flushes on its own
+   * schedule, so "last used" lags rather than costing a write per call.
+   */
+  readonly onTokenUse?: (id: string) => void;
 }
 
 /** Tokens open the whole control plane, so they get the same floor as the other secrets. */
@@ -72,12 +82,14 @@ export type FetchHandler = (request: Request) => Response | Promise<Response>;
 interface PreparedToken {
   readonly digest: Buffer;
   readonly principal: Principal;
+  readonly id?: string;
 }
 
 interface PreparedConfig {
   readonly cookieName: string;
   readonly tokens: readonly PreparedToken[];
   readonly identitySessionSecret?: string;
+  readonly onTokenUse?: (id: string) => void;
 }
 
 const trustedClientKeys = new WeakMap<Request, string>();
@@ -290,7 +302,7 @@ async function handleSession(
   } catch {
     candidate = undefined;
   }
-  const principal = typeof candidate === "string" ? matchToken(candidate, prepared.tokens) : undefined;
+  const principal = typeof candidate === "string" ? matchToken(candidate, prepared) : undefined;
   if (!principal) {
     const retryAfterMs = throttle.recordFailure(clientKey);
     return retryAfterMs === undefined ? authenticationError(401) : tooManyAttempts(retryAfterMs);
@@ -439,13 +451,13 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
   //
   // Measured through this handler at 1000 tokens: 18.36 ms per request before.
   const seen = new Set<string>();
-  const add = (recordDigest: Buffer, role: Role, subject: string): void => {
+  const add = (recordDigest: Buffer, role: Role, subject: string, id?: string): void => {
     if (role !== "admin" && role !== "editor" && role !== "viewer") throw invalidConfiguration();
     if (!SUBJECT_PATTERN.test(subject) || subject.trim().length === 0) throw invalidConfiguration();
     const key = recordDigest.toString("base64url");
     if (seen.has(key)) throw invalidConfiguration();
     seen.add(key);
-    prepared.push({ digest: recordDigest, principal: { role, subject } });
+    prepared.push({ digest: recordDigest, principal: { role, subject }, ...(id === undefined ? {} : { id }) });
   };
 
   for (const record of config.tokens) {
@@ -457,9 +469,14 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
   for (const record of config.digests ?? []) {
     const decoded = Buffer.from(record.digest, "base64url");
     if (decoded.byteLength !== DIGEST_BYTES) throw invalidConfiguration();
-    add(decoded, record.role, record.subject);
+    add(decoded, record.role, record.subject, record.id);
   }
-  return { cookieName, tokens: prepared, ...(config.identitySessionSecret === undefined ? {} : { identitySessionSecret: config.identitySessionSecret }) };
+  return {
+    cookieName,
+    tokens: prepared,
+    ...(config.identitySessionSecret === undefined ? {} : { identitySessionSecret: config.identitySessionSecret }),
+    ...(config.onTokenUse === undefined ? {} : { onTokenUse: config.onTokenUse }),
+  };
 }
 
 function authenticateWithPreparedTokens(request: Request, prepared: PreparedConfig): Principal | undefined {
@@ -468,10 +485,10 @@ function authenticateWithPreparedTokens(request: Request, prepared: PreparedConf
     const match = /^Bearer ([^\s]+)$/iu.exec(authorization);
     // Explicit credentials are authoritative. A malformed or invalid Bearer
     // value must not silently inherit the browser's OIDC identity cookie.
-    return match?.[1] === undefined ? undefined : matchToken(match[1], prepared.tokens);
+    return match?.[1] === undefined ? undefined : matchToken(match[1], prepared);
   }
   const candidate = readCookie(request.headers.get("cookie"), prepared.cookieName);
-  const byToken = candidate === undefined ? undefined : matchToken(candidate, prepared.tokens);
+  const byToken = candidate === undefined ? undefined : matchToken(candidate, prepared);
   if (byToken) return byToken;
   // Second, not first: a request that presented a token meant to act as that
   // token, and answering it as whoever the browser happens to be signed in as
@@ -488,16 +505,18 @@ function matchIdentitySession(request: Request, secret: string): Principal | und
   return claims === undefined ? undefined : { role: claims.role, subject: claims.subject };
 }
 
-function matchToken(candidate: string, tokens: readonly PreparedToken[]): Principal | undefined {
+function matchToken(candidate: string, prepared: PreparedConfig): Principal | undefined {
   if (!TOKEN_PATTERN.test(candidate)) return undefined;
   const candidateDigest = digest(candidate);
-  let match: Principal | undefined;
+  let match: PreparedToken | undefined;
   // Compare every configured digest so the matching record's position is not observable.
-  for (const record of tokens) {
+  for (const record of prepared.tokens) {
     const equal = timingSafeEqual(candidateDigest, record.digest);
-    if (equal) match = record.principal;
+    if (equal) match = record;
   }
-  return match;
+  // Reported after the scan, so telling anybody costs nothing observable.
+  if (match?.id !== undefined) prepared.onTokenUse?.(match.id);
+  return match?.principal;
 }
 
 /** A credential, so the value has to look like one as well as be unshadowed. */

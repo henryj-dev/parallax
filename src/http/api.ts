@@ -240,7 +240,11 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
     if (segments.length === 3 && method === "GET") return { command: "token list", input: {} };
     if (segments.length === 3 && method === "POST") {
       const body = await parseJson(request);
-      return { command: "token issue", input: { subject: body.subject, role: body.role }, status: 201 };
+      return {
+        command: "token issue",
+        input: { subject: body.subject, role: body.role, ...(body.expiresIn === undefined ? {} : { expiresIn: body.expiresIn }) },
+        status: 201,
+      };
     }
     if (segments.length === 4 && segments[3] && method === "DELETE") {
       return { command: "token revoke", input: { id: segments[3] }, empty: true };

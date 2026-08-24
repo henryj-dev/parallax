@@ -52,6 +52,17 @@ export class InMemoryAccessTokenRepository implements AccessTokenRepository {
     });
   }
 
+  async touch(uses: readonly { readonly id: string; readonly at: string }[]): Promise<void> {
+    await this.#enqueue(() => {
+      for (const use of uses) {
+        const token = this.#tokens.get(use.id);
+        if (token && !(token.lastUsedAt && token.lastUsedAt >= use.at)) {
+          this.#tokens.set(use.id, { ...token, lastUsedAt: use.at });
+        }
+      }
+    });
+  }
+
   async revoke(id: string, retainedAdministratorCount: number): Promise<AccessTokenRevocationResult> {
     return this.#enqueue(() => {
       const target = this.#tokens.get(id);

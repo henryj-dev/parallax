@@ -9,11 +9,14 @@ import type {
 } from "../application/ports.ts";
 import { ensurePrivateDirectory, withFileLock } from "./atomic-file.ts";
 
+/** The draft `#mutate` hands out is edited in place, so the rows are writable. */
+type MutableAccessToken = { -readonly [K in keyof StoredAccessToken]: StoredAccessToken[K] };
+
 interface ConfigurationDocument {
   version: 1;
   settings: Record<string, unknown>;
   credentials?: string;
-  accessTokens: StoredAccessToken[];
+  accessTokens: MutableAccessToken[];
 }
 
 /**
@@ -69,6 +72,17 @@ export class FileConfigurationStore {
             throw new Error("access token already exists");
           }
           document.accessTokens.push({ ...token });
+        });
+      },
+      touch: async (uses) => {
+        if (uses.length === 0) return;
+        await this.#mutate((document) => {
+          for (const use of uses) {
+            const token = document.accessTokens.find((candidate) => candidate.id === use.id);
+            // Never backwards, and a token revoked since the use was recorded
+            // is simply gone -- neither is worth failing a flush over.
+            if (token && !(token.lastUsedAt && token.lastUsedAt >= use.at)) token.lastUsedAt = use.at;
+          }
         });
       },
       revoke: async (id, retainedAdministratorCount) => this.#mutate((document) => {
@@ -156,7 +170,7 @@ function parseDocument(value: unknown): ConfigurationDocument {
   return { version: 1, settings, ...(credentials ? { credentials } : {}), accessTokens };
 }
 
-function readAccessToken(value: unknown): StoredAccessToken {
+function readAccessToken(value: unknown): MutableAccessToken {
   if (!isObject(value)
     || typeof value.id !== "string"
     || typeof value.subject !== "string"
@@ -173,7 +187,19 @@ function readAccessToken(value: unknown): StoredAccessToken {
     || Number.isNaN(createdAt.valueOf()) || createdAt.toISOString() !== value.createdAt) {
     throw new Error("invalid stored access token");
   }
-  return { id: value.id, subject: value.subject, role: value.role, digest: value.digest, createdAt: value.createdAt };
+  const optional = (field: "expiresAt" | "lastUsedAt"): Record<string, string> => {
+    const at = value[field];
+    if (at === undefined) return {};
+    if (typeof at !== "string" || Number.isNaN(new Date(at).valueOf()) || new Date(at).toISOString() !== at) {
+      throw new Error("invalid stored access token");
+    }
+    return { [field]: at };
+  };
+  return {
+    id: value.id, subject: value.subject, role: value.role, digest: value.digest, createdAt: value.createdAt,
+    ...optional("expiresAt"),
+    ...optional("lastUsedAt"),
+  };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

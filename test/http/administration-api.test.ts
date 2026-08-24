@@ -51,6 +51,14 @@ class MemoryAccessTokenRepository implements AccessTokenRepository {
     this.tokens.splice(index, 1);
     return "deleted";
   }
+
+  async touch(uses: readonly { readonly id: string; readonly at: string }[]): Promise<void> {
+    for (const use of uses) {
+      const index = this.tokens.findIndex((token) => token.id === use.id);
+      const existing = this.tokens[index];
+      if (existing) this.tokens[index] = { ...existing, lastUsedAt: use.at };
+    }
+  }
 }
 
 function request(path: string, method = "GET", body?: unknown, token = "admin-token-000000000000000000000"): Request {
