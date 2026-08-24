@@ -160,7 +160,11 @@ export function createDnsServer(options: DnsServerOptions): {
     options.now ?? Date.now,
     positiveInteger(options.rateLimitMaxClients ?? DEFAULT_RATE_LIMIT_MAX_CLIENTS, "rateLimitMaxClients"),
   );
-  const cookies = createDnsCookies(options.cookieSecret ? { secret: options.cookieSecret } : {});
+  const cookies = createDnsCookies({
+    ...(options.cookieSecret ? { secret: options.cookieSecret } : {}),
+    // Shared with the rate limiter, so a test that moves time moves both.
+    ...(options.now ? { now: options.now } : {}),
+  });
   const requireCookie = options.requireCookie ?? false;
   const soaSettings = options.soa ?? {};
   const resolveHost = options.resolveHost ?? resolveDnsAddress;

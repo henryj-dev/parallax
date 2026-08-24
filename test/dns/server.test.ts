@@ -890,8 +890,68 @@ describe("DNS server", () => {
         const reply = received(await ask(port, withCookie("www.example.com", CLIENT_COOKIE)));
         assert.equal(rcodeOf(reply), RCODE.NOERROR);
         const returned = cookieOf(reply);
-        assert.equal(returned.length, 16, "8 bytes of client cookie and 8 of server cookie");
+        assert.equal(returned.length, 24, "8 bytes of client cookie and 16 of server cookie");
         assert.deepEqual([...returned.subarray(0, 8)], [...CLIENT_COOKIE], "the client's own bytes come back");
+        // RFC 9018 §4.3: version, three reserved bytes, then a timestamp.
+        assert.equal(returned.readUInt8(8), 1, "version 1");
+        assert.deepEqual([...returned.subarray(9, 12)], [0, 0, 0], "reserved bytes stay zero");
+        const stamped = returned.readUInt32BE(12);
+        assert.ok(Math.abs(stamped - Math.floor(Date.now() / 1000)) < 60, `stamped now, got ${stamped}`);
+      });
+
+      /**
+       * A cookie used to be good for the life of the process, which made it a
+       * permanent key to the address it names: anybody who had ever held one
+       * could go on spoofing that address past `requireCookie` indefinitely.
+       */
+      it("stops accepting a server cookie once it is older than the window", async () => {
+        let clock = Date.UTC(2026, 0, 1, 12, 0, 0);
+        const secret = Buffer.alloc(32, 9);
+        const { port } = await start({
+          zones: () => [EXAMPLE], requireCookie: true, cookieSecret: secret, now: () => clock,
+        });
+
+        const issued = cookieOf(received(await ask(port, withCookie("www.example.com", CLIENT_COOKIE))));
+        const proven = received(await ask(port, withCookie("www.example.com", issued)));
+        assert.equal((proven.readUInt16BE(2) & 0x0200) >> 9, 0, "accepted while fresh");
+
+        clock += 3_601_000;
+        const stale = received(await ask(port, withCookie("www.example.com", issued)));
+        assert.equal((stale.readUInt16BE(2) & 0x0200) >> 9, 1, "past an hour it proves nothing");
+
+        // And the reply still carries a freshly stamped one, so the client
+        // recovers on its next query rather than being locked out.
+        const renewed = cookieOf(stale);
+        assert.equal(renewed.readUInt32BE(12), Math.floor(clock / 1000));
+        const again = received(await ask(port, withCookie("www.example.com", renewed)));
+        assert.equal((again.readUInt16BE(2) & 0x0200) >> 9, 0, "proven again with the new one");
+      });
+
+      it("refuses a cookie stamped further ahead than a clock could plausibly be", async () => {
+        let clock = Date.UTC(2026, 0, 1, 12, 0, 0);
+        const secret = Buffer.alloc(32, 9);
+        const { port } = await start({
+          zones: () => [EXAMPLE], requireCookie: true, cookieSecret: secret, now: () => clock,
+        });
+        const future = cookieOf(received(await ask(port, withCookie("www.example.com", CLIENT_COOKIE))));
+
+        clock -= 600_000;
+        const reply = received(await ask(port, withCookie("www.example.com", future)));
+        assert.equal((reply.readUInt16BE(2) & 0x0200) >> 9, 1, "ten minutes ahead is beyond the allowed skew");
+      });
+
+      it("does not accept a cookie minted for a different address", async () => {
+        // The hash covers the address, so a cookie lifted from one client
+        // proves nothing for another. This is the property the whole scheme
+        // exists for, and the timestamp must not have displaced it.
+        const secret = Buffer.alloc(32, 9);
+        const { port } = await start({ zones: () => [EXAMPLE], requireCookie: true, cookieSecret: secret });
+        const mine = cookieOf(received(await ask(port, withCookie("www.example.com", CLIENT_COOKIE))));
+
+        const tampered = Buffer.from(mine);
+        tampered.writeUInt8(tampered.readUInt8(20) ^ 0xff, 20);
+        const reply = received(await ask(port, withCookie("www.example.com", tampered)));
+        assert.equal((reply.readUInt16BE(2) & 0x0200) >> 9, 1, "a forged hash proves nothing");
       });
 
       it("leaves a client that sends no cookie exactly as it was", async () => {

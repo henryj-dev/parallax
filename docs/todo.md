@@ -97,7 +97,7 @@ T18-b · T19 · T20 · T21 은 2026-08-24 에 「한다」로 결정되어 아�
 
 - [x] **D1** · `L` · OIDC discovery — `/.well-known/openid-configuration` 에서
       엔드포인트를 읽고, 역할 클레임 이름을 환경변수로 연다
-- [ ] **T20** · `L` · EDNS 쿠키에 타임스탬프와 허용 창
+- [x] **T20** · `L` · EDNS 쿠키에 타임스탬프와 허용 창
 - [ ] **T21** · `L` · CNAME 체인 추적
 - [ ] **D2** · 액세스 토큰에 `expiresAt`·`lastUsedAt`
 - [ ] **D6** · 요청 로그·요청 ID·DNS 질의 메트릭
