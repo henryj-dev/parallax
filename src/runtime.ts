@@ -1,6 +1,6 @@
 import { constants as fsConstants } from "node:fs";
-import { access, lstat, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { access } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { AccessTokenService } from "./application/access-tokens.ts";
 import { CloudflareCredentialManager } from "./application/cloudflare-credentials.ts";
 import { FallbackDomainService } from "./application/fallback-domains.ts";
@@ -10,13 +10,13 @@ import { DomainValidationError } from "./domain/dns.ts";
 import { watchingZones } from "./dns/zone-changes.ts";
 import { OwnershipSecretError } from "./adapters/ownership.ts";
 import { RoutingProviderAdapter } from "./adapters/router.ts";
-import type { ProviderAdapter, SettingsRepository } from "./application/ports.ts";
+import type { SettingsRepository } from "./application/ports.ts";
 import type { CommandRuntime } from "./cli/commands.ts";
 import type { ParallaxConfig } from "./config.ts";
 import { createFileStateAdapters } from "./infrastructure/file-state.ts";
 import { FileConfigurationStore } from "./infrastructure/file-settings.ts";
 import { FileProviderAdapter } from "./infrastructure/file-provider.ts";
-import { applyMigrations, findMigrationsDirectory, type MigrationRun, type MigrationTarget } from "./infrastructure/migrations.ts";
+import { applyMigrations, findMigrationsDirectory, type MigrationTarget } from "./infrastructure/migrations.ts";
 import {
   createPostgresAdapters,
   createPostgresPool,

@@ -19,7 +19,6 @@ export interface CloudflareCredentialManagerOptions {
   readonly ownershipSecret: string;
   /** Injected so a test can bind without reaching Cloudflare. */
   readonly resolveZoneId?: (zone: string, token: string) => Promise<string>;
-  readonly environmentAdapters?: ReadonlyMap<string, ProviderAdapter>;
   readonly createAdapter?: (credential: CloudflareCredentialSecret) => ProviderAdapter;
 }
 
@@ -32,7 +31,6 @@ export interface CloudflareProfileSummary extends CloudflareProfileMetadata {
 export class CloudflareCredentialManager {
   readonly #store: EncryptedCredentialStore;
   readonly #router: RoutingProviderAdapter;
-  readonly #environmentAdapters: ReadonlyMap<string, ProviderAdapter>;
   readonly #createAdapter: (credential: CloudflareCredentialSecret) => ProviderAdapter;
   readonly #resolveZoneId: (zone: string, token: string) => Promise<string>;
   readonly #routedZones = new Set<string>();
@@ -41,7 +39,6 @@ export class CloudflareCredentialManager {
   constructor(options: CloudflareCredentialManagerOptions) {
     this.#store = options.store;
     this.#router = options.router;
-    this.#environmentAdapters = options.environmentAdapters ?? new Map();
     this.#createAdapter = options.createAdapter ?? ((credential) => new CloudflareProviderAdapter({
       zoneId: credential.zoneId,
       token: credential.token,
@@ -251,19 +248,19 @@ export class CloudflareCredentialManager {
     }
   }
 
+  /**
+   * Takes the zone's adapter out of the router.
+   *
+   * This used to consult a map of adapters built from the environment, so a
+   * zone losing its stored binding could fall back to one configured outside
+   * the store. Nothing supplied that map -- `createRuntime` is the only
+   * production caller and has no way to pass one -- so the lookup always
+   * missed and this was already only the `else` branch.
+   */
   #restoreEnvironmentRoute(zone: string): void {
-    const fallback = this.#environmentAdapters.get(zone);
-    if (fallback) this.#router.registerExternal(zone, fallback);
-    else this.#router.unregisterExternal(zone);
+    this.#router.unregisterExternal(zone);
   }
 }
-
-/**
- * A syntactically valid zone used only to build a provider target while probing
- * a profile. The Cloudflare adapter addresses records by zone id, so the name
- * never reaches the API.
- */
-const PROBE_ZONE = "profile-probe.invalid";
 
 export class CredentialNotFoundError extends Error {
   override readonly name = "CredentialNotFoundError";

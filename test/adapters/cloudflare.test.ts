@@ -132,7 +132,7 @@ describe("CloudflareProviderAdapter", () => {
     // field. The desired state keeps the whole presentation form, so the two
     // have to be taken apart on the way out and put back on the way in.
     const sent: unknown[] = [];
-    const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       if (init?.method === "POST") {
         sent.push(JSON.parse(String(init.body)));
         return Response.json({ success: true, result: {} });

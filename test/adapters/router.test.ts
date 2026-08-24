@@ -69,13 +69,14 @@ describe("RoutingProviderAdapter", () => {
 
   it("revisions only configuration changes that can alter readiness", () => {
     const router = new RoutingProviderAdapter();
-    const internalRevision = router.configurationRevision();
-    router.setInternal(new SpyAdapter());
-    assert.equal(router.configurationRevision(), internalRevision + 1);
+    const empty = router.configurationRevision();
+    router.setFallback(new SpyAdapter());
+    assert.equal(router.configurationRevision(), empty + 1, "a target that had no provider now has one");
 
-    const replacementRevision = router.configurationRevision();
-    router.setInternal(new SpyAdapter());
-    assert.equal(router.configurationRevision(), replacementRevision, "adapter replacement stays configured");
+    const withFallback = router.configurationRevision();
+    router.setFallback(new SpyAdapter());
+    assert.equal(router.configurationRevision(), withFallback, "adapter replacement stays configured");
+    router.setFallback(undefined);
 
     router.registerExternal("example.com", new SpyAdapter());
     const externalRevision = router.configurationRevision();

@@ -59,7 +59,7 @@ describe("CloudflareCredentialManager", () => {
     }
   });
 
-  it("loads encrypted credentials, updates live routing, and restores environment routing after deletion", async () => {
+  it("loads encrypted credentials, updates live routing, and unroutes the zone after deletion", async () => {
     const directory = await mkdtemp(join(tmpdir(), "parallax-manager-"));
     try {
       const store = new EncryptedCredentialStore({ repository: new FileConfigurationStore(join(directory, "configuration.json")).credentials, masterKey: randomBytes(32) });
@@ -70,7 +70,6 @@ describe("CloudflareCredentialManager", () => {
       const manager = new CloudflareCredentialManager({
         store,
         router,
-        environmentAdapters: new Map([["example.com", environment]]),
         ownershipSecret: "ownership-secret-that-is-at-least-32-bytes",
         resolveZoneId: async (zone) => `id-for-${zone}`,
         createAdapter: (credential) => {
@@ -102,9 +101,16 @@ describe("CloudflareCredentialManager", () => {
       await restartedRouter.list("example.com/external");
       assert.equal(created.at(-1)?.credential.token, "top-secret");
 
+      // Unbinding takes the adapter out of the router and leaves nothing in its
+      // place. It used to be able to fall back to an adapter built from the
+      // environment, but nothing ever supplied one, so this is what already
+      // happened -- said plainly now. The external view stays quarantined
+      // rather than sliding into the local fallback, which is the rule that
+      // keeps a revoked credential from silently becoming a JSON file.
       assert.equal(await manager.unbindZone("example.com"), true);
-      await router.list("example.com/external");
-      assert.deepEqual(environment.targets, ["example.com/external"]);
+      assert.equal(router.isConfigured("example.com/external"), false);
+      await assert.rejects(router.list("example.com/external"), /no provider is configured/u);
+      assert.deepEqual(environment.targets, [], "and the old adapter is not reached again");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

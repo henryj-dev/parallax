@@ -11,7 +11,7 @@ export interface RoutingProviderAdapterOptions {
 export class RoutingProviderAdapter implements ProviderAdapter {
   readonly #external = new Map<string, ProviderAdapter>();
   readonly #quarantinedExternal = new Set<string>();
-  #internal?: ProviderAdapter;
+  readonly #internal?: ProviderAdapter;
   #fallback?: ProviderAdapter;
   #fallbackViews = new Set<"internal" | "external">();
   #configurationRevision = 0;
@@ -22,13 +22,6 @@ export class RoutingProviderAdapter implements ProviderAdapter {
     if (options.fallback) this.#fallbackViews = new Set(["internal", "external"]);
     const entries = options.external instanceof Map ? options.external.entries() : Object.entries(options.external ?? {});
     for (const [zone, adapter] of entries) this.registerExternal(zone, adapter);
-  }
-
-  /** Swaps the internal-view adapter, so a settings change needs no restart. */
-  setInternal(adapter: ProviderAdapter | undefined): void {
-    const before = this.isConfigured("readiness.invalid/internal");
-    this.#internal = adapter;
-    if (before !== this.isConfigured("readiness.invalid/internal")) this.#configurationRevision += 1;
   }
 
   /** Swaps the adapter used when no specific one is configured for a target. */

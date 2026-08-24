@@ -293,7 +293,7 @@ describe("keeping the overrides in step with the zones", () => {
   });
 
   it("keeps every other entry when it does write", async () => {
-    const { service, provider } = syncing(OTHERS);
+    const { service } = syncing(OTHERS);
     const { domains } = await service.sync("main", ["tenant-zone.example"], "10.0.0.53");
     assert.equal(domains.length, 4);
     for (const entry of OTHERS) {

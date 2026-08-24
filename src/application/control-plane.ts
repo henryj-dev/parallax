@@ -7,7 +7,6 @@ import {
   normalizeExternalRecords,
   normalizeZoneName,
   providerManagement,
-  readPersistedViewName,
   RECORD_TYPES,
   validateExternalRecords,
   validateRecordId,

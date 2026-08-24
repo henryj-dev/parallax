@@ -53,7 +53,7 @@
 
 ## 5단계 — 잔재 정리
 
-- [ ] **T12** · `S` · CoreDNS 잔재 5곳 + `noUnusedLocals`·`noUnusedParameters`
+- [x] **T12** · `S` · CoreDNS 잔재 5곳 + `noUnusedLocals`·`noUnusedParameters`
       <br>⚠️ **플래그를 먼저 켜고 무엇이 빨개지는지 본 다음** 지운다. 목록은
       리포트가 아니라 컴파일러가 준다
 
