@@ -103,6 +103,13 @@ const MAX_LABEL_BYTES = 63;
 export const MAX_RDATA_BYTES = 0xffff;
 /** Without an OPT record a client is promised no more than this. */
 export const MIN_UDP_PAYLOAD = 512;
+/**
+ * The largest message DNS-over-TCP can frame, because the frame's length
+ * prefix is an unsigned 16-bit field. A property of the transport, not a
+ * policy -- and not the same limit as `MAX_RDATA_BYTES` above, which happens
+ * to be the same number for the same reason one field up.
+ */
+export const MAX_TCP_MESSAGE_BYTES = 0xffff;
 
 /**
  * Reads the one question a query carries.

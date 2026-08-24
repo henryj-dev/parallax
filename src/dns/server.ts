@@ -6,7 +6,7 @@ import { providerManagement, type RecordType } from "../domain/dns.ts";
 import { createDnsCookies } from "./cookies.ts";
 import { DEFAULT_SOA_TIMERS, encodeRdata, encodeSoa, rrType, type SoaTimers } from "./rdata.ts";
 import {
-  CLASS_ANY, CLASS_IN, MAX_EDNS_VERSION, MAX_RDATA_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
+  CLASS_ANY, CLASS_IN, MAX_EDNS_VERSION, MAX_RDATA_BYTES, MAX_TCP_MESSAGE_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
   isResponseToQuery, opcodeOf, readQuery, writeName, writeReply, writeTruncatedReply,
   type ParsedQuery, type ResourceRecord,
 } from "./wire.ts";
@@ -263,7 +263,32 @@ export function createDnsServer(options: DnsServerOptions): {
     };
     const budget = overTcp ? Number.MAX_SAFE_INTEGER : query.udpPayloadSize;
     try {
-      return writeReply(parts, budget);
+      const reply = writeReply(parts, budget);
+      // A DNS-over-TCP message is length-prefixed with a uint16, so this is a
+      // ceiling the transport imposes and the assembler above knows nothing
+      // about. Over UDP `writeReply` has already truncated to fit; over TCP the
+      // budget is deliberately unbounded, because TC on a TCP reply tells the
+      // client to retry over TCP -- which is where it already is.
+      //
+      // What used to happen: the framing wrote this length into two bytes,
+      // `writeUInt16BE` threw ERR_OUT_OF_RANGE, and the `.catch()` beside it
+      // destroyed the socket. Measured at 2,500 A records -- the secondary
+      // received **zero bytes** and nothing here said why. SERVFAIL is an
+      // answer, and it is small.
+      //
+      // ⚠️ This does not make a large zone transferable. AXFR is meant to span
+      // several messages (RFC 5936) and this build puts the whole zone in one;
+      // until that changes, a zone past this size cannot be transferred at all.
+      // The difference this makes is that it now says so.
+      if (overTcp && reply.length > MAX_TCP_MESSAGE_BYTES) {
+        options.onUnanswerable?.({
+          zone: zone.name,
+          name: query.question.name,
+          reason: `reply is ${reply.length} bytes and a DNS-over-TCP message cannot exceed ${MAX_TCP_MESSAGE_BYTES}`,
+        });
+        return writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: true, ...(cookie ? { cookie } : {}) }, budget);
+      }
+      return reply;
     } catch (error) {
       // Everything that knows which record it was has already run. Whatever is
       // left -- a name that will not re-encode, a type this build cannot write

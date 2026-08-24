@@ -369,6 +369,59 @@ describe("DNS server", () => {
     assert.ok(answers.some((record) => record.type === TYPE.MX));
   });
 
+  /**
+   * A zone whose wire form outgrows the frame that has to carry it.
+   *
+   * DNS-over-TCP prefixes each message with a uint16 length, so 65535 bytes is
+   * the ceiling the transport imposes -- and AXFR here puts the whole zone in
+   * one message. The framing used to write that length unconditionally,
+   * `writeUInt16BE` threw, and the `.catch()` beside it destroyed the socket:
+   * the secondary received **zero bytes** and nothing was logged or counted.
+   *
+   * ⚠️ This asserts the failure is *reported*, not that the transfer works.
+   * Splitting AXFR across messages is T18; until then a zone this size cannot
+   * be transferred, and the point of this test is that it says so out loud.
+   */
+  it("answers SERVFAIL and reports it when a zone will not fit one TCP message", async () => {
+    const unanswerable: { zone: string; name: string; reason: string }[] = [];
+    const huge: ServedZone = {
+      name: "example.com",
+      serial: 1,
+      records: Array.from({ length: 2_500 }, (_unused, index) => ({
+        name: `host-with-a-longish-label-${index}`, type: "A" as const, content: "203.0.113.5", ttl: 300,
+      })),
+    };
+    const { port } = await start({
+      zones: () => [huge],
+      transferAllow: ["127.0.0.0/8"],
+      onUnanswerable: (detail) => unanswerable.push(detail),
+    });
+
+    const reply = await askOverTcp(port, buildQuery("example.com", TYPE.AXFR));
+
+    assert.equal(rcodeOf(reply), RCODE.SERVFAIL, "an answer, rather than a dropped connection");
+    assert.equal(unanswerable.length, 1, "and the reason exists somewhere");
+    assert.equal(unanswerable[0]?.zone, "example.com");
+    assert.match(unanswerable[0]?.reason ?? "", /cannot exceed 65535/u);
+  });
+
+  it("still transfers a zone that does fit", async () => {
+    // The guard must not have moved the ceiling down onto ordinary zones.
+    const ordinary: ServedZone = {
+      name: "example.com",
+      serial: 1,
+      records: Array.from({ length: 800 }, (_unused, index) => ({
+        name: `host-${index}`, type: "A" as const, content: "203.0.113.5", ttl: 300,
+      })),
+    };
+    const { port } = await start({ zones: () => [ordinary], transferAllow: ["127.0.0.0/8"] });
+
+    const reply = await askOverTcp(port, buildQuery("example.com", TYPE.AXFR));
+
+    assert.equal(rcodeOf(reply), RCODE.NOERROR);
+    assert.equal(readAnswers(reply).length, 802, "SOA, 800 records, SOA");
+  });
+
   it("emits NOTIFY when a served zone's serial rises", async () => {
     const sent: Array<{ packet: Buffer; address: string; port: number }> = [];
     const zone = { ...EXAMPLE, serial: 12 };
