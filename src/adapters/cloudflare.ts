@@ -22,6 +22,10 @@ export interface CloudflareProviderAdapterOptions {
   accountId?: string;
   /** How many buckets to ask about while looking for R2 custom domains. */
   maxBuckets?: number;
+  /** Attempts per request, including the first. 1 disables retrying. */
+  maxAttempts?: number;
+  /** Injected by tests so a backoff does not become a slow suite. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 interface CloudflareRecord {
@@ -47,6 +51,8 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
   readonly #ownershipSecret: string;
   readonly #accountId: string;
   readonly #maxBuckets: number;
+  readonly #maxAttempts: number;
+  readonly #sleep: (ms: number) => Promise<void>;
 
   constructor(options: CloudflareProviderAdapterOptions) {
     if (!options.token.trim()) throw new Error("Cloudflare API token is required");
@@ -60,6 +66,8 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
     this.#ownershipSecret = options.ownershipSecret;
     this.#accountId = (options.accountId ?? "").trim();
     this.#maxBuckets = positiveInteger(options.maxBuckets ?? 200, "Cloudflare bucket limit");
+    this.#maxAttempts = positiveInteger(options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS, "Cloudflare attempt limit");
+    this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => { setTimeout(resolve, ms).unref?.(); }));
     ownershipComment("validation/target", "validation", this.#ownershipSecret);
   }
 
@@ -210,28 +218,61 @@ export class CloudflareProviderAdapter implements ProviderAdapter {
     }
   }
 
+  /**
+   * One call, retried where retrying is safe.
+   *
+   * Cloudflare allows 1200 requests per five minutes and `apply` sends one per
+   * record in sequence, so a large zone meets 429 as a matter of course. Every
+   * one of those used to fail the view part-applied: the operations before it
+   * are live at the provider and the ones after it are not.
+   *
+   * ⚠️ What may be retried is decided by the method, and the reason differs for
+   * each status:
+   *
+   * - **429** is a refusal. The request was not carried out, whatever it was,
+   *   so retrying it is safe even for a create.
+   * - **5xx and a transport failure** are ambiguous -- the write may have
+   *   landed. Retrying a create there is how one record becomes two, so only
+   *   idempotent methods get a second attempt. `PATCH` and `DELETE` name a
+   *   record id and `GET` changes nothing; `POST` invents an id at the
+   *   provider and is the one method that cannot be replayed.
+   */
   async #request(method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {
-    let response: Response;
-    try {
-      response = await this.#fetch(`${this.#baseUrl}${path}`, {
-        method,
-        signal: AbortSignal.timeout(this.#timeoutMs),
-        headers: {
-          authorization: `Bearer ${this.#token}`,
-          ...(body === undefined ? {} : { "content-type": "application/json" }),
-        },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
-    } catch (error) {
-      throw new Error(`Cloudflare API transport failure: ${redact(error instanceof Error ? error.message : String(error), this.#token)}`);
+    const replayable = method !== "POST";
+    for (let attempt = 1; ; attempt += 1) {
+      const last = attempt >= this.#maxAttempts;
+      let response: Response;
+      try {
+        response = await this.#fetch(`${this.#baseUrl}${path}`, {
+          method,
+          signal: AbortSignal.timeout(this.#timeoutMs),
+          headers: {
+            authorization: `Bearer ${this.#token}`,
+            ...(body === undefined ? {} : { "content-type": "application/json" }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+      } catch (error) {
+        if (replayable && !last) {
+          await this.#sleep(backoffMs(attempt));
+          continue;
+        }
+        throw new Error(`Cloudflare API transport failure: ${redact(error instanceof Error ? error.message : String(error), this.#token)}`);
+      }
+      const payload = await readJson(response);
+      if (!response.ok || payload.success !== true) {
+        const rateLimited = response.status === 429;
+        const serverFault = response.status >= 500;
+        if (!last && (rateLimited || (serverFault && replayable))) {
+          await this.#sleep(retryAfterMs(response) ?? backoffMs(attempt));
+          continue;
+        }
+        const errors = Array.isArray(payload.errors) ? payload.errors : [];
+        const codes = errors.flatMap((error) => isObject(error) && (typeof error.code === "number" || typeof error.code === "string") ? [String(error.code)] : []);
+        throw new Error(`Cloudflare API request failed (HTTP ${response.status}${codes.length > 0 ? `; codes ${codes.join(",")}` : ""})`);
+      }
+      return payload;
     }
-    const payload = await readJson(response);
-    if (!response.ok || payload.success !== true) {
-      const errors = Array.isArray(payload.errors) ? payload.errors : [];
-      const codes = errors.flatMap((error) => isObject(error) && (typeof error.code === "number" || typeof error.code === "string") ? [String(error.code)] : []);
-      throw new Error(`Cloudflare API request failed (HTTP ${response.status}${codes.length > 0 ? `; codes ${codes.join(",")}` : ""})`);
-    }
-    return payload;
   }
 }
 
@@ -304,6 +345,27 @@ export async function resolveZoneId(options: ResolveZoneIdOptions): Promise<stri
     throw new Error(`Cloudflare returned ${matches.length} zones named ${name}; the binding would be ambiguous`);
   }
   return matches[0]!;
+}
+
+/** Attempts per request, including the first. Two retries is enough for a burst. */
+const DEFAULT_MAX_ATTEMPTS = 3;
+const BASE_BACKOFF_MS = 500;
+/** A cap, so a provider asking for an hour does not hold an apply for one. */
+const MAX_BACKOFF_MS = 30_000;
+
+function backoffMs(attempt: number): number {
+  return Math.min(BASE_BACKOFF_MS * 2 ** (attempt - 1), MAX_BACKOFF_MS);
+}
+
+/** `Retry-After` in seconds or as a date, whichever the provider chose to send. */
+function retryAfterMs(response: Response): number | undefined {
+  const header = response.headers.get("retry-after");
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, MAX_BACKOFF_MS);
+  const when = Date.parse(header);
+  if (Number.isNaN(when)) return undefined;
+  return Math.min(Math.max(when - Date.now(), 0), MAX_BACKOFF_MS);
 }
 
 function positiveInteger(value: number, field: string): number {

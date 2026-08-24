@@ -363,3 +363,87 @@ describe("CloudflareProviderAdapter", () => {
     });
   });
 });
+
+/**
+ * Cloudflare allows 1200 requests per five minutes and `apply` sends one per
+ * record, in sequence, so a large zone meets 429 as a matter of course. Each
+ * one used to leave the view part-applied -- the operations before it live at
+ * the provider, the ones after it not.
+ *
+ * What may be replayed is decided by the method, and the two failure kinds are
+ * not the same question. A 429 is a refusal, so nothing happened and any method
+ * may go again. A 5xx or a dropped connection is ambiguous, and replaying a
+ * create there is how one record becomes two.
+ */
+describe("Cloudflare retries only where a replay is safe", () => {
+  const OWNERSHIP = "ownership-secret-that-is-at-least-32-bytes";
+  const RECORD = { id: "web", name: "www", type: "A" as const, content: "203.0.113.4", ttl: 300 };
+
+  function adapterOver(handler: (attempt: number, init: RequestInit) => Response) {
+    const attempts: { method: string }[] = [];
+    const slept: number[] = [];
+    const adapter = new CloudflareProviderAdapter({
+      token: "cf-token", zoneId: "zone-1", ownershipSecret: OWNERSHIP,
+      fetch: async (_input, init = {}) => {
+        attempts.push({ method: String(init.method ?? "GET") });
+        return handler(attempts.length, init);
+      },
+      sleep: async (ms) => { slept.push(ms); },
+    });
+    return { adapter, attempts, slept };
+  }
+
+  const ok = (payload: unknown = { success: true, result: [] }) =>
+    new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+  const status = (code: number, headers: Record<string, string> = {}) =>
+    new Response(JSON.stringify({ success: false, errors: [] }), { status: code, headers });
+
+  it("retries a rate-limited create, because a refusal did not create anything", async () => {
+    const { adapter, attempts, slept } = adapterOver((attempt) =>
+      attempt === 1 ? status(429, { "retry-after": "2" }) : ok({ success: true, result: {} }));
+
+    await adapter.apply("example.com/external", { kind: "create", desired: RECORD });
+
+    assert.deepEqual(attempts.map((call) => call.method), ["POST", "POST"]);
+    assert.deepEqual(slept, [2000], "and it waited as long as the provider asked");
+  });
+
+  it("does not retry a create the server may already have applied", async () => {
+    // 5xx is ambiguous. A second POST is how one record becomes two.
+    const { adapter, attempts } = adapterOver(() => status(503));
+    await assert.rejects(
+      adapter.apply("example.com/external", { kind: "create", desired: RECORD }),
+      /HTTP 503/u,
+    );
+    assert.deepEqual(attempts.map((call) => call.method), ["POST"]);
+  });
+
+  it("does not retry a create whose connection dropped", async () => {
+    const attempts: string[] = [];
+    const adapter = new CloudflareProviderAdapter({
+      token: "cf-token", zoneId: "zone-1", ownershipSecret: OWNERSHIP,
+      fetch: async (_input, init = {}) => {
+        attempts.push(String(init.method ?? "GET"));
+        throw new Error("socket hang up");
+      },
+      sleep: async () => undefined,
+    });
+    await assert.rejects(adapter.apply("example.com/external", { kind: "create", desired: RECORD }), /transport failure/u);
+    assert.deepEqual(attempts, ["POST"]);
+  });
+
+  it("retries a listing through a server fault, since a read replays cleanly", async () => {
+    const { adapter, attempts, slept } = adapterOver((attempt) =>
+      attempt < 3 ? status(500) : ok({ success: true, result: [], result_info: { total_pages: 1 } }));
+
+    assert.deepEqual(await adapter.list("example.com/external"), []);
+    assert.equal(attempts.length, 3);
+    assert.deepEqual(slept, [500, 1000], "exponential, and bounded by the attempt limit");
+  });
+
+  it("gives up rather than retrying forever", async () => {
+    const { adapter, attempts } = adapterOver(() => status(429));
+    await assert.rejects(adapter.list("example.com/external"), /HTTP 429/u);
+    assert.equal(attempts.length, 3, "the attempt limit, including the first");
+  });
+});
