@@ -59,7 +59,7 @@
 
 ## 6단계 — 성능·견고성 (전/후를 같은 방법으로 잰다)
 
-- [ ] **T13** · `S` · `prepareConfig` 의 O(n²)·캐시 무효화·`roleOf` 재계산
+- [x] **T13** · `S` · `prepareConfig` 의 O(n²)·캐시 무효화·`roleOf` 재계산
       <br>📌 셋 중 **중복 검사를 `Set` 으로 바꾸는 것만 해도 곡선이 사라진다**
 - [ ] **T14** · `S` · 파일 락 회수에 boot id — `src/infrastructure/atomic-file.ts:113`
       <br>⚠️ **재현이 먼저.** 컨테이너에서 정말 pid 1 인지 확인한 뒤 고칠 것

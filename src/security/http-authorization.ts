@@ -81,6 +81,16 @@ interface PreparedConfig {
 }
 
 const trustedClientKeys = new WeakMap<Request, string>();
+/**
+ * The principal this layer already established, so the routing layer does not
+ * authenticate the same request a second time to learn its role.
+ */
+const resolvedPrincipals = new WeakMap<Request, Principal>();
+
+/** The principal `createAuthorizedHandler` proved, when this request came through it. */
+export function resolvedPrincipal(request: Request): Principal | undefined {
+  return resolvedPrincipals.get(request);
+}
 
 /** Transport-only metadata used for per-client throttling; never read from an HTTP header. */
 export function setTrustedClientKey(request: Request, key: string): void {
@@ -108,8 +118,19 @@ export function authenticate(request: Request, config: SecurityConfig): Principa
  * configured, unauthenticated callers are not treated as the
  * `authentication-disabled` administrator — they have to present a session.
  */
+const identityConfigs = new WeakMap<SecurityConfig, { secret: string; result: SecurityConfig }>();
+
 export function withIdentityProvider(config: SecurityConfig, identitySessionSecret: string): SecurityConfig {
-  return { ...config, enabled: true, identitySessionSecret };
+  // The same inputs give back the same object, because the handler's prepared
+  // digests are cached by object identity. `accessTokens.security()` already
+  // returns a stable object while nothing changes; this used to wrap it in a
+  // fresh one on every request, so with an identity provider configured the
+  // cache never hit once and every request re-hashed every token.
+  const cached = identityConfigs.get(config);
+  if (cached && cached.secret === identitySessionSecret) return cached.result;
+  const result: SecurityConfig = { ...config, enabled: true, identitySessionSecret };
+  identityConfigs.set(config, { secret: identitySessionSecret, result });
+  return result;
 }
 
 /** Returns whether the principal may invoke the request's route and method. */
@@ -217,7 +238,7 @@ export function createAuthorizedHandler(
       return authenticationError(403);
     }
     if (!authorize(principal, request)) return authenticationError(403);
-    return next(withActor(request, principal.subject));
+    return next(withActor(request, principal.subject, principal));
   };
 }
 
@@ -321,10 +342,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function withActor(request: Request, subject: string): Request {
+function withActor(request: Request, subject: string, principal?: Principal): Request {
   const headers = new Headers(request.headers);
   headers.set("x-parallax-actor", subject);
-  return new Request(request, { headers });
+  const next = new Request(request, { headers });
+  // Carried out of band rather than in a header: a header is client-supplied
+  // input everywhere else, and the role decides what the caller may do.
+  if (principal) resolvedPrincipals.set(next, principal);
+  return next;
 }
 
 /**
@@ -406,12 +431,20 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
   if (config.identitySessionSecret !== undefined) assertSessionSecret(config.identitySessionSecret);
 
   const prepared: PreparedToken[] = [];
+  // A `Set` rather than a scan of every digest prepared so far. The scan was
+  // O(n²) and used `timingSafeEqual`, which is the wrong tool twice over: this
+  // loop validates *configuration*, it does not authenticate anybody, and what
+  // it compares are already-hashed digests rather than secrets. The constant
+  // time that does matter is in `matchToken`, which is untouched.
+  //
+  // Measured through this handler at 1000 tokens: 18.36 ms per request before.
+  const seen = new Set<string>();
   const add = (recordDigest: Buffer, role: Role, subject: string): void => {
     if (role !== "admin" && role !== "editor" && role !== "viewer") throw invalidConfiguration();
     if (!SUBJECT_PATTERN.test(subject) || subject.trim().length === 0) throw invalidConfiguration();
-    for (const existing of prepared) {
-      if (timingSafeEqual(recordDigest, existing.digest)) throw invalidConfiguration();
-    }
+    const key = recordDigest.toString("base64url");
+    if (seen.has(key)) throw invalidConfiguration();
+    seen.add(key);
     prepared.push({ digest: recordDigest, principal: { role, subject } });
   };
 

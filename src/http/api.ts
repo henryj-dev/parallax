@@ -16,7 +16,7 @@ import {
 } from "../cli/commands.ts";
 import { DomainValidationError } from "../domain/dns.ts";
 import { CredentialInUseError, CredentialValidationError } from "../security/credential-store.ts";
-import { authenticate, createAuthorizedHandler, setTrustedClientKey, type Role, type SecurityConfig } from "../security/http-authorization.ts";
+import { authenticate, createAuthorizedHandler, resolvedPrincipal, setTrustedClientKey, type Role, type SecurityConfig } from "../security/http-authorization.ts";
 
 const MAX_REQUEST_BODY_BYTES = 1_048_576;
 
@@ -483,9 +483,22 @@ async function credentialRoute(segments: string[], method: string, request: Requ
   throw new NotFoundError("route was not found");
 }
 
-/** The role the security layer already authenticated, or admin when it is off. */
+/**
+ * The role the security layer already authenticated, or admin when it is off.
+ *
+ * It really did already authenticate it, so the answer is carried through
+ * rather than recomputed. Asking again meant a second `prepareConfig` on every
+ * request -- re-hashing every configured token to learn a role that had just
+ * been established -- and the fallback below is what that second pass would
+ * have degraded to anyway.
+ */
 function roleOf(request: Request, security: SecurityConfig): Role {
   if (!security.enabled) return "admin";
+  const resolved = resolvedPrincipal(request);
+  if (resolved) return resolved.role;
+  // `createApiHandler` is the only production path and always goes through the
+  // authorization layer. A caller that builds this handler differently -- a
+  // test, an embedding -- still gets an answer rather than a wrong one.
   return authenticate(request, security)?.role ?? "viewer";
 }
 
