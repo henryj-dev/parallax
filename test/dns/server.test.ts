@@ -604,6 +604,73 @@ describe("DNS server", () => {
     assert.equal(rcodeOf(removed), RCODE.NXDOMAIN);
   });
 
+  /**
+   * A CNAME alone is a correct answer and the resolver would ask again for the
+   * target. Following it here saves that round trip, which is what every other
+   * authoritative server does -- and the target's records are ones this zone
+   * already holds, so nothing is asserted that was not already ours.
+   */
+  describe("following a CNAME inside the zone", () => {
+    const ALIASED: ServedZone = {
+      name: "example.com",
+      serial: 1,
+      records: [
+        { name: "shop", type: "CNAME", content: "front.example.com", ttl: 300 },
+        { name: "front", type: "CNAME", content: "origin.example.com", ttl: 300 },
+        { name: "origin", type: "A", content: "203.0.113.20", ttl: 300 },
+        { name: "away", type: "CNAME", content: "elsewhere.example.net", ttl: 300 },
+        { name: "loop", type: "CNAME", content: "loop.example.com", ttl: 300 },
+        { name: "mail", type: "CNAME", content: "origin.example.com", ttl: 300 },
+      ],
+    };
+
+    it("answers the chain and the address it ends at", async () => {
+      const { port } = await start({ zones: () => [ALIASED] });
+      const reply = await ask(port, buildQuery("shop.example.com"));
+      assert.ok(reply);
+      const answers = readAnswers(reply);
+
+      assert.deepEqual(answers.map((record) => [record.name, record.type]), [
+        ["shop.example.com", TYPE.CNAME],
+        ["front.example.com", TYPE.CNAME],
+        ["origin.example.com", TYPE.A],
+      ]);
+      assert.equal(answers.at(-1)?.data.join("."), "203.0.113.20");
+    });
+
+    it("stops at the edge of the zone", async () => {
+      // The target belongs to whoever is authoritative for that name.
+      const { port } = await start({ zones: () => [ALIASED] });
+      const reply = await ask(port, buildQuery("away.example.com"));
+      assert.ok(reply);
+      assert.deepEqual(readAnswers(reply).map((record) => record.name), ["away.example.com"]);
+    });
+
+    it("does not spin on a zone that points at itself", async () => {
+      const { port } = await start({ zones: () => [ALIASED] });
+      const reply = await ask(port, buildQuery("loop.example.com"));
+      assert.ok(reply);
+      assert.equal(rcodeOf(reply), RCODE.NOERROR);
+      assert.equal(readAnswers(reply).length, 1, "the CNAME itself, and no second visit");
+    });
+
+    it("returns the CNAME alone when the target holds nothing of that type", async () => {
+      const { port } = await start({ zones: () => [ALIASED] });
+      const reply = await ask(port, buildQuery("mail.example.com", TYPE.MX));
+      assert.ok(reply);
+      const answers = readAnswers(reply);
+      assert.equal(answers.length, 1);
+      assert.equal(answers[0]?.type, TYPE.CNAME);
+    });
+
+    it("still answers the CNAME itself when that is what was asked for", async () => {
+      const { port } = await start({ zones: () => [ALIASED] });
+      const reply = await ask(port, buildQuery("shop.example.com", TYPE.CNAME));
+      assert.ok(reply);
+      assert.deepEqual(readAnswers(reply).map((record) => record.name), ["shop.example.com"]);
+    });
+  });
+
   it("emits NOTIFY when a served zone's serial rises", async () => {
     const sent: Array<{ packet: Buffer; address: string; port: number }> = [];
     const zone = { ...EXAMPLE, serial: 12 };

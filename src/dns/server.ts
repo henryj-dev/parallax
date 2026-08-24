@@ -707,7 +707,68 @@ function answerFromZone(
     }
   }
   if (unservable) return { query, rcode: RCODE.SERVFAIL, authoritative: true };
+  // A CNAME on its own is a correct answer, and the resolver would ask again
+  // for the target. Following it here saves that round trip, which is what
+  // every other authoritative server does -- and the target's records are ones
+  // this zone already holds, so nothing is being asserted that was not ours.
+  if (alias && query.question.type !== TYPE.CNAME && query.question.type !== TYPE.ANY) {
+    answers.push(...chaseAlias(zone, name, alias.content, query.question.type, onUnservable));
+  }
   return { query, rcode: RCODE.NOERROR, authoritative: true, answers };
+}
+
+/** A CNAME may point at a CNAME. Bounded, because a zone may also point at itself. */
+const MAX_ALIAS_DEPTH = 8;
+
+/**
+ * The records the alias leads to, as far as this zone can follow it.
+ *
+ * Only exact names inside this zone. A target outside it belongs to whoever is
+ * authoritative for that name, and a target covered only by a wildcard is left
+ * to the resolver's own query -- synthesizing into somebody else's question is
+ * more than saving a round trip.
+ *
+ * Never fails the answer. The CNAME already in hand is complete and correct on
+ * its own, so a target that will not encode stops the walk and is reported,
+ * rather than turning a good answer into SERVFAIL.
+ */
+function chaseAlias(
+  zone: ServedZone,
+  answered: string,
+  from: string,
+  type: number,
+  onUnservable: DnsServerOptions["onUnservable"],
+): ResourceRecord[] {
+  const index = indexOf(zone);
+  const chased: ResourceRecord[] = [];
+  // Seeded with the name already in the answer, so a CNAME pointing at its own
+  // owner cannot make the walk emit that record a second time.
+  const seen = new Set<string>([answered]);
+  let target = from.replace(/\.$/u, "").toLowerCase();
+
+  for (let depth = 0; depth < MAX_ALIAS_DEPTH; depth += 1) {
+    if (target !== zone.name && !target.endsWith(`.${zone.name}`)) return chased;
+    if (seen.has(target)) return chased;
+    seen.add(target);
+
+    const at = index.byName.get(target) ?? [];
+    const matches = at.filter((record) => rrType(record.type) === type);
+    const next = at.find((record) => record.type === "CNAME");
+    const step = matches.length > 0 ? matches : next ? [next] : [];
+    if (step.length === 0) return chased;
+
+    for (const record of step) {
+      try {
+        chased.push({ name: target, type: rrType(record.type), ttl: record.ttl, data: servableRdata(record.type, record.content) });
+      } catch (error) {
+        onUnservable?.({ zone: zone.name, name: record.name, type: record.type, reason: message(error) });
+        return chased;
+      }
+    }
+    if (matches.length > 0 || !next) return chased;
+    target = next.content.replace(/\.$/u, "").toLowerCase();
+  }
+  return chased;
 }
 
 function message(error: unknown): string {
