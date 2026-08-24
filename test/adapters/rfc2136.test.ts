@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { after, describe, it } from "node:test";
 import { Rfc2136ProviderAdapter } from "../../src/adapters/rfc2136.ts";
+import { buildReconcilePlan } from "../../src/domain/reconciliation.ts";
 import { ownershipComment } from "../../src/adapters/ownership.ts";
 import { encodeRdata } from "../../src/dns/rdata.ts";
 import { parseTsigKey } from "../../src/dns/tsig.ts";
@@ -130,7 +132,64 @@ describe("the RFC 2136 provider", () => {
       key: { ...KEY, secret: Buffer.alloc(32, 9) },
       ownershipSecret: OWNERSHIP_SECRET,
     });
-    await assert.rejects(() => wrong.list(TARGET), /NOTAUTH|refused/u, "a wrong key was accepted");
+    // RFC 8945 §5.2 keeps NOTAUTH readable without a signature, precisely so a
+    // peer can say which of the two ends is wrong. Anything else unsigned is
+    // discarded before it is read.
+    await assert.rejects(() => wrong.list(TARGET), /refused this key: NOTAUTH/u, "a wrong key was accepted");
+  });
+
+  /**
+   * The break this adapter shipped with, kept as the exploit that found it.
+   *
+   * The marker's signature covered `(target, recordId)` and nothing else, so
+   * the type and content digest were unsigned plaintext and the record a marker
+   * described was decided by where the TXT sat. Every one of those is an
+   * attacker's choice if they can write a single TXT in the zone -- which is
+   * what an ACME delegation grants.
+   */
+  it("refuses a marker whose signature was copied from another record", async () => {
+    const { primary, adapter } = await primaryAndAdapter([theirs("www", "198.51.100.9")]);
+    await adapter.apply(TARGET, { kind: "create", desired: { id: "blog", name: "blog", type: "A", content: "203.0.113.5", ttl: 300 } });
+
+    // Read our own marker the way anyone can: `dig TXT _parallax.blog…`.
+    const published = primary.records.find((record) => record.type === TYPE.TXT);
+    assert.ok(published);
+    const marker = published.rdata.subarray(1).toString();
+    const token = marker.split(" ").slice(2).join(" ");
+
+    // Copy the signature verbatim; recompute only the two plaintext fields for
+    // somebody else's record, and plant it where that record lives.
+    const digest = createHash("sha256").update("198.51.100.9", "utf8").digest("hex").slice(0, 16);
+    primary.records.push({
+      name: `_parallax.www.${ZONE}`, type: TYPE.TXT, ttl: 0,
+      rdata: encodeRdata("TXT", `A ${digest} ${token}`),
+    });
+
+    const listed = await adapter.list(TARGET);
+    const victim = listed.find((record) => record.name === "www");
+    assert.equal(victim?.managed, false, "a copied signature claimed a record it was not issued for");
+    // ...so reconciliation has nothing to delete. This is the step that used to
+    // reach `apply` and remove the record with this deployment's own key.
+    const plan = buildReconcilePlan(
+      [{ id: "blog", name: "blog", type: "A", content: "203.0.113.5", ttl: 300 }],
+      listed,
+    );
+    assert.deepEqual(plan.operations.filter((operation) => operation.kind === "delete"), []);
+  });
+
+  it("refuses an answer that is not signed, and reads the one refusal that cannot be", async () => {
+    const { primary, adapter } = await primaryAndAdapter();
+    // A peer that answers without a signature is a peer we cannot identify.
+    primary.stripSignatures = true;
+    await assert.rejects(() => adapter.list(TARGET), /carried no signature/u);
+  });
+
+  it("refuses a transfer that stopped part way through", async () => {
+    const { primary, adapter } = await primaryAndAdapter([theirs("www", "198.51.100.9")]);
+    // RFC 5936 §6: a transfer with an error detected is discarded whole. A
+    // short zone read as a complete one makes every missing record look deleted.
+    primary.truncateTransfer = true;
+    await assert.rejects(() => adapter.list(TARGET), /closed part way through/u);
   });
 
   it("leaves the zone's own records alone", async () => {

@@ -508,6 +508,45 @@ describe("the split layout", () => {
     assert.equal(entries[0]?.actor, "the-real-one");
   });
 
+  /**
+   * The window that used to destroy history: retention pruned the side files
+   * before the state file landed, so a commit that never happened still took
+   * revisions with it.
+   */
+  it("keeps every retained revision when a commit is interrupted before it lands", async () => {
+    const path = await statePath();
+    const repository = new FileStateRepository(path);
+    const retention = { maxRevisionsPerZone: 3 };
+    for (let revision = 1; revision <= 4; revision += 1) {
+      await repository.commitDesiredChange({
+        snapshot: { ...zoneFixture("alpha.example", revision), updatedAt: `2026-08-08T00:0${revision}:00.000Z` },
+        audit: auditFixture("alpha.example", revision),
+        statuses: [],
+        retention,
+      });
+    }
+    const before = (await repository.listRevisions("alpha.example")).map((one) => one.revision);
+    assert.deepEqual(before, [2, 3, 4], "retention should be holding three");
+
+    // The state file as it stands is what a crash before the next commit's
+    // rename leaves behind: read it back with a fresh repository and the
+    // revision file must still carry every revision the committed state
+    // vouches for.
+    const reopened = new FileStateRepository(path);
+    assert.equal((await reopened.get("alpha.example"))?.revision, 4);
+    assert.deepEqual((await reopened.listRevisions("alpha.example")).map((one) => one.revision), [2, 3, 4]);
+
+    // And a revision file that a crash left un-pruned is trimmed by the next
+    // commit rather than left to grow.
+    await repository.commitDesiredChange({
+      snapshot: { ...zoneFixture("alpha.example", 5), updatedAt: "2026-08-08T00:05:00.000Z" },
+      audit: auditFixture("alpha.example", 5),
+      statuses: [],
+      retention,
+    });
+    assert.deepEqual((await repository.listRevisions("alpha.example")).map((one) => one.revision), [3, 4, 5]);
+  });
+
   it("takes a deleted zone's history with it", async () => {
     const path = await statePath();
     const repository = new FileStateRepository(path);
@@ -546,7 +585,21 @@ describe("the split layout", () => {
     assert.deepEqual((await repository.audit()).map((one) => one.at), [
       "2026-08-10T00:00:00.000Z", "2026-08-09T00:00:00.000Z", "2026-08-08T00:00:00.000Z",
     ]);
-    // The skip hint moved with the log; a stale one would skip a real prune.
+    // ⚠️ The hint deliberately lags the log by one commit, and must never lead
+    // it. Retention now runs *after* the state file lands -- a crash in that
+    // window has to leave more history than configured rather than less -- so
+    // the hint written at commit time still names the entry the prune removed.
+    // Lagging costs one wasted pass over a log that is already short. Leading
+    // would skip a prune that is still owed, which is unbounded growth.
+    const hint = JSON.parse(await readFile(path, "utf8")).auditOldestAt as string;
+    assert.ok(hint <= "2026-08-08T00:00:00.000Z", `the skip hint outran the log: ${hint}`);
+
+    // ...and the next commit does the pass the lag left owed, without needing
+    // retention to be asked for again.
+    await repository.appendAudit(
+      { ...auditFixture("alpha.example", 1), at: "2026-08-11T00:00:00.000Z" },
+      { deleteAuditBefore: "2026-08-01T00:00:00.000Z" },
+    );
     assert.equal(JSON.parse(await readFile(path, "utf8")).auditOldestAt, "2026-08-08T00:00:00.000Z");
   });
 });

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import type { ProviderAdapter } from "../application/ports.ts";
-import type { DesiredRecord, RecordType } from "../domain/dns.ts";
+import { RECORD_TYPES, type DesiredRecord, type RecordType } from "../domain/dns.ts";
 import type { ProviderRecord, ReconcileOperation } from "../domain/reconciliation.ts";
-import { assertAnswered, exchange, readAnswers, storedType, writeQuestion, type AnsweredRecord, type DnsEndpoint } from "../dns/client.ts";
+import { assertAnswered, exchange, readAnswers, storedType, writeQuestion, type AnsweredRecord, type DnsEndpoint, type TsigVerification } from "../dns/client.ts";
 import { encodeRdata, rrType } from "../dns/rdata.ts";
 import { signRequest, type TsigKey } from "../dns/tsig.ts";
 import { CLASS_IN, TYPE, WireFormatError, writeName } from "../dns/wire.ts";
@@ -147,7 +147,7 @@ export class Rfc2136ProviderAdapter implements ProviderAdapter {
     ]);
     const owned = new Set<string>();
     for (const marker of markers) {
-      const parsed = parseMarker(marker.content, this.#ownershipSecret, target);
+      const parsed = parseMarker(marker.content, this.#ownershipSecret, target, desired.name);
       // Read from `_parallax.<name>`, so the record they describe is this
       // name -- the same join `#markers` makes out of a whole transfer.
       if (parsed?.recordId === recordId) owned.add(`${desired.name}\u0000${parsed.key}`);
@@ -168,7 +168,7 @@ export class Rfc2136ProviderAdapter implements ProviderAdapter {
       if (answer.type !== TYPE.TXT || answer.content === undefined) continue;
       const name = relativeName(answer.name, zone);
       if (name === undefined || !isMarkerName(name)) continue;
-      const parsed = parseMarker(answer.content, this.#ownershipSecret, target);
+      const parsed = parseMarker(answer.content, this.#ownershipSecret, target, markedName(name));
       // The marker names a type and a content digest; which record it describes
       // comes from where it sits. Joining the two here is what stops a marker
       // at one name from claiming an identical record at another.
@@ -179,14 +179,14 @@ export class Rfc2136ProviderAdapter implements ProviderAdapter {
 
   async #transfer(zone: string): Promise<AnsweredRecord[]> {
     const request = signRequest(writeQuestion(zone, TYPE.AXFR, this.#id()), this.#key, this.#now);
-    const replies = await exchange(this.#server, request.message, "transfer");
+    const replies = await exchange(this.#server, request.message, "transfer", this.#verify(request.mac));
     for (const reply of replies) assertAnswered(reply, `the transfer of ${zone}`);
     return readAnswers(replies);
   }
 
   async #query(name: string, type: number): Promise<AnsweredRecord[]> {
     const request = signRequest(writeQuestion(name, type, this.#id()), this.#key, this.#now);
-    const [reply] = await exchange(this.#server, request.message, "one");
+    const [reply] = await exchange(this.#server, request.message, "one", this.#verify(request.mac));
     if (!reply) throw new Error(`no answer for ${name}`);
     // NXDOMAIN is a fact, not a failure: it means nothing is there yet.
     if ((reply.readUInt16BE(2) & 0xf) === 3) return [];
@@ -197,9 +197,21 @@ export class Rfc2136ProviderAdapter implements ProviderAdapter {
   async #update(zone: string, prerequisites: readonly Buffer[], updates: readonly Buffer[]): Promise<void> {
     const message = writeUpdate(zone, prerequisites, updates, this.#id());
     const request = signRequest(message, this.#key, this.#now);
-    const [reply] = await exchange(this.#server, request.message, "one");
+    const [reply] = await exchange(this.#server, request.message, "one", this.#verify(request.mac));
     if (!reply) throw new Error(`no answer to the update of ${zone}`);
     assertAnswered(reply, `the update of ${zone}`);
+  }
+
+  /**
+   * What every answer is checked against.
+   *
+   * The signing was one-way once: requests carried a MAC and replies were read
+   * for their rcode alone. The zone this adapter reads decides which records it
+   * believes it owns, so taking it on the network's word made every guard below
+   * it decorative.
+   */
+  #verify(requestMac: Buffer): TsigVerification {
+    return { key: this.#key, requestMac, now: this.#now };
   }
 
   #id(): number {
@@ -261,23 +273,56 @@ function requireMarker(zone: string, name: string, marker: string): Buffer {
 // ------------------------------------------------------------- the marker --
 
 /**
- * `<type> <content digest> <ownership marker>`.
+ * `<type> <content digest> <ownership marker>`, where the marker signs the
+ * other two **and the name it sits under**.
  *
- * The digest is what binds a marker to one record rather than to a name: two A
- * records at `www` are two markers, and changing a record's content changes
- * which marker describes it -- which is why an update replaces both in one
- * message.
+ * 🔴 It did not, and that was a complete break of the one promise this control
+ * plane makes. `ownershipComment` signs `(target, recordId)` and nothing else,
+ * so the type and the digest were an unsigned plaintext prefix and the record a
+ * marker described was decided purely by where the TXT was placed. All three
+ * are things an attacker chooses.
+ *
+ * The exploit, run end to end before this was written: read our own marker out
+ * of public DNS (`dig TXT _parallax.blog.example.com`), copy the signature
+ * verbatim, recompute the two plaintext fields for somebody else's `www A`, and
+ * write the result to `_parallax.www`. One TXT write in the zone -- the
+ * permission an ACME delegation hands out -- and `list()` reported `www` as
+ * ours, reconciliation planned a delete for it, and `apply` carried it out with
+ * this deployment's privileged TSIG key.
+ *
+ * Both guards in `apply` passed, because both asked whether the marker verified
+ * rather than whether it verified *for this record*. The prerequisite passed too:
+ * it asks only that the marker still exist, and the attacker left theirs there.
+ *
+ * Signing the scope is what fixes it. Moving a marker, or editing either
+ * plaintext field, now invalidates the signature it was copied from.
  */
-function markerRecord(target: string, record: DesiredRecord, recordId: string, secret: string): string {
-  return `${record.type} ${contentDigest(record.content)} ${ownershipComment(target, recordId, secret)}`;
+function markerScope(target: string, name: string, type: RecordType, digest: string): string {
+  return `${target}\u0000${name}\u0000${type}\u0000${digest}`;
 }
 
-function parseMarker(content: string | undefined, secret: string, target: string): { key: string; recordId: string } | undefined {
+function markerRecord(target: string, record: DesiredRecord, recordId: string, secret: string): string {
+  const digest = contentDigest(record.content);
+  return `${record.type} ${digest} ${ownershipComment(markerScope(target, record.name, record.type, digest), recordId, secret)}`;
+}
+
+/**
+ * Reads a marker as a claim about the record at `atName`, and verifies it as
+ * that claim. `atName` is not taken from the marker -- it is where the marker
+ * was found, which is exactly what the signature now covers.
+ */
+function parseMarker(
+  content: string | undefined,
+  secret: string,
+  target: string,
+  atName: string,
+): { key: string; recordId: string } | undefined {
   if (content === undefined) return undefined;
   const parts = content.split(" ");
   if (parts.length < 3) return undefined;
   const [type, digest, ...marker] = parts as [string, string, ...string[]];
-  const ownership = readOwnershipComment(marker.join(" "), secret, target);
+  if (!(RECORD_TYPES as readonly string[]).includes(type)) return undefined;
+  const ownership = readOwnershipComment(marker.join(" "), secret, markerScope(target, atName, type as RecordType, digest));
   if (!ownership) return undefined;
   return { key: `${type}\u0000${digest}`, recordId: ownership.recordId };
 }

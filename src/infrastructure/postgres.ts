@@ -544,9 +544,14 @@ export class PostgresAccessTokenRepository implements AccessTokenRepository {
 
   async create(token: StoredAccessToken): Promise<void> {
     await this.#pool.query(
-      `INSERT INTO parallax_access_tokens (id, subject, role, token_digest, created_at, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [token.id, token.subject, token.role, token.digest, token.createdAt, token.expiresAt ?? null],
+      // `last_used_at` is here because a restore carries one. Issuing never
+      // sets it, so its absence was invisible until the file-to-PostgreSQL
+      // migration -- which the backup path exists for -- silently reported
+      // every migrated token as never used. That is the exact signal an
+      // operator reads to decide which tokens to revoke.
+      `INSERT INTO parallax_access_tokens (id, subject, role, token_digest, created_at, expires_at, last_used_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [token.id, token.subject, token.role, token.digest, token.createdAt, token.expiresAt ?? null, token.lastUsedAt ?? null],
     );
   }
 

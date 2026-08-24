@@ -35,12 +35,17 @@ export interface FakePrimary {
   readonly records: FakeRecord[];
   /** Every update this server accepted, for tests that care how it was asked. */
   readonly updates: number;
+  /** Answer without a TSIG, the way a peer that cannot be identified would. */
+  stripSignatures: boolean;
+  /** Hang up after the opening SOA, the way a reset connection does. */
+  truncateTransfer: boolean;
   close(): Promise<void>;
 }
 
 export async function startFakePrimary(options: { zone: string; key: TsigKey; records?: FakeRecord[] }): Promise<FakePrimary> {
   const records: FakeRecord[] = [...options.records ?? []];
   let updates = 0;
+  const misbehaviour = { stripSignatures: false, truncateTransfer: false };
   const soa: FakeRecord = {
     name: options.zone,
     type: TYPE.SOA,
@@ -67,6 +72,9 @@ export async function startFakePrimary(options: { zone: string; key: TsigKey; re
           reply.copy(framed, 2);
           socket.write(framed);
         }
+        // A reset connection, not a slow one: the client must tell the two
+        // apart, and only this one exercises the close path.
+        if (misbehaviour.truncateTransfer) socket.end();
       }
     });
     socket.on("error", () => undefined);
@@ -90,6 +98,9 @@ export async function startFakePrimary(options: { zone: string; key: TsigKey; re
     const question = parsed.question;
     if (!question) return [sign(reply(message, RCODE.FORMERR, []), verdict.mac)];
     if (question.type === TYPE.AXFR) {
+      // Only the opening SOA, then the socket closes: the shape a reset
+      // connection leaves, which a client must not read as a short zone.
+      if (misbehaviour.truncateTransfer) return [sign(reply(message, RCODE.NOERROR, [soa]), verdict.mac)];
       return [sign(reply(message, RCODE.NOERROR, [soa, ...records, soa]), verdict.mac)];
     }
     const matched = records.filter((record) => record.name === question.name && record.type === question.type);
@@ -134,7 +145,7 @@ export async function startFakePrimary(options: { zone: string; key: TsigKey; re
   }
 
   function sign(message: Buffer, requestMac: Buffer): Buffer {
-    return signReply(message, options.key, requestMac).message;
+    return misbehaviour.stripSignatures ? message : signReply(message, options.key, requestMac).message;
   }
 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -145,6 +156,10 @@ export async function startFakePrimary(options: { zone: string; key: TsigKey; re
     port,
     records,
     get updates() { return updates; },
+    get stripSignatures() { return misbehaviour.stripSignatures; },
+    set stripSignatures(value: boolean) { misbehaviour.stripSignatures = value; },
+    get truncateTransfer() { return misbehaviour.truncateTransfer; },
+    set truncateTransfer(value: boolean) { misbehaviour.truncateTransfer = value; },
     close: () => new Promise<void>((resolve) => { server.close(() => resolve()); }),
   };
 }

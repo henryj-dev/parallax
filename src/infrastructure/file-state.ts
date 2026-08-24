@@ -59,6 +59,8 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
   readonly #path: string;
   readonly #sideDirectory: string;
   #writeTail: Promise<void> = Promise.resolve();
+  /** Set when the last read found a half-written final line, so the next write repairs it. */
+  #tornAuditTail = false;
 
   constructor(path: string) {
     if (path.trim().length === 0) throw new Error("state file path must not be empty");
@@ -221,6 +223,8 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
       const dropped = new Set<string>();
       const appended: AuditEntry[] = [];
       let compacted: AuditEntry[] | undefined;
+      let pruneRevisions: { zone: string; keep: number } | undefined;
+      let pruneAudit: { zone: string; before: string } | undefined;
 
       const revisionsOf = async (zone: string): Promise<Record<string, ZoneRevision>> => {
         const already = loaded.get(zone);
@@ -229,10 +233,6 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
         const copy = clone(fromDisk);
         loaded.set(zone, copy);
         return copy;
-      };
-      const auditEntries = async (): Promise<AuditEntry[]> => {
-        if (!compacted) compacted = migrating?.audit ?? await this.#readAuditLog(state);
-        return compacted;
       };
 
       const draft: MutationDraft = {
@@ -257,21 +257,31 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
           if (state.auditOldestAt === undefined || entry.at < state.auditOldestAt) state.auditOldestAt = entry.at;
           return entry;
         },
+        /**
+         * ⚠️ Retention decides here and deletes **after the commit**.
+         *
+         * It used to prune the side files before the state file landed, and a
+         * crash in that window destroyed history the commit never earned.
+         * Measured: a zone at revision 4 keeping three, committing revision 5 --
+         * the keep-top-three ran over `[2,3,4,5]`, wrote `[3,4,5]`, and the
+         * crash left the zone at revision 4 with only two of its three
+         * revisions. Revision 2 was gone, and retention would never have
+         * removed it.
+         *
+         * Deferring it inverts the error: a crash now leaves *more* history
+         * than configured, which the next commit trims.
+         */
         async applyRetention(zone, retention) {
           const maxRevisions = (retention as RetentionPolicy | undefined)?.maxRevisionsPerZone ?? 0;
           if (maxRevisions > 0 && !dropped.has(zone)) {
-            const revisions = await revisionsOf(zone);
-            const keep = new Set(Object.keys(revisions).map(Number).sort((left, right) => right - left).slice(0, maxRevisions));
-            for (const key of Object.keys(revisions)) if (!keep.has(Number(key))) delete revisions[key];
-            touched.add(zone);
+            await revisionsOf(zone);
+            pruneRevisions = { zone, keep: maxRevisions };
           }
           const before = retention?.deleteAuditBefore;
           // The log is read only when something in it could actually be older
           // than the cutoff. Every other commit leaves it an append.
           if (!before || state.auditOldestAt === undefined || state.auditOldestAt >= before) return;
-          const kept = (await auditEntries()).filter((entry) => entry.zone !== zone || entry.at >= before);
-          compacted = kept;
-          state.auditOldestAt = oldestAt(kept, appended);
+          pruneAudit = { zone, before };
         },
       };
 
@@ -292,14 +302,51 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
         if (!compacted) compacted = migrating.audit;
       }
       for (const zone of touched) await this.#writeRevisionFile(zone, loaded.get(zone) ?? {});
-      if (compacted) await this.#rewriteAuditLog([...compacted, ...appended]);
-      else if (appended.length > 0) await this.#appendAuditLog(appended);
+      // A torn tail must be cut out rather than appended after: the next line
+      // would start mid-object and the damage would become permanent.
+      if (compacted || (this.#tornAuditTail && appended.length > 0)) {
+        await this.#rewriteAuditLog([...(compacted ?? await this.#readAuditLog(state)), ...appended]);
+      } else if (appended.length > 0) {
+        await this.#appendAuditLog(appended);
+      }
 
       await this.#writeStateFile(state);
 
       // Only now, because until the state file landed these were still named by
       // it. An unlink that a crash skips leaves a file nothing reads.
       for (const zone of dropped) await this.#removeRevisionFile(zone);
+      // Retention, on the safe side of the commit. Skipping it leaves history
+      // the operator did not ask to keep; doing it before would have thrown
+      // away history they did.
+      if (pruneRevisions) {
+        const revisions = loaded.get(pruneRevisions.zone) ?? {};
+        const keep = new Set(Object.keys(revisions).map(Number).sort((left, right) => right - left).slice(0, pruneRevisions.keep));
+        if (keep.size < Object.keys(revisions).length) {
+          for (const key of Object.keys(revisions)) if (!keep.has(Number(key))) delete revisions[key];
+          await this.#writeRevisionFile(pruneRevisions.zone, revisions);
+        }
+      }
+      if (pruneAudit) {
+        const { zone, before } = pruneAudit;
+        const kept = (await this.#readAuditLog(state)).filter((entry) => entry.zone !== zone || entry.at >= before);
+        await this.#rewriteAuditLog(kept);
+        // The hint follows the log it describes, and never leads it. Written
+        // after the rewrite, so a crash in between leaves it pointing at an
+        // entry that is already gone -- which costs one wasted pass. Written
+        // before, it would name an entry that is still there and skip the prune
+        // that removes it, and the log would grow without bound.
+        //
+        // ⚠️ This is a second write of the state file, and it is not a second
+        // commit: nothing else in `state` has changed, so a crash before it
+        // leaves the store exactly as the first write left it.
+        const oldest = oldestAt(kept);
+        const next = oldest === undefined ? undefined : oldest;
+        if (next !== state.auditOldestAt) {
+          if (next === undefined) delete state.auditOldestAt;
+          else state.auditOldestAt = next;
+          await this.#writeStateFile(state);
+        }
+      }
       return value;
     }));
     this.#writeTail = result.then(() => undefined, () => undefined);
@@ -397,12 +444,25 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
       throw error;
     }
     const byId = new Map<number, AuditEntry>();
-    for (const [index, line] of source.split("\n").entries()) {
+    const lines = source.split("\n");
+    for (const [index, line] of lines.entries()) {
       if (line.trim().length === 0) continue;
       let entry: AuditEntry;
       try {
         entry = readAuditEntry(JSON.parse(line));
       } catch (error) {
+        // ⚠️ The last line is the one a crash can tear, because this log is the
+        // only side file that is appended rather than replaced by rename. It was
+        // refused here, and refusing it wedged the store: `audit()` threw
+        // forever, and so did every commit, because retention is on by default
+        // and reads the log. Measured -- a truncated tail made both throw.
+        //
+        // A torn tail is dropped. An unparseable line with committed lines after
+        // it is not a torn append; it is corruption, and that still refuses.
+        if (index === lines.length - 1 || lines.slice(index + 1).every((rest) => rest.trim().length === 0)) {
+          this.#tornAuditTail = true;
+          break;
+        }
         throw new Error(`unsupported or invalid audit log line ${index + 1}`, { cause: error });
       }
       if (entry.id >= state.nextAuditId) continue;

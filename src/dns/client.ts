@@ -1,8 +1,9 @@
 import { connect } from "node:net";
 import type { RecordType } from "../domain/dns.ts";
 import { decodeRdata } from "./rdata-decode.ts";
+import { readTsig, verifyTsig, type TsigKey } from "./tsig.ts";
 import {
-  CLASS_IN, MAX_TCP_MESSAGE_BYTES, RCODE, TYPE, WireFormatError, readName, typeName, writeName,
+  CLASS_IN, RCODE, TYPE, WireFormatError, readName, typeName, writeName,
 } from "./wire.ts";
 
 /**
@@ -38,6 +39,12 @@ export interface AnsweredRecord {
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
+ * A ceiling on one transfer, so a peer that never ends one cannot exhaust this
+ * process. Well past any zone this control plane would publish.
+ */
+const MAX_TRANSFER_BYTES = 256 * 1024 * 1024;
+
+/**
  * Sends one message and reads the replies.
  *
  * A transfer answers with several and is finished by the second SOA (RFC 5936
@@ -48,26 +55,95 @@ export async function exchange(
   endpoint: DnsEndpoint,
   message: Buffer,
   expect: "one" | "transfer",
+  verify?: TsigVerification,
 ): Promise<Buffer[]> {
+  const replies = await receive(endpoint, message, expect);
+  return verify ? verifyReplies(replies, verify) : replies;
+}
+
+/**
+ * What a signed exchange needs to check the answers.
+ *
+ * ⚠️ Optional in the type and never optional in practice: every caller in this
+ * build signs, and every one of them must pass this. It was not here at all
+ * once -- the requests were signed and the answers were taken on the network's
+ * word, which made the signing decorative in the direction that matters. A
+ * peer that can answer on the connection chooses what the zone contains.
+ */
+export interface TsigVerification {
+  readonly key: TsigKey;
+  /** The MAC of the request these replies answer, which binds them to it. */
+  readonly requestMac: Buffer;
+  readonly now?: () => number;
+}
+
+/**
+ * RFC 8945 §5.2: a reply that does not verify is discarded, not read.
+ *
+ * The first reply is bound to the request's MAC and each one after it chains
+ * onto its predecessor (§5.3.1), which is the same walk the server does when it
+ * signs them -- so a dropped, reordered or substituted envelope fails here.
+ */
+function verifyReplies(replies: readonly Buffer[], verify: TsigVerification): Buffer[] {
+  let prior = verify.requestMac;
+  return replies.map((reply, index) => {
+    const record = readTsig(reply);
+    // RFC 8945 §5.2: an unverifiable message is discarded *unless* its rcode is
+    // NOTAUTH. That exception is what lets a peer say "your key is wrong" --
+    // it cannot sign such an answer, by definition. Refusing it too would
+    // replace the one actionable sentence with "no signature".
+    if (!record && (reply.readUInt16BE(2) & 0xf) === RCODE.NOTAUTH) {
+      throw new Error("the peer refused this key: NOTAUTH");
+    }
+    if (!record) throw new Error("the answer carried no signature, and this exchange was signed");
+    const verdict = verifyTsig(reply, record, [verify.key], verify.now ?? Date.now, index === 0 ? { mac: prior } : { mac: prior, envelope: true });
+    if (verdict.kind !== "ok") throw new Error(`the answer did not verify: ${verdict.reason}`);
+    prior = verdict.mac;
+    return reply;
+  });
+}
+
+function receive(endpoint: DnsEndpoint, message: Buffer, expect: "one" | "transfer"): Promise<Buffer[]> {
   const timeoutMs = endpoint.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   return new Promise<Buffer[]>((resolve, reject) => {
     const socket = connect({ host: endpoint.host, port: endpoint.port });
     const replies: Buffer[] = [];
     let buffered = Buffer.alloc(0);
+    let received = 0;
     let soaSeen = 0;
     let settled = false;
 
     const finish = (error?: Error): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       socket.destroy();
       if (error) reject(error);
       else resolve(replies);
     };
 
-    socket.setTimeout(timeoutMs, () => finish(new Error(`${endpoint.host}:${endpoint.port} did not answer within ${timeoutMs}ms`)));
+    // ⚠️ A deadline, not an idle timeout. `socket.setTimeout` resets on every
+    // byte, so a peer trickling one byte per interval holds the connection --
+    // and the transfer buffer -- open indefinitely. The listener already made
+    // this distinction for incoming frames; the client had not.
+    const deadline = setTimeout(
+      () => finish(new Error(`${endpoint.host}:${endpoint.port} did not finish within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    deadline.unref?.();
+
+    socket.setTimeout(timeoutMs, () => finish(new Error(`${endpoint.host}:${endpoint.port} went quiet for ${timeoutMs}ms`)));
     socket.on("error", (error) => finish(error));
-    socket.on("close", () => finish(replies.length > 0 ? undefined : new Error(`${endpoint.host}:${endpoint.port} closed without answering`)));
+    socket.on("close", () => {
+      // A transfer that stopped early is not a short zone. RFC 5936 §6: a
+      // transfer with any error detected must be discarded, and the client
+      // keeps serving what it had. Resolving here reported a truncated zone as
+      // a complete one, and the records the peer never sent read as deleted.
+      if (expect === "transfer" && soaSeen < 2) {
+        return finish(new Error(`${endpoint.host}:${endpoint.port} closed part way through the transfer`));
+      }
+      finish(replies.length > 0 ? undefined : new Error(`${endpoint.host}:${endpoint.port} closed without answering`));
+    });
     socket.on("connect", () => {
       const framed = Buffer.alloc(2 + message.length);
       framed.writeUInt16BE(message.length, 0);
@@ -79,14 +155,23 @@ export async function exchange(
       for (;;) {
         if (buffered.length < 2) return;
         const length = buffered.readUInt16BE(0);
-        if (length > MAX_TCP_MESSAGE_BYTES) return finish(new WireFormatError("a framed reply claims more than a DNS message may hold"));
         if (buffered.length < 2 + length) return;
         const reply = Buffer.from(buffered.subarray(2, 2 + length));
         buffered = buffered.subarray(2 + length);
+        // ⚠️ Before anything reads a header field. A two-byte frame -- a length
+        // of zero -- made `readUInt16BE(2)` below throw a RangeError inside this
+        // listener, outside the promise, so it was uncaught and the process
+        // died. Two bytes from a peer, measured.
+        if (reply.length < 12) return finish(new WireFormatError("a reply is too short to be a DNS message"));
+        received += reply.length;
+        // Bounded on purpose. A peer streaming well-formed messages whose answer
+        // sections hold no SOA advances nothing, and `replies` grew until the
+        // process died.
+        if (received > MAX_TRANSFER_BYTES) return finish(new Error(`the transfer passed ${MAX_TRANSFER_BYTES} bytes without ending`));
         replies.push(reply);
         if (expect === "one") return finish();
-        // ⚠️ A refused transfer answers once and stops. Waiting for the second
-        // SOA that a refusal never carries turned "your key is wrong" into a
+        // A refused transfer answers once and stops. Waiting for the second SOA
+        // that a refusal never carries turned "your key is wrong" into a
         // timeout -- the failure arrived late, and as the wrong sentence.
         if (replies.length === 1 && (reply.readUInt16BE(2) & 0xf) !== RCODE.NOERROR) return finish();
         // The first SOA opens the transfer and the second closes it.

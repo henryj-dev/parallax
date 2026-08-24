@@ -104,17 +104,13 @@ export interface RestoreSummary {
  * having to remove a state file or drop a schema on purpose.
  */
 export async function importBackup(stores: BackupStores, document: BackupDocument): Promise<RestoreSummary> {
-  const existing = await stores.zones.list({ limit: 1, offset: 0 });
-  if (existing.length > 0) {
-    throw new BackupError(
-      `refusing to restore into a store that already holds ${existing[0]?.name}.`
-      + " Empty it first -- remove the state file and its .d directory, or drop and re-migrate the schema.",
-    );
-  }
-  const tokens = await stores.accessTokens.list();
-  if (tokens.length > 0) {
-    throw new BackupError(`refusing to restore into a store that already holds ${tokens.length} access token(s)`);
-  }
+  await assertEmpty(stores, document);
+  // Everything is checked before anything is written, because a restore is not
+  // a transaction: it is a sequence of writes into a store that has no way to
+  // roll them back. A document that was going to fail at zone 300 used to fail
+  // there, leaving 299 zones and no audit, no settings, no tokens -- and the
+  // refusal above then made the retry impossible.
+  assertRestorable(document);
 
   let revisions = 0;
   for (const zone of document.zones) {
@@ -124,12 +120,14 @@ export async function importBackup(stores: BackupStores, document: BackupDocumen
       await stores.zones.saveRevision(snapshot);
       revisions += 1;
     }
-    // A zone whose current revision is not among the retained snapshots -- one
-    // written through `save` rather than committed, or a history pruned past
-    // it. Without this the restore would quietly move it backwards.
-    if (!zone.revisions.some((snapshot) => snapshot.revision === zone.current.revision)) {
-      await stores.zones.save(zone.current);
-    }
+    // The replay leaves the zone on the highest revision it wrote, which is not
+    // always the one the document says is current -- the snapshot may have been
+    // pruned past, or the export may have caught the zone mid-commit and
+    // captured a revision newer than the `current` it had already read.
+    // Membership alone was checked here, so the second case restored a zone to
+    // a revision the document never claimed.
+    const highest = zone.revisions.reduce((top, snapshot) => Math.max(top, snapshot.revision), 0);
+    if (highest !== zone.current.revision) await stores.zones.save(zone.current);
   }
   for (const entry of [...document.audit].sort((left, right) => left.id - right.id)) {
     const { id: _assignedByTheStore, ...rest } = entry;
@@ -182,6 +180,100 @@ export function readBackupDocument(value: unknown): BackupDocument {
     accessTokens: requireArray(candidate.accessTokens, "accessTokens") as unknown as StoredAccessToken[],
     ...(typeof candidate.credentials === "string" ? { credentials: candidate.credentials } : {}),
   };
+}
+
+/**
+ * Refuses a store that already holds anything a restore would replace.
+ *
+ * It checked zones and tokens, and wrote settings and the credential document
+ * regardless. Measured: a target provisioned with its own credentials and no
+ * zones -- the ordinary order for a new instance -- had its credential
+ * ciphertext replaced by the document's, unrecoverably where the two master
+ * keys differ, and its settings left as neither side's because
+ * `SettingsRepository.write` is a patch rather than a replacement.
+ */
+async function assertEmpty(stores: BackupStores, document: BackupDocument): Promise<void> {
+  const zones = await stores.zones.list({ limit: 1, offset: 0 });
+  if (zones.length > 0) {
+    throw new BackupError(
+      `refusing to restore into a store that already holds ${zones[0]?.name}.`
+      + " Empty it first -- remove the state file and its .d directory, or drop and re-migrate the schema.",
+    );
+  }
+  const tokens = await stores.accessTokens.list();
+  if (tokens.length > 0) {
+    throw new BackupError(`refusing to restore into a store that already holds ${tokens.length} access token(s)`);
+  }
+  if (document.credentials !== undefined && await stores.credentials.read() !== undefined) {
+    throw new BackupError(
+      "refusing to restore into a store that already holds a credential document."
+      + " Replacing it would discard credentials this backup cannot restore if the two master keys differ.",
+    );
+  }
+  const settings = await stores.settings.read();
+  if (Object.keys(document.settings).length > 0 && Object.keys(settings).length > 0) {
+    throw new BackupError(
+      `refusing to restore into a store that already holds ${Object.keys(settings).length} setting(s).`
+      + " Settings are written as a patch, so the result would be neither this backup's nor the store's.",
+    );
+  }
+}
+
+/**
+ * Everything that would make the write loop fail part way, found first.
+ *
+ * The document reader deliberately validates shallowly and leaves the rest to
+ * the repositories -- which is right for what a zone *is*, and wrong for what
+ * makes a restore stop half done.
+ */
+function assertRestorable(document: BackupDocument): void {
+  for (const [index, zone] of document.zones.entries()) {
+    const seen = new Set<number>();
+    for (const snapshot of zone.revisions) {
+      const revision = (snapshot as { revision?: unknown }).revision;
+      if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) {
+        throw new BackupError(`zones[${index}] carries a revision that is not a positive integer`);
+      }
+      if (seen.has(revision)) throw new BackupError(`zones[${index}] carries revision ${revision} more than once`);
+      seen.add(revision);
+    }
+  }
+  const ids = new Set<number>();
+  for (const entry of document.audit) {
+    const id = (entry as { id?: unknown }).id;
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 1) {
+      throw new BackupError("an audit entry carries an id that is not a positive integer");
+    }
+    if (ids.has(id)) throw new BackupError(`the audit log carries id ${id} more than once`);
+    ids.add(id);
+  }
+  for (const [index, token] of document.accessTokens.entries()) {
+    assertRestorableToken(token, index);
+  }
+}
+
+/**
+ * ⚠️ An access token record goes straight into the set every request is
+ * authenticated against, and `prepareConfig` refuses a whole configuration it
+ * cannot read -- inside the request handler. One unusable row therefore takes
+ * the API down for everybody, including the call that would delete it.
+ */
+function assertRestorableToken(value: unknown, index: number): void {
+  const token = value as Record<string, unknown>;
+  const digest = typeof token.digest === "string" ? Buffer.from(token.digest, "base64url") : undefined;
+  if (typeof token.id !== "string" || token.id.length === 0
+    || typeof token.subject !== "string" || token.subject.trim().length === 0
+    || (token.role !== "admin" && token.role !== "editor" && token.role !== "viewer")
+    || digest === undefined || digest.byteLength !== 32 || digest.toString("base64url") !== token.digest
+    || !isIsoTimestamp(token.createdAt)
+    || (token.expiresAt !== undefined && !isIsoTimestamp(token.expiresAt))
+    || (token.lastUsedAt !== undefined && !isIsoTimestamp(token.lastUsedAt))) {
+    throw new BackupError(`accessTokens[${index}] is not a usable access token record`);
+  }
+}
+
+function isIsoTimestamp(value: unknown): boolean {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
 }
 
 function requireArray(value: unknown, field: string): readonly unknown[] {
