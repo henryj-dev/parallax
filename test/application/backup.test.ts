@@ -200,6 +200,82 @@ describe("backup and restore", () => {
     assert.equal((await target.zones.get("alpha.example"))?.revision, 9);
   });
 
+  /**
+   * The refusal covered zones and tokens, and wrote settings and the credential
+   * document regardless -- so the ordinary order for a new instance (provision
+   * credentials, then load data) destroyed the credentials it had just been
+   * given, unrecoverably where the two master keys differ.
+   */
+  it("refuses to replace a credential document or settings that are already there", async () => {
+    const source = await fileStores();
+    await fill(source.stores);
+    const document = await exportBackup(source.stores);
+
+    const withCredentials = memoryStores();
+    await withCredentials.credentials.write("TARGET-CIPHERTEXT-DO-NOT-LOSE");
+    await assert.rejects(() => importBackup(withCredentials, document), /already holds a credential document/u);
+    assert.equal(await withCredentials.credentials.read(), "TARGET-CIPHERTEXT-DO-NOT-LOSE");
+
+    const withSettings = memoryStores();
+    await withSettings.settings.write({ oidcIssuer: "https://idp.example" });
+    await assert.rejects(() => importBackup(withSettings, document), /already holds 1 setting/u);
+    // Settings are written as a patch, so a restore over them would have left a
+    // document that is neither side's.
+    assert.deepEqual(await withSettings.settings.read(), { oidcIssuer: "https://idp.example" });
+  });
+
+  /**
+   * A restore is a sequence of writes into a store with no way to roll them
+   * back, so anything that would fail has to be found before the first one.
+   */
+  it("finds a document that cannot be restored before it writes any of it", async () => {
+    const source = await fileStores();
+    await fill(source.stores);
+    const document = await exportBackup(source.stores);
+    const broken = {
+      ...document,
+      zones: document.zones.map((zone, index) => (index === 1
+        ? { ...zone, revisions: [...zone.revisions, zone.revisions[0] as never] }
+        : zone)),
+    };
+
+    const target = memoryStores();
+    await assert.rejects(() => importBackup(target, broken), /more than once/u);
+    // Nothing was written, so the retry that the emptiness refusal would
+    // otherwise have made impossible is still available.
+    assert.deepEqual(await target.zones.list(), []);
+    await importBackup(target, document);
+    assert.equal((await target.zones.list()).length, 2);
+  });
+
+  /**
+   * ⚠️ One unusable row takes the whole API down: `prepareConfig` refuses a
+   * configuration it cannot read, and it runs inside the request handler -- so
+   * every request 500s, including the one that would delete the row.
+   */
+  it("refuses an access token record that would lock everyone out", async () => {
+    const source = await fileStores();
+    const document = await exportBackup(source.stores);
+    const valid = {
+      id: "t", subject: "someone", role: "admin",
+      digest: Buffer.alloc(32, 1).toString("base64url"), createdAt: "2026-08-08T00:00:00.000Z",
+    };
+    const withToken = (token: Record<string, unknown>): typeof document =>
+      ({ ...document, accessTokens: [token as never] });
+
+    for (const [what, token] of [
+      ["a role outside the three", { ...valid, role: "root" }],
+      ["a digest that is not 32 bytes", { ...valid, digest: "AA" }],
+      ["an unreadable expiry", { ...valid, expiresAt: "whenever" }],
+      ["no subject", { ...valid, subject: "  " }],
+    ] as const) {
+      await assert.rejects(() => importBackup(memoryStores(), withToken(token)), /not a usable access token/u, what);
+    }
+    const target = memoryStores();
+    await importBackup(target, withToken(valid));
+    assert.equal((await target.accessTokens.list()).length, 1);
+  });
+
   it("refuses a document it was not asked to read", async () => {
     assert.throws(() => readBackupDocument("a string"), /must be a JSON object/u);
     assert.throws(() => readBackupDocument({ format: 99 }), /unsupported backup format 99/u);

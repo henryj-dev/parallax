@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { mergeApplyStatus, RevisionConflictError, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type DesiredChange, type PageRequest, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import { assertPersistedDesiredViewsValid } from "../application/control-plane.ts";
@@ -473,6 +473,13 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
 
   async #appendAuditLog(entries: readonly AuditEntry[]): Promise<void> {
     await ensurePrivateDirectory(this.#sideDirectory);
+    let created = false;
+    try {
+      await stat(this.#auditPath);
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+      created = true;
+    }
     const file = await open(this.#auditPath, "a", 0o600);
     try {
       await file.writeFile(entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""), "utf8");
@@ -480,6 +487,12 @@ export class FileStateRepository implements ZoneRepository, StatusRepository {
     } finally {
       await file.close();
     }
+    // The first append creates the file, and `fsync` on a file does not commit
+    // its directory entry. `writeFileAtomically` already does this; the append
+    // path did not, so a crash could lose the whole log while the state file had
+    // committed a `nextAuditId` that vouched for its contents -- an empty audit
+    // log rather than a corrupt one, which is the quieter failure.
+    if (created) await syncDirectory(this.#sideDirectory);
   }
 
   async #rewriteAuditLog(entries: readonly AuditEntry[]): Promise<void> {
@@ -522,6 +535,15 @@ function oldestAt(...groups: readonly (readonly AuditEntry[])[]): string | undef
     for (const entry of group) if (oldest === undefined || entry.at < oldest) oldest = entry.at;
   }
   return oldest;
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 async function writeFileAtomically(path: string, contents: string): Promise<void> {

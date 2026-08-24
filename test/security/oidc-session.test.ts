@@ -280,12 +280,69 @@ describe("identity sign-in", () => {
 describe("OIDC discovery", () => {
   const ISSUER = "https://idp.example.com";
 
+  /**
+   * A provider serving its document.
+   *
+   * `issuer` defaults to the one being asked about, because a real provider
+   * always publishes it and Discovery §4.3 makes the client check it. A test
+   * that is about the issuer says so by giving its own.
+   */
   function serving(document: unknown, status = 200): typeof fetch {
+    const served = document !== null && typeof document === "object" && !("issuer" in document)
+      ? { issuer: ISSUER, ...document }
+      : document;
     return (async (input: string | URL | Request) => {
       assert.equal(String(input), `${ISSUER}/.well-known/openid-configuration`);
-      return new Response(JSON.stringify(document), { status, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify(served), { status, headers: { "content-type": "application/json" } });
     }) as unknown as typeof fetch;
   }
+
+  /** A document served exactly as given, for the tests that are about `issuer`. */
+  function servingExactly(document: unknown): typeof fetch {
+    return (async () => new Response(JSON.stringify(document), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+  }
+
+  /**
+   * OpenID Connect Discovery §4.3. This is the check that makes the
+   * cross-origin endpoints below safe: without it, an open redirect under the
+   * issuer -- or a takeover of one path on it -- hands an attacker this
+   * deployment's `client_secret`, the authorization codes, and the claim the
+   * role is read from. `fetch` follows redirects and `response.ok` stays true
+   * afterwards, so the document really can come from anywhere.
+   */
+  it("refuses a discovery document that claims a different issuer", async () => {
+    await assert.rejects(
+      () => discoverEndpoints(ISSUER, servingExactly({
+        issuer: "https://attacker.test",
+        authorization_endpoint: "https://attacker.test/a",
+        token_endpoint: "https://attacker.test/t",
+        userinfo_endpoint: "https://attacker.test/u",
+      })),
+      /claims issuer "https:\/\/attacker.test", not/u,
+    );
+    // A document with no issuer at all is the same refusal, not a pass.
+    await assert.rejects(
+      () => discoverEndpoints(ISSUER, servingExactly({
+        authorization_endpoint: `${ISSUER}/a`, token_endpoint: `${ISSUER}/t`, userinfo_endpoint: `${ISSUER}/u`,
+      })),
+      /claims issuer undefined/u,
+    );
+  });
+
+  it("falls back to the issuer's own origin when discovery cannot be trusted", async () => {
+    // The refusal must land on the safe side: `assumedEndpoints` stays on the
+    // configured issuer, so a hostile document costs a round trip and nothing
+    // else.
+    const reasons: string[] = [];
+    const resolve = createEndpointResolver(ISSUER, servingExactly({
+      issuer: "https://attacker.test",
+      authorization_endpoint: "https://attacker.test/a",
+      token_endpoint: "https://attacker.test/t",
+      userinfo_endpoint: "https://attacker.test/u",
+    }), (reason) => reasons.push(reason));
+    assert.deepEqual(await resolve(), assumedEndpoints(ISSUER));
+    assert.match(reasons[0] ?? "", /claims issuer/u);
+  });
 
   it("takes the endpoints the provider publishes, wherever it puts them", async () => {
     // Google is the everyday case: it issues as one host and hands its token
@@ -359,6 +416,7 @@ describe("OIDC discovery", () => {
       asked += 1;
       if (asked === 1) return new Response("nope", { status: 503 });
       return new Response(JSON.stringify({
+        issuer: ISSUER,
         authorization_endpoint: `${ISSUER}/a`, token_endpoint: `${ISSUER}/t`, userinfo_endpoint: `${ISSUER}/u`,
       }), { status: 200, headers: { "content-type": "application/json" } });
     }) as unknown as typeof fetch;

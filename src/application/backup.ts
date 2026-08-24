@@ -58,11 +58,34 @@ export async function exportBackup(stores: BackupStores, now: () => Date = () =>
   const backupZones: BackupZone[] = [];
   const statuses: ApplyStatus[] = [];
   for (const zone of zones) {
-    backupZones.push({ current: zone, revisions: await stores.zones.listRevisions(zone.name) });
+    const revisions = await stores.zones.listRevisions(zone.name);
+    // ⚠️ Every read here is a separate lockless one, and nothing quiesces the
+    // control plane -- so a commit landing between them leaves the document
+    // saying one thing and carrying another. Measured: a zone exported as
+    // revision 4 carrying a revision 5, which the restore then replayed onto 5.
+    //
+    // Read again and take the later one rather than refusing: a backup that
+    // fails because the server was busy is a backup nobody takes. What must not
+    // survive is the *inconsistency*, and re-reading the zone after its history
+    // closes the window in the direction that matters -- the current snapshot
+    // is never older than the revisions filed under it.
+    const settled = await stores.zones.get(zone.name);
+    if (settled === undefined) continue;
+    const highest = revisions.reduce((top, snapshot) => Math.max(top, snapshot.revision), 0);
+    backupZones.push({
+      current: settled,
+      revisions: highest > settled.revision
+        ? await stores.zones.listRevisions(zone.name)
+        : revisions,
+    });
     statuses.push(...await stores.statuses.list(zone.name));
   }
   // Ascending, because that is the order a restore has to replay them in and
   // the reader should not have to know to sort first.
+  // Read last, and kept whole. It names zones that no longer exist, and that is
+  // correct rather than a mid-export artefact: a zone's deletion entry outlives
+  // the zone on purpose, and filtering to the zones still present would throw
+  // away the history of every zone ever deleted.
   const audit = (await stores.zones.audit()).slice().sort((left, right) => left.id - right.id);
   const credentials = await stores.credentials.read();
   return {

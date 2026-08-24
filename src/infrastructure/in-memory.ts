@@ -301,7 +301,7 @@ export class InMemoryProvider implements ProviderAdapter {
       const index = this.#ownedIndex(records, operation.providerId);
       records[index] = { ...operation.desired, providerId: operation.providerId, managed: true };
     } else {
-      const index = this.#ownedIndex(records, operation.providerId);
+      const index = this.#ownedIndex(records, operation.providerId, operation.actual);
       records.splice(index, 1);
     }
     this.#records.set(target, records);
@@ -318,10 +318,24 @@ export class InMemoryProvider implements ProviderAdapter {
    * every implementation this, and a double that answers differently from the
    * things it stands in for is not standing in for them.
    */
-  #ownedIndex(records: readonly ProviderRecord[], providerId: string): number {
+  #ownedIndex(
+    records: readonly ProviderRecord[],
+    providerId: string,
+    actual?: ProviderRecord,
+  ): number {
     const index = records.findIndex((record) => record.providerId === providerId);
     if (index < 0) throw new Error(`provider record ${providerId} does not exist`);
     if (!records[index]?.managed) throw new Error(`refusing to write to unmanaged provider record ${providerId}`);
+    // ⚠️ The stored record's `managed` was the only thing asked, and the real
+    // adapters ask about the *operation's* record too -- Cloudflare on
+    // `actual.managed` and again on the id agreeing, RFC 2136 the same. So a
+    // delete naming an unmanaged `actual` for a record this double had stored
+    // as managed was accepted here and refused by both of them. A double that
+    // is more permissive than the things it stands in for is not standing in
+    // for them, which is the finding the provider contract made about this
+    // class in the first place.
+    if (actual && !actual.managed) throw new Error(`refusing to delete unmanaged provider record ${providerId}`);
+    if (actual && actual.providerId !== providerId) throw new Error("provider id does not match the actual record");
     return index;
   }
 

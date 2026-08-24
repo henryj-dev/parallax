@@ -78,6 +78,27 @@ export async function discoverEndpoints(issuer: string, fetchImpl: typeof fetch 
     throw new OidcError("the identity provider's discovery document was not an object");
   }
   const record = document as Record<string, unknown>;
+  // OpenID Connect Discovery §4.3: the document must claim the issuer it was
+  // asked about. This is what makes the cross-origin endpoints below safe --
+  // Google's really do live on another host -- and without it an open redirect
+  // under the issuer, or a takeover of one path on it, was enough. `fetch`
+  // follows redirects and `response.ok` is still true afterwards, so the
+  // document could come from anywhere.
+  //
+  // The failure it prevented is total: `exchangeCode` POSTs this deployment's
+  // `client_secret` and the authorization code to `token_endpoint`, and
+  // `readIdentity` takes the subject and the role claim from `userinfo`. An
+  // attacker choosing those three returns `{"entitlements":["admin"]}` and
+  // Parallax mints a signed session for them.
+  //
+  // A throw here falls back to `assumedEndpoints(issuer)`, which stays on the
+  // configured issuer's own origin -- so this fails in the safe direction.
+  if (record.issuer !== issuer) {
+    throw new OidcError(
+      `the discovery document claims issuer ${JSON.stringify(record.issuer)}, not ${issuer}.`
+      + " Confirm PARALLAX_OIDC_ISSUER names the issuer exactly as the provider spells it.",
+    );
+  }
   const endpoint = (name: string, required: boolean): string | undefined => {
     const value = record[name];
     if (typeof value !== "string" || value.length === 0) {
