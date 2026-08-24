@@ -172,7 +172,13 @@ describe("portal mapping", () => {
     assert.match(deleted.url, /\/fallback\/main\/domains\/example.com$/);
   });
 
-  it("loads zoneless history from GET /api/v1/history walking hasMore", async () => {
+  /**
+   * ⚠️ This used to assert the walk: two requests on open, `limit=500` each,
+   * until `hasMore` went false. That was the defect -- a year of audit pulled
+   * into the browser the moment the panel opened -- so the expectation is
+   * inverted rather than deleted. One page on open, the rest on request.
+   */
+  it("loads zoneless history one page at a time, and only asks again when told to", async () => {
     const paths = [];
     const client = createApiClient({
       fetchImpl: async (input) => {
@@ -180,17 +186,22 @@ describe("portal mapping", () => {
         paths.push(`${url.pathname}${url.search}`);
         const offset = Number(url.searchParams.get("offset"));
         return Response.json(offset === 0
-          ? { entries: [{ action: "zone.created" }], limit: 500, offset: 0, hasMore: true }
-          : { entries: [{ action: "record.upserted" }], limit: 500, offset: 1, hasMore: false });
+          ? { entries: [{ action: "zone.created" }], limit: 50, offset: 0, hasMore: true }
+          : { entries: [{ action: "record.upserted" }], limit: 50, offset: 1, hasMore: false });
       },
     });
     const store = createStore(client);
+
     assert.equal(await store.loadGlobalHistory(), true);
-    assert.deepEqual(store.getState().history.map((entry) => entry.action), ["zone.created", "record.upserted"]);
+    assert.deepEqual(store.getState().history.map((entry) => entry.action), ["zone.created"]);
     assert.equal(store.getState().historyScope, "global");
+    assert.deepEqual(paths, ["/api/v1/history?limit=50&offset=0"], "one request, not a walk");
+
+    assert.equal(await store.loadMoreHistory(), true);
+    assert.deepEqual(store.getState().history.map((entry) => entry.action), ["zone.created", "record.upserted"]);
     assert.deepEqual(paths, [
-      "/api/v1/history?limit=500&offset=0",
-      "/api/v1/history?limit=500&offset=1",
+      "/api/v1/history?limit=50&offset=0",
+      "/api/v1/history?limit=50&offset=1",
     ]);
   });
 
@@ -210,5 +221,87 @@ describe("portal mapping", () => {
     assert.equal(identity.redirect, "manual");
     const session = seen.find((call) => call.url.includes("/session") && call.method === "DELETE");
     assert.ok(session, "sign-out must still clear the token session");
+  });
+});
+
+/**
+ * The API caps a page at 500 rows; the client used to defeat that with a loop
+ * that walked to the end. On a deployment with the default 365-day audit
+ * retention, opening the history panel pulled the whole trail into the browser
+ * and made the server walk it with a growing OFFSET, which slows as it goes.
+ *
+ * So the assertion is about *requests*, not rows: one page on open, one more
+ * per press, and never a second request nobody asked for.
+ */
+describe("portal paging", () => {
+  function pagingClient(pages) {
+    const asked = [];
+    const fetchImpl = async (url) => {
+      asked.push(String(url));
+      const offset = Number(new URL(String(url), "http://localhost").searchParams.get("offset"));
+      const page = pages[offset] ?? { entries: [], hasMore: false };
+      return new Response(JSON.stringify(page), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    return { asked, client: createApiClient({ fetchImpl }) };
+  }
+
+  it("asks for one page of history when a zone is opened", async () => {
+    const { asked, client } = pagingClient({
+      0: { entries: [{ id: 3 }, { id: 2 }], hasMore: true },
+      2: { entries: [{ id: 1 }], hasMore: false },
+    });
+    const store = createStore({
+      ...client,
+      getZone: async () => ({ name: "example.com", revision: 1, views: [] }),
+      zoneStatus: async () => ({ statuses: [] }),
+    });
+
+    await store.selectZone("example.com");
+
+    const historyRequests = asked.filter((url) => url.includes("/history"));
+    assert.equal(historyRequests.length, 1, "one request, not a walk to the end");
+    assert.match(historyRequests[0], /offset=0/u);
+    assert.equal(store.getState().history.length, 2);
+    assert.equal(store.getState().historyHasMore, true, "and it says there is more");
+  });
+
+  it("appends exactly one further page per press, then stops offering", async () => {
+    const { asked, client } = pagingClient({
+      0: { entries: [{ id: 3 }, { id: 2 }], hasMore: true },
+      2: { entries: [{ id: 1 }], hasMore: false },
+    });
+    const store = createStore({
+      ...client,
+      getZone: async () => ({ name: "example.com", revision: 1, views: [] }),
+      zoneStatus: async () => ({ statuses: [] }),
+    });
+    await store.selectZone("example.com");
+
+    await store.loadMoreHistory();
+
+    assert.equal(asked.filter((url) => url.includes("/history")).length, 2);
+    assert.deepEqual(store.getState().history.map((entry) => entry.id), [3, 2, 1]);
+    assert.equal(store.getState().historyHasMore, false);
+
+    // Nothing left to ask for, so the next press must not reach the server.
+    assert.equal(await store.loadMoreHistory(), false);
+    assert.equal(asked.filter((url) => url.includes("/history")).length, 2);
+  });
+
+  it("does not leave the button forever when a page claims more but delivers none", async () => {
+    const { client } = pagingClient({
+      0: { entries: [{ id: 1 }], hasMore: true },
+      1: { entries: [], hasMore: true },
+    });
+    const store = createStore({
+      ...client,
+      getZone: async () => ({ name: "example.com", revision: 1, views: [] }),
+      zoneStatus: async () => ({ statuses: [] }),
+    });
+    await store.selectZone("example.com");
+
+    await store.loadMoreHistory();
+
+    assert.equal(store.getState().historyHasMore, false, "believe the rows, not the flag");
   });
 });

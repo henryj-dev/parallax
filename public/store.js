@@ -14,7 +14,15 @@ import { effectiveExternalTtl } from "./ttl.js";
  * to know which call inside a flow went wrong.
  */
 
-export const HISTORY_PAGE_SIZE = 5;
+/**
+ * How much of each trail one request asks for.
+ *
+ * Both were declared and then never used: the client drained every page to the
+ * end instead, so the API's 500-row cap bought nothing and the history panel
+ * pulled a year of audit into the browser. They are the fetch size now, and
+ * "load more" is what asks for the next one.
+ */
+export const HISTORY_PAGE_SIZE = 50;
 export const REVISION_PAGE_SIZE = 50;
 
 /** Scopes a view can surface an inline error against. */
@@ -45,6 +53,8 @@ export function createStore(client) {
     history: [],
     historyError: "",
     historyScope: "zone",
+    historyHasMore: false,
+    loadingMoreHistory: false,
 
     plan: null,
     planError: "",
@@ -53,6 +63,8 @@ export function createStore(client) {
 
     revisions: [],
     revisionsError: "",
+    revisionsHasMore: false,
+    loadingMoreRevisions: false,
     inspectedRevision: null,
     inspectedRevisionError: "",
 
@@ -239,7 +251,7 @@ export function createStore(client) {
             (status) => ({ status, error: "" }),
             (error) => ({ status: null, error: error.message }),
           ),
-          client.history(name).then(
+          client.history(name, { limit: HISTORY_PAGE_SIZE, offset: 0 }).then(
             (history) => ({ history, error: "" }),
             (error) => ({ history: null, error: error.message }),
           ),
@@ -251,6 +263,7 @@ export function createStore(client) {
         state.status = statusResult.status;
         state.statusError = statusResult.error;
         state.history = historyResult.history?.entries ?? [];
+        state.historyHasMore = historyResult.history?.hasMore === true;
         state.historyError = historyResult.error;
         return true;
       } catch (error) {
@@ -260,6 +273,7 @@ export function createStore(client) {
         state.status = null;
         state.statusError = "";
         state.history = [];
+        state.historyHasMore = false;
         state.historyError = "";
         notice("zone.detailsFailed", { error: error.message }, "error");
         return false;
@@ -477,16 +491,43 @@ export function createStore(client) {
 
     async loadRevisions() {
       state.revisions = [];
+      state.revisionsHasMore = false;
       state.revisionsError = "";
       emitChange();
       try {
-        const payload = await client.listRevisions(activeName());
+        const payload = await client.listRevisions(activeName(), { limit: REVISION_PAGE_SIZE, offset: 0 });
         state.revisions = payload?.revisions ?? [];
+        state.revisionsHasMore = payload?.hasMore === true;
       } catch (error) {
         handleUnauthorized(error);
+        state.revisionsHasMore = false;
         state.revisionsError = error.message;
       }
       emitChange();
+    },
+
+    /** The next page of snapshots, appended to the ones already listed. */
+    async loadMoreRevisions() {
+      if (!state.revisionsHasMore || state.loadingMoreRevisions) return false;
+      state.loadingMoreRevisions = true;
+      emitChange();
+      try {
+        const payload = await client.listRevisions(activeName(), {
+          limit: REVISION_PAGE_SIZE,
+          offset: state.revisions.length,
+        });
+        const revisions = payload?.revisions ?? [];
+        state.revisions = [...state.revisions, ...revisions];
+        state.revisionsHasMore = payload?.hasMore === true && revisions.length > 0;
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        state.revisionsError = error.message;
+        return false;
+      } finally {
+        state.loadingMoreRevisions = false;
+        emitChange();
+      }
     },
 
     /**
@@ -614,16 +655,50 @@ export function createStore(client) {
       state.historyScope = "global";
       emitChange();
       try {
-        const history = await client.globalHistory();
+        const history = await client.globalHistory({ limit: HISTORY_PAGE_SIZE, offset: 0 });
         state.history = history?.entries ?? [];
+        state.historyHasMore = history?.hasMore === true;
         emitChange();
         return true;
       } catch (error) {
         handleUnauthorized(error);
         state.history = [];
+        state.historyHasMore = false;
         state.historyError = error.message;
         emitChange();
         return false;
+      }
+    },
+
+    /**
+     * The next page of whichever trail is on screen.
+     *
+     * Appends rather than replaces, and refuses to run twice at once: the
+     * button stays visible while the request is in flight, and a second press
+     * would otherwise ask for the same offset and show the page twice.
+     */
+    async loadMoreHistory() {
+      if (!state.historyHasMore || state.loadingMoreHistory) return false;
+      state.loadingMoreHistory = true;
+      emitChange();
+      try {
+        const offset = state.history.length;
+        const page = state.historyScope === "global"
+          ? await client.globalHistory({ limit: HISTORY_PAGE_SIZE, offset })
+          : await client.history(activeName(), { limit: HISTORY_PAGE_SIZE, offset });
+        const entries = page?.entries ?? [];
+        state.history = [...state.history, ...entries];
+        // A page that claims more but delivers nothing would leave the button
+        // forever. Believe the rows, not the flag.
+        state.historyHasMore = page?.hasMore === true && entries.length > 0;
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        state.historyError = error.message;
+        return false;
+      } finally {
+        state.loadingMoreHistory = false;
+        emitChange();
       }
     },
 

@@ -108,6 +108,8 @@ export interface Store {
   apply(): Outcome;
 
   loadRevisions(): Promise<void>;
+  /** Appends the next page of snapshots. Refuses while one is in flight. */
+  loadMoreRevisions(): Outcome;
   /** Loads one snapshot for reading, or closes the one already open. */
   inspectRevision(revision: number): Outcome;
   restoreRevision(revision: number): Outcome;
@@ -123,6 +125,8 @@ export interface Store {
   deleteFallbackSuffix(profile: string, suffix: string): Outcome;
   /** Loads zoneless history from GET /api/v1/history, walking every page. */
   loadGlobalHistory(): Outcome;
+  /** Appends the next page of whichever trail is on screen. */
+  loadMoreHistory(): Outcome;
   selectProfile(name: string): void;
   selectBinding(zone: string): void;
   saveProfile(name: string, credential: { token?: string; accountId?: string }): Outcome;

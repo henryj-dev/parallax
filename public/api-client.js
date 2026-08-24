@@ -83,18 +83,21 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     }
   }
 
-  async function listAllKeyed(path, key, label) {
-    const items = [];
-    let offset = 0;
-    for (;;) {
-      const join = path.includes("?") ? "&" : "?";
-      const page = await request(`${path}${join}limit=500&offset=${offset}`);
-      if (!page || !Array.isArray(page[key])) throw new ApiError(`invalid ${label} page`, 502);
-      items.push(...page[key]);
-      if (!page.hasMore) return { ...page, [key]: items };
-      if (page[key].length === 0) throw new ApiError(`${label} pagination did not advance`, 502);
-      offset += page[key].length;
-    }
+  /**
+   * One page, as the server offered it.
+   *
+   * The zone list and the status overview are drained to the end because the
+   * portal genuinely needs all of both. History and revisions are not: the API
+   * caps a page at 500 and the client used to defeat that cap with a loop, so
+   * opening the history panel on a deployment with the default 365-day audit
+   * retention pulled the whole trail into the browser -- and made the server
+   * walk it with a growing `OFFSET`, which gets slower the further it goes.
+   */
+  async function readPage(path, key, label, { limit, offset }) {
+    const join = path.includes("?") ? "&" : "?";
+    const page = await request(`${path}${join}limit=${limit}&offset=${offset}`);
+    if (!page || !Array.isArray(page[key])) throw new ApiError(`invalid ${label} page`, 502);
+    return page;
   }
 
   return {
@@ -144,15 +147,15 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     zoneStatus: (zone) => request(`${zonePath(zone)}/status`),
     /** One line per zone, walked the same way as the zone list so a second page is not silently dropped. */
     statusOverview: listAllStatus,
-    history: (zone) => listAllKeyed(`${zonePath(zone)}/history`, "entries", "history"),
-    /** Newest first, every zone, walked the same way as a per-zone page. */
-    globalHistory: () => listAllKeyed("/history", "entries", "history"),
+    history: (zone, page) => readPage(`${zonePath(zone)}/history`, "entries", "history", page),
+    /** Newest first, across every zone. Paged like the per-zone trail. */
+    globalHistory: (page) => readPage("/history", "entries", "history", page),
     preview: (zone, desired) => request(`${zonePath(zone)}/preview`, { method: "POST", body: desired }),
     apply: (zone, revision) => request(`${zonePath(zone)}/apply`, { method: "POST", headers: ifMatch(revision) }),
     adopt: (zone, revision) =>
       request(`${zonePath(zone)}/adopt?view=external`, { method: "POST", headers: ifMatch(revision) }),
 
-    listRevisions: (zone) => listAllKeyed(`${zonePath(zone)}/revisions`, "revisions", "revision"),
+    listRevisions: (zone, page) => readPage(`${zonePath(zone)}/revisions`, "revisions", "revision", page),
     getRevision: (zone, revision) => request(`${zonePath(zone)}/revisions/${encodeURIComponent(revision)}`),
     restoreRevision: (zone, revision, expected) =>
       request(`${zonePath(zone)}/revisions/${encodeURIComponent(revision)}/restore`, {

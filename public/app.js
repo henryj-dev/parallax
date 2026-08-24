@@ -370,12 +370,19 @@ function renderHistory(state) {
     $("#history-empty").hidden = false;
     $("#history-empty").textContent = t("history.loadFailed", { error: state.historyError });
     $("#history-list").innerHTML = "";
+    $("#history-more").hidden = true;
     return;
   }
   const entries = state.history;
   $("#history-empty").hidden = entries.length > 0;
   $("#history-empty").textContent = t(state.historyScope === "global" ? "history.noneGlobal" : "history.none");
   $("#history-list").innerHTML = entries.map((entry) => `<li><b>${escapeHtml(localizeAuditAction(entry.action, t))}</b><time>${escapeHtml(formatDate(entry.at))}</time><small>${escapeHtml(entry.actor || t("history.system"))}${entry.revision ? ` · ${escapeHtml(t("history.revision", { revision: entry.revision }))}` : ""}${changeCounts(entry, t)}</small></li>`).join("");
+  // Only when the server said there is more. The trail can be a year long, so
+  // the page asks for the next slice rather than the whole thing on open.
+  const more = $("#history-more");
+  more.hidden = !state.historyHasMore;
+  more.disabled = state.loadingMoreHistory;
+  more.textContent = t(state.loadingMoreHistory ? "history.loading" : "history.loadMore");
 }
 
 function renderPlan(state) {
@@ -452,12 +459,18 @@ function renderRevisions(state) {
   const content = $("#revisions-content");
   if (state.revisionsError) {
     content.innerHTML = `<div class="form-error">${escapeHtml(t("revisions.loadFailed", { error: state.revisionsError }))}</div>`;
+    $("#revisions-more").hidden = true;
     return;
   }
   if (state.revisions.length === 0) {
     content.innerHTML = `<div class="mini-empty">${escapeHtml(t("revisions.none"))}</div>`;
+    $("#revisions-more").hidden = true;
     return;
   }
+  const moreRevisions = $("#revisions-more");
+  moreRevisions.hidden = !state.revisionsHasMore;
+  moreRevisions.disabled = state.loadingMoreRevisions;
+  moreRevisions.textContent = t(state.loadingMoreRevisions ? "history.loading" : "revisions.loadMore");
   content.innerHTML = [...state.revisions].reverse().map((revision) => {
     const records = (revision.views ?? []).reduce((count, view) => count + (view.records?.length ?? 0), 0);
     const current = revision.revision === state.activeZone?.revision;
@@ -790,6 +803,8 @@ store.onIntent((event) => {
   if (event.type === "auth-required") openAuthDialog();
 });
 
+$("#history-more").addEventListener("click", () => void store.loadMoreHistory());
+$("#revisions-more").addEventListener("click", () => void store.loadMoreRevisions());
 $("#locale-select").addEventListener("change", (event) => setLocale(event.currentTarget.value));
 $("#zone-search").addEventListener("input", () => renderZoneList(store.getState()));
 $("#zone-list").addEventListener("click", (event) => {

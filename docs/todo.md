@@ -48,7 +48,7 @@
 
 - [x] **T9** · `S` · 실패한 apply 를 error 레벨로 — `public/store.js:413`
 - [x] **T10** · `XS` · 버려진 프로바이더 대상을 warning 으로 — `public/store.js:286`
-- [ ] **T11** · `S` · 히스토리·리비전의 페이지 소진 중단 — `public/api-client.js:86`
+- [x] **T11** · `S` · 히스토리·리비전의 페이지 소진 중단 — `public/api-client.js:86`
       <br>UI 변경이 따라온다. 셋 중 가장 크고 앞의 둘과 독립이라 미뤄도 된다
 
 ## 5단계 — 잔재 정리

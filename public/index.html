@@ -142,6 +142,7 @@
                 </div>
                 <ol id="history-list" class="history-list"><li class="history-loading skeleton"></li><li class="history-loading skeleton"></li></ol>
                 <div id="history-empty" class="mini-empty" hidden data-i18n="history.none">No changes have been recorded for this zone.</div>
+                <button id="history-more" class="button compact quiet" type="button" hidden data-i18n="history.loadMore">Load older changes</button>
               </section>
             </aside>
           </div>
@@ -220,6 +221,7 @@
       <div class="dialog-heading"><span><span class="eyebrow" data-i18n="revisions.eyebrow">Immutable desired state</span><h2 data-i18n="revisions.title">Revision history</h2></span><button class="icon-button" id="close-revisions" aria-label="Close dialog" data-i18n-aria-label="dialog.close">×</button></div>
       <p data-i18n="revisions.body">Restoring a snapshot creates a new revision. Existing history is never rewritten.</p>
       <div id="revisions-content" class="revision-list" aria-live="polite"></div>
+      <button id="revisions-more" class="button compact quiet" type="button" hidden data-i18n="revisions.loadMore">Load older revisions</button>
     </dialog>
 
     <dialog id="credential-dialog" class="wide-dialog provider-dialog">
