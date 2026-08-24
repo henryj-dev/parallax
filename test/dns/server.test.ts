@@ -422,6 +422,76 @@ describe("DNS server", () => {
     assert.equal(readAnswers(reply).length, 802, "SOA, 800 records, SOA");
   });
 
+  /**
+   * RFC 4592 §3.3.1: a wildcard synthesizes only from the *closest encloser*.
+   *
+   * The walk used to keep climbing past names the zone actually holds, so
+   * `*.example.com` answered for `a.b.example.com` even though `b.example.com`
+   * exists and `*.b.example.com` does not. The right answer there is NXDOMAIN.
+   *
+   * This is the divergence that matters most for a split-horizon control plane:
+   * Cloudflare and a zone file both apply the closest-encloser rule, so the
+   * same desired state answered one thing outside and another thing inside.
+   */
+  it("does not reach past a name the zone holds to find a wildcard", async () => {
+    const zone: ServedZone = {
+      name: "example.com",
+      serial: 1,
+      records: [
+        { name: "b", type: "A", content: "203.0.113.5", ttl: 300 },
+        { name: "*", type: "A", content: "203.0.113.99", ttl: 300 },
+      ],
+    };
+    const { port } = await start({ zones: () => [zone] });
+
+    assert.equal(rcodeOf(await ask(port, buildQuery("b.example.com"))), RCODE.NOERROR, "the real name");
+    assert.equal(rcodeOf(await ask(port, buildQuery("x.example.com"))), RCODE.NOERROR, "covered by the wildcard");
+
+    // `b.example.com` is the closest encloser and there is no `*.b.example.com`.
+    const below = await ask(port, buildQuery("a.b.example.com"));
+    assert.ok(below);
+    assert.equal(rcodeOf(below), RCODE.NXDOMAIN);
+    assert.equal(readAnswers(below).length, 0);
+
+    // ⚠️ The blast radius, pinned: only a name under an *existing* one changes.
+    // A catch-all wildcard still covers arbitrary depth where nothing exists in
+    // between, and that is what most zones actually lean on.
+    const deepButEmpty = await ask(port, buildQuery("a.nothing-here.example.com"));
+    assert.ok(deepButEmpty);
+    assert.equal(rcodeOf(deepButEmpty), RCODE.NOERROR);
+    assert.equal(readAnswers(deepButEmpty)[0]?.data.join("."), "203.0.113.99");
+  });
+
+  it("still lets the nearest wildcard answer, at every depth it should", async () => {
+    // The comment on `wildcardMatch` promises exactly this, and it has to keep
+    // being true after the walk learns where to stop.
+    const zone: ServedZone = {
+      name: "example.com",
+      serial: 1,
+      records: [
+        { name: "*.eu", type: "A", content: "203.0.113.7", ttl: 300 },
+        { name: "*", type: "A", content: "203.0.113.99", ttl: 300 },
+      ],
+    };
+    const { port } = await start({ zones: () => [zone] });
+
+    const nearest = await ask(port, buildQuery("shop.eu.example.com"));
+    assert.ok(nearest);
+    assert.equal(rcodeOf(nearest), RCODE.NOERROR);
+    assert.equal(readAnswers(nearest)[0]?.data.join("."), "203.0.113.7", "the nearer wildcard wins");
+
+    // `shop.eu.example.com` does not exist, so the closest encloser of the name
+    // below it is still `eu.example.com` -- the same wildcard covers it.
+    const deeper = await ask(port, buildQuery("deep.shop.eu.example.com"));
+    assert.ok(deeper);
+    assert.equal(rcodeOf(deeper), RCODE.NOERROR);
+    assert.equal(readAnswers(deeper)[0]?.data.join("."), "203.0.113.7");
+
+    const apexLevel = await ask(port, buildQuery("other.example.com"));
+    assert.ok(apexLevel);
+    assert.equal(readAnswers(apexLevel)[0]?.data.join("."), "203.0.113.99", "and the apex wildcard still covers its own level");
+  });
+
   it("emits NOTIFY when a served zone's serial rises", async () => {
     const sent: Array<{ packet: Buffer; address: string; port: number }> = [];
     const zone = { ...EXAMPLE, serial: 12 };

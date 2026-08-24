@@ -670,24 +670,51 @@ function servableRdata(type: RecordType, content: string): Buffer {
 }
 
 /**
- * The records a wilddcard covering this name holds, or none.
+ * Whether the zone holds this name at all -- as a record of its own, or as an
+ * ancestor of one, or as the apex.
+ *
+ * The middle case is the empty non-terminal: `a.b.example.com` existing makes
+ * `b.example.com` exist too, with nothing in it. DNS treats that as a name, and
+ * both the negative answers and the wildcard rule below depend on it.
+ */
+function nameExists(zone: ServedZone, name: string): boolean {
+  if (name === zone.name) return true;
+  const suffix = `.${name}`;
+  return zone.records.some((record) => {
+    const owner = absolute(record.name, zone.name);
+    return owner === name || owner.endsWith(suffix);
+  });
+}
+
+/**
+ * The records a wildcard covering this name holds, or none.
  *
  * The desired state accepts `*` and `*.name`, and every other publisher of the
  * internal view expands them -- a zone file, PowerDNS and Cloudflare all do.
  * Taking them literally here would answer NXDOMAIN for names the same desired
  * state resolves everywhere else.
  *
- * The walk goes upwards from the queried name's parent and stops at the first
- * wildcard it finds, so `*.eu.example.com` answers for `shop.eu.example.com`
- * and `*.example.com` does not get the chance. A name that exists never reaches
- * here, which is the rule that keeps a wildcard from answering over a real one.
+ * The walk climbs to the **closest encloser** -- the longest ancestor of the
+ * queried name that the zone actually holds -- and looks for a wildcard only
+ * there. RFC 4592 §3.3.1, and the difference is not academic: it used to climb
+ * past existing names until it found any wildcard at all, so a zone holding
+ * `b` and `*` answered `a.b.example.com` from `*.example.com`. The closest
+ * encloser there is `b.example.com`, the source of synthesis would be
+ * `*.b.example.com`, and there is none -- so the answer is NXDOMAIN.
+ *
+ * Every other publisher of this desired state applies that rule, which made
+ * this the one place where inside and outside disagreed about whether a name
+ * exists. A name that exists never reaches here at all, which is the separate
+ * rule that keeps a wildcard from answering over a real one.
  */
 function wildcardMatch(zone: ServedZone, name: string): ServedZone["records"] {
   let parent = name.slice(name.indexOf(".") + 1);
   for (;;) {
-    const covering = `*.${parent}`;
-    const records = zone.records.filter((record) => absolute(record.name, zone.name) === covering);
-    if (records.length > 0) return records;
+    if (nameExists(zone, parent)) {
+      const covering = `*.${parent}`;
+      return zone.records.filter((record) => absolute(record.name, zone.name) === covering);
+    }
+    // The apex always exists, so this is a floor rather than a guess.
     if (parent === zone.name || !parent.includes(".")) return [];
     parent = parent.slice(parent.indexOf(".") + 1);
   }
