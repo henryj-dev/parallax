@@ -270,7 +270,14 @@ export function readName(message: Buffer, start: number): { name: string; offset
     if (offset + length > message.length) throw new WireFormatError("label runs past the end of the message");
     bytes += length + 1;
     if (bytes > MAX_NAME_BYTES) throw new WireFormatError("name is longer than 255 bytes");
-    labels.push(message.toString("latin1", offset, offset + length));
+    // A label may hold any byte, `.` included, and this codebase carries a name
+    // as one dotted string. Without escaping, a single 11-byte label spelling
+    // `example.com` read back identical to the two-label name and was answered
+    // for as though it were the zone apex. Presentation format has always
+    // spelled it this way; `writeName` reads the escape back.
+    labels.push(message.toString("latin1", offset, offset + length)
+      .replace(/\\/gu, "\\\\")
+      .replace(/\./gu, "\\."));
     offset += length;
   }
   return { name: labels.join(".").toLowerCase(), offset: afterPointer ?? offset };
@@ -278,9 +285,12 @@ export function readName(message: Buffer, start: number): { name: string; offset
 
 /** Encodes a name uncompressed. Compression is not used: the saving is small. */
 export function writeName(name: string): Buffer {
-  const trimmed = name.replace(/\.$/u, "");
-  if (trimmed === "") return Buffer.of(0);
-  const parts = trimmed.split(".");
+  // The root, and the null MX/SRV/SVCB target that is spelled the same way.
+  if (name === "" || name === ".") return Buffer.of(0);
+  const parts = splitEscapedName(name);
+  // A trailing dot is the root label, which the terminator below already writes.
+  if (parts.at(-1) === "") parts.pop();
+  if (parts.length === 0) return Buffer.of(0);
   const chunks: Buffer[] = [];
   for (const part of parts) {
     const label = Buffer.from(part, "latin1");
@@ -291,6 +301,34 @@ export function writeName(name: string): Buffer {
   const encoded = Buffer.concat(chunks);
   if (encoded.length > MAX_NAME_BYTES) throw new WireFormatError(`name ${name} is longer than 255 bytes`);
   return encoded;
+}
+
+/**
+ * Splits on the dots that separate labels, leaving the escaped ones alone.
+ *
+ * `readName` writes `\\.` for a dot inside a label and `\\\\` for a backslash, so
+ * this is the other half of that round trip -- without it, echoing the question
+ * back would split one label into two and the reply would not match the query.
+ */
+function splitEscapedName(name: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  for (let index = 0; index < name.length; index += 1) {
+    const character = name[index];
+    if (character === "\\" && index + 1 < name.length) {
+      current += name[index + 1];
+      index += 1;
+      continue;
+    }
+    if (character === ".") {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  parts.push(current);
+  return parts;
 }
 
 export interface ResourceRecord {

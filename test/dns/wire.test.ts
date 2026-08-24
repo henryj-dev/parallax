@@ -153,6 +153,54 @@ describe("DNS wire format", () => {
     });
   });
 
+  describe("a label that contains a dot", () => {
+    /**
+     * The wire format lets a label hold any byte, `.` included. This codebase
+     * carries a name as one dotted string, so a single 11-byte label spelling
+     * `example.com` used to read back identical to the two-label name -- and
+     * `matchZone` then handed the query to the zone apex and answered
+     * authoritatively for a name nobody had asked about. The reply was
+     * discarded by the resolver, because re-encoding split it back into two
+     * labels and the question no longer matched.
+     *
+     * Escaping is what keeps the two apart. Presentation format has always
+     * spelled it this way, so `writeName` has to read the escape back.
+     */
+    it("keeps a dotted label distinct from the two-label name", () => {
+      const oneLabel = Buffer.concat([Buffer.of(11), Buffer.from("example.com", "latin1"), Buffer.of(0)]);
+      const twoLabels = Buffer.concat([
+        Buffer.of(7), Buffer.from("example", "latin1"),
+        Buffer.of(3), Buffer.from("com", "latin1"), Buffer.of(0),
+      ]);
+
+      assert.equal(readName(oneLabel, 0).name, "example\\.com");
+      assert.equal(readName(twoLabels, 0).name, "example.com");
+      assert.notEqual(readName(oneLabel, 0).name, readName(twoLabels, 0).name);
+    });
+
+    it("writes an escaped label back as the one label it came from", () => {
+      // Round trip, which is what `assemble` needs when it echoes the question.
+      const oneLabel = Buffer.concat([Buffer.of(11), Buffer.from("example.com", "latin1"), Buffer.of(0)]);
+      assert.deepEqual(writeName(readName(oneLabel, 0).name), oneLabel);
+    });
+
+    it("still writes ordinary names, the root and a trailing dot as before", () => {
+      assert.deepEqual(writeName("example.com"), Buffer.concat([
+        Buffer.of(7), Buffer.from("example", "latin1"),
+        Buffer.of(3), Buffer.from("com", "latin1"), Buffer.of(0),
+      ]));
+      assert.deepEqual(writeName("example.com."), writeName("example.com"));
+      assert.deepEqual(writeName("."), Buffer.of(0), "the null MX target and the root");
+      assert.deepEqual(writeName(""), Buffer.of(0));
+      assert.throws(() => writeName("a..b"), /invalid label/u);
+    });
+
+    it("keeps a literal backslash in a label from becoming an escape", () => {
+      const withSlash = Buffer.concat([Buffer.of(3), Buffer.from("a\\b", "latin1"), Buffer.of(0)]);
+      assert.deepEqual(writeName(readName(withSlash, 0).name), withSlash);
+    });
+  });
+
   describe("EDNS", () => {
     it("promises only 512 bytes to a client that did not say it could take more", () => {
       const query = readQuery(buildQuery("example.com"));
