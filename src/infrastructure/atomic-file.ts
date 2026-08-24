@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { lstat, mkdir, open, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, join, parse, resolve } from "node:path";
@@ -10,6 +11,20 @@ interface LockOwner {
   readonly hostname: string;
   readonly pid: number;
   readonly nonce: string;
+  /**
+   * When the holding process started, as the kernel counts it.
+   *
+   * A pid alone does not identify a process across a restart, and in a
+   * container it identifies almost nothing: the server is pid 1 every time and
+   * the hostname is the pod's, so a lock left by a crash named exactly the
+   * process that came back. `pidAlive` then said "held", and every write failed
+   * from then on until somebody deleted the file by hand -- one OOMKill away,
+   * on the file backend, which is the default.
+   *
+   * Absent where the kernel will not say (anything without `/proc`, so macOS),
+   * and there the pid check stands alone as before.
+   */
+  readonly startedAt?: string;
 }
 
 /**
@@ -58,7 +73,13 @@ export async function withFileLock<T>(
   const directory = dirname(path);
   await ensurePrivateDirectory(directory);
   const lockPath = join(directory, `.${basename(path)}.lock`);
-  const owner: LockOwner = { hostname: hostname(), pid: process.pid, nonce: randomUUID() };
+  const startedAt = processStartedAt("self");
+  const owner: LockOwner = {
+    hostname: hostname(),
+    pid: process.pid,
+    nonce: randomUUID(),
+    ...(startedAt === undefined ? {} : { startedAt }),
+  };
   const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? LOCK_RETRY_MS;
   const deadline = Date.now() + timeoutMs;
@@ -100,6 +121,25 @@ function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoExcepti
   return error instanceof Error && "code" in error && error.code === code;
 }
 
+/**
+ * Field 22 of `/proc/<pid>/stat`: the process's start time in clock ticks since
+ * boot. Read after the last `)` because the second field is the executable name
+ * and may itself contain spaces or brackets.
+ *
+ * Two processes that share a pid cannot share this, so it is what makes the
+ * comparison below an identity rather than a guess.
+ */
+function processStartedAt(pid: number | "self"): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const afterName = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const startTime = afterName[19];
+    return startTime && /^\d+$/u.test(startTime) ? startTime : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -125,7 +165,14 @@ async function reclaimDeadLock(lockPath: string): Promise<boolean> {
     } catch {
       return false;
     }
-    if (owner.hostname !== hostname() || typeof owner.pid !== "number" || pidAlive(owner.pid)) return false;
+    if (owner.hostname !== hostname() || typeof owner.pid !== "number") return false;
+    if (pidAlive(owner.pid)) {
+      // The pid is in use -- but by the process that took this lock, or by one
+      // that merely inherited its number? Where the kernel can say, ask it.
+      const running = processStartedAt(owner.pid);
+      const held = typeof owner.startedAt === "string" ? owner.startedAt : undefined;
+      if (running === undefined || held === undefined || running === held) return false;
+    }
     const current = await lstat(lockPath);
     if (current.ino !== inspected.ino || current.dev !== inspected.dev) return false;
     await unlink(lockPath);
