@@ -25,8 +25,8 @@ export const TYPE = Object.freeze({
   A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, HINFO: 13, MX: 15, TXT: 16, AAAA: 28,
   LOC: 29, SRV: 33, NAPTR: 35, CERT: 37, DNAME: 39, OPT: 41, DS: 43, SSHFP: 44,
   DNSKEY: 48, TLSA: 52, SMIMEA: 53, OPENPGPKEY: 61, SVCB: 64, HTTPS: 65,
-  URI: 256, CAA: 257, ANY: 255, AXFR: 252, TSIG: 250,
-} as const satisfies Record<RecordType | "SOA" | "OPT" | "ANY" | "AXFR" | "TSIG", number>);
+  URI: 256, CAA: 257, ANY: 255, AXFR: 252, IXFR: 251, TSIG: 250,
+} as const satisfies Record<RecordType | "SOA" | "OPT" | "ANY" | "AXFR" | "IXFR" | "TSIG", number>);
 
 const TYPE_NAMES = new Map<number, string>(Object.entries(TYPE).map(([name, value]) => [value as number, name]));
 
@@ -290,6 +290,41 @@ export function readName(message: Buffer, start: number): { name: string; offset
     offset += length;
   }
   return { name: labels.join(".").toLowerCase(), offset: afterPointer ?? offset };
+}
+
+/**
+ * The serial a secondary says it already has, from the SOA an IXFR query
+ * carries in its authority section (RFC 1995 §3).
+ *
+ * Absent rather than thrown when the query does not carry one, or carries
+ * something that is not an SOA: the answer to that is a full transfer, which
+ * the specification allows for any IXFR at all.
+ */
+export function readTransferSerial(message: Buffer): number | undefined {
+  try {
+    if (message.length < 12) return undefined;
+    const questions = message.readUInt16BE(4);
+    const answers = message.readUInt16BE(6);
+    if (message.readUInt16BE(8) === 0) return undefined;
+    let offset = 12;
+    for (let index = 0; index < questions; index += 1) offset = readName(message, offset).offset + 4;
+    for (let index = 0; index < answers; index += 1) {
+      const afterName = readName(message, offset).offset;
+      offset = afterName + 10 + message.readUInt16BE(afterName + 8);
+    }
+    const afterName = readName(message, offset).offset;
+    if (afterName + 10 > message.length || message.readUInt16BE(afterName) !== TYPE.SOA) return undefined;
+    const rdataStart = afterName + 10;
+    const rdataEnd = rdataStart + message.readUInt16BE(afterName + 8);
+    if (rdataEnd > message.length) return undefined;
+    // MNAME then RNAME, either of which may be a compression pointer, and the
+    // serial is the first fixed field after them.
+    const afterRname = readName(message, readName(message, rdataStart).offset).offset;
+    if (afterRname + 4 > rdataEnd) return undefined;
+    return message.readUInt32BE(afterRname);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Encodes a name uncompressed. Compression is not used: the saving is small. */

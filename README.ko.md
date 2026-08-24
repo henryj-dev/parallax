@@ -424,7 +424,7 @@ GET /api/v1/openapi.json
 | `PARALLAX_DNS_HOST` | 기본값은 `HOST`, 그다음 `127.0.0.1` |
 | `PARALLAX_DNS_FORWARD_TO` | 모든 존 밖 이름의 상위. 비우면 `REFUSED`로 답함 |
 | `PARALLAX_DNS_FORWARD_ALLOW` | 재귀를 허용할 클라이언트 CIDR. 기본은 루프백이고, 리스너가 루프백이 아니면서 포워딩이 켜져 있으면 **필수** |
-| `PARALLAX_DNS_TRANSFER_ALLOW` | `AXFR`를 허용할 클라이언트 CIDR. **기본은 전부 거부** |
+| `PARALLAX_DNS_TRANSFER_ALLOW` | `AXFR`·`IXFR`를 허용할 클라이언트 CIDR. **기본은 전부 거부** |
 | `PARALLAX_DNS_TSIG_KEYS` | `name:algorithm:base64secret`, 쉼표 구분. 키를 하나라도 두면 `AXFR`에 유효한 TSIG 서명이 **필수**가 된다. `hmac-sha256`/`hmac-sha512`만 |
 | `PARALLAX_DNS_NOTIFY_TO` | 서빙 중인 존의 serial이 오를 때 NOTIFY를 받을 호스트. `host`, `host:port`, 또는 서명할 키를 지정하는 `host:port#keyname` |
 | `PARALLAX_DNS_SOA_PRIMARY` · `_SOA_MAILBOX` | SOA 필드 |

@@ -426,7 +426,7 @@ and the defaults are the careful ones.
 | `PARALLAX_DNS_HOST` | Defaults to `HOST`, then to `127.0.0.1` |
 | `PARALLAX_DNS_FORWARD_TO` | Upstreams for names outside every zone. Empty answers `REFUSED` |
 | `PARALLAX_DNS_FORWARD_ALLOW` | Client CIDRs allowed to recurse. Defaults to loopback — and is **required** if the listener is not loopback and forwarding is on |
-| `PARALLAX_DNS_TRANSFER_ALLOW` | Client CIDRs allowed `AXFR`. **Defaults to deny all** |
+| `PARALLAX_DNS_TRANSFER_ALLOW` | Client CIDRs allowed `AXFR` and `IXFR`. **Defaults to deny all** |
 | `PARALLAX_DNS_TSIG_KEYS` | `name:algorithm:base64secret`, comma-separated. Setting any key makes a valid TSIG signature **required** for `AXFR`; `hmac-sha256`/`hmac-sha512` only |
 | `PARALLAX_DNS_NOTIFY_TO` | Hosts that get NOTIFY when a served zone's serial rises. `host`, `host:port`, or `host:port#keyname` to sign it |
 | `PARALLAX_DNS_SOA_PRIMARY` · `_SOA_MAILBOX` | SOA fields |

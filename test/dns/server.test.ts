@@ -35,6 +35,16 @@ function buildQuery(name: string, type: number = TYPE.A, id = 0x4242): Buffer {
   return Buffer.concat([header, encodeName(name), tail]);
 }
 
+/** The serial out of an SOA rdata: two names, then the number. */
+function soaSerial(data: Buffer): number {
+  const skip = (offset: number): number => {
+    let cursor = offset;
+    while ((data[cursor] as number) !== 0) cursor += (data[cursor] as number) + 1;
+    return cursor + 1;
+  };
+  return data.readUInt32BE(skip(skip(0)));
+}
+
 function forwardedReply(message: Buffer, marker: number[]): Buffer {
   const reply = Buffer.from(message);
   reply.writeUInt16BE((reply.readUInt16BE(2) & 0x7900) | 0x8080, 2);
@@ -706,6 +716,124 @@ describe("DNS server", () => {
       { address: "2001:db8::54", port: 53 },
       { address: "2001:db8::55", port: 53 },
     ]);
+  });
+
+  /**
+   * ⚠️ These assert against this build's own encoder. The stronger half was
+   * measured against BIND 9.10.6's `dig ixfr=<serial>` on 2026-08-24, and the
+   * control is the contrast rather than the absence of a complaint: from the
+   * same server, `ixfr=1` came back as six records carrying only the two that
+   * changed, and `ixfr=0` -- a serial nothing retains -- came back as the whole
+   * zone. `dig` is not assumed present in CI, so what is pinned here is the
+   * behaviour that measurement confirmed.
+   */
+  describe("IXFR", () => {
+    const AT_ONE: ServedZone = {
+      name: "example.com",
+      serial: 1,
+      records: [
+        { name: "keep", type: "A", content: "192.0.2.1", ttl: 60 },
+        { name: "gone", type: "A", content: "192.0.2.2", ttl: 60 },
+      ],
+    };
+    const AT_TWO: ServedZone = {
+      ...AT_ONE,
+      serial: 2,
+      records: [
+        { name: "keep", type: "A", content: "192.0.2.1", ttl: 60 },
+        { name: "added", type: "A", content: "192.0.2.3", ttl: 60 },
+      ],
+    };
+    const history = async (zone: string, serial: number): Promise<ServedZone | undefined> =>
+      zone === AT_ONE.name && serial === 1 ? AT_ONE : undefined;
+
+    /** An IXFR query: the question, plus the SOA that says what the client has. */
+    function ixfrQuery(name: string, serial: number, withSoa = true): Buffer {
+      const question = buildQuery(name, TYPE.IXFR);
+      if (!withSoa) return question;
+      const rdata = Buffer.concat([
+        encodeName(`ns.${name}`),
+        encodeName(`hostmaster.${name}`),
+        (() => {
+          const numbers = Buffer.alloc(20);
+          numbers.writeUInt32BE(serial, 0);
+          return numbers;
+        })(),
+      ]);
+      const head = Buffer.alloc(10);
+      head.writeUInt16BE(TYPE.SOA, 0);
+      head.writeUInt16BE(1, 2);
+      head.writeUInt32BE(0, 4);
+      head.writeUInt16BE(rdata.length, 8);
+      const message = Buffer.concat([question, encodeName(name), head, rdata]);
+      message.writeUInt16BE(1, 8); // NSCOUNT
+      return message;
+    }
+
+    const serialsAndNames = (reply: Buffer): string[] => readAnswers(reply).map((record) =>
+      record.type === TYPE.SOA ? `SOA:${soaSerial(record.data)}` : record.name);
+
+    it("sends only the difference when it can reach the serial the client names", async () => {
+      const { port } = await start({ zones: () => [AT_TWO], transferAllow: ["127.0.0.0/8"], zoneAtSerial: history });
+      const reply = await askOverTcp(port, ixfrQuery("example.com", 1));
+      // RFC 1995 §4: the new serial, then deletions under the old, then
+      // additions under the new, then the new serial again.
+      assert.deepEqual(serialsAndNames(reply), [
+        "SOA:2", "SOA:1", "gone.example.com", "SOA:2", "added.example.com", "SOA:2",
+      ]);
+      // The record that did not change is not in it -- which is the point.
+      assert.ok(!serialsAndNames(reply).includes("keep.example.com"));
+    });
+
+    it("answers a client that is already current, or ahead, with one SOA", async () => {
+      const { port } = await start({ zones: () => [AT_TWO], transferAllow: ["127.0.0.0/8"], zoneAtSerial: history });
+      for (const serial of [2, 99]) {
+        assert.deepEqual(serialsAndNames(await askOverTcp(port, ixfrQuery("example.com", serial))), ["SOA:2"],
+          `serial ${serial} should have nothing to send`);
+      }
+    });
+
+    it("falls back to the whole zone when the serial is out of reach or unstated", async () => {
+      const { port } = await start({ zones: () => [AT_TWO], transferAllow: ["127.0.0.0/8"], zoneAtSerial: history });
+      const full = ["SOA:2", "keep.example.com", "added.example.com", "SOA:2"];
+      assert.deepEqual(serialsAndNames(await askOverTcp(port, ixfrQuery("example.com", 0))), full);
+      // No SOA in the authority section: nothing says what the client has.
+      assert.deepEqual(serialsAndNames(await askOverTcp(port, ixfrQuery("example.com", 0, false))), full);
+      // ...and a deployment that offers no history at all.
+      const { port: bare } = await start({ zones: () => [AT_TWO], transferAllow: ["127.0.0.0/8"] });
+      assert.deepEqual(serialsAndNames(await askOverTcp(bare, ixfrQuery("example.com", 1))), full);
+    });
+
+    it("asks a UDP client to come back over TCP by answering with the SOA", async () => {
+      const { port } = await start({ zones: () => [AT_TWO], transferAllow: ["127.0.0.0/8"], zoneAtSerial: history });
+      const reply = await ask(port, ixfrQuery("example.com", 1));
+      // Not TC and not REFUSED: RFC 1995 §2 makes the current SOA the answer,
+      // and the client retries over TCP on seeing it.
+      assert.ok(reply, "a datagram must come back at all");
+      assert.equal(rcodeOf(reply), RCODE.NOERROR);
+      assert.deepEqual(serialsAndNames(reply), ["SOA:2"]);
+    });
+
+    it("is gated exactly as AXFR is", async () => {
+      const outside = await start({ zones: () => [AT_TWO], transferAllow: ["10.0.0.0/8"], zoneAtSerial: history });
+      assert.equal(rcodeOf(await askOverTcp(outside.port, ixfrQuery("example.com", 1))), RCODE.REFUSED);
+      // ...including over UDP, where an unallowed client must not learn the
+      // serial either.
+      assert.equal(rcodeOf(await ask(outside.port, ixfrQuery("example.com", 1))), RCODE.REFUSED);
+
+      const secret = Buffer.alloc(32, 5).toString("base64");
+      const key = parseTsigKey(`transfer.key:hmac-sha256:${secret}`, "TEST");
+      const signed = await start({
+        zones: () => [AT_TWO], transferAllow: ["127.0.0.0/8"], zoneAtSerial: history, tsigKeys: [key],
+      });
+      assert.equal(rcodeOf(await askOverTcp(signed.port, ixfrQuery("example.com", 1))), RCODE.NOTAUTH);
+      const request = signRequest(ixfrQuery("example.com", 1), key);
+      const reply = await askOverTcp(signed.port, request.message);
+      assert.equal(rcodeOf(reply), RCODE.NOERROR);
+      const record = readTsig(reply);
+      assert.ok(record);
+      assert.equal(verifyTsig(reply, record, [key], undefined, { mac: request.mac }).kind, "ok");
+    });
   });
 
   /**

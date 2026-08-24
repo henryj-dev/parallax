@@ -12,7 +12,7 @@ import {
 import { DEFAULT_SOA_TIMERS, encodeRdata, encodeSoa, rrType, type SoaTimers } from "./rdata.ts";
 import {
   CLASS_ANY, CLASS_IN, MAX_EDNS_VERSION, MAX_RDATA_BYTES, MAX_TCP_MESSAGE_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
-  isResponseToQuery, opcodeOf, readQuery, writeName, writeReply, writeTruncatedReply,
+  isResponseToQuery, opcodeOf, readQuery, readTransferSerial, writeName, writeReply, writeTruncatedReply,
   type ParsedQuery, type ReplyParts, type ResourceRecord,
 } from "./wire.ts";
 
@@ -48,6 +48,22 @@ export interface DnsServerOptions {
   readonly forwardAllow?: readonly string[];
   /** Client CIDRs allowed to request AXFR over TCP. Defaults to deny all. */
   readonly transferAllow?: readonly string[];
+  /**
+   * A zone as it stood at an earlier serial, for IXFR (RFC 1995).
+   *
+   * Absent, or returning nothing, means every transfer is a full one -- which
+   * is always a valid answer to an IXFR, and is what the specification asks for
+   * when the server cannot reach that far back. There is no journal behind
+   * this: the serial *is* the revision, and the store already keeps the
+   * retained revisions, so the difference is computed from two snapshots
+   * rather than from a third record of what happened between them.
+   *
+   * ⚠️ This reaches the store from the query path. It is gated the same way
+   * the transfer itself is -- the allowlist, which denies everything by
+   * default, and a TSIG signature where keys are configured -- and the rate
+   * limiter applies as it does to everything else.
+   */
+  readonly zoneAtSerial?: (zone: string, serial: number) => Promise<ServedZone | undefined>;
   /**
    * Shared secrets for zone transfer and NOTIFY (RFC 8945).
    *
@@ -248,7 +264,7 @@ export function createDnsServer(options: DnsServerOptions): {
   function evaluateSignature(message: Buffer, query: ParsedQuery, clientAddress: string): Signing {
     const record = readTsig(message);
     if (!record) {
-      if (tsigKeys.length === 0 || query.question.type !== TYPE.AXFR) return { kind: "unsigned" };
+      if (tsigKeys.length === 0 || !isTransfer(query.question.type)) return { kind: "unsigned" };
       // No signature to answer with, so this refusal goes back bare.
       return { kind: "refused", reply: writeReply({ query, rcode: RCODE.NOTAUTH, authoritative: false }, Number.MAX_SAFE_INTEGER) };
     }
@@ -261,6 +277,45 @@ export function createDnsServer(options: DnsServerOptions): {
     const bare = writeReply({ query, rcode: RCODE.NOTAUTH, authoritative: false }, Number.MAX_SAFE_INTEGER);
     const named = tsigKeys.find((candidate) => candidate.name === record.keyName);
     return { kind: "refused", reply: signErrorReply(bare, record, verdict.error, named, now) };
+  }
+
+  /**
+   * The difference between what a secondary has and what this zone is now.
+   *
+   * Undefined means "answer this as a full transfer", which is what the caller
+   * does with it. That is the honest answer whenever the difference cannot be
+   * computed -- and it is the specification's own fallback, not a shortcut.
+   */
+  async function incrementalAnswer(message: Buffer, query: ParsedQuery, zone: ServedZone, overTcp: boolean): Promise<ReplyParts | undefined> {
+    if (query.question.name !== zone.name) return undefined;
+    const soa = soaRecord(zone, negativeTtl, soaSettings);
+    const upToDate: ReplyParts = { query, rcode: RCODE.NOERROR, authoritative: true, answers: [soa] };
+    const clientSerial = readTransferSerial(message);
+    if (clientSerial === undefined) return undefined;
+    // Equal, or somehow ahead of us: there is nothing to send, and the SOA is
+    // how that is said. Over UDP the same answer is what asks the client to
+    // come back over TCP, so a transfer never rides a datagram it may not fit.
+    if (clientSerial >= zone.serial || !overTcp) return upToDate;
+
+    const previous = await options.zoneAtSerial?.(zone.name, clientSerial);
+    if (!previous || previous.serial !== clientSerial) return undefined;
+    const before = transferRecords(previous, options.onUnservable);
+    const after = transferRecords(zone, options.onUnservable);
+    // A record that cannot be written is reported by the full path, with the
+    // SERVFAIL that goes with it. Doing it twice would double the log line.
+    if (!before || !after) return undefined;
+
+    const removed = missingFrom(before, after);
+    const added = missingFrom(after, before);
+    // RFC 1995 §4, as one condensed difference rather than one per serial: the
+    // deletions under the old serial, the additions under the new, and the new
+    // SOA again to close it.
+    return {
+      query,
+      rcode: RCODE.NOERROR,
+      authoritative: true,
+      answers: [soa, soaRecord(previous, negativeTtl, soaSettings), ...removed, soa, ...added, soa],
+    };
   }
 
   /** The answer itself, once the message has been shown to be one we accept. */
@@ -329,9 +384,13 @@ export function createDnsServer(options: DnsServerOptions): {
     if (requireCookie && !overTcp && verdict.kind !== "proven") {
       return [writeTruncatedReply({ query, rcode: RCODE.NOERROR, authoritative: false, ...(cookie ? { cookie } : {}) })];
     }
-    if (query.question.type === TYPE.AXFR
-      && (!overTcp || !cidrsContain(transferAllow, clientAddress))) {
-      return answer(RCODE.REFUSED);
+    // Both transfer types answer to the same policy. They part company only
+    // over UDP: AXFR cannot be attempted there at all, while an IXFR that will
+    // not fit is answered with the current SOA and the client comes back over
+    // TCP (RFC 1995 §2). That answer is built below, where the zone is known.
+    if (isTransfer(query.question.type)) {
+      if (!cidrsContain(transferAllow, clientAddress)) return answer(RCODE.REFUSED);
+      if (query.question.type === TYPE.AXFR && !overTcp) return answer(RCODE.REFUSED);
     }
     const zone = matchZone(options.zones(), query.question.name);
     if (!zone) {
@@ -364,8 +423,15 @@ export function createDnsServer(options: DnsServerOptions): {
     if (query.question.class !== CLASS_IN && query.question.class !== CLASS_ANY) {
       return answer(RCODE.REFUSED);
     }
+    // An incremental answer, when one can be built. Everything else -- the
+    // client is up to date, it asked over UDP, the serial it names is no longer
+    // retained -- comes back as a full transfer or a lone SOA, both of which
+    // are valid answers to an IXFR.
+    const incremental = query.question.type === TYPE.IXFR
+      ? await incrementalAnswer(message, query, zone, overTcp)
+      : undefined;
     const parts = {
-      ...answerFromZone(query, zone, negativeTtl, options.onUnservable, soaSettings),
+      ...(incremental ?? answerFromZone(query, zone, negativeTtl, options.onUnservable, soaSettings)),
       ...(cookie ? { cookie } : {}),
     };
     const budget = overTcp ? Number.MAX_SAFE_INTEGER : Math.max(MIN_UDP_PAYLOAD, query.udpPayloadSize - reserved);
@@ -388,7 +454,7 @@ export function createDnsServer(options: DnsServerOptions): {
         // that is (RFC 5936 §2.2). Everything else has to fit one, so a reply
         // that does not is answered SERVFAIL and reported -- loudly, because
         // the alternative is a query that vanishes.
-        if (query.question.type === TYPE.AXFR) {
+        if (isTransfer(query.question.type)) {
           const split = splitTransfer(parts, tcpCeiling);
           if (split) return split;
         }
@@ -463,8 +529,9 @@ export function createDnsServer(options: DnsServerOptions): {
     udp.on("message", (message, remote) => {
       if (!rateLimiter.allow(remote.address)) return;
       void respond(message, false, remote.address).then(counted).then(([reply]) => {
-        // Only a transfer ever produces more than one, and a transfer never
-        // reaches here: AXFR over UDP is refused before an answer is built.
+        // Only a transfer ever produces more than one, and no transfer produces
+        // more than one here: AXFR over UDP is refused before an answer is
+        // built, and an IXFR over UDP is answered with a lone SOA.
         if (reply) udp.send(reply, remote.port, remote.address);
       }).catch(() => undefined);
     });
@@ -795,23 +862,12 @@ function answerFromZone(
   if (name === zone.name && query.question.type === TYPE.SOA) {
     return { query, rcode: RCODE.NOERROR, authoritative: true, answers: [soa] };
   }
-  if (name === zone.name && query.question.type === TYPE.AXFR) {
-    const answers: ResourceRecord[] = [soa];
-    for (const record of zone.records) {
-      try {
-        answers.push({
-          name: absolute(record.name, zone.name),
-          type: rrType(record.type),
-          ttl: record.ttl,
-          data: servableRdata(record.type, record.content),
-        });
-      } catch (error) {
-        onUnservable?.({ zone: zone.name, name: record.name, type: record.type, reason: message(error) });
-        return { query, rcode: RCODE.SERVFAIL, authoritative: true };
-      }
-    }
-    answers.push(soa);
-    return { query, rcode: RCODE.NOERROR, authoritative: true, answers };
+  // A full transfer. An IXFR arrives here when no difference could be built,
+  // and RFC 1995 §4 says a full answer to one looks exactly like an AXFR.
+  if (name === zone.name && isTransfer(query.question.type)) {
+    const records = transferRecords(zone, onUnservable);
+    if (!records) return { query, rcode: RCODE.SERVFAIL, authoritative: true };
+    return { query, rcode: RCODE.NOERROR, authoritative: true, answers: [soa, ...records, soa] };
   }
   let atName: ServedZone["records"] = indexOf(zone).byName.get(name) ?? [];
 
@@ -943,6 +999,49 @@ function message(error: unknown): string {
  * Nothing can carry that, and the caller says so rather than emitting a frame
  * the transport will reject.
  */
+function isTransfer(type: number): boolean {
+  return type === TYPE.AXFR || type === TYPE.IXFR;
+}
+
+/** Every record in a zone, on the wire, or nothing when one of them will not go. */
+function transferRecords(
+  zone: ServedZone,
+  onUnservable: DnsServerOptions["onUnservable"],
+): ResourceRecord[] | undefined {
+  const records: ResourceRecord[] = [];
+  for (const record of zone.records) {
+    try {
+      records.push({
+        name: absolute(record.name, zone.name),
+        type: rrType(record.type),
+        ttl: record.ttl,
+        data: servableRdata(record.type, record.content),
+      });
+    } catch (error) {
+      onUnservable?.({ zone: zone.name, name: record.name, type: record.type, reason: message(error) });
+      return undefined;
+    }
+  }
+  return records;
+}
+
+/**
+ * The records in the first list that the second does not have.
+ *
+ * Identity is the whole record -- owner, type, TTL and rdata -- because that is
+ * what a secondary stores. A TTL change with the same rdata is a delete and an
+ * add, which is what RFC 1995 expects and what makes the secondary's copy match
+ * ours afterwards.
+ */
+function missingFrom(candidates: readonly ResourceRecord[], present: readonly ResourceRecord[]): ResourceRecord[] {
+  const held = new Set(present.map(recordKey));
+  return candidates.filter((record) => !held.has(recordKey(record)));
+}
+
+function recordKey(record: ResourceRecord): string {
+  return `${record.name}\u0000${record.type}\u0000${record.ttl}\u0000${record.data.toString("base64")}`;
+}
+
 function splitTransfer(parts: ReplyParts, budget: number): Buffer[] | undefined {
   const answers = parts.answers ?? [];
   if (answers.length === 0) return undefined;

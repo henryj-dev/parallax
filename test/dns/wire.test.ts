@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   MIN_UDP_PAYLOAD, RCODE, TYPE, WireFormatError,
-  isResponseToQuery, readName, readQuery, typeName, writeName, writeReply,
+  isResponseToQuery, readName, readQuery, readTransferSerial, typeName, writeName, writeReply,
 } from "../../src/dns/wire.ts";
 
 /**
@@ -281,5 +281,61 @@ describe("DNS wire format", () => {
   it("names known types and admits when it does not know one", () => {
     assert.equal(typeName(TYPE.HTTPS), "HTTPS");
     assert.equal(typeName(99), "TYPE99");
+  });
+});
+
+describe("the serial an IXFR query carries", () => {
+  /** Question, then one authority SOA -- the shape RFC 1995 §3 asks for. */
+  function ixfrQuery(options: { serial?: number; compressed?: boolean; type?: number; rdataLength?: number } = {}): Buffer {
+    const header = Buffer.alloc(12);
+    header.writeUInt16BE(0x2222, 0);
+    header.writeUInt16BE(1, 4);
+    header.writeUInt16BE(1, 8);
+    const question = Buffer.concat([encodeName("example.com"), (() => {
+      const tail = Buffer.alloc(4);
+      tail.writeUInt16BE(TYPE.IXFR, 0);
+      tail.writeUInt16BE(1, 2);
+      return tail;
+    })()]);
+    // A pointer back to the question's name, which a real client sends and a
+    // hand-rolled reader is most likely to get wrong.
+    const owner = options.compressed ? Buffer.of(0xc0, 12) : encodeName("example.com");
+    const rdata = Buffer.concat([
+      options.compressed ? Buffer.of(0xc0, 12) : encodeName("ns.example.com"),
+      encodeName("hostmaster.example.com"),
+      (() => {
+        const numbers = Buffer.alloc(20);
+        numbers.writeUInt32BE(options.serial ?? 7, 0);
+        return numbers;
+      })(),
+    ]);
+    const head = Buffer.alloc(10);
+    head.writeUInt16BE(options.type ?? TYPE.SOA, 0);
+    head.writeUInt16BE(1, 2);
+    head.writeUInt16BE(options.rdataLength ?? rdata.length, 8);
+    return Buffer.concat([header, question, owner, head, rdata]);
+  }
+
+  it("reads it past both names, compressed or not", () => {
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 12 })), 12);
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 12, compressed: true })), 12);
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 0 })), 0);
+    assert.equal(readTransferSerial(ixfrQuery({ serial: 0xffffffff })), 0xffffffff);
+  });
+
+  it("says nothing rather than guessing", () => {
+    // No authority section at all -- an AXFR-shaped query.
+    const bare = ixfrQuery();
+    bare.writeUInt16BE(0, 8);
+    assert.equal(readTransferSerial(bare), undefined);
+    // An authority record that is not an SOA.
+    assert.equal(readTransferSerial(ixfrQuery({ type: TYPE.A })), undefined);
+    // Rdata that stops before the serial does.
+    assert.equal(readTransferSerial(ixfrQuery({ rdataLength: 4 })), undefined);
+    assert.equal(readTransferSerial(Buffer.alloc(6)), undefined);
+    // Truncated mid-record: read past the end rather than throwing at a caller
+    // that has no answer for it.
+    const truncated = ixfrQuery();
+    assert.equal(readTransferSerial(truncated.subarray(0, truncated.length - 8)), undefined);
   });
 });

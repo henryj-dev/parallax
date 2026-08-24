@@ -497,6 +497,17 @@ if (config.dns) {
     transferAllow: dnsConfig.transferAllow,
     ...(dnsConfig.notifyTo ? { notifyTo: dnsConfig.notifyTo } : {}),
     tsigKeys: dnsConfig.tsigKeys,
+    // The serial is the revision, so an older serial is a stored revision and
+    // there is no journal to keep in step with anything. Absent -- pruned by
+    // retention, or a zone that has since been deleted and remade -- means the
+    // secondary gets a full transfer, which is always a valid answer.
+    zoneAtSerial: async (zone, serial) => {
+      try {
+        return servedZones([await controlPlane.getRevision(zone, serial)])[0];
+      } catch {
+        return undefined;
+      }
+    },
     // Absent values stay absent, so the listener keeps its own defaults.
     ...dnsConfig.limits,
     soa: {
