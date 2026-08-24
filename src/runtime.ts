@@ -10,6 +10,7 @@ import { DomainValidationError } from "./domain/dns.ts";
 import { watchingZones } from "./dns/zone-changes.ts";
 import { OwnershipSecretError } from "./adapters/ownership.ts";
 import { RoutingProviderAdapter } from "./adapters/router.ts";
+import { Rfc2136ProviderAdapter } from "./adapters/rfc2136.ts";
 import type { SettingsRepository } from "./application/ports.ts";
 import type { BackupStores } from "./application/backup.ts";
 import type { CommandRuntime } from "./cli/commands.ts";
@@ -100,7 +101,20 @@ export async function createRuntime(config: ParallaxConfig, options: RuntimeOpti
     throw new RuntimeStartupError(`configuration could not be read: ${message(error)}`);
   }
 
-  const provider = new RoutingProviderAdapter();
+  // The `internal` slot, which has stood empty since the CoreDNS and PowerDNS
+  // publishers were removed. A deployment that names a server to publish into
+  // gets one; every other deployment is unchanged, and its internal view is
+  // answered by this process's own listener as before.
+  const internalUpdate = config.dns?.internalUpdate;
+  const provider = new RoutingProviderAdapter(internalUpdate
+    ? {
+      internal: new Rfc2136ProviderAdapter({
+        server: { host: internalUpdate.host, port: internalUpdate.port },
+        key: internalUpdate.key,
+        ownershipSecret: config.ownershipSecret ?? "",
+      }),
+    }
+    : {});
   // One store, two services. The device-settings service speaks with the same
   // stored token as the DNS side rather than holding a second secret of its own.
   const credentialStore = config.credentialMasterKey

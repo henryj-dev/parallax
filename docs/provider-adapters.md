@@ -16,7 +16,8 @@
 
 | | 무엇 |
 |---|---|
-| `src/adapters/cloudflare.ts` | 유일한 실제 외부 프로바이더 |
+| `src/adapters/cloudflare.ts` | 실제 외부 프로바이더 |
+| `src/adapters/rfc2136.ts` | RFC 2136 동적 업데이트. BIND·Knot·PowerDNS 에 한 번에 붙는다. internal 뷰용 |
 | `src/infrastructure/file-provider.ts` | 로컬 폴백. 단일 노드·개발용 |
 | `src/infrastructure/in-memory.ts` | 검사용. **계약 스위트를 함께 통과한다** |
 | `src/adapters/router.ts` | `<존>/<뷰>` 대상을 구현으로 보낸다 |
@@ -78,13 +79,14 @@ HMAC 이고, **대상이 서명 안에 들어간다.** 그래서 `example.com/in
 ### 프로바이더에 넣을 필드가 없으면
 
 **대부분 없다.** Cloudflare 가 레코드 코멘트를 가진 게 오히려 예외다. 지금까지 나온
-답 셋:
+답 넷:
 
 | 프로바이더 | 표시가 사는 곳 |
 |---|---|
 | Cloudflare | 레코드의 `comment` 필드 |
 | PowerDNS | 곁테이블 `parallax_powerdns_ownership`, 레코드 id 로 키. **여전히 프로바이더 안이다** |
 | CoreDNS | 존 파일의 줄 주석 |
+| **RFC 2136** | 존 안의 예약된 이름 TXT — `_parallax.<이름>` |
 
 📌 규칙은 「필드를 찾아라」가 아니라 **「그 프로바이더가 문자열을 붙들어 줄 자리를
 찾아라」**다. PowerDNS 는 자기 데이터베이스에 우리 테이블을 하나 만들었고, 그건 로컬
@@ -127,8 +129,12 @@ Cloudflare 는 account id 가 없으면 **던진다**. 그게 옳다 — 「acco
 2. 규칙 열한 개를 통과시킨다. 통과 못 하는 것이 있으면 `exempt` 에 **이유와 함께**
    적는다 — 스위치가 아니라 문장이 붙은 예외라, 다음 사람이 읽는다.
 3. `RoutingProviderAdapter` 에 등록한다. 외부 뷰는 `registerExternal(zone, adapter)`,
-   내부 뷰는 생성자의 `internal`.
+   내부 뷰는 생성자의 `internal` — RFC 2136 어댑터가 지금 그 자리에 있다.
 4. 설정을 `src/config.ts` 에 연다.
+
+RFC 2136 어댑터가 이 순서로 만들어졌다. 규칙 열한 개가 먼저 있었고, 하네스가 어댑터
+본체보다 먼저 있었고, 다 쓰고 나니 **첫 실행에 열한 개가 전부 통과했다.** 스위트가
+명세 노릇을 한 것이고, 그게 이 파일들이 존재하는 이유다.
 
 면제를 하나 지우는 것도 이 스위트가 하는 일이다: in-memory 프로바이더는 소유권 검사를
 하지 않았고, 스위트가 그것을 물었고, 답이 「진짜 어댑터 둘은 한다」였다. 그래서 면제가

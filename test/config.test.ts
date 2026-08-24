@@ -384,6 +384,45 @@ describe("configuration", () => {
     );
   });
 
+  it("reads a server to publish the internal view into, and the key it is named with", () => {
+    const secret = Buffer.alloc(32, 4).toString("base64");
+    const base = {
+      PARALLAX_DNS_PORT: "53",
+      PARALLAX_OWNERSHIP_SECRET: "an-ownership-secret-of-at-least-32-bytes",
+      PARALLAX_DNS_TSIG_KEYS: `update.key:hmac-sha256:${secret}`,
+    };
+    const update = readConfig({ ...base, PARALLAX_DNS_INTERNAL_UPDATE: "10.0.0.9:5353#update.key" }).dns?.internalUpdate;
+    assert.equal(update?.host, "10.0.0.9");
+    assert.equal(update?.port, 5353);
+    // Named, not repeated: one secret authorises the transfer and the update,
+    // and a second copy is a second thing to rotate.
+    assert.equal(update?.key.name, "update.key");
+    assert.deepEqual(update?.key.secret, Buffer.from(secret, "base64"));
+
+    assert.equal(readConfig({ ...base }).dns?.internalUpdate, undefined);
+    assert.deepEqual(readConfig({ ...base, PARALLAX_DNS_INTERNAL_UPDATE: "[2001:db8::9]:53#update.key" }).dns?.internalUpdate?.host, "2001:db8::9");
+
+    assert.throws(
+      () => readConfig({ ...base, PARALLAX_DNS_INTERNAL_UPDATE: "10.0.0.9:53#absent.key" }),
+      /names key absent.key, which is not in PARALLAX_DNS_TSIG_KEYS/,
+    );
+    assert.throws(
+      () => readConfig({ ...base, PARALLAX_DNS_INTERNAL_UPDATE: "10.0.0.9:53" }),
+      /must be host:port#keyname/,
+    );
+    // Publishing into another server writes ownership markers into it, and
+    // there is no marker without a secret. Refused here so `config check` says
+    // so before a rollout rather than the adapter's constructor after one.
+    assert.throws(
+      () => readConfig({
+        PARALLAX_DNS_PORT: "53",
+        PARALLAX_DNS_TSIG_KEYS: `update.key:hmac-sha256:${secret}`,
+        PARALLAX_DNS_INTERNAL_UPDATE: "10.0.0.9:53#update.key",
+      }),
+      /needs PARALLAX_OWNERSHIP_SECRET/,
+    );
+  });
+
   it("reads TSIG keys and refuses ones that would not authenticate anything", () => {
     const secret = Buffer.alloc(32, 4).toString("base64");
     assert.deepEqual(readConfig({ PARALLAX_DNS_PORT: "53" }).dns?.tsigKeys, []);

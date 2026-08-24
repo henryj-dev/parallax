@@ -87,6 +87,21 @@ export interface DnsListenerSettings {
    */
   readonly tsigKeys: readonly TsigKey[];
   /**
+   * Publish the internal view into a server that speaks RFC 2136, instead of
+   * only answering it from this process.
+   *
+   * The two are not exclusive and the difference matters: a listener inside
+   * this process stops answering when this process stops, and a server that was
+   * published to does not. That property was lost when the CoreDNS and PowerDNS
+   * publishers were removed (`1db6f25`) on the grounds that nothing used them;
+   * this is the way back to it for a deployment that needs it.
+   */
+  readonly internalUpdate?: {
+    readonly host: string;
+    readonly port: number;
+    readonly key: TsigKey;
+  };
+  /**
    * What the listener will spend on one client and on the network as a whole.
    *
    * The listener has always had these; nothing reached them. They belong here
@@ -167,6 +182,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
   const portalSignIn = readPortalSignIn(environment, oidc !== undefined);
   const readinessMaxStalenessMs = readStaleness(environment.PARALLAX_READINESS_MAX_STALENESS_SECONDS);
   const dns = readDnsListener(environment);
+  assertInternalUpdateIsUsable(dns, ownershipSecret);
   const allowPlaintextPostgres = readOptIn(
     environment.PARALLAX_ALLOW_PLAINTEXT_POSTGRES,
     "PARALLAX_ALLOW_PLAINTEXT_POSTGRES",
@@ -193,6 +209,22 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     ...(readinessMaxStalenessMs !== undefined ? { readinessMaxStalenessMs } : {}),
     ...(dns ? { dns } : {}),
   };
+}
+
+/**
+ * Publishing into somebody else's server means writing ownership markers into
+ * it, and there is no marker without a secret.
+ *
+ * Refused here rather than deep in the adapter's constructor, so `config check`
+ * reports it before a rollout and the sentence names the two settings involved
+ * instead of the one that happened to notice.
+ */
+function assertInternalUpdateIsUsable(dns: DnsListenerSettings | undefined, ownershipSecret: string | undefined): void {
+  if (!dns?.internalUpdate || ownershipSecret) return;
+  throw new Error(
+    "PARALLAX_DNS_INTERNAL_UPDATE publishes records into another server and marks them as ours, which needs"
+    + " PARALLAX_OWNERSHIP_SECRET. Generate one with: openssl rand -base64 32",
+  );
 }
 
 /**
@@ -242,6 +274,7 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     // operator would have no way to tell which secret is in force.
     throw new Error(`PARALLAX_DNS_TSIG_KEYS names ${duplicate.name} more than once`);
   }
+  const internalUpdate = readInternalUpdate(environment, tsigKeys);
   const notifyTo = (environment.PARALLAX_DNS_NOTIFY_TO ?? "")
     .split(",")
     .map((destination) => destination.trim())
@@ -254,10 +287,40 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     transferAllow,
     ...(notifyTo.length > 0 ? { notifyTo } : {}),
     tsigKeys,
+    ...(internalUpdate ? { internalUpdate } : {}),
     limits: readDnsLimits(environment),
     ...(soaPrimary ? { soaPrimary } : {}),
     ...(soaMailbox ? { soaMailbox } : {}),
   };
+}
+
+/**
+ * `host:port#keyname`, naming one of `PARALLAX_DNS_TSIG_KEYS`.
+ *
+ * The key is named rather than repeated: the same secret usually authorises the
+ * transfer and the update, and a second copy of it in a second variable is a
+ * second thing to rotate and one of them will be missed.
+ */
+function readInternalUpdate(
+  environment: NodeJS.ProcessEnv,
+  keys: readonly TsigKey[],
+): { host: string; port: number; key: TsigKey } | undefined {
+  const raw = environment.PARALLAX_DNS_INTERNAL_UPDATE?.trim();
+  if (!raw) return undefined;
+  const separator = raw.lastIndexOf("#");
+  if (separator <= 0) {
+    throw new Error("PARALLAX_DNS_INTERNAL_UPDATE must be host:port#keyname, naming a key from PARALLAX_DNS_TSIG_KEYS");
+  }
+  const keyName = raw.slice(separator + 1).trim().replace(/\.$/u, "").toLowerCase();
+  const key = keys.find((candidate) => candidate.name === keyName);
+  if (!key) throw new Error(`PARALLAX_DNS_INTERNAL_UPDATE names key ${keyName}, which is not in PARALLAX_DNS_TSIG_KEYS`);
+  const address = raw.slice(0, separator).trim();
+  const bracketed = /^\[([^\]]+)\]:(\d+)$/u.exec(address);
+  const plain = /^([^:]+):(\d+)$/u.exec(address);
+  const match = bracketed ?? plain;
+  if (!match) throw new Error("PARALLAX_DNS_INTERNAL_UPDATE must name a host and a port, as in 10.0.0.9:53#update.key");
+  const port = readPort(match[2] as string, "PARALLAX_DNS_INTERNAL_UPDATE");
+  return { host: match[1] as string, port, key };
 }
 
 /**

@@ -445,6 +445,7 @@ GET /api/v1/openapi.json
 | `PARALLAX_DNS_TRANSFER_ALLOW` | `AXFR`·`IXFR`를 허용할 클라이언트 CIDR. **기본은 전부 거부** |
 | `PARALLAX_DNS_TSIG_KEYS` | `name:algorithm:base64secret`, 쉼표 구분. 키를 하나라도 두면 `AXFR`에 유효한 TSIG 서명이 **필수**가 된다. `hmac-sha256`/`hmac-sha512`만 |
 | `PARALLAX_DNS_NOTIFY_TO` | 서빙 중인 존의 serial이 오를 때 NOTIFY를 받을 호스트. `host`, `host:port`, 또는 서명할 키를 지정하는 `host:port#keyname` |
+| `PARALLAX_DNS_INTERNAL_UPDATE` | `host:port#keyname` — internal 뷰를 **RFC 2136** 서버에도 발행한다. 발행받은 서버는 이 프로세스가 멈춰도 계속 답하고, 이 프로세스 안의 리스너는 그러지 못한다 |
 | `PARALLAX_DNS_SOA_PRIMARY` · `_SOA_MAILBOX` | SOA 필드 |
 | `PARALLAX_DNS_REQUIRE_COOKIE` | RFC 7873 DNS 쿠키 요구 |
 | `PARALLAX_DNS_RATE_LIMIT_PER_SECOND` · `_BURST` · `_MAX_CLIENTS` | 클라이언트별 레이트 리밋 |

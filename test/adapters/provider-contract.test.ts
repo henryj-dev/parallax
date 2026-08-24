@@ -5,11 +5,15 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { CloudflareProviderAdapter } from "../../src/adapters/cloudflare.ts";
 import { ownershipComment } from "../../src/adapters/ownership.ts";
+import { Rfc2136ProviderAdapter } from "../../src/adapters/rfc2136.ts";
+import { encodeRdata, rrType } from "../../src/dns/rdata.ts";
+import { parseTsigKey } from "../../src/dns/tsig.ts";
 import type { ProviderAdapter } from "../../src/application/ports.ts";
 import type { DesiredRecord } from "../../src/domain/dns.ts";
 import type { ProviderRecord } from "../../src/domain/reconciliation.ts";
 import { FileProviderAdapter } from "../../src/infrastructure/file-provider.ts";
 import { InMemoryProvider } from "../../src/infrastructure/in-memory.ts";
+import { startFakePrimary } from "./rfc2136-server.ts";
 
 /**
  * What every provider adapter has to do, asked of each of them the same way.
@@ -405,6 +409,46 @@ describeProviderContract({
       },
       async reopen() {
         return build();
+      },
+    };
+  },
+});
+
+/**
+ * The adapter this suite was written before, which is the order it was meant to
+ * be used in: the rules were the specification, and the harness was the first
+ * thing written of the adapter rather than the last.
+ */
+describeProviderContract({
+  name: "the RFC 2136 provider",
+  async open() {
+    const key = parseTsigKey(`update.key:hmac-sha256:${Buffer.alloc(32, 3).toString("base64")}`, "TEST");
+    const primary = await startFakePrimary({ zone: "example.com", key });
+    const build = (): ProviderAdapter => new Rfc2136ProviderAdapter({
+      server: { host: "127.0.0.1", port: primary.port, timeoutMs: 5_000 },
+      key,
+      ownershipSecret: OWNERSHIP_SECRET,
+    });
+    return {
+      adapter: build(),
+      // This adapter publishes the internal view; the external target is
+      // Cloudflare's. The marker carries the target either way.
+      target: "example.com/internal",
+      async seedUnmanaged(record) {
+        // Straight into the zone, with no marker beside it -- which is exactly
+        // what a record somebody else added looks like.
+        primary.records.push({
+          name: record.name === "@" ? "example.com" : `${record.name}.example.com`,
+          type: rrType(record.type),
+          ttl: record.ttl,
+          rdata: encodeRdata(record.type, record.content),
+        });
+      },
+      async reopen() {
+        return build();
+      },
+      async close() {
+        await primary.close();
       },
     };
   },
