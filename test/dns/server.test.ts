@@ -668,6 +668,59 @@ describe("DNS server", () => {
       assert.equal(readAnswers(reply).length, 1, "the CNAME itself, and no second visit");
     });
 
+    /**
+     * The rcode belongs to the end of the chain, not to the name that was asked
+     * (RFC 1034 §4.3.2, RFC 6604 §2).
+     *
+     * It answered NOERROR, so the same nonexistence got two different answers
+     * from one server depending on which name you asked for — and a resolver
+     * cached NODATA where it was entitled to cache NXDOMAIN.
+     */
+    it("answers a chain that ends nowhere the way the direct query already did", async () => {
+      const dangling: ServedZone = {
+        name: "example.com",
+        serial: 3,
+        records: [{ name: "gone", type: "CNAME", content: "missing.example.com", ttl: 60 }],
+      };
+      const { port } = await start({ zones: () => [dangling] });
+      const direct = await ask(port, buildQuery("missing.example.com"));
+      const chased = await ask(port, buildQuery("gone.example.com"));
+      assert.ok(direct);
+      assert.ok(chased);
+      assert.equal(rcodeOf(direct), RCODE.NXDOMAIN);
+      assert.equal(rcodeOf(chased), RCODE.NXDOMAIN, "one server gave one nonexistence two answers");
+      // The CNAME is still carried, because it is true and the resolver needs it.
+      assert.equal(readAnswers(chased).length, 1);
+      assert.equal(readAnswers(chased)[0]?.type, TYPE.CNAME);
+    });
+
+    it("leaves a chain that ends somewhere real alone", async () => {
+      const { port } = await start({ zones: () => [ALIASED] });
+      // A target that exists but holds nothing of the asked type is NODATA.
+      const reply = await ask(port, buildQuery("mail.example.com", TYPE.MX));
+      assert.ok(reply);
+      assert.equal(rcodeOf(reply), RCODE.NOERROR);
+    });
+
+    /**
+     * ⚠️ The other half of the rule, and the one a mutation check found nothing
+     * covering: a target outside this zone is not ours to call nonexistent.
+     * Saying NXDOMAIN there would deny a name some other server is authoritative
+     * for, on our authority — and resolvers would cache it.
+     */
+    it("never calls a name outside the zone nonexistent", async () => {
+      const outward: ServedZone = {
+        name: "example.com",
+        serial: 4,
+        records: [{ name: "cdn", type: "CNAME", content: "edge.vendor.example.net", ttl: 60 }],
+      };
+      const { port } = await start({ zones: () => [outward] });
+      const reply = await ask(port, buildQuery("cdn.example.com"));
+      assert.ok(reply);
+      assert.equal(rcodeOf(reply), RCODE.NOERROR, "this server denied a name it is not authoritative for");
+      assert.equal(readAnswers(reply)[0]?.type, TYPE.CNAME);
+    });
+
     it("returns the CNAME alone when the target holds nothing of that type", async () => {
       const { port } = await start({ zones: () => [ALIASED] });
       const reply = await ask(port, buildQuery("mail.example.com", TYPE.MX));
@@ -783,6 +836,26 @@ describe("DNS server", () => {
       ]);
       // The record that did not change is not in it -- which is the point.
       assert.ok(!serialsAndNames(reply).includes("keep.example.com"));
+    });
+
+    /**
+     * A serial is a number on a circle (RFC 1982 §3.2), and RFC 1995 §2 decides
+     * "newer" that way. Plain `>=` broke once and permanently: past the wrap, a
+     * secondary was told it was up to date forever, with nothing anywhere
+     * saying so.
+     */
+    it("reads a serial that has wrapped as older, not newer", async () => {
+      const wrapped: ServedZone = { ...AT_TWO, serial: 1 };
+      const previous: ServedZone = { ...AT_ONE, serial: 0xffffffff };
+      const { port } = await start({
+        zones: () => [wrapped],
+        transferAllow: ["127.0.0.0/8"],
+        zoneAtSerial: async (zone, serial) => (zone === wrapped.name && serial === 0xffffffff ? previous : undefined),
+      });
+      const reply = await askOverTcp(port, ixfrQuery("example.com", 0xffffffff));
+      assert.deepEqual(serialsAndNames(reply), [
+        "SOA:1", "SOA:4294967295", "gone.example.com", "SOA:1", "added.example.com", "SOA:1",
+      ], "a wrapped serial was read as newer than ours, so the secondary was told it was current");
     });
 
     it("answers a client that is already current, or ahead, with one SOA", async () => {

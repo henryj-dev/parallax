@@ -131,6 +131,35 @@ describe("TSIG", () => {
     }
   });
 
+  /**
+   * A key name arrives from anyone who can reach the port, and reaches a log
+   * line. It was read as raw bytes with no alphabet and no length cap.
+   */
+  it("refuses a key name that is not one this build could have configured", () => {
+    /** A TSIG record whose owner name is these exact label bytes. */
+    const named = (labels: readonly Buffer[]): Buffer => {
+      const owner = Buffer.concat([...labels.flatMap((label) => [Buffer.of(label.length), label]), Buffer.of(0)]);
+      const { message: signed } = signRequest(query(), KEY, now);
+      const record = readTsig(signed);
+      assert.ok(record);
+      const head = signed.subarray(0, record.offset);
+      const tail = signed.subarray(record.offset + writeName(KEY.name).length);
+      return Buffer.concat([head, owner, tail]);
+    };
+
+    // Newlines in a key name wrote whatever lines the sender chose into the log.
+    assert.equal(readTsig(named([Buffer.from("evil\nparallax: all clear")])), undefined);
+    // A `.` inside a label came back unescaped and made the refusal itself throw,
+    // so the peer got a dropped packet instead of the BADKEY it needed.
+    assert.equal(readTsig(named([Buffer.from(".x")])), undefined);
+    assert.equal(readTsig(named([Buffer.from([0x00, 0x07])])), undefined);
+    // ...and a name past what a name may be is refused before it is assembled.
+    assert.equal(readTsig(named(Array.from({ length: 6 }, () => Buffer.alloc(60, 0x61)))), undefined);
+    // The ordinary case still reads.
+    const ordinary = readTsig(named([Buffer.from("transfer"), Buffer.from("key")]));
+    assert.equal(ordinary?.keyName, "transfer.key");
+  });
+
   it("refuses key material that would not authenticate anything", () => {
     assert.throws(() => parseTsigKey("only.a.name", "K"), /name:algorithm:base64secret/u);
     assert.throws(() => parseTsigKey(`k:hmac-md5:${SECRET}`, "K"), /algorithm must be one of/u);

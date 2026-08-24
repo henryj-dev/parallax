@@ -99,6 +99,9 @@ function readTsigRdata(
   const keyName = readName(message, start);
   const algorithmEnd = skipName(message, rdataStart);
   const algorithm = readName(message, rdataStart);
+  // A name this build could never have configured is not a key it holds, and
+  // carrying it further only carries it into a log line.
+  if (keyName === undefined || algorithm === undefined) return undefined;
   let cursor = algorithmEnd;
   if (cursor + 10 > rdataStart + rdataLength) return undefined;
   // Time signed is 48 bits, so it outlives the 32-bit epoch on purpose.
@@ -140,18 +143,42 @@ function skipName(message: Buffer, start: number): number {
   }
 }
 
-function readName(message: Buffer, start: number): string {
+/**
+ * A name from a message anyone can send, read as a name and nothing else.
+ *
+ * ⚠️ It returned the bytes as latin1 with no filtering and no total length cap,
+ * and the result reached `console.warn` through the rejection log. A key name
+ * spelled out of newlines therefore wrote whatever lines its sender chose, over
+ * this deployment's name -- one unauthenticated packet, and it worked with no
+ * keys configured at all, because a present TSIG is always verified.
+ *
+ * It also fed the string back to `writeName` when refusing, which throws on an
+ * unescaped `.` inside a label -- so a two-byte name turned the BADKEY the peer
+ * needed into a dropped packet.
+ *
+ * The alphabet here is the one `parseTsigKey` already requires of a configured
+ * key, so anything this refuses could never have named a key that exists.
+ */
+function readName(message: Buffer, start: number): string | undefined {
   const labels: string[] = [];
   let offset = start;
+  let total = 0;
   for (;;) {
     const length = message[offset] as number;
     offset += 1;
     if (length === 0) break;
-    labels.push(message.toString("latin1", offset, offset + length));
+    total += length + 1;
+    if (total > MAX_NAME_BYTES) return undefined;
+    const label = message.toString("latin1", offset, offset + length);
+    if (!/^[A-Za-z0-9_-]+$/u.test(label)) return undefined;
+    labels.push(label);
     offset += length;
   }
   return labels.join(".").toLowerCase();
 }
+
+/** RFC 1035 §2.3.4, so a name cannot be used to make this build hold anything large. */
+const MAX_NAME_BYTES = 255;
 
 /**
  * What came before this message, when it is an answer rather than a question.

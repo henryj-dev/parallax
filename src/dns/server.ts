@@ -292,10 +292,16 @@ export function createDnsServer(options: DnsServerOptions): {
     const upToDate: ReplyParts = { query, rcode: RCODE.NOERROR, authoritative: true, answers: [soa] };
     const clientSerial = readTransferSerial(message);
     if (clientSerial === undefined) return undefined;
-    // Equal, or somehow ahead of us: there is nothing to send, and the SOA is
-    // how that is said. Over UDP the same answer is what asks the client to
-    // come back over TCP, so a transfer never rides a datagram it may not fit.
-    if (clientSerial >= zone.serial || !overTcp) return upToDate;
+    // Equal, or ahead of us: there is nothing to send, and the SOA is how that
+    // is said. Over UDP the same answer is what asks the client to come back
+    // over TCP, so a transfer never rides a datagram it may not fit.
+    //
+    // ⚠️ Serial arithmetic, not `>=`. RFC 1995 §2 decides "newer" the way RFC
+    // 1982 §3.2 defines it, and a serial is a number on a circle. Plain
+    // comparison broke exactly once and permanently: at the wrap from
+    // 4294967295 to 1, a secondary holding the old value was told it was up to
+    // date forever, with no error anywhere to say so.
+    if (!isOlder(clientSerial, zone.serial) || !overTcp) return upToDate;
 
     const previous = await options.zoneAtSerial?.(zone.name, clientSerial);
     if (!previous || previous.serial !== clientSerial) return undefined;
@@ -913,6 +919,19 @@ function answerFromZone(
   // this zone already holds, so nothing is being asserted that was not ours.
   if (alias && query.question.type !== TYPE.CNAME && query.question.type !== TYPE.ANY) {
     answers.push(...chaseAlias(zone, name, alias.content, query.question.type, onUnservable));
+    // ⚠️ The rcode belongs to the end of the chain, not to the name that was
+    // asked. RFC 1034 §4.3.2 restarts the lookup at the canonical name and RFC
+    // 6604 §2 says the rcode refers to the last name in the chain -- so a chain
+    // ending nowhere is NXDOMAIN, exactly as the direct query for that target
+    // already answers. It returned NOERROR, so the same nonexistence got two
+    // different answers from one server, and resolvers cached the weaker one.
+    // Normalized the way `chaseAlias` does it: a CNAME's content is already an
+    // absolute name, so putting the zone on the end of it again would ask about
+    // a name nothing holds and answer NXDOMAIN for every alias in the zone.
+    const target = alias.content.replace(/\.$/u, "").toLowerCase();
+    if (withinZone(zone, target) && !nameExists(zone, target) && wildcardMatch(zone, target).length === 0) {
+      return { query, rcode: RCODE.NXDOMAIN, authoritative: true, answers, authority: [soa] };
+    }
   }
   return { query, rcode: RCODE.NOERROR, authoritative: true, answers };
 }
@@ -999,6 +1018,24 @@ function message(error: unknown): string {
  * Nothing can carry that, and the caller says so rather than emitting a frame
  * the transport will reject.
  */
+/**
+ * Whether `left` precedes `right` on the serial-number circle (RFC 1982 §3.2).
+ *
+ * Half the space either way, so the answer is which direction is shorter. Two
+ * serials exactly opposite are undefined by the specification and answered
+ * `false` here, which sends a full transfer -- the safe reading of "I cannot
+ * tell".
+ */
+/** Whether a name is one this zone would answer for at all. */
+function withinZone(zone: ServedZone, name: string): boolean {
+  return name === zone.name || name.endsWith(`.${zone.name}`);
+}
+
+function isOlder(left: number, right: number): boolean {
+  const difference = (right - left) >>> 0;
+  return difference !== 0 && difference < 0x8000_0000;
+}
+
 function isTransfer(type: number): boolean {
   return type === TYPE.AXFR || type === TYPE.IXFR;
 }

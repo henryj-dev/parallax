@@ -316,8 +316,20 @@ export class AccessTokenService {
     return result;
   }
 
+  /**
+   * ⚠️ An unreadable expiry counts as expired.
+   *
+   * `Date.parse` gives `NaN` for a string it cannot read, and `NaN <= n` is
+   * false -- so a stored token whose `expiresAt` was malformed authenticated
+   * forever, while `list()` showed the operator an expiry they believed was in
+   * force. `issue()` always writes a valid timestamp, so this arrives from a
+   * restore or a direct write to the store; either way, the safe reading of "I
+   * cannot tell when this stops working" is that it already has.
+   */
   #hasExpired(token: StoredAccessToken): boolean {
-    return token.expiresAt !== undefined && Date.parse(token.expiresAt) <= this.#now().valueOf();
+    if (token.expiresAt === undefined) return false;
+    const at = Date.parse(token.expiresAt);
+    return !Number.isFinite(at) || at <= this.#now().valueOf();
   }
 
   /**

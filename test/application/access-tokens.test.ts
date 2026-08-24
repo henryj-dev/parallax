@@ -59,6 +59,26 @@ describe("AccessTokenService", () => {
     }), service.security()) !== undefined;
   }
 
+  it("treats an expiry it cannot read as already past", async () => {
+    // `Date.parse` gives NaN, and `NaN <= now` is false -- so this token used to
+    // authenticate forever while `list()` showed an expiry the operator believed
+    // was in force. It arrives from a restore or a direct store write; `issue`
+    // always writes a valid timestamp.
+    const repository = new InMemoryAccessTokenRepository();
+    await repository.create({
+      id: "broken",
+      subject: "someone",
+      role: "admin",
+      digest: Buffer.alloc(32, 1).toString("base64url"),
+      createdAt: "2026-08-08T00:00:00.000Z",
+      expiresAt: "whenever",
+    });
+    const service = new AccessTokenService(repository);
+    await service.load();
+    assert.deepEqual(service.security().tokens ?? [], [], "a token with an unreadable expiry still authenticated");
+    assert.equal((await service.list())[0]?.expired, true);
+  });
+
   it("accepts a token another process issued, without being restarted", async () => {
     const repository = new MemoryAccessTokenRepository();
     const { server, cli } = pair(repository);
