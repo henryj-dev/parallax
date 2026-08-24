@@ -58,7 +58,13 @@ export function checkConfig(environment: NodeJS.ProcessEnv = process.env): Confi
     environment: "ok",
     portalSignIn: config.portalSignIn,
     identityProvider: config.oidc ? "configured" : "absent",
-    dns: config.dns ? `${config.dns.host}:${config.dns.port} forward=${config.dns.forwardTo.length}` : "disabled",
+    // Key names, never the secrets: this line is written to whatever the
+    // operator ran the check into, which is not a place a shared secret goes.
+    dns: config.dns
+      ? `${config.dns.host}:${config.dns.port} forward=${config.dns.forwardTo.length}`
+        + ` transfer=${config.dns.transferAllow.length ? config.dns.transferAllow.length : "denied"}`
+        + ` tsig=${config.dns.tsigKeys.length > 0 ? config.dns.tsigKeys.map((key) => key.name).join("+") : "none"}`
+      : "disabled",
     tls: config.tls ? "on" : "off",
     storage: config.databaseUrl ? "postgresql" : "file",
     bootstrapTokens: config.bootstrapTokens.length,

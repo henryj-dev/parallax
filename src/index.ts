@@ -496,6 +496,7 @@ if (config.dns) {
     forwardAllow: dnsConfig.forwardAllow,
     transferAllow: dnsConfig.transferAllow,
     ...(dnsConfig.notifyTo ? { notifyTo: dnsConfig.notifyTo } : {}),
+    tsigKeys: dnsConfig.tsigKeys,
     // Absent values stay absent, so the listener keeps its own defaults.
     ...dnsConfig.limits,
     soa: {
@@ -508,6 +509,11 @@ if (config.dns) {
       recordUnservable();
       console.error(`parallax: ${record.zone} ${record.name} ${record.type} could not be answered: ${record.reason}`);
     },
+    onSignatureRejected: (detail) => {
+      // Never the secret, and never the MAC: the key name and the reason are
+      // what an operator repairs from, and both ends already know them.
+      console.warn(`parallax: refused a TSIG-signed message from ${detail.client} under key ${detail.keyName}: ${detail.reason}`);
+    },
     onUnanswerable: (detail) => {
       // No record to name: every per-record guard passed and the reply still
       // could not be built. Said out loud because the query was answered
@@ -519,6 +525,11 @@ if (config.dns) {
   try {
     await dnsServer.listen(dnsConfig.port, dnsConfig.host);
     console.log(`parallax: dns://${dnsConfig.host}:${dnsConfig.port} answering for ${dnsSnapshot.length} zone(s)`);
+    if (dnsConfig.tsigKeys.length > 0) {
+      console.log(`parallax: zone transfer requires a TSIG signature under ${dnsConfig.tsigKeys.map((key) => key.name).join(", ")}`);
+    } else if (dnsConfig.transferAllow.length > 0) {
+      console.warn("parallax: zone transfer is allowed by address alone. An address is a routing decision somebody else makes; set PARALLAX_DNS_TSIG_KEYS to require a shared secret as well.");
+    }
     if (dnsConfig.forwardTo.length === 0) {
       console.warn("parallax: no DNS upstream is configured, so names outside every managed zone are answered REFUSED. Set PARALLAX_DNS_FORWARD_TO if clients use this as their resolver.");
     }

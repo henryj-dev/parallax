@@ -5,10 +5,14 @@ import { after, describe, it } from "node:test";
 import {
   createDnsServer,
   createTimedDnsResolver,
+  parseNotifyDestination,
   type ResolvedDnsAddress,
   type ServedZone,
   type UnservableRecord,
 } from "../../src/dns/server.ts";
+import {
+  TSIG_ERROR, parseTsigKey, readTsig, signRequest, verifyTsig,
+} from "../../src/dns/tsig.ts";
 import { RCODE, TYPE, readName } from "../../src/dns/wire.ts";
 import { shutdownProcess } from "../../src/shutdown.ts";
 
@@ -702,6 +706,150 @@ describe("DNS server", () => {
       { address: "2001:db8::54", port: 53 },
       { address: "2001:db8::55", port: 53 },
     ]);
+  });
+
+  /**
+   * ⚠️ These assert against this build's own signer, which is the weaker half
+   * of the evidence. The stronger half was measured against BIND 9.10.6's
+   * `dig -y ... AXFR` on 2026-08-24: a 2,500-record zone transferred across two
+   * messages, 81,833 bytes, with no verification warning -- and, as the control,
+   * breaking the envelope chain produced `tsig verify failure` from the same
+   * client. `dig` is not assumed present in CI, so what is pinned here is the
+   * behaviour that measurement confirmed.
+   */
+  describe("TSIG", () => {
+    const SECRET = Buffer.alloc(32, 5).toString("base64");
+    const KEY = parseTsigKey(`transfer.key:hmac-sha256:${SECRET}`, "TEST");
+
+    it("requires a signature for AXFR once a key is configured", async () => {
+      const { port } = await start({ zones: () => [EXAMPLE], transferAllow: ["127.0.0.0/8"], tsigKeys: [KEY] });
+      const reply = await askOverTcp(port, buildQuery("example.com", TYPE.AXFR));
+      // NOTAUTH, not REFUSED: the allowlist let this client through and the
+      // credential is what was missing.
+      assert.equal(rcodeOf(reply), RCODE.NOTAUTH);
+      assert.equal(readAnswers(reply).length, 0);
+    });
+
+    it("transfers a signed AXFR and chains the signature across every message", async () => {
+      const size = 2_500;
+      const huge: ServedZone = {
+        name: "example.com",
+        serial: 1,
+        records: Array.from({ length: size }, (_unused, index) => ({
+          name: `host-with-a-longish-label-${index}`, type: "A" as const, content: "203.0.113.5", ttl: 300,
+        })),
+      };
+      const { port } = await start({ zones: () => [huge], transferAllow: ["127.0.0.0/8"], tsigKeys: [KEY] });
+      const request = signRequest(buildQuery("example.com", TYPE.AXFR), KEY);
+      const messages = await askAllOverTcp(port, request.message);
+      assert.ok(messages.length > 1, `a zone this size needs more than one message, got ${messages.length}`);
+
+      let previous = request.mac;
+      for (const [index, reply] of messages.entries()) {
+        // Every frame still fits, signature included -- the reservation, not
+        // an accident of this zone's size.
+        assert.ok(reply.length <= 0xffff, `message ${index} is ${reply.length} bytes`);
+        const record = readTsig(reply);
+        assert.ok(record, `message ${index} carries no signature`);
+        const prior = { mac: previous, ...(index === 0 ? {} : { envelope: true }) };
+        assert.equal(verifyTsig(reply, record, [KEY], undefined, prior).kind, "ok", `message ${index} did not verify`);
+        // The chain: the same message checked against the wrong predecessor
+        // must fail, or the ordering is not actually asserted by the MAC.
+        const misordered = verifyTsig(reply, record, [KEY], undefined, { ...prior, mac: Buffer.alloc(previous.length) });
+        assert.equal(misordered.kind === "rejected" && misordered.error, TSIG_ERROR.BADSIG);
+        previous = record.mac;
+      }
+      assert.equal(readAnswers(messages[0] as Buffer)[0]?.type, TYPE.SOA);
+    });
+
+    it("names the reason a signature was refused without leaking the key", async () => {
+      const rejected: { client: string; keyName: string; reason: string }[] = [];
+      const { port } = await start({
+        zones: () => [EXAMPLE],
+        transferAllow: ["127.0.0.0/8"],
+        tsigKeys: [KEY],
+        onSignatureRejected: (detail) => rejected.push(detail),
+      });
+      const wrong = signRequest(buildQuery("example.com", TYPE.AXFR), { ...KEY, secret: Buffer.alloc(32, 6) });
+      const reply = await askOverTcp(port, wrong.message);
+      assert.equal(rcodeOf(reply), RCODE.NOTAUTH);
+      // The refusal is itself a TSIG record, carrying the extended error, so
+      // the peer learns which of the three went wrong.
+      const record = readTsig(reply);
+      assert.ok(record);
+      assert.equal(record.error, TSIG_ERROR.BADSIG);
+      assert.equal(record.mac.length, 0, "a message this end could not verify is not signed back");
+      assert.equal(rejected.length, 1);
+      assert.equal(rejected[0]?.keyName, "transfer.key");
+      assert.equal(rejected[0]?.client, "127.0.0.1");
+      assert.ok(!JSON.stringify(rejected).includes(SECRET.slice(0, 12)));
+
+      const unknown = signRequest(buildQuery("example.com", TYPE.AXFR), { ...KEY, name: "nobody.key" });
+      const second = readTsig(await askOverTcp(port, unknown.message));
+      assert.ok(second);
+      assert.equal(second.error, TSIG_ERROR.BADKEY);
+    });
+
+    it("answers an ordinary signed query, signed", async () => {
+      const { port } = await start({ zones: () => [EXAMPLE], tsigKeys: [KEY] });
+      const request = signRequest(buildQuery("www.example.com", TYPE.A), KEY);
+      const reply = await askOverTcp(port, request.message);
+      const record = readTsig(reply);
+      assert.ok(record, "a signed question is answered signed");
+      assert.equal(verifyTsig(reply, record, [KEY], undefined, { mac: request.mac }).kind, "ok");
+      // The binding is real: the same reply does not verify against another
+      // question's signature.
+      const elsewhere = verifyTsig(reply, record, [KEY], undefined, { mac: Buffer.alloc(request.mac.length) });
+      assert.equal(elsewhere.kind === "rejected" && elsewhere.error, TSIG_ERROR.BADSIG);
+      assert.equal(readAnswers(reply).filter((answer) => answer.type === TYPE.A).length, 2);
+    });
+
+    it("does not relay a signed question to an upstream that cannot hold the key", async () => {
+      const { socket: upstream, port: upstreamPort } = await upstreamOn();
+      let receivedQueries = 0;
+      upstream.on("message", () => { receivedQueries += 1; });
+      closers.push(async () => { upstream.close(); });
+      const { port } = await start({
+        zones: () => [EXAMPLE],
+        forwardTo: [`127.0.0.1#${upstreamPort}`],
+        forwardAllow: ["127.0.0.0/8"],
+        tsigKeys: [KEY],
+      });
+      const request = signRequest(buildQuery("outside.example", TYPE.A), KEY);
+      assert.equal(rcodeOf(await askOverTcp(port, request.message)), RCODE.REFUSED);
+      assert.equal(receivedQueries, 0, "our peer's credential does not go to a stranger");
+    });
+
+    it("signs NOTIFY with the key the destination names, and sends none it cannot", async () => {
+      const rejected: { keyName: string }[] = [];
+      const sent: Array<{ packet: Buffer; address: string }> = [];
+      const zone = { ...EXAMPLE, serial: 12 };
+      const { server } = await start({
+        zones: () => [zone],
+        tsigKeys: [KEY],
+        notifyTo: ["10.0.0.2:5300#transfer.key", "10.0.0.3", "10.0.0.4#absent.key"],
+        onSignatureRejected: (detail) => rejected.push(detail),
+        sendNotify: async (packet, address) => { sent.push({ packet, address }); },
+      });
+      await server.notifyChanged(new Map([["example.com", 11]]), [{ ...zone, serial: 12 }]);
+
+      assert.deepEqual(sent.map((one) => one.address), ["10.0.0.2", "10.0.0.3"]);
+      const signed = readTsig(sent[0]?.packet as Buffer);
+      assert.ok(signed);
+      assert.equal(verifyTsig(sent[0]?.packet as Buffer, signed, [KEY]).kind, "ok");
+      // A destination that named no key is sent as it always was.
+      assert.equal(readTsig(sent[1]?.packet as Buffer), undefined);
+      // ...and one that named a key nobody holds is not sent unsigned instead.
+      assert.deepEqual(rejected.map((one) => one.keyName), ["absent.key"]);
+    });
+
+    it("reads a key name off a destination without swallowing the port", () => {
+      assert.deepEqual(parseNotifyDestination("10.0.0.2:5300#a.key"), { address: "10.0.0.2", port: 5300, keyName: "a.key" });
+      assert.deepEqual(parseNotifyDestination("[2001:db8::53]:5300#A.Key."), { address: "2001:db8::53", port: 5300, keyName: "a.key" });
+      assert.deepEqual(parseNotifyDestination("10.0.0.2"), { address: "10.0.0.2", port: 53 });
+      // A trailing `#` names nothing, so it is not a key selector.
+      assert.deepEqual(parseNotifyDestination("10.0.0.2#"), { address: "10.0.0.2", port: 53 });
+    });
   });
 
   it("closes so a subsequent bind on the same ports can succeed", async () => {

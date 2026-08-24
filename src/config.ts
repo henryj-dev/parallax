@@ -1,5 +1,6 @@
 import { isIP } from "node:net";
 import { isStrongBootstrapToken } from "./application/access-tokens.ts";
+import { parseTsigKey, type TsigKey } from "./dns/tsig.ts";
 import { isPortalSignIn, PORTAL_SIGN_IN, type PortalSignIn } from "./http/portal-entry.ts";
 import type { Role, TokenRecord } from "./security/http-authorization.ts";
 
@@ -69,8 +70,22 @@ export interface DnsListenerSettings {
   readonly forwardAllow: readonly string[];
   /** Client networks allowed to transfer a complete zone over TCP. Empty denies all transfers. */
   readonly transferAllow: readonly string[];
-  /** Hosts that receive NOTIFY when a served zone's serial rises. `host` or `host:port`. */
+  /**
+   * Hosts that receive NOTIFY when a served zone's serial rises.
+   *
+   * `host`, `host:port`, or `host:port#keyname` to sign it with one of the keys
+   * below.
+   */
   readonly notifyTo?: readonly string[];
+  /**
+   * Shared secrets for zone transfer (RFC 8945). Empty leaves AXFR gated on
+   * address alone.
+   *
+   * ⚠️ These are secrets. They are parsed into buffers here and deliberately
+   * never rendered back: `config check` reports how many are configured and
+   * under what names, and nothing prints the material.
+   */
+  readonly tsigKeys: readonly TsigKey[];
   /**
    * What the listener will spend on one client and on the network as a whole.
    *
@@ -216,6 +231,17 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
   );
   const soaPrimary = readDnsName(environment.PARALLAX_DNS_SOA_PRIMARY, "PARALLAX_DNS_SOA_PRIMARY");
   const soaMailbox = readDnsName(environment.PARALLAX_DNS_SOA_MAILBOX, "PARALLAX_DNS_SOA_MAILBOX");
+  const tsigKeys = (environment.PARALLAX_DNS_TSIG_KEYS ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => parseTsigKey(entry, "PARALLAX_DNS_TSIG_KEYS"));
+  const duplicate = tsigKeys.find((key, index) => tsigKeys.findIndex((other) => other.name === key.name) !== index);
+  if (duplicate) {
+    // Two entries under one name: verification would take the first and the
+    // operator would have no way to tell which secret is in force.
+    throw new Error(`PARALLAX_DNS_TSIG_KEYS names ${duplicate.name} more than once`);
+  }
   const notifyTo = (environment.PARALLAX_DNS_NOTIFY_TO ?? "")
     .split(",")
     .map((destination) => destination.trim())
@@ -227,6 +253,7 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     forwardAllow,
     transferAllow,
     ...(notifyTo.length > 0 ? { notifyTo } : {}),
+    tsigKeys,
     limits: readDnsLimits(environment),
     ...(soaPrimary ? { soaPrimary } : {}),
     ...(soaMailbox ? { soaMailbox } : {}),

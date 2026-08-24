@@ -5,12 +5,22 @@ import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
 import { dnsAnswered, dnsForwardSeconds } from "../observability/signals.ts";
 import { createDnsCookies } from "./cookies.ts";
+import {
+  readTsig, signEnvelope, signErrorReply, signReply, signRequest, tsigOverhead, verifyTsig,
+  type TsigKey,
+} from "./tsig.ts";
 import { DEFAULT_SOA_TIMERS, encodeRdata, encodeSoa, rrType, type SoaTimers } from "./rdata.ts";
 import {
   CLASS_ANY, CLASS_IN, MAX_EDNS_VERSION, MAX_RDATA_BYTES, MAX_TCP_MESSAGE_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
   isResponseToQuery, opcodeOf, readQuery, writeName, writeReply, writeTruncatedReply,
   type ParsedQuery, type ReplyParts, type ResourceRecord,
 } from "./wire.ts";
+
+/** What the signature layer decided about one incoming message. */
+type Signing =
+  | { readonly kind: "unsigned" }
+  | { readonly kind: "signed"; readonly key: TsigKey; readonly requestMac: Buffer }
+  | { readonly kind: "refused"; readonly reply: Buffer };
 
 /** One zone's answers, as the control plane computed them. */
 export interface ServedZone {
@@ -38,6 +48,14 @@ export interface DnsServerOptions {
   readonly forwardAllow?: readonly string[];
   /** Client CIDRs allowed to request AXFR over TCP. Defaults to deny all. */
   readonly transferAllow?: readonly string[];
+  /**
+   * Shared secrets for zone transfer and NOTIFY (RFC 8945).
+   *
+   * Empty leaves both as they were, gated on address alone. Configuring any key
+   * makes a signature *required* on AXFR -- an allowlisted address that cannot
+   * sign stops being enough, which is the point of turning it on.
+   */
+  readonly tsigKeys?: readonly TsigKey[];
   readonly negativeTtl?: number;
   readonly forwardTimeoutMs?: number;
   readonly maxConcurrentForwards?: number;
@@ -90,6 +108,14 @@ export interface DnsServerOptions {
    * reported failure and a query that vanished.
    */
   readonly onUnanswerable?: (detail: { zone: string; name: string; reason: string }) => void;
+  /**
+   * A message arrived signed and the signature did not hold.
+   *
+   * Worth a line wherever it happens: on a deployment with keys configured this
+   * is either a misconfigured secondary or somebody trying, and the two are
+   * told apart by how often it repeats and from where.
+   */
+  readonly onSignatureRejected?: (detail: { client: string; keyName: string; reason: string }) => void;
   /** Hosts that receive NOTIFY when a served zone's serial rises. `host` or `host:port`. */
   readonly notifyTo?: readonly string[];
   /** Injected by tests that capture NOTIFY instead of sending UDP. */
@@ -148,6 +174,8 @@ export function createDnsServer(options: DnsServerOptions): {
   const forwardTimeoutMs = options.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS;
   const forwardAllow = compileCidrs(options.forwardAllow ?? DEFAULT_FORWARD_ALLOW);
   const transferAllow = compileCidrs(options.transferAllow ?? []);
+  const tsigKeys = options.tsigKeys ?? [];
+  const now = options.now ?? Date.now;
   const maxConcurrentForwards = positiveInteger(options.maxConcurrentForwards ?? DEFAULT_MAX_CONCURRENT_FORWARDS, "maxConcurrentForwards");
   const tcpIdleTimeoutMs = positiveInteger(options.tcpIdleTimeoutMs ?? DEFAULT_TCP_IDLE_TIMEOUT_MS, "tcpIdleTimeoutMs");
   const tcpIncompleteFrameTimeoutMs = positiveInteger(
@@ -176,8 +204,12 @@ export function createDnsServer(options: DnsServerOptions): {
   let activeForwards = 0;
 
   /**
-   * The messages to send back, in order. Almost always one -- AXFR is the
-   * exception, and the reason this is a list rather than a buffer.
+   * The messages to send back, in order, with the signature layer around them.
+   *
+   * Split from the answering below because a signature is about the message
+   * rather than about the question: it has to be checked before anything is
+   * decided, and applied after everything is, including the error replies that
+   * return early from a dozen places in between.
    */
   async function respond(message: Buffer, overTcp: boolean, clientAddress: string): Promise<Buffer[]> {
     let query;
@@ -188,6 +220,63 @@ export function createDnsServer(options: DnsServerOptions): {
       if (error instanceof WireFormatError) return [];
       throw error;
     }
+    const signing = evaluateSignature(message, query, clientAddress);
+    if (signing.kind === "refused") return [signing.reply];
+    const replies = await answerQuery(message, query, overTcp, clientAddress, signing);
+    if (signing.kind !== "signed") return replies;
+    // The first reply is bound to the request's MAC; each one after it chains
+    // onto the one before, so a transfer cannot be reordered or have an
+    // envelope lifted out of the middle (RFC 8945 §5.3.1).
+    let previous = signing.requestMac;
+    return replies.map((reply, index) => {
+      const signed = index === 0
+        ? signReply(reply, signing.key, previous, now)
+        : signEnvelope(reply, signing.key, previous, now);
+      previous = signed.mac;
+      return signed.message;
+    });
+  }
+
+  /**
+   * Whether this message carries a signature, and whether it is one this
+   * deployment honours.
+   *
+   * A key configured anywhere makes AXFR require one. That is deliberately not
+   * per-zone: the allowlist is not per-zone either, and a deployment that has
+   * gone to the trouble of provisioning a key has said what it wants.
+   */
+  function evaluateSignature(message: Buffer, query: ParsedQuery, clientAddress: string): Signing {
+    const record = readTsig(message);
+    if (!record) {
+      if (tsigKeys.length === 0 || query.question.type !== TYPE.AXFR) return { kind: "unsigned" };
+      // No signature to answer with, so this refusal goes back bare.
+      return { kind: "refused", reply: writeReply({ query, rcode: RCODE.NOTAUTH, authoritative: false }, Number.MAX_SAFE_INTEGER) };
+    }
+    const verdict = verifyTsig(message, record, tsigKeys, now);
+    if (verdict.kind === "ok") {
+      const key = tsigKeys.find((candidate) => candidate.name === record.keyName) as TsigKey;
+      return { kind: "signed", key, requestMac: verdict.mac };
+    }
+    options.onSignatureRejected?.({ client: clientAddress, keyName: record.keyName, reason: verdict.reason });
+    const bare = writeReply({ query, rcode: RCODE.NOTAUTH, authoritative: false }, Number.MAX_SAFE_INTEGER);
+    const named = tsigKeys.find((candidate) => candidate.name === record.keyName);
+    return { kind: "refused", reply: signErrorReply(bare, record, verdict.error, named, now) };
+  }
+
+  /** The answer itself, once the message has been shown to be one we accept. */
+  async function answerQuery(
+    message: Buffer,
+    query: ParsedQuery,
+    overTcp: boolean,
+    clientAddress: string,
+    signing: Signing & { kind: "unsigned" | "signed" },
+  ): Promise<Buffer[]> {
+    const signed = signing.kind === "signed";
+    // Reserved out of every budget below rather than checked afterwards: the
+    // assembler is the only thing that can drop a record to make room, and by
+    // the time the signature is appended it has already gone.
+    const reserved = signing.kind === "signed" ? tsigOverhead(signing.key) : 0;
+    const tcpCeiling = MAX_TCP_MESSAGE_BYTES - reserved;
     const verdict = cookies.evaluate(query.cookie, clientAddress);
     // Every reply carries a fresh server cookie when the client sent one, so a
     // client that is unproven now becomes proven on its next query.
@@ -199,6 +288,10 @@ export function createDnsServer(options: DnsServerOptions): {
     )];
 
     const relay = async (): Promise<Buffer[]> => {
+      // A signed question was asked of this server by name. Relaying it would
+      // send our peer's credential to an upstream that does not hold the key,
+      // and the answer that came back could not be signed as ours.
+      if (signed) return answer(RCODE.REFUSED);
       if (activeForwards >= maxConcurrentForwards) return answer(RCODE.SERVFAIL);
       activeForwards += 1;
       let forwarded: Buffer | undefined;
@@ -275,7 +368,7 @@ export function createDnsServer(options: DnsServerOptions): {
       ...answerFromZone(query, zone, negativeTtl, options.onUnservable, soaSettings),
       ...(cookie ? { cookie } : {}),
     };
-    const budget = overTcp ? Number.MAX_SAFE_INTEGER : query.udpPayloadSize;
+    const budget = overTcp ? Number.MAX_SAFE_INTEGER : Math.max(MIN_UDP_PAYLOAD, query.udpPayloadSize - reserved);
     try {
       const reply = writeReply(parts, budget);
       // A DNS-over-TCP message is length-prefixed with a uint16, so this is a
@@ -290,19 +383,19 @@ export function createDnsServer(options: DnsServerOptions): {
       // received **zero bytes** and nothing here said why. SERVFAIL is an
       // answer, and it is small.
       //
-      if (overTcp && reply.length > MAX_TCP_MESSAGE_BYTES) {
+      if (overTcp && reply.length > tcpCeiling) {
         // A transfer is allowed to span messages, and is the only thing here
         // that is (RFC 5936 §2.2). Everything else has to fit one, so a reply
         // that does not is answered SERVFAIL and reported -- loudly, because
         // the alternative is a query that vanishes.
         if (query.question.type === TYPE.AXFR) {
-          const split = splitTransfer(parts, MAX_TCP_MESSAGE_BYTES);
+          const split = splitTransfer(parts, tcpCeiling);
           if (split) return split;
         }
         options.onUnanswerable?.({
           zone: zone.name,
           name: query.question.name,
-          reason: `reply is ${reply.length} bytes and a DNS-over-TCP message cannot exceed ${MAX_TCP_MESSAGE_BYTES}`,
+          reason: `reply is ${reply.length} bytes and a DNS-over-TCP message cannot exceed ${tcpCeiling}`,
         });
         return [writeReply({ query, rcode: RCODE.SERVFAIL, authoritative: true, ...(cookie ? { cookie } : {}) }, budget)];
       }
@@ -508,7 +601,20 @@ export function createDnsServer(options: DnsServerOptions): {
         const packet = writeNotify(zone.name);
         for (const destination of destinations) {
           const parsed = parseNotifyDestination(destination);
-          await send(packet, parsed.address, parsed.port);
+          const key = parsed.keyName === undefined
+            ? undefined
+            : tsigKeys.find((candidate) => candidate.name === parsed.keyName);
+          if (parsed.keyName !== undefined && !key) {
+            // Named a key that is not configured. Sending it unsigned would be
+            // the one thing the operator asked not to happen.
+            options.onSignatureRejected?.({
+              client: parsed.address,
+              keyName: parsed.keyName,
+              reason: `notify destination names a key that is not in the configured set`,
+            });
+            continue;
+          }
+          await send(key ? signRequest(packet, key, now).message : packet, parsed.address, parsed.port);
         }
       }
     },
@@ -527,7 +633,24 @@ async function bindAddresses(host: string, resolveHost: (host: string) => Promis
   return [binding];
 }
 
-function parseNotifyDestination(value: string): { address: string; port: number } {
+/**
+ * A NOTIFY destination, optionally naming the key to sign it with.
+ *
+ * `10.0.0.2:53#transfer.key`. The key goes per destination rather than being
+ * one global choice because secondaries do not have to share a secret -- the
+ * inbound direction tries every configured key and needs no such decision, but
+ * a packet leaving here has to be signed with exactly one, and picking the
+ * first would quietly break the second secondary.
+ */
+export function parseNotifyDestination(value: string): { address: string; port: number; keyName?: string } {
+  const separator = value.lastIndexOf("#");
+  if (separator > 0) {
+    const keyName = value.slice(separator + 1).trim().replace(/\.$/u, "").toLowerCase();
+    // The separator is consumed either way. Leaving a bare trailing `#` on the
+    // address turns a typo into a hostname nothing resolves.
+    const destination = parseNotifyDestination(value.slice(0, separator));
+    return keyName ? { ...destination, keyName } : destination;
+  }
   const bracketed = /^\[([^\]]+)\](?::(\d+))?$/u.exec(value);
   if (bracketed) {
     const port = notifyPort(bracketed[2]);

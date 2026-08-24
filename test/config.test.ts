@@ -229,6 +229,7 @@ describe("configuration", () => {
       forwardTo: [],
       forwardAllow: ["127.0.0.0/8", "::1/128"],
       transferAllow: [],
+      tsigKeys: [],
       limits: {},
     });
   });
@@ -380,6 +381,27 @@ describe("configuration", () => {
     assert.throws(
       () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_TRANSFER_ALLOW: "not-an-address" }),
       /PARALLAX_DNS_TRANSFER_ALLOW contains an invalid address/,
+    );
+  });
+
+  it("reads TSIG keys and refuses ones that would not authenticate anything", () => {
+    const secret = Buffer.alloc(32, 4).toString("base64");
+    assert.deepEqual(readConfig({ PARALLAX_DNS_PORT: "53" }).dns?.tsigKeys, []);
+    const keys = readConfig({
+      PARALLAX_DNS_PORT: "53",
+      PARALLAX_DNS_TSIG_KEYS: `transfer.key:hmac-sha256:${secret}, second.key:hmac-sha512:${secret}`,
+    }).dns?.tsigKeys ?? [];
+    assert.deepEqual(keys.map((key) => `${key.name}/${key.algorithm}`), ["transfer.key/hmac-sha256", "second.key/hmac-sha512"]);
+    assert.deepEqual(keys[0]?.secret, Buffer.from(secret, "base64"));
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_TSIG_KEYS: `k:hmac-sha1:${secret}` }),
+      /PARALLAX_DNS_TSIG_KEYS algorithm must be one of/,
+    );
+    // Two entries under one name: verification takes the first and the operator
+    // has no way to see which secret is in force.
+    assert.throws(
+      () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_TSIG_KEYS: `k:hmac-sha256:${secret},k:hmac-sha512:${secret}` }),
+      /names k more than once/,
     );
   });
 });

@@ -17,20 +17,29 @@ export const CLASS_IN = 1;
  * `RECORD_TYPES` and forgetting this file would otherwise produce a record that
  * validates, publishes, and cannot be answered for.
  *
- * SOA, OPT and ANY are not stored types -- they are synthesized, negotiated and
- * asked for -- so they are named separately rather than added to the domain.
+ * SOA, OPT, ANY and TSIG are not stored types -- they are synthesized,
+ * negotiated, asked for and signed with -- so they are named separately rather
+ * than added to the domain.
  */
 export const TYPE = Object.freeze({
   A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, HINFO: 13, MX: 15, TXT: 16, AAAA: 28,
   LOC: 29, SRV: 33, NAPTR: 35, CERT: 37, DNAME: 39, OPT: 41, DS: 43, SSHFP: 44,
   DNSKEY: 48, TLSA: 52, SMIMEA: 53, OPENPGPKEY: 61, SVCB: 64, HTTPS: 65,
-  URI: 256, CAA: 257, ANY: 255, AXFR: 252,
-} as const satisfies Record<RecordType | "SOA" | "OPT" | "ANY" | "AXFR", number>);
+  URI: 256, CAA: 257, ANY: 255, AXFR: 252, TSIG: 250,
+} as const satisfies Record<RecordType | "SOA" | "OPT" | "ANY" | "AXFR" | "TSIG", number>);
 
 const TYPE_NAMES = new Map<number, string>(Object.entries(TYPE).map(([name, value]) => [value as number, name]));
 
 export const RCODE = Object.freeze({
   NOERROR: 0, FORMERR: 1, SERVFAIL: 2, NXDOMAIN: 3, NOTIMP: 4, REFUSED: 5,
+  /**
+   * "You are not authorised for this zone." What a TSIG failure is answered
+   * with (RFC 8945 §5.2), and distinct from REFUSED on purpose: REFUSED says
+   * the request was not entertained, NOTAUTH says it was and the credential is
+   * what failed -- which is the difference between "check the allowlist" and
+   * "check the key".
+   */
+  NOTAUTH: 9,
   /**
    * "I do not speak the EDNS version you asked for." Extended: it does not fit
    * the header's four bits and is carried in the OPT record, so it can only be
