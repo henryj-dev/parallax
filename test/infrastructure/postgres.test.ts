@@ -11,6 +11,7 @@ import {
   PostgresSettingsRepository,
   PostgresZoneRepository,
   createPostgresAdapters,
+  createPostgresPool,
   type PgClient,
   type PgPool,
   type PgQueryResult,
@@ -648,6 +649,51 @@ describe("a stored snapshot the current rules would not accept", () => {
     const zone = await repository.get("example.com");
     assert.equal(zone?.views[0]?.records[0]?.id, "oversized");
     assert.equal(zone?.views[0]?.records[0]?.content.length, 90_000);
+  });
+});
+
+/**
+ * The pool's own limits, which no repository test reaches.
+ *
+ * Every test above hands a `FakePool` to a repository, so the real
+ * `createPostgresPool` -- the only place that decides how many connections
+ * exist and how long a caller waits for one -- was never constructed by the
+ * suite at all. That is how it came to have neither setting: an unbounded wait
+ * is invisible until something is actually contending for the pool.
+ *
+ * ⚠️ These assert the wiring, not the waiting. That a caller past `max`
+ * receives an error rather than hanging is behaviour of `pg` against a real
+ * server, and it is checked by `pnpm verify:postgres`, which needs Docker and
+ * therefore cannot live here.
+ */
+describe("the PostgreSQL pool's limits", () => {
+  const CONNECTION = "postgres://parallax:parallax@127.0.0.1:5432/parallax";
+
+  it("bounds the pool and the wait for it, without connecting", async () => {
+    const pool = createPostgresPool(CONNECTION) as unknown as { options: Record<string, unknown>; end(): Promise<void> };
+    try {
+      assert.equal(pool.options.max, 10, "as many concurrent applies as connections");
+      assert.equal(pool.options.connectionTimeoutMillis, 10_000, "exhaustion is an error, not a hang");
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it("lets a caller name its own, so the defaults are a floor and not a rule", async () => {
+    const pool = createPostgresPool(CONNECTION, { max: 3, connectionTimeoutMillis: 250 }) as unknown as {
+      options: Record<string, unknown>;
+      end(): Promise<void>;
+    };
+    try {
+      assert.equal(pool.options.max, 3);
+      assert.equal(pool.options.connectionTimeoutMillis, 250);
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it("still refuses an empty connection string", async () => {
+    assert.throws(() => createPostgresPool("   "), /connection string must not be empty/u);
   });
 });
 

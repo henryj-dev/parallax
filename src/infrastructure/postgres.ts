@@ -45,10 +45,39 @@ interface PgPoolConstructor {
 
 const require = createRequire(import.meta.url);
 
+/**
+ * How many connections this process will hold, and how long a caller waits for
+ * one before being told it cannot have it.
+ *
+ * `max` is `pg`'s own default written down rather than changed. It is here
+ * because it is not an arbitrary number: `PostgresApplyLock.withZoneLock` holds
+ * one checked-out client for the whole of an apply -- including the provider
+ * network calls, because the advisory lock is session-scoped and has to outlive
+ * them -- so this is also the number of zones that can be applied at once.
+ * Raising it raises that; it does not remove the ceiling.
+ *
+ * The timeout is the actual fix. Without one, the caller that arrives after the
+ * pool is exhausted waits forever: no error, no log, a request that simply
+ * never answers. `applyPending` walks zones in sequence and never reaches it,
+ * so this is the concurrent-HTTP-apply path.
+ *
+ * ⚠️ 10 seconds is shorter than a large apply, and deliberately. Waiting out an
+ * apply would only move the hang; failing says which resource ran out while the
+ * caller can still act on it.
+ */
+const DEFAULT_MAX_CONNECTIONS = 10;
+const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
+
 export function createPostgresPool(connectionString: string, options: PostgresPoolOptions = {}): CloseablePgPool {
   if (connectionString.trim().length === 0) throw new Error("PostgreSQL connection string must not be empty");
   const module = require("pg") as { Pool: PgPoolConstructor };
-  return new module.Pool({ ...options, connectionString });
+  // Defaults first, so a caller that names one still wins.
+  return new module.Pool({
+    max: DEFAULT_MAX_CONNECTIONS,
+    connectionTimeoutMillis: DEFAULT_CONNECTION_TIMEOUT_MS,
+    ...options,
+    connectionString,
+  });
 }
 
 export class PostgresZoneRepository implements ZoneRepository {
