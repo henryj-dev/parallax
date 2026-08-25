@@ -12,9 +12,11 @@ import {
   type SecurityConfig,
   type TokenDigestRecord,
 } from "../../src/security/http-authorization.ts";
+import { signSession } from "../../src/security/session-token.ts";
 
 const config: SecurityConfig = {
   enabled: true,
+  tokenSessionSecret: "token-session-secret-that-is-at-least-32-bytes",
   tokens: [
     { token: "viewer-secret-0000000000000000000", role: "viewer", subject: "read-only" },
     { token: "editor-secret-0000000000000000000", role: "editor", subject: "operator" },
@@ -38,20 +40,21 @@ describe("HTTP token authentication", () => {
   });
 
   it("accepts a strictly parsed percent-encoded session cookie", () => {
+    const session = signSession({ subject: "read-only", role: "viewer", expiresAt: Math.floor(Date.now() / 1000) + 60, id: "test-session" }, config.tokenSessionSecret as string);
     const cookieRequest = new Request("https://portal.example/api/v1/zones", {
-      headers: { cookie: "theme=dark; parallax_session=viewer%2Dsecret%2D0000000000000000000" },
+      headers: { cookie: `theme=dark; __Host-parallax_session=${encodeURIComponent(session)}` },
     });
     assert.equal(authenticate(cookieRequest, config)?.role, "viewer");
   });
 
   it("rejects malformed bearer credentials and ambiguous session cookies", () => {
     const malformed = new Request("https://portal.example/api/v1/zones", {
-      headers: { authorization: "Basic viewer-secret", cookie: "parallax_session=viewer-secret-0000000000000000000" },
+      headers: { authorization: "Basic viewer-secret", cookie: "__Host-parallax_session=viewer-secret-0000000000000000000" },
     });
     assert.equal(authenticate(malformed, config), undefined);
 
     const duplicate = new Request("https://portal.example/api/v1/zones", {
-      headers: { cookie: "parallax_session=viewer-secret-0000000000000000000; parallax_session=editor-secret-0000000000000000000" },
+      headers: { cookie: "__Host-parallax_session=viewer-secret-0000000000000000000; __Host-parallax_session=editor-secret-0000000000000000000" },
     });
     assert.equal(authenticate(duplicate, config), undefined);
   });
@@ -231,7 +234,11 @@ describe("authorized handler", () => {
   });
 
   it("exchanges a token for an HttpOnly session cookie the page cannot read", async () => {
-    const issued = await handler(new Request("https://portal.example/api/v1/session", {
+    const sessionHandler = createAuthorizedHandler({
+      ...config,
+      tokenSessionSecret: "token-session-secret-that-is-at-least-32-bytes",
+    }, downstream);
+    const issued = await sessionHandler(new Request("https://portal.example/api/v1/session", {
       method: "POST",
       headers: { origin: "https://portal.example", "content-type": "application/json" },
       body: JSON.stringify({ token: "editor-secret-0000000000000000000" }),
@@ -240,26 +247,62 @@ describe("authorized handler", () => {
     assert.equal(issued.status, 200);
     assert.deepEqual(await issued.json(), { role: "editor", subject: "operator", expiresIn: 43_200 });
     const cookie = issued.headers.get("set-cookie") ?? "";
-    assert.match(cookie, /^parallax_session=editor-secret-0000000000000000000;/);
+    assert.match(cookie, /^__Host-parallax_session=v1\./u);
+    assert.doesNotMatch(cookie, /editor-secret/u);
     for (const attribute of ["Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=43200", "Secure"]) {
       assert.ok(cookie.includes(attribute), `${attribute} in ${cookie}`);
     }
 
     // The issued cookie authenticates the next request.
-    const reused = await handler(new Request("https://portal.example/api/v1/zones", {
+    const reused = await sessionHandler(new Request("https://portal.example/api/v1/zones", {
       headers: { cookie: cookie.split(";")[0] ?? "" },
     }));
     assert.deepEqual(await reused.json(), { actor: "operator" });
   });
 
+  it("signs token sessions and revokes the exact cookie on DELETE", async () => {
+    const sessionHandler = createAuthorizedHandler({
+      ...config,
+      tokenSessionSecret: "token-session-secret-that-is-at-least-32-bytes",
+    }, downstream);
+    const issued = await sessionHandler(new Request("https://portal.example/api/v1/session", {
+      method: "POST",
+      headers: { origin: "https://portal.example", "content-type": "application/json" },
+      body: JSON.stringify({ token: "editor-secret-0000000000000000000" }),
+    }));
+    assert.equal(issued.status, 200);
+    const cookie = issued.headers.get("set-cookie") ?? "";
+    assert.match(cookie, /^__Host-parallax_session=v1\./u);
+    assert.doesNotMatch(cookie, /editor-secret/u);
+    const cookiePair = cookie.split(";")[0] ?? "";
+    assert.equal((await sessionHandler(new Request("https://portal.example/api/v1/zones", {
+      headers: { cookie: cookiePair },
+    }))).status, 200);
+
+    const cleared = await sessionHandler(new Request("https://portal.example/api/v1/session", {
+      method: "DELETE",
+      headers: { cookie: cookiePair, "sec-fetch-site": "same-origin" },
+    }));
+    assert.equal(cleared.status, 204);
+    assert.equal((await sessionHandler(new Request("https://portal.example/api/v1/zones", {
+      headers: { cookie: cookiePair },
+    }))).status, 401);
+  });
+
   it("omits Secure on a plain-HTTP origin so a loopback session still works", async () => {
-    const issued = await handler(new Request("http://127.0.0.1:3000/api/v1/session", {
+    const sessionHandler = createAuthorizedHandler({
+      ...config,
+      tokenSessionSecret: "token-session-secret-that-is-at-least-32-bytes",
+    }, downstream);
+    const issued = await sessionHandler(new Request("http://127.0.0.1:3000/api/v1/session", {
       method: "POST",
       headers: { origin: "http://127.0.0.1:3000", "content-type": "application/json" },
       body: JSON.stringify({ token: "admin-secret-00000000000000000000" }),
     }));
     const cookie = issued.headers.get("set-cookie") ?? "";
     assert.equal(issued.status, 200);
+    assert.match(cookie, /^parallax_session=v1\./u);
+    assert.doesNotMatch(cookie, /admin-secret/u);
     assert.ok(cookie.includes("HttpOnly"));
     assert.ok(!cookie.includes("Secure"), cookie);
   });
@@ -292,26 +335,29 @@ describe("authorized handler", () => {
     }));
     assert.equal(cleared.status, 204);
     const cookie = cleared.headers.get("set-cookie") ?? "";
-    assert.match(cookie, /^parallax_session=;/);
+    assert.match(cookie, /^__Host-parallax_session=;/);
     assert.ok(cookie.includes("Max-Age=0"), cookie);
   });
 
   it("accepts Sec-Fetch-Site as same-origin proof for cookie-authenticated mutations", async () => {
+    const session = signSession({ subject: "operator", role: "editor", expiresAt: Math.floor(Date.now() / 1000) + 60, id: "mutation-session" }, config.tokenSessionSecret as string);
+    const cookie = `__Host-parallax_session=${encodeURIComponent(session)}`;
     const allowed = await handler(new Request("https://portal.example/api/v1/zones/example.com/apply", {
       method: "POST",
-      headers: { cookie: "parallax_session=editor-secret-0000000000000000000", "sec-fetch-site": "same-origin" },
+      headers: { cookie, "sec-fetch-site": "same-origin" },
     }));
     assert.equal(allowed.status, 200);
 
     const crossSite = await handler(new Request("https://portal.example/api/v1/zones/example.com/apply", {
       method: "POST",
-      headers: { cookie: "parallax_session=editor-secret-0000000000000000000", "sec-fetch-site": "cross-site" },
+      headers: { cookie, "sec-fetch-site": "cross-site" },
     }));
     assert.equal(crossSite.status, 403);
   });
 
   it("requires same-origin proof for cookie-authenticated mutations", async () => {
-    const cookieHeaders = { cookie: "parallax_session=editor-secret-0000000000000000000" };
+    const session = signSession({ subject: "operator", role: "editor", expiresAt: Math.floor(Date.now() / 1000) + 60, id: "origin-session" }, config.tokenSessionSecret as string);
+    const cookieHeaders = { cookie: `__Host-parallax_session=${encodeURIComponent(session)}` };
     const rejected = await handler(new Request("https://portal.example/api/v1/zones/example.com/apply", {
       method: "POST",
       headers: cookieHeaders,

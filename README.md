@@ -496,6 +496,7 @@ parallax_dns_zones_skipped_total                zones whose internal view would 
 parallax_dns_unservable_records_total           stored records that reached the wire and could not
 parallax_dns_unanswerable_replies_total         queries that could not be answered
 parallax_dns_notify_failures_total              NOTIFY sends that failed
+parallax_dns_forward_failures_total             DNS forwarding failures by upstream index and reason
 parallax_refresh_failures_total                 background refresh failures, by subsystem
 parallax_tls_certificate_reload_failures_total  certificate reloads that failed
 ```
@@ -516,6 +517,42 @@ The image runs the API, the portal and the CLI from one process, as an
 unprivileged uid `10001`. `migrations/` stays root-owned and unwritable by that
 uid on purpose: compromising the service must not let it plant SQL for a later
 privileged `parallax migrate`.
+
+### Security assumptions at deployment
+
+The DNS `servedByProvider` path intentionally relays provider-placeholder names
+even when the client is outside `forwardAllow`. It is not a general open
+resolver: the name must belong to a served zone and use that zone's configured
+placeholder. Both UDP and TCP entry points still apply the per-client rate
+limiter, and `maxConcurrentForwards` (default `256`) bounds in-flight work.
+However, if `forwardTo` points at an internal resolver, this path gives external
+clients a limited view of internal DNS answers. Treat internal-name exposure
+and SSRF-like reachability as part of the deployment threat model, and keep the
+placeholder set limited to names that are safe to relay.
+
+Authorization is route-based, not zone-based. An `editor` may edit, apply,
+import, or restore every zone visible to this deployment; there is no per-zone
+RBAC. Multi-team deployments must isolate zones into separate control planes or
+add an explicit zone authorization layer before treating an editor as
+tenant-scoped.
+
+The cookies have different security meanings: `parallax_identity` (prefixed
+`__Host-` over HTTPS) is an HMAC-signed identity session, `parallax_session`
+is the token session, and `parallax_oidc_id` is a sensitive provider ID token
+used only for IdP logout, not an API bearer credential. HTTPS deployments use
+the `__Host-` names and do not accept the old unprefixed names; existing
+browsers therefore need one sign-out during rollout.
+
+Set `PARALLAX_SESSION_SECRET` to a stable random value of at least 32 bytes on
+every replica. It signs the browser session exchanged from an access token;
+without it, the server refuses to issue a token session rather than placing the
+bearer token in a cookie. Rotating it logs out all token sessions.
+
+Failed HTTP authentication attempts are counted in a bounded, process-local
+LRU map after credential verification. This is not a guessing throttle: every
+credential is still evaluated, and a multi-replica deployment will see failure
+observations separately. A shared limiter is an observability improvement, not
+a substitute for the 32-byte minimum token entropy.
 
 | Store | When |
 |---|---|

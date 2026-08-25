@@ -3,7 +3,7 @@ import { lookup } from "node:dns/promises";
 import { connect, createServer, isIP, type Server, type Socket as TcpSocket } from "node:net";
 import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
-import { dnsAnswered, dnsForwardSeconds } from "../observability/signals.ts";
+import { dnsAnswered, dnsForwardFailures, dnsForwardSeconds } from "../observability/signals.ts";
 import { createDnsCookies } from "./cookies.ts";
 import {
   readTsig, signEnvelope, signErrorReply, signReply, signRequest, tsigOverhead, verifyTsig,
@@ -1266,28 +1266,47 @@ async function forward(
   overTcp: boolean,
   resolveHost: (host: string, timeoutMs: number) => Promise<ResolvedDnsAddress | undefined>,
 ): Promise<Buffer | undefined> {
-  for (const upstream of upstreams) {
+  for (const [upstreamIndex, upstream] of upstreams.entries()) {
     const [host, port] = splitUpstream(upstream);
     const deadline = performance.now() + timeoutMs;
     let resolved: ResolvedDnsAddress;
     try {
       const candidate = await resolveHost(host, timeoutMs);
-      if (!candidate) continue;
+      if (!candidate) {
+        dnsForwardFailures({ upstream: String(upstreamIndex), reason: "resolve" });
+        continue;
+      }
       resolved = candidate;
+    } catch {
+      dnsForwardFailures({ upstream: String(upstreamIndex), reason: "resolve" });
+      continue;
+    }
+    try {
       assertResolvedAddress(resolved, host);
     } catch {
+      dnsForwardFailures({ upstream: String(upstreamIndex), reason: "address_refused" });
       continue;
     }
     const remainingMs = Math.ceil(deadline - performance.now());
-    if (remainingMs <= 0) continue;
+    if (remainingMs <= 0) {
+      dnsForwardFailures({ upstream: String(upstreamIndex), reason: "budget" });
+      continue;
+    }
     // Preserve the client's transport: a TCP retry relayed over UDP could only
     // return another truncated reply. Both paths validate DNS correlation data.
-    const reply = overTcp
+    const attempt = overTcp
       ? await relayOverTcp(message, query, resolved.address, port, remainingMs)
       : await relayOverUdp(message, query, resolved.address, resolved.family, port, remainingMs);
-    if (reply) return reply;
+    if (attempt.reply) return attempt.reply;
+    dnsForwardFailures({ upstream: String(upstreamIndex), reason: attempt.reason ?? "timeout" });
   }
   return undefined;
+}
+
+type RelayFailureReason = "connect_send" | "correlation" | "timeout";
+interface RelayAttempt {
+  readonly reply?: Buffer;
+  readonly reason?: RelayFailureReason;
 }
 
 /**
@@ -1347,27 +1366,29 @@ function relayOverUdp(
   family: 4 | 6,
   port: number,
   timeoutMs: number,
-): Promise<Buffer | undefined> {
+): Promise<RelayAttempt> {
   return new Promise((resolve) => {
     const socket = createSocket(family === 6 ? "udp6" : "udp4");
     let settled = false;
-    const done = (value: Buffer | undefined): void => {
+    let sawUnmatchedReply = false;
+    const done = (value: RelayAttempt): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       try { socket.close(); } catch { /* The connect may have failed before bind. */ }
       resolve(value);
     };
-    const timer = setTimeout(() => done(undefined), timeoutMs);
+    const timer = setTimeout(() => done({ reason: sawUnmatchedReply ? "correlation" : "timeout" }), timeoutMs);
     timer.unref();
     socket.on("message", (answer) => {
-      if (isResponseToQuery(answer, query)) done(answer);
+      if (isResponseToQuery(answer, query)) done({ reply: answer });
+      else sawUnmatchedReply = true;
     });
-    socket.once("error", () => done(undefined));
+    socket.once("error", () => done({ reason: "connect_send" }));
     // Connected UDP makes the kernel reject datagrams from every other source
     // address or port before the DNS-level checks above run.
     socket.connect(port, host, () => {
-      socket.send(message, (error) => { if (error) done(undefined); });
+      socket.send(message, (error) => { if (error) done({ reason: "connect_send" }); });
     });
   });
 }
@@ -1378,7 +1399,7 @@ function relayOverTcp(
   host: string,
   port: number,
   timeoutMs: number,
-): Promise<Buffer | undefined> {
+): Promise<RelayAttempt> {
   return new Promise((resolve) => {
     const framed = Buffer.alloc(2 + message.length);
     framed.writeUInt16BE(message.length, 0);
@@ -1386,14 +1407,15 @@ function relayOverTcp(
     const socket = connect(port, host, () => socket.write(framed));
     let buffered = Buffer.alloc(0);
     let settled = false;
-    const done = (value: Buffer | undefined): void => {
+    let sawUnmatchedReply = false;
+    const done = (value: RelayAttempt): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
       resolve(value);
     };
-    const timer = setTimeout(() => done(undefined), timeoutMs);
+    const timer = setTimeout(() => done({ reason: sawUnmatchedReply ? "correlation" : "timeout" }), timeoutMs);
     timer.unref();
     // Same reason as the listener above: no `setEncoding()` on this socket, so
     // the string half of the parameter's type never arrives.
@@ -1407,13 +1429,14 @@ function relayOverTcp(
         const answer = Buffer.from(buffered.subarray(2, size + 2));
         buffered = buffered.subarray(size + 2);
         if (isResponseToQuery(answer, query)) {
-          done(answer);
+          done({ reply: answer });
           return;
         }
+        sawUnmatchedReply = true;
       }
     });
-    socket.on("error", () => done(undefined));
-    socket.on("close", () => done(undefined));
+    socket.on("error", () => done({ reason: "connect_send" }));
+    socket.on("close", () => done({ reason: sawUnmatchedReply ? "correlation" : "connect_send" }));
   });
 }
 

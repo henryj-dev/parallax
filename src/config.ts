@@ -27,6 +27,8 @@ export interface ParallaxConfig {
   credentialMasterKey?: Buffer;
   /** Optional break-glass tokens; normal tokens are issued through the portal. */
   bootstrapTokens: TokenRecord[];
+  /** Signs browser sessions exchanged from access tokens. */
+  sessionSecret?: string;
   /** Certificate and key that let this process end TLS itself, instead of a proxy. */
   tls?: { certFile: string; keyFile: string };
   /** Port answering plain HTTP with a redirect to the TLS origin; unset disables it. */
@@ -172,6 +174,10 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     throw new Error("PARALLAX_OWNERSHIP_SECRET must contain at least 32 bytes");
   }
   const credentialMasterKey = readCredentialMasterKey(environment.PARALLAX_CREDENTIAL_MASTER_KEY);
+  const sessionSecret = environment.PARALLAX_SESSION_SECRET?.trim() || undefined;
+  if (sessionSecret !== undefined && Buffer.byteLength(sessionSecret, "utf8") < 32) {
+    throw new Error("PARALLAX_SESSION_SECRET must contain at least 32 bytes");
+  }
   const tls = readTls(environment);
   const redirect = environment.PARALLAX_HTTP_REDIRECT_PORT?.trim();
   const httpRedirectPort = redirect ? readPort(redirect, "PARALLAX_HTTP_REDIRECT_PORT") : undefined;
@@ -200,6 +206,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     configurationFile: environment.PARALLAX_CONFIG_FILE?.trim() || "data/parallax-config.json",
     ...(databaseUrl ? { databaseUrl } : {}),
     ...(ownershipSecret ? { ownershipSecret } : {}),
+    ...(sessionSecret ? { sessionSecret } : {}),
     ...(credentialMasterKey ? { credentialMasterKey } : {}),
     bootstrapTokens: readBootstrapTokens(environment.PARALLAX_AUTH_TOKENS),
     ...(tls ? { tls } : {}),

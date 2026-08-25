@@ -164,8 +164,17 @@ export function createEndpointResolver(
 
 export interface OidcTokens {
   readonly accessToken: string;
-  readonly idToken?: string;
+  readonly idToken: string;
+  readonly idTokenClaims: IdTokenClaims;
   readonly expiresIn: number;
+}
+
+export interface IdTokenClaims {
+  readonly subject: string;
+  readonly issuer: string;
+  readonly audience: string | readonly string[];
+  readonly expiresAt: number;
+  readonly nonce: string;
 }
 
 /** What the provider says about the person, reduced to what Parallax uses. */
@@ -181,9 +190,10 @@ export class OidcError extends Error {
 }
 
 /** The authorization request, and the two values the callback has to match. */
-export function beginAuthorization(config: OidcConfig, endpoints: OidcEndpoints): { url: string; state: string; verifier: string } {
+export function beginAuthorization(config: OidcConfig, endpoints: OidcEndpoints): { url: string; state: string; verifier: string; nonce: string } {
   const state = randomUrlSafe(16);
   const verifier = randomUrlSafe(32);
+  const nonce = randomUrlSafe(16);
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   const parameters = new URLSearchParams({
     response_type: "code",
@@ -191,11 +201,12 @@ export function beginAuthorization(config: OidcConfig, endpoints: OidcEndpoints)
     redirect_uri: config.redirectUri,
     scope: config.scopes,
     state,
+    nonce,
     code_challenge: challenge,
     code_challenge_method: "S256",
   });
   const separator = endpoints.authorization.includes("?") ? "&" : "?";
-  return { url: `${endpoints.authorization}${separator}${parameters}`, state, verifier };
+  return { url: `${endpoints.authorization}${separator}${parameters}`, state, verifier, nonce };
 }
 
 export async function exchangeCode(
@@ -203,7 +214,9 @@ export async function exchangeCode(
   endpoints: OidcEndpoints,
   code: string,
   verifier: string,
+  expectedNonce: string,
   fetchImpl: typeof fetch = fetch,
+  now: () => number = Date.now,
 ): Promise<OidcTokens> {
   const response = await fetchImpl(endpoints.token, {
     method: "POST",
@@ -225,11 +238,36 @@ export async function exchangeCode(
   if (typeof accessToken !== "string" || accessToken.length === 0) {
     throw new OidcError("the identity provider returned no access token");
   }
-  return {
-    accessToken,
-    ...(typeof idToken === "string" ? { idToken } : {}),
-    expiresIn: typeof expiresIn === "number" ? expiresIn : 3600,
-  };
+  if (typeof idToken !== "string" || idToken.length === 0) {
+    throw new OidcError("the identity provider returned no ID token");
+  }
+  const idTokenClaims = validateIdToken(idToken, config, expectedNonce, now);
+  return { accessToken, idToken, idTokenClaims, expiresIn: typeof expiresIn === "number" ? expiresIn : 3600 };
+}
+
+function validateIdToken(value: string, config: OidcConfig, expectedNonce: string, now: () => number): IdTokenClaims {
+  const parts = value.split(".");
+  if (parts.length !== 3) throw new OidcError("the identity provider returned a malformed ID token");
+  let claims: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(parts[1] as string, "base64url").toString("utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("not an object");
+    claims = parsed as Record<string, unknown>;
+  } catch {
+    throw new OidcError("the identity provider returned a malformed ID token");
+  }
+  const subject = typeof claims.sub === "string" ? claims.sub : "";
+  const issuer = typeof claims.iss === "string" ? claims.iss : "";
+  const audience = typeof claims.aud === "string" || (Array.isArray(claims.aud) && claims.aud.every((item) => typeof item === "string"))
+    ? claims.aud as string | readonly string[] : undefined;
+  const expiresAt = typeof claims.exp === "number" && Number.isFinite(claims.exp) ? claims.exp : undefined;
+  const nonce = typeof claims.nonce === "string" ? claims.nonce : "";
+  const audiences = audience === undefined ? [] : Array.isArray(audience) ? audience : [audience];
+  if (!subject || issuer !== config.issuer || audience === undefined || !audiences.includes(config.clientId)
+    || expiresAt === undefined || expiresAt <= Math.floor(now() / 1000) || nonce !== expectedNonce) {
+    throw new OidcError("the identity provider returned an ID token with invalid claims");
+  }
+  return { subject, issuer, audience, expiresAt, nonce };
 }
 
 /**
@@ -256,6 +294,7 @@ export async function readIdentity(
   const record = claims as Record<string, unknown>;
   const subject = typeof record.sub === "string" ? record.sub : "";
   if (subject.length === 0) throw new OidcError("the identity provider returned an account with no subject");
+  if (subject !== tokens.idTokenClaims.subject) throw new OidcError("the identity provider returned an account for a different subject");
 
   // One named claim, and by default `entitlements` rather than `roles`. The
   // provider this was written against draws that line itself: `roles` says what

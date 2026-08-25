@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createIdentityHandler } from "../../src/http/identity-routes.ts";
 import { authenticate, IDENTITY_COOKIE, withIdentityProvider } from "../../src/security/http-authorization.ts";
-import { assumedEndpoints, beginAuthorization, createEndpointResolver, discoverEndpoints, endSessionUrl, readIdentity, type OidcConfig } from "../../src/security/oidc.ts";
+import { assumedEndpoints, beginAuthorization, createEndpointResolver, discoverEndpoints, endSessionUrl, exchangeCode, readIdentity, type IdTokenClaims, type OidcConfig } from "../../src/security/oidc.ts";
 import { readSession, signSession } from "../../src/security/session-token.ts";
+import { cookieNameForRequest } from "../../src/security/cookies.ts";
 
 const SECRET = "identity-session-secret-at-least-32-bytes";
 const SETTINGS = {
@@ -16,13 +17,35 @@ const SETTINGS = {
   sessionMaxAgeSeconds: 3600,
 };
 const CONFIG: OidcConfig = { ...SETTINGS };
+const identityCookieName = cookieNameForRequest(IDENTITY_COOKIE, new URL("https://parallax.example"));
+let lastNonce = "";
+
+function unsignedIdToken(claims: Record<string, unknown>): string {
+  const encode = (value: unknown): string => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "RS256", typ: "JWT" })}.${encode(claims)}.test-signature`;
+}
+
+const directIdTokenClaims: IdTokenClaims = {
+  subject: "direct-subject",
+  issuer: CONFIG.issuer,
+  audience: CONFIG.clientId,
+  expiresAt: Math.floor(Date.now() / 1000) + 300,
+  nonce: "direct-nonce",
+};
 
 /** A provider that answers the two calls the flow makes, with what it is given. */
 function provider(claims: Record<string, unknown>, tokens: Record<string, unknown> = {}): typeof fetch {
   return (async (input: string | URL | Request) => {
     const url = String(typeof input === "object" && "url" in input ? input.url : input);
     if (url.endsWith("/oidc/token")) {
-      return Response.json({ access_token: "provider-access-token", expires_in: 300, ...tokens });
+      const idToken = typeof tokens.id_token === "string" ? tokens.id_token : unsignedIdToken({
+        iss: CONFIG.issuer,
+        aud: CONFIG.clientId,
+        sub: typeof claims.sub === "string" ? claims.sub : "u",
+        exp: Math.floor(Date.now() / 1000) + 300,
+        nonce: lastNonce,
+      });
+      return Response.json({ access_token: "provider-access-token", expires_in: 300, id_token: idToken, ...tokens });
     }
     if (url.endsWith("/oidc/userinfo")) return Response.json(claims);
     throw new Error(`unexpected call to ${url}`);
@@ -56,6 +79,56 @@ describe("session values", () => {
   });
 });
 
+describe("ID token validation", () => {
+  const expectedNonce = "nonce-from-browser-handshake";
+  const endpoints = assumedEndpoints(CONFIG.issuer);
+  const validClaims = {
+    iss: CONFIG.issuer,
+    aud: CONFIG.clientId,
+    sub: "oidc-subject",
+    exp: 2_000_000,
+    nonce: expectedNonce,
+  };
+
+  async function exchange(idToken: string) {
+    return exchangeCode(
+      CONFIG,
+      endpoints,
+      "authorization-code",
+      "pkce-verifier",
+      expectedNonce,
+      async () => Response.json({ access_token: "provider-access-token", id_token: idToken }),
+      () => 1_000_000,
+    );
+  }
+
+  it("requires a valid ID token and binds it to the authorization request", async () => {
+    const valid = await exchange(unsignedIdToken(validClaims));
+    assert.equal(valid.idTokenClaims.subject, "oidc-subject");
+
+    for (const [label, claims] of [
+      ["issuer", { ...validClaims, iss: "https://other-idp.example" }],
+      ["audience", { ...validClaims, aud: "another-client" }],
+      ["expiry", { ...validClaims, exp: 999 }],
+      ["subject", { ...validClaims, sub: "" }],
+      ["nonce", { ...validClaims, nonce: "attacker-nonce" }],
+      ["missing nonce", (() => { const { nonce: _nonce, ...withoutNonce } = validClaims; return withoutNonce; })()],
+    ] as const) {
+      await assert.rejects(exchange(unsignedIdToken(claims)), /ID token with invalid claims/u, label);
+    }
+
+    await assert.rejects(exchange("not-a-jwt"), /malformed ID token/u);
+  });
+
+  it("requires the provider to return an ID token", async () => {
+    await assert.rejects(
+      exchangeCode(CONFIG, endpoints, "authorization-code", "pkce-verifier", expectedNonce,
+        async () => Response.json({ access_token: "provider-access-token" }), () => 1_000_000),
+      /no ID token/u,
+    );
+  });
+});
+
 describe("identity sign-in", () => {
   it("carries the provider's role into the session and into authentication", async () => {
     const handler = createIdentityHandler({
@@ -68,20 +141,23 @@ describe("identity sign-in", () => {
     // Over https the handshake cookies carry the `__Host-` prefix, which is what
     // stops a sibling host from setting one of them for the parent domain.
     const state = handshake.get("__Host-parallax_oidc_state") as string;
+    lastNonce = handshake.get("__Host-parallax_oidc_nonce") as string;
     assert.match((started as Response).headers.get("location") ?? "", /code_challenge_method=S256/);
+    assert.match((started as Response).headers.get("location") ?? "", /nonce=/u);
 
     const done = await handler(new Request(`https://parallax.example/auth/callback?code=abc&state=${state}`, {
       headers: {
-        cookie: `__Host-parallax_oidc_state=${state}; __Host-parallax_oidc_verifier=${handshake.get("__Host-parallax_oidc_verifier")}; __Host-parallax_oidc_return=/zones`,
+        cookie: `__Host-parallax_oidc_state=${state}; __Host-parallax_oidc_verifier=${handshake.get("__Host-parallax_oidc_verifier")}; __Host-parallax_oidc_return=/zones; __Host-parallax_oidc_nonce=${lastNonce}`,
       },
     }));
     assert.equal(done?.status, 302);
     assert.equal((done as Response).headers.get("location"), "/zones");
-    const session = cookiesOf(done as Response).get(IDENTITY_COOKIE) as string;
+    const session = cookiesOf(done as Response).get(identityCookieName) as string;
+    assert.ok(cookiesOf(done as Response).has("__Host-parallax_oidc_id"));
 
     // The whole point: that cookie is now a principal the control plane accepts.
     const principal = authenticate(
-      new Request("https://parallax.example/api/v1/zones", { headers: { cookie: `${IDENTITY_COOKIE}=${encodeURIComponent(session)}` } }),
+      new Request("https://parallax.example/api/v1/zones", { headers: { cookie: `${identityCookieName}=${encodeURIComponent(session)}` } }),
       { enabled: true, tokens: [{ token: "a-token-of-at-least-32-bytes-long-x", subject: "deploy", role: "admin" }], identitySessionSecret: SECRET },
     );
     assert.deepEqual(principal, { role: "editor", subject: "keystone-user-1" });
@@ -98,7 +174,7 @@ describe("identity sign-in", () => {
     const session = signSession({ subject: "keystone-user-1", role: "viewer", expiresAt: Math.floor(Date.now() / 1000) + 60 }, SECRET);
 
     const answered = await handler(new Request(`https://parallax.example${SESSION_PATH}`, {
-      headers: { cookie: `${IDENTITY_COOKIE}=${encodeURIComponent(session)}` },
+      headers: { cookie: `${identityCookieName}=${encodeURIComponent(session)}` },
     }));
     assert.equal(answered.status, 200);
     assert.deepEqual(await answered.json(), { role: "viewer", subject: "keystone-user-1" });
@@ -110,7 +186,7 @@ describe("identity sign-in", () => {
       const explicitFailure = await handler(new Request(`https://parallax.example${SESSION_PATH}`, {
         headers: {
           authorization,
-          cookie: `${IDENTITY_COOKIE}=${encodeURIComponent(session)}`,
+          cookie: `${identityCookieName}=${encodeURIComponent(session)}`,
         },
       }));
       assert.equal(explicitFailure.status, 401,
@@ -127,12 +203,12 @@ describe("identity sign-in", () => {
     assert.match((answered as Response).headers.get("location") ?? "", /signin_error/);
     // Not cleared either: a failed sign-in must not sign out whoever is already
     // signed in on this browser.
-    assert.equal(cookiesOf(answered as Response).has(IDENTITY_COOKIE), false, "no session may be issued");
+    assert.equal(cookiesOf(answered as Response).has(identityCookieName), false, "no session may be issued");
   });
 
   it("refuses an account the provider grants no role for", async () => {
     await assert.rejects(
-      readIdentity(CONFIG, assumedEndpoints(CONFIG.issuer), { accessToken: "t", expiresIn: 300 }, provider({ sub: "stranger" })),
+      readIdentity(CONFIG, assumedEndpoints(CONFIG.issuer), { accessToken: "t", idToken: "id", idTokenClaims: { ...directIdTokenClaims, subject: "stranger" }, expiresIn: 300 }, provider({ sub: "stranger" })),
       (error: Error) => {
         // Anyone in the directory can authenticate; that is not the same as
         // being someone here, and defaulting would make it the same.
@@ -147,7 +223,7 @@ describe("identity sign-in", () => {
     // and says in its own console that neither is for authorization. A holder
     // of both and no entitlement is somebody with a job title, not a grant.
     await assert.rejects(
-      readIdentity(CONFIG, assumedEndpoints(CONFIG.issuer), { accessToken: "t", expiresIn: 300 },
+      readIdentity(CONFIG, assumedEndpoints(CONFIG.issuer), { accessToken: "t", idToken: "id", idTokenClaims: { ...directIdTokenClaims, subject: "labelled" }, expiresIn: 300 },
         provider({ sub: "labelled", roles: ["admin"], groups: ["platform"], roles_label: "Administrator" })),
       (error: Error) => {
         assert.match(error.message, /no `entitlements` granting it a role in Parallax/u);
@@ -179,12 +255,13 @@ describe("identity sign-in", () => {
       method: "POST",
       headers: {
         origin: "https://parallax.example",
-        cookie: `${IDENTITY_COOKIE}=${encodeURIComponent(session)}`,
+        cookie: `${identityCookieName}=${encodeURIComponent(session)}`,
       },
     }));
     assert.equal(cleared?.status, 302);
     const cookieHeader = (cleared as Response).headers.getSetCookie().join("\n");
-    assert.match(cookieHeader, new RegExp(`${IDENTITY_COOKIE}=`));
+    assert.match(cookieHeader, new RegExp(`${identityCookieName}=`));
+    assert.match(cookieHeader, /__Host-parallax_oidc_id=/u);
     assert.match(cookieHeader, /Max-Age=0/);
   });
 
@@ -235,7 +312,7 @@ describe("identity sign-in", () => {
     assert.equal(shadowed?.status, 302);
     assert.match((shadowed as Response).headers.get("location") ?? "", /signin_error/u);
     // Not cleared -- never set. The failure path does not reach the exchange.
-    assert.equal(cookiesOf(shadowed as Response).get(IDENTITY_COOKIE), undefined, "no session may be issued");
+    assert.equal(cookiesOf(shadowed as Response).get(identityCookieName), undefined, "no session may be issued");
   });
 
   /**
@@ -252,6 +329,7 @@ describe("identity sign-in", () => {
     const next = "/zones?view=internal#rec";
     const started = await handler(new Request(`https://parallax.example/auth/login?next=${encodeURIComponent(next)}`));
     const handshake = cookiesOf(started as Response);
+    lastNonce = handshake.get("__Host-parallax_oidc_nonce") as string;
     assert.equal(handshake.get("__Host-parallax_oidc_return"), next);
 
     const state = handshake.get("__Host-parallax_oidc_state") as string;
@@ -261,6 +339,7 @@ describe("identity sign-in", () => {
           `__Host-parallax_oidc_state=${state}`,
           `__Host-parallax_oidc_verifier=${handshake.get("__Host-parallax_oidc_verifier")}`,
           `__Host-parallax_oidc_return=${encodeURIComponent(next)}`,
+          `__Host-parallax_oidc_nonce=${lastNonce}`,
         ].join("; "),
       },
     }));
@@ -438,7 +517,7 @@ describe("OIDC discovery", () => {
       scopes: "openid", roleClaim: "parallax/role",
     };
 
-    const identity = await readIdentity(config, assumedEndpoints(ISSUER), { accessToken: "t", expiresIn: 300 }, userinfo);
+    const identity = await readIdentity(config, assumedEndpoints(ISSUER), { accessToken: "t", idToken: "id", idTokenClaims: { ...directIdTokenClaims, subject: "person", issuer: ISSUER, audience: config.clientId }, expiresIn: 300 }, userinfo);
 
     assert.equal(identity.role, "editor", "the named claim, not the default one beside it");
   });

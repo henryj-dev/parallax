@@ -109,7 +109,10 @@ gauge(
 
 const securityConfig = (): SecurityConfig => {
   const tokens = accessTokens.security();
-  return config.oidc ? withIdentityProvider(tokens, config.oidc.sessionSecret) : tokens;
+  const withTokenSessions: SecurityConfig = config.sessionSecret === undefined
+    ? tokens
+    : { ...tokens, tokenSessionSecret: config.sessionSecret };
+  return config.oidc ? withIdentityProvider(withTokenSessions, config.oidc.sessionSecret) : withTokenSessions;
 };
 
 if (!securityConfig().enabled && !isLoopbackHost(config.host)) {

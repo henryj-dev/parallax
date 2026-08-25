@@ -21,6 +21,8 @@ export interface SessionClaims {
   readonly role: Role;
   /** Seconds since the epoch, after which the value is refused. */
   readonly expiresAt: number;
+  /** Random identifier used for revocation of token-backed browser sessions. */
+  readonly id?: string;
 }
 
 const VERSION = "v1";
@@ -39,6 +41,7 @@ export function signSession(claims: SessionClaims, secret: string): string {
     sub: claims.subject,
     role: claims.role,
     exp: claims.expiresAt,
+    ...(claims.id === undefined ? {} : { sid: claims.id }),
   }), "utf8"));
   return `${VERSION}.${payload}.${base64Url(sign(payload, secret))}`;
 }
@@ -67,12 +70,13 @@ export function readSession(value: string, secret: string, now: () => number = D
     return undefined;
   }
   if (typeof claims !== "object" || claims === null) return undefined;
-  const { sub, role, exp } = claims as Record<string, unknown>;
+  const { sub, role, exp, sid } = claims as Record<string, unknown>;
   if (typeof sub !== "string" || sub.length === 0) return undefined;
   if (role !== "admin" && role !== "editor" && role !== "viewer") return undefined;
   if (typeof exp !== "number" || !Number.isFinite(exp)) return undefined;
   if (exp * 1000 <= now()) return undefined;
-  return { subject: sub, role, expiresAt: exp };
+  if (sid !== undefined && (typeof sid !== "string" || sid.length === 0)) return undefined;
+  return { subject: sub, role, expiresAt: exp, ...(sid === undefined ? {} : { id: sid }) };
 }
 
 /** For the state and PKCE values, which only have to be unguessable. */

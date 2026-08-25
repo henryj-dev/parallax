@@ -45,3 +45,16 @@ export function readCookie(
   }
   return candidate;
 }
+
+/**
+ * Names cookies that must not be shadowable by a sibling host.
+ *
+ * The `__Host-` prefix is valid only with Secure cookies, so plain-HTTP
+ * loopback deployments keep the unprefixed name. Callers use this for both
+ * setting and reading; accepting the old name would preserve the shadowing
+ * window during a deployment.
+ */
+export function cookieNameForRequest(base: string, requestOrUrl: Request | URL): string {
+  const url = requestOrUrl instanceof URL ? requestOrUrl : new URL(requestOrUrl.url);
+  return url.protocol === "https:" && !base.startsWith("__Host-") ? `__Host-${base}` : base;
+}

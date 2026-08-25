@@ -1095,7 +1095,7 @@ export function buildOpenApiDocument(options: OpenApiOptions = {}): JsonSchema {
           description: "An access token, issued by `POST /api/v1/tokens` or supplied by the environment. What a machine sends.",
         },
         sessionCookie: {
-          type: "apiKey", in: "cookie", name: "parallax_session",
+          type: "apiKey", in: "cookie", name: "__Host-parallax_session",
           description: "Set by `POST /api/v1/session`, or by signing in through the identity provider. What a browser sends.",
         },
       },

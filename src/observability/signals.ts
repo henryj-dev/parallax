@@ -97,6 +97,12 @@ export const dnsForwardSeconds = histogram(
   [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4],
 );
 
+/** Forwarding failures, split by configured upstream index and bounded reason. */
+export const dnsForwardFailures = counter(
+  "parallax_dns_forward_failures_total",
+  "DNS forwarding failures by configured upstream index and reason.",
+);
+
 /** Answers the API sent, by status. A bounded set: this code chooses them all. */
 export const httpAnswered = counter(
   "parallax_http_responses_total",

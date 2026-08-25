@@ -1,5 +1,5 @@
-import { readSession, assertSessionSecret } from "./session-token.ts";
-import { readCookie as readCookieValue } from "./cookies.ts";
+import { readSession, assertSessionSecret, randomUrlSafe, signSession } from "./session-token.ts";
+import { cookieNameForRequest, readCookie as readCookieValue } from "./cookies.ts";
 import { createHash, timingSafeEqual } from "node:crypto";
 
 export type Role = "admin" | "editor" | "viewer";
@@ -43,6 +43,8 @@ export interface SecurityConfig {
   readonly lockoutMs?: number;
   /** Lifetime of an issued session cookie in seconds. Defaults to 12 hours. */
   readonly sessionMaxAgeSeconds?: number;
+  /** Signs browser sessions exchanged from bearer tokens. */
+  readonly tokenSessionSecret?: string;
   /**
    * Signs the cookie an identity provider login leaves behind. Absent means no
    * such login is offered, and only tokens authenticate.
@@ -89,15 +91,18 @@ interface PreparedConfig {
   readonly cookieName: string;
   readonly tokens: readonly PreparedToken[];
   readonly identitySessionSecret?: string;
+  readonly tokenSessionSecret?: string;
   readonly onTokenUse?: (id: string) => void;
 }
+
+type RevokedSessions = Map<string, number>;
 
 const trustedClientKeys = new WeakMap<Request, string>();
 /**
  * The principal this layer already established, so the routing layer does not
  * authenticate the same request a second time to learn its role.
  */
-const resolvedPrincipals = new WeakMap<Request, Principal>();
+  const resolvedPrincipals = new WeakMap<Request, Principal>();
 
 /** The principal `createAuthorizedHandler` proved, when this request came through it. */
 export function resolvedPrincipal(request: Request): Principal | undefined {
@@ -217,6 +222,7 @@ export function createAuthorizedHandler(
     initial.lockoutMs ?? DEFAULT_LOCKOUT_MS,
     now,
   );
+  const revokedSessions: RevokedSessions = new Map();
   let cachedConfig: SecurityConfig | undefined;
   let cachedPrepared: PreparedConfig | undefined;
   const preparedFor = (config: SecurityConfig): PreparedConfig => {
@@ -239,9 +245,9 @@ export function createAuthorizedHandler(
     }
     const prepared = preparedFor(config);
     const sessionMaxAge = config.sessionMaxAgeSeconds ?? DEFAULT_SESSION_MAX_AGE_SECONDS;
-    if (isSessionRoute(request)) return handleSession(request, prepared, throttle, sessionMaxAge, clientKey);
+    if (isSessionRoute(request)) return handleSession(request, prepared, throttle, sessionMaxAge, clientKey, now, revokedSessions);
 
-    const principal = authenticateWithPreparedTokens(request, prepared);
+    const principal = authenticateWithPreparedTokens(request, prepared, revokedSessions, now);
     if (!principal) {
       const retryAfterMs = throttle.recordFailure(clientKey);
       return retryAfterMs === undefined ? authenticationError(401) : tooManyAttempts(retryAfterMs);
@@ -279,12 +285,14 @@ async function handleSession(
   throttle: FailureThrottle,
   maxAgeSeconds: number,
   clientKey: string,
+  now: () => number,
+  revokedSessions: RevokedSessions,
 ): Promise<Response> {
   if (request.method === "GET") {
     // Who the caller currently is. The portal draws itself from this: an
     // administration control it cannot use is worse than one it cannot see,
     // because pressing it is the only way to find out.
-    const principal = authenticateWithPreparedTokens(request, prepared);
+    const principal = authenticateWithPreparedTokens(request, prepared, revokedSessions, now);
     return principal
       ? Response.json({ role: principal.role, subject: principal.subject }, { headers: { "cache-control": "no-store" } })
       : authenticationError(401);
@@ -294,6 +302,7 @@ async function handleSession(
   }
   if (!hasSameOrigin(request)) return authenticationError(403);
   if (request.method === "DELETE") {
+    revokeTokenSession(request, prepared, revokedSessions, now);
     return new Response(null, {
       status: 204,
       headers: { "cache-control": "no-store", "set-cookie": clearedCookieValue(prepared.cookieName, request) },
@@ -312,21 +321,34 @@ async function handleSession(
     const retryAfterMs = throttle.recordFailure(clientKey);
     return retryAfterMs === undefined ? authenticationError(401) : tooManyAttempts(retryAfterMs);
   }
+  if (prepared.tokenSessionSecret === undefined) {
+    return Response.json(
+      { error: "session_unavailable", message: "a session signing secret is not configured" },
+      { status: 503, headers: { "cache-control": "no-store" } },
+    );
+  }
+  const session = signSession({
+    subject: principal.subject,
+    role: principal.role,
+    expiresAt: Math.floor(now() / 1000) + maxAgeSeconds,
+    id: randomUrlSafe(18),
+  }, prepared.tokenSessionSecret);
   return Response.json(
     { role: principal.role, subject: principal.subject, expiresIn: maxAgeSeconds },
     {
       status: 200,
       headers: {
         "cache-control": "no-store",
-        "set-cookie": sessionCookieValue(prepared.cookieName, candidate as string, request, maxAgeSeconds),
+        "set-cookie": sessionCookieValue(prepared.cookieName, session, request, maxAgeSeconds),
       },
     },
   );
 }
 
 function sessionCookieValue(name: string, token: string, request: Request, maxAgeSeconds: number): string {
+  const cookieName = cookieNameForRequest(name, request);
   return [
-    `${name}=${encodeURIComponent(token)}`,
+    `${cookieName}=${encodeURIComponent(token)}`,
     "Path=/",
     "HttpOnly",
     "SameSite=Strict",
@@ -336,8 +358,9 @@ function sessionCookieValue(name: string, token: string, request: Request, maxAg
 }
 
 function clearedCookieValue(name: string, request: Request): string {
+  const cookieName = cookieNameForRequest(name, request);
   return [
-    `${name}=`,
+    `${cookieName}=`,
     "Path=/",
     "HttpOnly",
     "SameSite=Strict",
@@ -446,6 +469,7 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
   const cookieName = config.cookieName ?? "parallax_session";
   if (!COOKIE_NAME_PATTERN.test(cookieName)) throw invalidConfiguration();
   if (config.identitySessionSecret !== undefined) assertSessionSecret(config.identitySessionSecret);
+  if (config.tokenSessionSecret !== undefined) assertSessionSecret(config.tokenSessionSecret);
 
   const prepared: PreparedToken[] = [];
   // A `Set` rather than a scan of every digest prepared so far. The scan was
@@ -480,11 +504,17 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
     cookieName,
     tokens: prepared,
     ...(config.identitySessionSecret === undefined ? {} : { identitySessionSecret: config.identitySessionSecret }),
+    ...(config.tokenSessionSecret === undefined ? {} : { tokenSessionSecret: config.tokenSessionSecret }),
     ...(config.onTokenUse === undefined ? {} : { onTokenUse: config.onTokenUse }),
   };
 }
 
-function authenticateWithPreparedTokens(request: Request, prepared: PreparedConfig): Principal | undefined {
+function authenticateWithPreparedTokens(
+  request: Request,
+  prepared: PreparedConfig,
+  revokedSessions: RevokedSessions = new Map(),
+  now: () => number = Date.now,
+): Principal | undefined {
   const authorization = request.headers.get("authorization");
   if (authorization !== null) {
     const match = /^Bearer ([^\s]+)$/iu.exec(authorization);
@@ -492,9 +522,13 @@ function authenticateWithPreparedTokens(request: Request, prepared: PreparedConf
     // value must not silently inherit the browser's OIDC identity cookie.
     return match?.[1] === undefined ? undefined : matchToken(match[1], prepared);
   }
-  const candidate = readCookie(request.headers.get("cookie"), prepared.cookieName);
-  const byToken = candidate === undefined ? undefined : matchToken(candidate, prepared);
-  if (byToken) return byToken;
+  const candidate = readCookie(request.headers.get("cookie"), cookieNameForRequest(prepared.cookieName, request));
+  if (prepared.tokenSessionSecret !== undefined) {
+    return candidate === undefined ? undefined : matchTokenSession(candidate, prepared.tokenSessionSecret, revokedSessions, now);
+  }
+  // A token-shaped cookie is never accepted without the separate signing
+  // secret. This also retires raw bearer cookies left by an older deployment.
+  if (candidate !== undefined) return undefined;
   // Second, not first: a request that presented a token meant to act as that
   // token, and answering it as whoever the browser happens to be signed in as
   // would attribute the change to the wrong actor.
@@ -503,8 +537,27 @@ function authenticateWithPreparedTokens(request: Request, prepared: PreparedConf
     : matchIdentitySession(request, prepared.identitySessionSecret);
 }
 
+function matchTokenSession(value: string, secret: string, revokedSessions: RevokedSessions, now: () => number): Principal | undefined {
+  const claims = readSession(value, secret, now);
+  if (claims === undefined || claims.id === undefined) return undefined;
+  if (revokedSessions.has(claims.id)) return undefined;
+  return { role: claims.role, subject: claims.subject };
+}
+
+function revokeTokenSession(request: Request, prepared: PreparedConfig, revokedSessions: RevokedSessions, now: () => number): void {
+  if (prepared.tokenSessionSecret === undefined) return;
+  const value = readCookie(request.headers.get("cookie"), cookieNameForRequest(prepared.cookieName, request));
+  if (value === undefined) return;
+  const claims = readSession(value, prepared.tokenSessionSecret, now);
+  if (claims?.id === undefined) return;
+  revokedSessions.set(claims.id, claims.expiresAt);
+  for (const [id, expiresAt] of revokedSessions) {
+    if (expiresAt <= Math.floor(now() / 1000) || revokedSessions.size > 10_000) revokedSessions.delete(id);
+  }
+}
+
 function matchIdentitySession(request: Request, secret: string): Principal | undefined {
-  const value = readCookie(request.headers.get("cookie"), IDENTITY_COOKIE);
+  const value = readCookie(request.headers.get("cookie"), cookieNameForRequest(IDENTITY_COOKIE, request));
   if (value === undefined) return undefined;
   const claims = readSession(value, secret);
   return claims === undefined ? undefined : { role: claims.role, subject: claims.subject };

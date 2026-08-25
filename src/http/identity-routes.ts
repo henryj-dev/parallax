@@ -1,5 +1,5 @@
 import type { OidcSettings } from "../config.ts";
-import { readCookie as readCookieValue } from "../security/cookies.ts";
+import { cookieNameForRequest, readCookie as readCookieValue } from "../security/cookies.ts";
 import { hasSameOrigin, IDENTITY_COOKIE } from "../security/http-authorization.ts";
 import { beginAuthorization, createEndpointResolver, endSessionUrl, exchangeCode, readIdentity, OidcError, type OidcConfig } from "../security/oidc.ts";
 import { randomUrlSafe, signSession } from "../security/session-token.ts";
@@ -10,6 +10,7 @@ export const IDENTITY_PREFIX = "/auth";
 const STATE_COOKIE = "parallax_oidc_state";
 const VERIFIER_COOKIE = "parallax_oidc_verifier";
 const RETURN_COOKIE = "parallax_oidc_return";
+const NONCE_COOKIE = "parallax_oidc_nonce";
 const ID_TOKEN_COOKIE = "parallax_oidc_id";
 /** Long enough to sign in, short enough that an abandoned attempt is not lying around. */
 const HANDSHAKE_SECONDS = 600;
@@ -71,12 +72,13 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
   };
 
   async function startLogin(url: URL): Promise<Response> {
-    const { url: authorize, state, verifier } = beginAuthorization(config, await endpointsOf());
+    const { url: authorize, state, verifier, nonce } = beginAuthorization(config, await endpointsOf());
     const returnTo = safeReturnPath(url.searchParams.get("next"));
     return redirect(authorize, [
       handshakeCookie(handshakeName(STATE_COOKIE, url), state, url),
       handshakeCookie(handshakeName(VERIFIER_COOKIE, url), verifier, url),
       handshakeCookie(handshakeName(RETURN_COOKIE, url), returnTo, url),
+      handshakeCookie(handshakeName(NONCE_COOKIE, url), nonce, url),
     ]);
   }
 
@@ -85,7 +87,8 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
     const expectedState = readCookie(cookies, handshakeName(STATE_COOKIE, url));
     const verifier = readCookie(cookies, handshakeName(VERIFIER_COOKIE, url));
     const returnTo = safeReturnPath(readCookie(cookies, handshakeName(RETURN_COOKIE, url)));
-    const cleared = [STATE_COOKIE, VERIFIER_COOKIE, RETURN_COOKIE]
+    const expectedNonce = readCookie(cookies, handshakeName(NONCE_COOKIE, url));
+    const cleared = [STATE_COOKIE, VERIFIER_COOKIE, RETURN_COOKIE, NONCE_COOKIE]
       .map((name) => clearedCookie(handshakeName(name, url), url));
 
     const provided = url.searchParams.get("error");
@@ -100,13 +103,13 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
     const state = url.searchParams.get("state");
     // A callback whose state does not match the one this browser was given is
     // somebody else's callback, replayed here.
-    if (!code || !state || !expectedState || !verifier || state !== expectedState) {
+    if (!code || !state || !expectedState || !verifier || !expectedNonce || state !== expectedState) {
       return failure("this sign-in did not start here, or it took too long", cleared, url);
     }
 
     try {
       const endpoints = await endpointsOf();
-      const tokens = await exchangeCode(config, endpoints, code, verifier, fetchImpl);
+      const tokens = await exchangeCode(config, endpoints, code, verifier, expectedNonce, fetchImpl);
       const identity = await readIdentity(config, endpoints, tokens, fetchImpl);
       const expiresAt = Math.floor(now() / 1000) + settings.sessionMaxAgeSeconds;
       const session = signSession({ subject: identity.subject, role: identity.role, expiresAt }, settings.sessionSecret);
@@ -127,8 +130,8 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
   }
 
   async function logout(request: Request, url: URL): Promise<Response> {
-    const idToken = readCookie(request.headers.get("cookie"), ID_TOKEN_COOKIE);
-    const cleared = [clearedCookie(IDENTITY_COOKIE, url), clearedCookie(ID_TOKEN_COOKIE, url)];
+    const idToken = readCookie(request.headers.get("cookie"), handshakeName(ID_TOKEN_COOKIE, url));
+    const cleared = [clearedCookie(handshakeName(IDENTITY_COOKIE, url), url), clearedCookie(handshakeName(ID_TOKEN_COOKIE, url), url)];
     const returnTo = new URL("/", url).toString();
     return redirect(endSessionUrl(await endpointsOf(), idToken, returnTo), cleared);
   }
@@ -167,7 +170,7 @@ function redirect(location: string, cookies: string[]): Response {
  * outright and no sign-in would ever complete.
  */
 function handshakeName(base: string, url: URL): string {
-  return url.protocol === "https:" ? `__Host-${base}` : base;
+  return cookieNameForRequest(base, url);
 }
 
 function handshakeCookie(name: string, value: string, url: URL): string {
@@ -178,7 +181,7 @@ function handshakeCookie(name: string, value: string, url: URL): string {
 }
 
 function sessionCookie(name: string, value: string, url: URL, maxAgeSeconds: number): string {
-  return cookie(name, value, url, maxAgeSeconds, "Lax");
+  return cookie(handshakeName(name, url), value, url, maxAgeSeconds, "Lax");
 }
 
 function clearedCookie(name: string, url: URL): string {
@@ -210,4 +213,4 @@ function readCookie(header: string | null, name: string): string | undefined {
   return readCookieValue(header, name);
 }
 
-export const IDENTITY_TEST_COOKIES = { STATE_COOKIE, VERIFIER_COOKIE, RETURN_COOKIE, ID_TOKEN_COOKIE, randomUrlSafe };
+export const IDENTITY_TEST_COOKIES = { STATE_COOKIE, VERIFIER_COOKIE, RETURN_COOKIE, NONCE_COOKIE, ID_TOKEN_COOKIE, randomUrlSafe };

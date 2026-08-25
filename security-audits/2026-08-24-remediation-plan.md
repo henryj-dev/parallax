@@ -84,6 +84,10 @@
   못하고, 완료 정의 1 이 요구하는 것이 정확히 그 구별이다.
 - ⚠️ 포털은 이 쿠키를 **읽지 않는다**(HttpOnly, `public/api-client.js:26`). 그래서 이
   변경의 파급은 서버 안에 갇힌다 — 확인했고, 그게 이 항목을 생각보다 값싸게 만든다.
+- **적용한 결정:** ㉠. `PARALLAX_SESSION_SECRET`(최소 32바이트)을 모든 replica 에
+  동일하게 배포하며, 미설정 시 토큰 세션 발급을 거부한다. 삭제 후 재사용 차단은
+  프로세스별 폐기 목록으로 보장한다. replica 를 가로지르는 즉시 폐기가 요구되면
+  공유 폐기 저장소가 별도 설계로 필요하다.
 
 ### A2 · 세션 쿠키에 `__Host-` 접두사가 없다 — `S`
 
@@ -130,10 +134,8 @@
      discovery 가 자기 것이라 주장한 값(`oidc.ts:96` 이 이미 그 자기주장을 검사한다)과,
      `aud` 는 `config.clientId` 와 대조한다.
   2. **UserInfo 의 `sub` 가 ID token 의 `sub` 와 같은지 대조한다.** OIDC Core §5.3.2
-     의 **MUST** 이고, 지금 `readIdentity` 는 userinfo 의 `sub` 만 읽는다.
-  3. `id_token` 이 없을 때 어떻게 할지 정한다 — 지금은 **없어도 통과**한다
-     (`oidc.ts` 의 `idToken` 이 optional). 필수로 만들 것인지가 이 항목의 유일한
-     설계 판단이다.
+     의 **MUST** 이며, `readIdentity` 에서 대조한다.
+  3. `id_token` 을 필수로 받고, `iss`·`aud`·`exp`·`sub`·`nonce` 를 검증한다.
 - **완료 정의:** 위 셋이 각각 틀린 값을 받았을 때 로그인이 `OidcError` 로 실패한다.
 - **회귀 테스트** (전부 가짜 `fetchImpl` 로):
   - `aud` 가 다른 ID token → 거부
@@ -146,19 +148,24 @@
   있다고 적고 있고 `exchangeCode` 가 정확히 그 경우다. **다만 그 예외가
   `iss`·`aud`·`exp` 까지 면제해 주지는 않는다** — 그래서 위 셋은 남는다. JWKS 는
   별건으로 둔다.
+- **적용 결과:** `exchangeCode` 가 ID token 을 필수화하고 위 claim 을 검증하며,
+  `readIdentity` 가 UserInfo `sub` 를 다시 대조한다. 회귀 테스트는 정상값과 다른
+  issuer/audience, 만료, 빈 subject, subject 불일치, malformed/missing ID token 을
+  포함한다.
 
 ### A4 · `nonce` — **발행이 먼저다** — `S` · A3 뒤
 
 - **어디:** `src/security/oidc.ts:184`(`beginAuthorization`) · 콜백
   `src/http/identity-routes.ts:95-110`
-- **지금 무엇이:** 인가 요청 파라미터는 `response_type` · `client_id` ·
-  `redirect_uri` · `scope` · `state` · `code_challenge` · `code_challenge_method`
-  뿐이고 `grep -n nonce src/security/oidc.ts` 는 **0건**이다.
+- **지금 무엇이:** 인가 요청에 nonce 를 추가하고 핸드셰이크 쿠키에 보관한다.
 - **변경:** 인가 요청에 `nonce` 를 넣고 `state`·`verifier` 와 같은 방식으로 핸드셰이크
   쿠키에 보관했다가, 콜백에서 ID token 의 `nonce` 와 대조한다.
 - **완료 정의:** 저 grep 이 0건이 아니게 되고, 값이 다른 `nonce` 를 든 ID token 이
   거부된다.
 - **회귀 테스트:** 다른 `nonce` → 거부. `nonce` 없는 ID token → 거부.
+- **적용 결과:** `beginAuthorization` 이 nonce 를 발행하고 `__Host-` 핸드셰이크
+  쿠키에 저장한다. 콜백은 이를 반드시 읽어 `exchangeCode` 에 전달하며, 불일치와
+  누락을 거부한다.
 - ⚠️ **A3 없이 이것만 하면 아무것도 사지 못한다** — 대조할 자리가 없다. 이 계획에서
   강제 순서가 있는 유일한 쌍이다.
 - ⚠️ 핸드셰이크 쿠키가 하나 늘어난다. **A2 의 이름 규칙을 그대로 따를 것.**
@@ -253,6 +260,9 @@
      `skipped` 수를 그 목록과 대조한다」를 넣는다 — `XS`
   2. 테스트 하나가 **알려진 스킵 수와 다르면 실패**하게 한다 — `S`. 사유 없는 새
      스킵을 CI 가 막는다
+- 이번 remediation은 첫 번째 방식을 적용했다. 현재 셋과 사유는
+  [`docs/test-skips.md`](../docs/test-skips.md)에 기록하고, 검수 절차는 `pnpm test`
+  요약의 `skipped N`을 그 목록과 대조한다.
 - **완료 정의:** 사유 없는 스킵이 하나 늘었을 때 **사람이 아니라 무언가가** 그것을
   말한다.
 - 📌 현재 셋: `test/infrastructure/atomic-file.test.ts:103` · `:122`
@@ -335,5 +345,70 @@ pnpm check && pnpm run check:portal && pnpm build && pnpm test
 
 ## 부록 A · 4단계 점검 결과
 
-*(비어 있다. A7 ~ A13 을 하나 닫을 때마다 여기에 한 문단씩 적는다 — 무엇을 봤고,
-무엇이 나왔고, 안 나왔으면 안 나왔다고.)*
+### A7 — dependency audit
+
+`package.json`, `pnpm-lock.yaml`, and the `audit` script were inspected. The
+production dependency set declares `pg` only. The credentialed networked run
+of `pnpm audit --audit-level moderate` returned `No known vulnerabilities
+found`.
+
+### A8 — migrations
+
+All five SQL migrations were read. The schema changes use `IF NOT EXISTS` for
+columns/tables, named-constraint catalog guards for later constraints, and
+transactions. Migrations 004 and 005 validate their new invariants; migration
+003 intentionally uses `NOT VALID` because it only widens the allowed action
+set. `src/infrastructure/migrations.ts` applies ordered files and records the
+applied version, so an older installation has a forward path. No unguarded
+destructive or secret-bearing migration was found.
+
+### A9 — Dockerfile
+
+The image was read together with `.github/workflows/docker.yml`. It builds on
+Node 24, installs production dependencies in a separate stage, copies the
+compiled app and assets to fixed paths, makes application files non-writable,
+creates `/var/lib/parallax` as the only writable file-backend directory, and
+runs as numeric uid 10001. The CI smoke assertions check uid 10001, portal
+availability, and that the serving uid cannot write migrations. No additional
+Docker finding was identified by this static review; an actual image build was
+not run locally.
+
+### A10 — GitHub Actions
+
+All five workflow files were inspected. The workflows use `contents: read` by
+default, with CodeQL narrowly adding `security-events: write` and the
+dependency-review workflow adding pull-request comments. No
+`pull_request_target` trigger was found. Third-party actions use major-version
+tags rather than immutable SHAs, which is a supply-chain traceability
+trade-off, but the workflows disable checkout credential persistence and do
+not expose deployment secrets to fork `pull_request` jobs. The dependency
+review comment permission is the only pull-request write permission.
+
+### A11 — hook and script suites
+
+The Python suites under `scripts/claude-hooks/` and
+`scripts/git-hooks/` were executed directly, and the repository's CI loop runs
+the same suites with a clean git identity/default branch setup. The suites
+reported zero failures. The shellcheck job was inspected; it covers
+`scripts/*.sh` at warning severity and deliberately excludes the Python hook
+snapshot. `shellcheck` is not installed in this macOS worktree, so its binary
+did not run locally; no local change was made to the stardust snapshot.
+
+### A12 — portal browser interaction
+
+The local portal was exercised in Chrome against `http://127.0.0.1:9900/` with
+an ephemeral test token. A stored TXT record value and token subject containing
+`<img src=x onerror="window.__parallaxXss=...">` were rendered in the zone
+detail, record list, revision, audit, and token views. They appeared as text;
+the browser reported zero matching `img[src="x"]`, zero `[onerror]` attributes,
+and `window.__parallaxXss` remained zero. The `signin_error` query path was also
+tested: the message appeared in the auth alert via text content, the query was
+removed from the URL, and the same zero-element checks held. No browser console
+errors were reported.
+
+### A13 — Cloudflare verification
+
+`pnpm verify:cloudflare` requires credentials for a real zone and has not been
+run in this worktree. The direct script invocation returned
+`skipped: set CF_ZONE to run the Cloudflare verification`; this is recorded as
+an unperformed external verification, not as a passing result.
