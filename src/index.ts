@@ -436,7 +436,10 @@ function isAuthenticated(request: IncomingMessage): boolean {
     const value = request.headers[name];
     if (typeof value === "string") headers.set(name, value);
   }
-  return authenticate(new Request("http://localhost/health/ready", { headers }), security) !== undefined;
+  return authenticate(new Request(
+    new URL("/health/ready", requestOrigin(request, nodeHandlerOptions)),
+    { headers },
+  ), security) !== undefined;
 }
 
 // Bound the time a client may take to send headers and a complete request so a
