@@ -9,23 +9,30 @@
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
 </pre>
 
-### 하나의 이름, 두 개의 답.
-
-**split-horizon DNS 컨트롤 플레인이자 운영 포털.**
+### **split-horizon DNS 컨트롤 플레인이자 운영 포털.**
 
 내부 DNS와 외부 프로바이더 DNS의 목표 상태를 한곳에 두고, 바뀌기 전에 미리
 보여 주며, 자기가 소유한 레코드에만 적용합니다.
 
+<br/>
+
 [![check](https://github.com/henryj-dev/parallax/actions/workflows/check.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/check.yml)
-[![scripts](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml)
-[![docker](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml)
 [![codeql](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml)
 [![dependency-review](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml)
+[![docker](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml)
+[![scripts](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml)
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A5%2024-5FA04E)](package.json)
-[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6)](tsconfig.json)
-[![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1-6BA539)](#-http-api)
+<br/>
+
+![node](https://img.shields.io/badge/node-24%2B-5FA04E?logo=node.js&logoColor=white)
+![typescript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
+[![openapi](https://img.shields.io/badge/OpenAPI-3.1-6BA539)](#http-api)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+<br/>
+
+> *시차(parallax)는 같은 것을 다른 자리에서 볼 때 위치가 달라 보이는 현상입니다 —
+> 하나의 대상, 두 개의 답, 그리고 둘 다 옳습니다.*
 
 [English](README.md) · 한국어
 
@@ -33,7 +40,26 @@
 
 ---
 
-## 문제를 그림 하나로
+## 목차
+
+- [문제](#문제)
+- [무엇을 하는가](#무엇을-하는가)
+- [빠른 시작](#빠른-시작)
+- [구조](#구조)
+- [소유권 모델](#소유권-모델)
+- [설정](#설정)
+- [명령줄](#명령줄)
+- [HTTP API](#http-api)
+- [레코드 타입](#레코드-타입)
+- [포털](#포털)
+- [운영](#운영)
+- [개발](#개발)
+- [현재 상태와 한계](#현재-상태와-한계)
+- [라이선스](#라이선스)
+
+---
+
+## 문제
 
 같은 이름이 누가 묻느냐에 따라 다른 것을 가리켜야 합니다. 그걸 두 시스템에
 나눠 두면, 맞게 유지하는 일도 두 번 해야 합니다.
@@ -60,7 +86,7 @@ Parallax는 목표 상태를 **하나만** 두고, 그것을 **두 뷰**로 투�
 
 ---
 
-## ✨ 무엇을 해 주는가
+## 무엇을 하는가
 
 <table>
 <tr>
@@ -133,7 +159,7 @@ AXFR(기본 거부), 아웃바운드 NOTIFY, 허용 목록 기반 포워딩, 클
 
 ---
 
-## 🚀 빠른 시작
+## 빠른 시작
 
 ```bash
 git clone https://github.com/henryj-dev/parallax
@@ -170,7 +196,7 @@ pnpm cli status  --zone example.com     # 각 뷰가 어디까지 적용됐는�
 
 ---
 
-## 🏗️ 어떻게 맞물리는가
+## 구조
 
 ```mermaid
 flowchart LR
@@ -218,7 +244,7 @@ flowchart LR
 
 ---
 
-## 🛡️ 소유권 모델
+## 소유권 모델
 
 Parallax가 사람·Terraform·인증서 봇과 한 존을 나눠 쓰면서도 서로 밟지 않게
 해 주는 부분입니다.
@@ -226,7 +252,7 @@ Parallax가 사람·Terraform·인증서 봇과 한 존을 나눠 쓰면서도 �
 발행하는 모든 레코드는 프로바이더의 자유 텍스트 필드에 마커를 답니다 —
 Cloudflare의 레코드 코멘트, 존 파일의 후행 코멘트:
 
-```
+```text
 parallax-managed:v3:<record-id>:<hmac-signature>
 ```
 
@@ -249,20 +275,78 @@ Cloudflare 코멘트는 100자로 제한되는데, 호출자가 이미 아는 �
 
 ---
 
-## 🖥️ 포털
+## 설정
 
-같은 프로세스가 **한국어와 영어로** 서빙합니다. 빌드 단계는 없습니다.
+루프백에서 파일 상태로 띄우는 데는 아래 중 아무것도 필요하지 않습니다.
 
-- **Horizon 렌즈** — 레코드 하나, 두 개의 답을 나란히
-- **존 작업 공간** — 레코드, 뷰별 동기화 상태, 리비전 진행
-- **적용 계획 대화상자** — 계획을 검토하고 거기서 바로 적용
-- **리비전 이력** — 스냅샷을 훑고 하나를 복원
-- **자격 증명 설정** — 프로필, 존 바인딩, 리졸버 오버라이드, 토큰
-- **로그인** — 액세스 토큰 또는 신원 공급자
+<details open>
+<summary><b>기본</b></summary>
+
+| 변수 | |
+|---|---|
+| `HOST` · `PORT` | API와 포털이 바인드하는 곳. 기본값 `127.0.0.1:3000` |
+| `DATABASE_URL` | PostgreSQL 사용. 없으면 단일 노드 파일 |
+| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | 그 파일들의 위치. 상태 파일은 히스토리를 옆의 `<상태 파일>.d/` 에 둔다 — 백업은 파일 하나가 아니라 디렉터리 단위로 |
+| `PARALLAX_AUTH_TOKENS` | 비상용 토큰(JSON). 평소 토큰은 포털에서 발급 |
+| `PARALLAX_OWNERSHIP_SECRET` | 소유권 마커 서명 |
+| `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장된 프로바이더 자격 증명 암호화(AES-256-GCM) |
+
+</details>
+
+<details>
+<summary><b>TLS와 신원</b></summary>
+
+| 변수 | |
+|---|---|
+| `PARALLAX_TLS_CERT_FILE` · `PARALLAX_TLS_KEY_FILE` | 프록시 뒤가 아니라 프로세스가 직접 TLS 종단. 변경되면 재적재 |
+| `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP를 TLS origin으로 리다이렉트 |
+| `PARALLAX_OIDC_ISSUER` · `_CLIENT_ID` · `_CLIENT_SECRET` · `_REDIRECT_URI` · `_SCOPES` | OpenID Connect 로그인. 엔드포인트는 발급자의 `/.well-known/openid-configuration` 에서 읽는다. 그것을 내놓지 않는 프로바이더는 `{issuer}/oidc/…` 로 되돌아가고 로그인 때 그렇게 말한다 |
+| `PARALLAX_OIDC_ROLE_CLAIM` | 여기서의 역할(`admin`·`editor`·`viewer`)을 담은 userinfo 클레임. 기본값 `entitlements` — 표준 클레임이 없으므로 다르게 부르는 디렉터리는 이름을 대야 한다 |
+| `PARALLAX_OIDC_SESSION_SECRET` · `_SESSION_SECONDS` | 세션 서명과 수명 |
+| `PARALLAX_PORTAL_SIGN_IN` | 로그인하지 않은 방문자에게 포털이 무엇을 제시할지 |
+
+</details>
+
+<details>
+<summary><b>DNS 리스너</b></summary>
+
+`PARALLAX_DNS_PORT`를 설정하는 것이 리스너를 켜는 스위치입니다. 나머지는 모두
+기본값이 있고, 그 기본값은 조심스러운 쪽입니다.
+
+| 변수 | |
+|---|---|
+| `PARALLAX_DNS_PORT` | **리스너를 켭니다.** 설정하지 않으면 포트를 열지 않음 |
+| `PARALLAX_DNS_HOST` | 기본값은 `HOST`, 그다음 `127.0.0.1` |
+| `PARALLAX_DNS_FORWARD_TO` | 모든 존 밖 이름의 상위. 비우면 `REFUSED`로 답함 |
+| `PARALLAX_DNS_FORWARD_ALLOW` | 재귀를 허용할 클라이언트 CIDR. 기본은 루프백이고, 리스너가 루프백이 아니면서 포워딩이 켜져 있으면 **필수** |
+| `PARALLAX_DNS_TRANSFER_ALLOW` | `AXFR`·`IXFR`를 허용할 클라이언트 CIDR. **기본은 전부 거부** |
+| `PARALLAX_DNS_TSIG_KEYS` | `name:algorithm:base64secret`, 쉼표 구분. 키를 하나라도 두면 `AXFR`에 유효한 TSIG 서명이 **필수**가 된다. `hmac-sha256`/`hmac-sha512`만 |
+| `PARALLAX_DNS_NOTIFY_TO` | 서빙 중인 존의 serial이 오를 때 NOTIFY를 받을 호스트. `host`, `host:port`, 또는 서명할 키를 지정하는 `host:port#keyname` |
+| `PARALLAX_DNS_INTERNAL_UPDATE` | `host:port#keyname` — internal 뷰를 **RFC 2136** 서버에도 발행한다. 발행받은 서버는 이 프로세스가 멈춰도 계속 답하고, 이 프로세스 안의 리스너는 그러지 못한다 |
+| `PARALLAX_DNS_SOA_PRIMARY` · `_SOA_MAILBOX` | SOA 필드 |
+| `PARALLAX_DNS_REQUIRE_COOKIE` | RFC 7873 DNS 쿠키 요구 |
+| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND` · `_BURST` · `_MAX_CLIENTS` | 클라이언트별 레이트 리밋 |
+| `PARALLAX_DNS_MAX_TCP_CONNECTIONS` · `_MAX_CONCURRENT_FORWARDS` · `_FORWARD_TIMEOUT_MS` | 자원 상한 |
+
+</details>
+
+<details>
+<summary><b>저장된 설정</b> — 환경변수가 아니라 저장소에 있습니다</summary>
+
+| 설정 | |
+|---|---|
+| `allowLocalProvider` | 대상에 실제 프로바이더가 없을 때 로컬 파일로 발행 |
+| `publicOrigin` | 브라우저가 포털에 닿는 절대 origin. 비우면 요청마다 유도 |
+| `trustForwardedHeaders` | `X-Forwarded-Proto` / `X-Forwarded-Host` 신뢰 |
+| `revisionRetention` | 존마다 보관할 최신 스냅샷 수. `0`이면 전부 보관 |
+| `auditRetentionDays` | 존마다 보관할 감사 이력 일수. `0`이면 전부 보관 |
+| `fallbackResolver` | 클라이언트 측 리졸버 오버라이드가 가리킬 주소 |
+
+</details>
 
 ---
 
-## ⌨️ CLI
+## 명령줄
 
 47개 명령. 어느 것에든 `--json`을 붙이면 기계가 읽는 출력이 나오고,
 `parallax help <command>`로 옵션을 봅니다.
@@ -362,12 +446,12 @@ DATABASE_URL=postgres://… parallax restore < parallax-backup.json
 
 ---
 
-## 🔌 HTTP API
+## HTTP API
 
 **40개 경로.** 프로세스가 자기 명령 표에서 생성하는 OpenAPI 3.1 문서가
 기술합니다 — 그래서 기술과 동작이 갈라질 수 없습니다.
 
-```
+```http
 GET /api/v1/openapi.json
 ```
 
@@ -398,78 +482,47 @@ GET /api/v1/openapi.json
 
 ---
 
-## ⚙️ 설정
+## 레코드 타입
 
-루프백에서 파일 상태로 띄우는 데는 아래 중 아무것도 필요하지 않습니다.
+23종. presentation format의 RDATA로 검증합니다 — 존 파일이 타입 뒤에 적는 바로
+그 텍스트입니다:
 
-<details open>
-<summary><b>기본</b></summary>
+```text
+A · AAAA · CAA · CERT · CNAME · DNAME · DNSKEY · DS · HINFO · HTTPS · LOC · MX
+NAPTR · NS · OPENPGPKEY · PTR · SMIMEA · SRV · SSHFP · SVCB · TLSA · TXT · URI
+```
 
-| 변수 | |
-|---|---|
-| `HOST` · `PORT` | API와 포털이 바인드하는 곳. 기본값 `127.0.0.1:3000` |
-| `DATABASE_URL` | PostgreSQL 사용. 없으면 단일 노드 파일 |
-| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | 그 파일들의 위치. 상태 파일은 히스토리를 옆의 `<상태 파일>.d/` 에 둔다 — 백업은 파일 하나가 아니라 디렉터리 단위로 |
-| `PARALLAX_AUTH_TOKENS` | 비상용 토큰(JSON). 평소 토큰은 포털에서 발급 |
-| `PARALLAX_OWNERSHIP_SECRET` | 소유권 마커 서명 |
-| `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장된 프로바이더 자격 증명 암호화(AES-256-GCM) |
+`SOA`는 제외했고, 서명자가 자기가 서명하는 존에 대해 만들어 내는 DNSSEC
+레코드 — `RRSIG`, `NSEC`, `NSEC3` — 도 제외했습니다. 모든 프로바이더가 그것들을
+스스로 만들고, 우리 것을 발행하면 묻지도 않은 답을 덮어쓰게 됩니다. `DS`와
+`DNSKEY`는 **넣었습니다**. `DS`는 부모에 놓여 서명된 자식으로 위임하는 것이고,
+그것은 남의 존에 대한 운영자의 결정이기 때문입니다.
 
-</details>
-
-<details>
-<summary><b>TLS와 신원</b></summary>
-
-| 변수 | |
-|---|---|
-| `PARALLAX_TLS_CERT_FILE` · `PARALLAX_TLS_KEY_FILE` | 프록시 뒤가 아니라 프로세스가 직접 TLS 종단. 변경되면 재적재 |
-| `PARALLAX_HTTP_REDIRECT_PORT` | 평문 HTTP를 TLS origin으로 리다이렉트 |
-| `PARALLAX_OIDC_ISSUER` · `_CLIENT_ID` · `_CLIENT_SECRET` · `_REDIRECT_URI` · `_SCOPES` | OpenID Connect 로그인. 엔드포인트는 발급자의 `/.well-known/openid-configuration` 에서 읽는다. 그것을 내놓지 않는 프로바이더는 `{issuer}/oidc/…` 로 되돌아가고 로그인 때 그렇게 말한다 |
-| `PARALLAX_OIDC_ROLE_CLAIM` | 여기서의 역할(`admin`·`editor`·`viewer`)을 담은 userinfo 클레임. 기본값 `entitlements` — 표준 클레임이 없으므로 다르게 부르는 디렉터리는 이름을 대야 한다 |
-| `PARALLAX_OIDC_SESSION_SECRET` · `_SESSION_SECONDS` | 세션 서명과 수명 |
-| `PARALLAX_PORTAL_SIGN_IN` | 로그인하지 않은 방문자에게 포털이 무엇을 제시할지 |
-
-</details>
-
-<details>
-<summary><b>DNS 리스너</b></summary>
-
-`PARALLAX_DNS_PORT`를 설정하는 것이 리스너를 켜는 스위치입니다. 나머지는 모두
-기본값이 있고, 그 기본값은 조심스러운 쪽입니다.
-
-| 변수 | |
-|---|---|
-| `PARALLAX_DNS_PORT` | **리스너를 켭니다.** 설정하지 않으면 포트를 열지 않음 |
-| `PARALLAX_DNS_HOST` | 기본값은 `HOST`, 그다음 `127.0.0.1` |
-| `PARALLAX_DNS_FORWARD_TO` | 모든 존 밖 이름의 상위. 비우면 `REFUSED`로 답함 |
-| `PARALLAX_DNS_FORWARD_ALLOW` | 재귀를 허용할 클라이언트 CIDR. 기본은 루프백이고, 리스너가 루프백이 아니면서 포워딩이 켜져 있으면 **필수** |
-| `PARALLAX_DNS_TRANSFER_ALLOW` | `AXFR`·`IXFR`를 허용할 클라이언트 CIDR. **기본은 전부 거부** |
-| `PARALLAX_DNS_TSIG_KEYS` | `name:algorithm:base64secret`, 쉼표 구분. 키를 하나라도 두면 `AXFR`에 유효한 TSIG 서명이 **필수**가 된다. `hmac-sha256`/`hmac-sha512`만 |
-| `PARALLAX_DNS_NOTIFY_TO` | 서빙 중인 존의 serial이 오를 때 NOTIFY를 받을 호스트. `host`, `host:port`, 또는 서명할 키를 지정하는 `host:port#keyname` |
-| `PARALLAX_DNS_INTERNAL_UPDATE` | `host:port#keyname` — internal 뷰를 **RFC 2136** 서버에도 발행한다. 발행받은 서버는 이 프로세스가 멈춰도 계속 답하고, 이 프로세스 안의 리스너는 그러지 못한다 |
-| `PARALLAX_DNS_SOA_PRIMARY` · `_SOA_MAILBOX` | SOA 필드 |
-| `PARALLAX_DNS_REQUIRE_COOKIE` | RFC 7873 DNS 쿠키 요구 |
-| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND` · `_BURST` · `_MAX_CLIENTS` | 클라이언트별 레이트 리밋 |
-| `PARALLAX_DNS_MAX_TCP_CONNECTIONS` · `_MAX_CONCURRENT_FORWARDS` · `_FORWARD_TIMEOUT_MS` | 자원 상한 |
-
-</details>
-
-<details>
-<summary><b>저장된 설정</b> — 환경변수가 아니라 저장소에 있습니다</summary>
-
-| 설정 | |
-|---|---|
-| `allowLocalProvider` | 대상에 실제 프로바이더가 없을 때 로컬 파일로 발행 |
-| `publicOrigin` | 브라우저가 포털에 닿는 절대 origin. 비우면 요청마다 유도 |
-| `trustForwardedHeaders` | `X-Forwarded-Proto` / `X-Forwarded-Host` 신뢰 |
-| `revisionRetention` | 존마다 보관할 최신 스냅샷 수. `0`이면 전부 보관 |
-| `auditRetentionDays` | 존마다 보관할 감사 이력 일수. `0`이면 전부 보관 |
-| `fallbackResolver` | 클라이언트 측 리졸버 오버라이드가 가리킬 주소 |
-
-</details>
+> [!WARNING]
+> **외부** 뷰에 비공개 주소를 발행하려면 해당 레코드에 `acknowledgeNonGlobalIp`를
+> 설정해야 합니다. 그러지 않으면 거부됩니다 — `10.0.0.11`을 공개 인터넷에 올리는
+> 것은 대개 실수이고, 실수가 아닐 때는 누군가 일부러 한 것이어야 합니다.
 
 ---
 
-## 📊 관측
+---
+
+## 포털
+
+같은 프로세스가 **한국어와 영어로** 서빙합니다. 빌드 단계는 없습니다.
+
+- **Horizon 렌즈** — 레코드 하나, 두 개의 답을 나란히
+- **존 작업 공간** — 레코드, 뷰별 동기화 상태, 리비전 진행
+- **적용 계획 대화상자** — 계획을 검토하고 거기서 바로 적용
+- **리비전 이력** — 스냅샷을 훑고 하나를 복원
+- **자격 증명 설정** — 프로필, 존 바인딩, 리졸버 오버라이드, 토큰
+- **로그인** — 액세스 토큰 또는 신원 공급자
+
+---
+
+## 운영
+
+### 관측
 
 | 엔드포인트 | |
 |---|---|
@@ -480,7 +533,7 @@ GET /api/v1/openapi.json
 게이지는 선언 시점에 레지스트리로 복사하지 않고, 값을 이미 쥔 쪽에서 스크레이프
 시점에 읽습니다. 복사본이 낡는 경로를 만들지 않기 위해서입니다.
 
-```
+```text
 parallax_ready                                  readiness 를 통과할 상태면 1
 parallax_desired_state_age_seconds              목표 상태를 마지막으로 읽은 뒤 경과
 parallax_desired_state_max_age_seconds          readiness 가 실패하기까지 허용되는 낡음
@@ -495,9 +548,7 @@ parallax_refresh_failures_total                 서브시스템별 백그라운�
 parallax_tls_certificate_reload_failures_total  실패한 인증서 재적재
 ```
 
----
-
-## 🐳 배포
+### 배포
 
 ```bash
 docker build -t parallax .
@@ -516,6 +567,38 @@ docker run --rm -p 3000:3000 \
 |---|---|
 | **PostgreSQL** | `DATABASE_URL`이 설정됐을 때. 7개 테이블, `parallax migrate`가 적용 |
 | **파일** | 그 밖의 경우. 원자적 쓰기, `0700` 디렉터리 안의 `0600` 파일 |
+
+### 배포 시 보안 가정
+
+DNS `servedByProvider` 경로는 클라이언트가 `forwardAllow` 밖에 있어도 프로바이더
+플레이스홀더 이름을 의도적으로 중계합니다. 일반적인 오픈 리졸버는 아닙니다. 이름이
+서비스 중인 존에 속해야 하고 그 존에 설정된 플레이스홀더여야 합니다. UDP·TCP 진입점
+모두 클라이언트별 레이트 리미터를 적용하며, `maxConcurrentForwards`(기본 `256`)가
+동시 작업량을 제한합니다. 다만 `forwardTo`가 내부 리졸버를 가리키면 이 경로는 외부
+클라이언트에게 내부 DNS 응답을 제한적으로 노출합니다. 내부 이름 노출과 SSRF 유사
+도달성을 배포 위협 모델의 일부로 취급하고, 플레이스홀더 집합은 중계해도 안전한
+이름으로만 유지하십시오.
+
+인가는 존 단위가 아니라 라우트 단위입니다. `editor`는 이 배포가 보는 모든 존을
+편집·적용·임포트·복원할 수 있으며 존별 RBAC은 없습니다. 여러 팀이 함께 쓰는 배포는
+존을 별도 컨트롤 플레인으로 분리하거나, 에디터를 테넌트 범위로 취급하기 전에 명시적인
+존 인가 계층을 추가해야 합니다.
+
+쿠키들은 보안상 의미가 각각 다릅니다. `parallax_identity`(HTTPS에서는 `__Host-`
+접두사)는 HMAC 서명된 신원 세션이고, `parallax_session`은 토큰 세션이며,
+`parallax_oidc_id`는 IdP 로그아웃에만 쓰이는 민감한 프로바이더 ID 토큰으로 API 베어러
+자격증명이 아닙니다. HTTPS 배포는 `__Host-` 이름을 쓰고 접두사 없는 옛 이름은 받지
+않습니다. 따라서 기존 브라우저는 롤아웃 중 한 번 로그아웃이 필요합니다.
+
+`PARALLAX_SESSION_SECRET`은 모든 레플리카에 최소 32바이트의 안정적인 무작위 값으로
+설정하십시오. 액세스 토큰에서 교환된 브라우저 세션에 서명하는 값이며, 없으면 서버는
+베어러 토큰을 쿠키에 넣는 대신 토큰 세션 발급을 거부합니다. 이 값을 교체하면 모든 토큰
+세션이 로그아웃됩니다.
+
+실패한 HTTP 인증 시도는 자격증명 검증 이후에 프로세스 지역 LRU 맵에 제한적으로
+집계됩니다. 이것은 추측 공격 방지 스로틀이 아닙니다. 모든 자격증명은 여전히 평가되며,
+여러 레플리카 배포에서는 실패 관측이 따로 집계됩니다. 공유 리미터는 관측성 개선이지
+32바이트 최소 토큰 엔트로피의 대체물이 아닙니다.
 
 ### 이 릴리스가 스키마를 바꾸는가?
 
@@ -545,7 +628,7 @@ git diff --name-only <배포된>..<새것> -- migrations/ src/infrastructure/mig
 
 ---
 
-## 🧪 개발
+## 개발
 
 ```bash
 pnpm check          # 타입 검사
@@ -572,31 +655,28 @@ pnpm verify:proxy       pnpm verify:cloudflare   # ⚠️ 실제 존에 씁니�
 
 ---
 
-## 📇 레코드 타입
+## 현재 상태와 한계
 
-23종. presentation format의 RDATA로 검증합니다 — 존 파일이 타입 뒤에 적는 바로
-그 텍스트입니다:
+**되는 것.** 하나의 목표 상태를 내부 뷰와 외부 뷰로 투영하고, HMAC으로 서명된 소유권
+마커를 붙이며, `preview`와 `apply`가 건드리지 않은 레코드 수를 명시적으로 보고합니다.
+UDP·TCP 권한 있는 DNS 리스너, 번호가 매겨진 리비전과 스냅샷 복원과 감사 로그,
+`zone adopt`, 역할·발급 액세스 토큰·OpenID Connect 로그인, 하나의 커맨드 레이어 위의
+포털·HTTP API·CLI, PostgreSQL 또는 단일 노드 파일 저장소, 권한 없이 도는 컨테이너
+이미지가 있습니다.
 
-```
-A · AAAA · CAA · CERT · CNAME · DNAME · DNSKEY · DS · HINFO · HTTPS · LOC · MX
-NAPTR · NS · OPENPGPKEY · PTR · SMIMEA · SRV · SSHFP · SVCB · TLSA · TXT · URI
-```
+**아직 안 되는 것.** 인가가 존 단위가 아니라 라우트 단위입니다. `editor`는 이 배포가
+보는 모든 존에 대해 행위할 수 있어서, 여러 팀이 쓰려면 존별 계층이 생기기 전까지는
+컨트롤 플레인을 분리해야 합니다. 실제 프로바이더 어댑터는 Cloudflare 하나뿐이고, 로컬
+파일 프로바이더는 프로바이더가 설정되지 않은 배포용입니다. `restore`는 병합이 아니며,
+이미 존이나 토큰이 있는 저장소는 거부합니다.
 
-`SOA`는 제외했고, 서명자가 자기가 서명하는 존에 대해 만들어 내는 DNSSEC
-레코드 — `RRSIG`, `NSEC`, `NSEC3` — 도 제외했습니다. 모든 프로바이더가 그것들을
-스스로 만들고, 우리 것을 발행하면 묻지도 않은 답을 덮어쓰게 됩니다. `DS`와
-`DNSKEY`는 **넣었습니다**. `DS`는 부모에 놓여 서명된 자식으로 위임하는 것이고,
-그것은 남의 존에 대한 운영자의 결정이기 때문입니다.
-
-> [!WARNING]
-> **외부** 뷰에 비공개 주소를 발행하려면 해당 레코드에 `acknowledgeNonGlobalIp`를
-> 설정해야 합니다. 그러지 않으면 거부됩니다 — `10.0.0.11`을 공개 인터넷에 올리는
-> 것은 대개 실수이고, 실수가 아닐 때는 누군가 일부러 한 것이어야 합니다.
+**의도적으로 범위 밖인 것.** `SOA`와, 서명자가 자기가 서명하는 존에 대해 생성하는
+DNSSEC 레코드(`RRSIG`, `NSEC`, `NSEC3`)는 발행하지 않습니다. 모든 프로바이더가 그것을
+스스로 만들기 때문입니다. `backup`과 `restore`는 HTTP 라우트가 없고, 앞으로도 주지
+않습니다.
 
 ---
 
-<div align="center">
+## 라이선스
 
-**Apache-2.0** · [LICENSE](LICENSE)
-
-</div>
+Apache-2.0. [LICENSE](LICENSE)를 참고하세요.

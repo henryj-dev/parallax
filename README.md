@@ -9,23 +9,30 @@
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
 </pre>
 
-### One name, two answers.
-
-**A split-horizon DNS control plane and operations portal.**
+### **A split-horizon DNS control plane and operations portal.**
 
 One desired state for internal DNS and external provider DNS — previewed before
 it moves, and applied only to the records it owns.
 
+<br/>
+
 [![check](https://github.com/henryj-dev/parallax/actions/workflows/check.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/check.yml)
-[![scripts](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml)
-[![docker](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml)
 [![codeql](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml)
 [![dependency-review](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml)
+[![docker](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml)
+[![scripts](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml)
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A5%2024-5FA04E)](package.json)
-[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6)](tsconfig.json)
-[![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1-6BA539)](#-http-api)
+<br/>
+
+![node](https://img.shields.io/badge/node-24%2B-5FA04E?logo=node.js&logoColor=white)
+![typescript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
+[![openapi](https://img.shields.io/badge/OpenAPI-3.1-6BA539)](#http-api)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+<br/>
+
+> *A parallax is the shift in a thing's apparent position when you look at it from
+> somewhere else — one object, two answers, both of them correct.*
 
 English · [한국어](README.ko.md)
 
@@ -33,7 +40,26 @@ English · [한국어](README.ko.md)
 
 ---
 
-## The problem, in one picture
+## Contents
+
+- [The problem](#the-problem)
+- [What it does](#what-it-does)
+- [Quick start](#quick-start)
+- [How it fits together](#how-it-fits-together)
+- [The ownership model](#the-ownership-model)
+- [Configuration](#configuration)
+- [Command line](#command-line)
+- [HTTP API](#http-api)
+- [Record types](#record-types)
+- [The portal](#the-portal)
+- [Operations](#operations)
+- [Development](#development)
+- [Status & limitations](#status--limitations)
+- [License](#license)
+
+---
+
+## The problem
 
 The same name has to mean two different things depending on who is asking.
 Keeping that in two systems means keeping it right twice.
@@ -61,7 +87,7 @@ plan.
 
 ---
 
-## ✨ What it does
+## What it does
 
 <table>
 <tr>
@@ -134,7 +160,7 @@ they cannot drift apart.
 
 ---
 
-## 🚀 Quick start
+## Quick start
 
 ```bash
 git clone https://github.com/henryj-dev/parallax
@@ -171,7 +197,7 @@ pnpm cli status  --zone example.com     # how far each view got
 
 ---
 
-## 🏗️ How it fits together
+## How it fits together
 
 ```mermaid
 flowchart LR
@@ -219,7 +245,7 @@ CLI acts with full rights because a shell on the box *is* control-plane access.
 
 ---
 
-## 🛡️ The ownership model
+## The ownership model
 
 This is the part that lets Parallax share a zone with a human, a Terraform run,
 and a certificate bot without any of them stepping on the others.
@@ -227,7 +253,7 @@ and a certificate bot without any of them stepping on the others.
 Every record Parallax publishes carries a marker in the provider's free-text
 field — a Cloudflare record comment, a trailing comment in a zone file:
 
-```
+```text
 parallax-managed:v3:<record-id>:<hmac-signature>
 ```
 
@@ -251,20 +277,78 @@ against a long zone name fail.
 
 ---
 
-## 🖥️ The portal
+## Configuration
 
-Served from the same process, in **English and Korean**, with no build step.
+Nothing below is required to start on loopback with file state.
 
-- **Horizon lens** — one record, both answers, side by side
-- **Zone workspace** — records, sync state per view, revision progress
-- **Apply plan dialog** — review the plan, then apply from it
-- **Revision history** — browse snapshots and restore one
-- **Credential settings** — profiles, zone bindings, resolver overrides, tokens
-- **Sign-in** — access token or your identity provider
+<details open>
+<summary><b>Core</b></summary>
+
+| Variable | |
+|---|---|
+| `HOST` · `PORT` | Where the API and portal bind. Defaults `127.0.0.1:3000` |
+| `DATABASE_URL` | Use PostgreSQL. Absent means single-node files |
+| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | Where those files live. The state file keeps its history beside it in `<state file>.d/` — back up the directory, not the one file |
+| `PARALLAX_AUTH_TOKENS` | Break-glass tokens, as JSON. Normal tokens are issued through the portal |
+| `PARALLAX_OWNERSHIP_SECRET` | Signs ownership markers |
+| `PARALLAX_CREDENTIAL_MASTER_KEY` | Encrypts stored provider credentials (AES-256-GCM) |
+
+</details>
+
+<details>
+<summary><b>TLS &amp; identity</b></summary>
+
+| Variable | |
+|---|---|
+| `PARALLAX_TLS_CERT_FILE` · `PARALLAX_TLS_KEY_FILE` | End TLS in-process instead of behind a proxy. Reloaded on change |
+| `PARALLAX_HTTP_REDIRECT_PORT` | Answer plain HTTP with a redirect to the TLS origin |
+| `PARALLAX_OIDC_ISSUER` · `_CLIENT_ID` · `_CLIENT_SECRET` · `_REDIRECT_URI` · `_SCOPES` | OpenID Connect sign-in. The endpoints come from the issuer's `/.well-known/openid-configuration`; a provider that publishes none falls back to `{issuer}/oidc/…` and says so at sign-in |
+| `PARALLAX_OIDC_ROLE_CLAIM` | Which userinfo claim grants a role here — `admin`, `editor` or `viewer`. Defaults to `entitlements`; no claim is standard, so a directory that spells it otherwise must say so |
+| `PARALLAX_OIDC_SESSION_SECRET` · `_SESSION_SECONDS` | Session signing and lifetime |
+| `PARALLAX_PORTAL_SIGN_IN` | What the portal offers a visitor who has not signed in |
+
+</details>
+
+<details>
+<summary><b>The DNS listener</b></summary>
+
+Setting `PARALLAX_DNS_PORT` is what turns it on. Everything else has a default,
+and the defaults are the careful ones.
+
+| Variable | |
+|---|---|
+| `PARALLAX_DNS_PORT` | **Enables the listener.** Unset leaves the port unbound |
+| `PARALLAX_DNS_HOST` | Defaults to `HOST`, then to `127.0.0.1` |
+| `PARALLAX_DNS_FORWARD_TO` | Upstreams for names outside every zone. Empty answers `REFUSED` |
+| `PARALLAX_DNS_FORWARD_ALLOW` | Client CIDRs allowed to recurse. Defaults to loopback — and is **required** if the listener is not loopback and forwarding is on |
+| `PARALLAX_DNS_TRANSFER_ALLOW` | Client CIDRs allowed `AXFR` and `IXFR`. **Defaults to deny all** |
+| `PARALLAX_DNS_TSIG_KEYS` | `name:algorithm:base64secret`, comma-separated. Setting any key makes a valid TSIG signature **required** for `AXFR`; `hmac-sha256`/`hmac-sha512` only |
+| `PARALLAX_DNS_NOTIFY_TO` | Hosts that get NOTIFY when a served zone's serial rises. `host`, `host:port`, or `host:port#keyname` to sign it |
+| `PARALLAX_DNS_INTERNAL_UPDATE` | `host:port#keyname` — also publish the internal view into a server that speaks **RFC 2136**. A server published to keeps answering when this process stops; a listener inside it does not |
+| `PARALLAX_DNS_SOA_PRIMARY` · `_SOA_MAILBOX` | SOA fields |
+| `PARALLAX_DNS_REQUIRE_COOKIE` | Require RFC 7873 DNS cookies |
+| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND` · `_BURST` · `_MAX_CLIENTS` | Per-client rate limiting |
+| `PARALLAX_DNS_MAX_TCP_CONNECTIONS` · `_MAX_CONCURRENT_FORWARDS` · `_FORWARD_TIMEOUT_MS` | Resource ceilings |
+
+</details>
+
+<details>
+<summary><b>Stored settings</b> — in the store, not the environment</summary>
+
+| Setting | |
+|---|---|
+| `allowLocalProvider` | Publish to a local file when no real provider is configured |
+| `publicOrigin` | Absolute origin browsers reach the portal at; empty derives it per request |
+| `trustForwardedHeaders` | Trust `X-Forwarded-Proto` / `X-Forwarded-Host` |
+| `revisionRetention` | Newest snapshots kept per zone; `0` keeps every one |
+| `auditRetentionDays` | Days of audit history kept per zone; `0` keeps everything |
+| `fallbackResolver` | Address a client-side resolver override should point at |
+
+</details>
 
 ---
 
-## ⌨️ CLI
+## Command line
 
 47 commands. Add `--json` to any of them for machine-readable output; run
 `parallax help <command>` for its options.
@@ -358,21 +442,22 @@ DATABASE_URL=postgres://… parallax migrate
 DATABASE_URL=postgres://… parallax restore < parallax-backup.json
 ```
 
-⚠️ The document is **as sensitive as the state file**, because it is a copy of
-it: it carries the credential store's ciphertext, which is useless without
-`PARALLAX_CREDENTIAL_MASTER_KEY` and is still not something to leave where the
-state file would not be left. `restore` refuses a store that already holds
-zones or tokens — it is not a merge. Audit ids are assigned by the store, so a
-restored log is renumbered from 1; the order and the content survive.
+> [!WARNING]
+> The document is **as sensitive as the state file**, because it is a copy of
+> it: it carries the credential store's ciphertext, which is useless without
+> `PARALLAX_CREDENTIAL_MASTER_KEY` and is still not something to leave where the
+> state file would not be left. `restore` refuses a store that already holds
+> zones or tokens — it is not a merge. Audit ids are assigned by the store, so a
+> restored log is renumbered from 1; the order and the content survive.
 
 ---
 
-## 🔌 HTTP API
+## HTTP API
 
 **40 paths**, described by an OpenAPI 3.1 document the process generates from
 its own command table — so the description cannot drift from the behaviour.
 
-```
+```http
 GET /api/v1/openapi.json
 ```
 
@@ -403,78 +488,46 @@ refuse if the zone moved on.
 
 ---
 
-## ⚙️ Configuration
+## Record types
 
-Nothing below is required to start on loopback with file state.
+23 types, validated by their RDATA in presentation format — the same text a zone
+file puts after the type:
 
-<details open>
-<summary><b>Core</b></summary>
+```text
+A · AAAA · CAA · CERT · CNAME · DNAME · DNSKEY · DS · HINFO · HTTPS · LOC · MX
+NAPTR · NS · OPENPGPKEY · PTR · SMIMEA · SRV · SSHFP · SVCB · TLSA · TXT · URI
+```
 
-| Variable | |
-|---|---|
-| `HOST` · `PORT` | Where the API and portal bind. Defaults `127.0.0.1:3000` |
-| `DATABASE_URL` | Use PostgreSQL. Absent means single-node files |
-| `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | Where those files live. The state file keeps its history beside it in `<state file>.d/` — back up the directory, not the one file |
-| `PARALLAX_AUTH_TOKENS` | Break-glass tokens, as JSON. Normal tokens are issued through the portal |
-| `PARALLAX_OWNERSHIP_SECRET` | Signs ownership markers |
-| `PARALLAX_CREDENTIAL_MASTER_KEY` | Encrypts stored provider credentials (AES-256-GCM) |
+`SOA` is excluded, and so are the DNSSEC records a signer produces for the zone
+it signs — `RRSIG`, `NSEC`, `NSEC3`. Every provider generates those itself, and
+publishing our own would overwrite an answer we never asked for. `DS` and
+`DNSKEY` *are* here: a `DS` sits in the parent and delegates to a signed child,
+which is an operator's decision about somebody else's zone.
 
-</details>
-
-<details>
-<summary><b>TLS &amp; identity</b></summary>
-
-| Variable | |
-|---|---|
-| `PARALLAX_TLS_CERT_FILE` · `PARALLAX_TLS_KEY_FILE` | End TLS in-process instead of behind a proxy. Reloaded on change |
-| `PARALLAX_HTTP_REDIRECT_PORT` | Answer plain HTTP with a redirect to the TLS origin |
-| `PARALLAX_OIDC_ISSUER` · `_CLIENT_ID` · `_CLIENT_SECRET` · `_REDIRECT_URI` · `_SCOPES` | OpenID Connect sign-in. The endpoints come from the issuer's `/.well-known/openid-configuration`; a provider that publishes none falls back to `{issuer}/oidc/…` and says so at sign-in |
-| `PARALLAX_OIDC_ROLE_CLAIM` | Which userinfo claim grants a role here — `admin`, `editor` or `viewer`. Defaults to `entitlements`; no claim is standard, so a directory that spells it otherwise must say so |
-| `PARALLAX_OIDC_SESSION_SECRET` · `_SESSION_SECONDS` | Session signing and lifetime |
-| `PARALLAX_PORTAL_SIGN_IN` | What the portal offers a visitor who has not signed in |
-
-</details>
-
-<details>
-<summary><b>The DNS listener</b></summary>
-
-Setting `PARALLAX_DNS_PORT` is what turns it on. Everything else has a default,
-and the defaults are the careful ones.
-
-| Variable | |
-|---|---|
-| `PARALLAX_DNS_PORT` | **Enables the listener.** Unset leaves the port unbound |
-| `PARALLAX_DNS_HOST` | Defaults to `HOST`, then to `127.0.0.1` |
-| `PARALLAX_DNS_FORWARD_TO` | Upstreams for names outside every zone. Empty answers `REFUSED` |
-| `PARALLAX_DNS_FORWARD_ALLOW` | Client CIDRs allowed to recurse. Defaults to loopback — and is **required** if the listener is not loopback and forwarding is on |
-| `PARALLAX_DNS_TRANSFER_ALLOW` | Client CIDRs allowed `AXFR` and `IXFR`. **Defaults to deny all** |
-| `PARALLAX_DNS_TSIG_KEYS` | `name:algorithm:base64secret`, comma-separated. Setting any key makes a valid TSIG signature **required** for `AXFR`; `hmac-sha256`/`hmac-sha512` only |
-| `PARALLAX_DNS_NOTIFY_TO` | Hosts that get NOTIFY when a served zone's serial rises. `host`, `host:port`, or `host:port#keyname` to sign it |
-| `PARALLAX_DNS_INTERNAL_UPDATE` | `host:port#keyname` — also publish the internal view into a server that speaks **RFC 2136**. A server published to keeps answering when this process stops; a listener inside it does not |
-| `PARALLAX_DNS_SOA_PRIMARY` · `_SOA_MAILBOX` | SOA fields |
-| `PARALLAX_DNS_REQUIRE_COOKIE` | Require RFC 7873 DNS cookies |
-| `PARALLAX_DNS_RATE_LIMIT_PER_SECOND` · `_BURST` · `_MAX_CLIENTS` | Per-client rate limiting |
-| `PARALLAX_DNS_MAX_TCP_CONNECTIONS` · `_MAX_CONCURRENT_FORWARDS` · `_FORWARD_TIMEOUT_MS` | Resource ceilings |
-
-</details>
-
-<details>
-<summary><b>Stored settings</b> — in the store, not the environment</summary>
-
-| Setting | |
-|---|---|
-| `allowLocalProvider` | Publish to a local file when no real provider is configured |
-| `publicOrigin` | Absolute origin browsers reach the portal at; empty derives it per request |
-| `trustForwardedHeaders` | Trust `X-Forwarded-Proto` / `X-Forwarded-Host` |
-| `revisionRetention` | Newest snapshots kept per zone; `0` keeps every one |
-| `auditRetentionDays` | Days of audit history kept per zone; `0` keeps everything |
-| `fallbackResolver` | Address a client-side resolver override should point at |
-
-</details>
+> [!WARNING]
+> Publishing a non-global address in the **external** view requires setting
+> `acknowledgeNonGlobalIp` on that record. It is refused otherwise — putting
+> `10.0.0.11` on the public internet is usually a mistake, and when it isn't, it
+> should be one somebody made on purpose.
 
 ---
 
-## 📊 Observability
+## The portal
+
+Served from the same process, in **English and Korean**, with no build step.
+
+- **Horizon lens** — one record, both answers, side by side
+- **Zone workspace** — records, sync state per view, revision progress
+- **Apply plan dialog** — review the plan, then apply from it
+- **Revision history** — browse snapshots and restore one
+- **Credential settings** — profiles, zone bindings, resolver overrides, tokens
+- **Sign-in** — access token or your identity provider
+
+---
+
+## Operations
+
+### Observability
 
 | Endpoint | |
 |---|---|
@@ -485,7 +538,7 @@ and the defaults are the careful ones.
 Gauges are read at scrape time from whoever already owns the value, rather than
 copied into a registry where the copy can go stale.
 
-```
+```text
 parallax_ready                                  1 when this process would pass readiness
 parallax_desired_state_age_seconds              since the desired state was last read
 parallax_desired_state_max_age_seconds          how stale that may get before readiness fails
@@ -501,9 +554,7 @@ parallax_refresh_failures_total                 background refresh failures, by 
 parallax_tls_certificate_reload_failures_total  certificate reloads that failed
 ```
 
----
-
-## 🐳 Deployment
+### Deployment
 
 ```bash
 docker build -t parallax .
@@ -588,7 +639,7 @@ overlap. Anything listed means they may not.
 
 ---
 
-## 🧪 Development
+## Development
 
 ```bash
 pnpm check          # typecheck
@@ -615,32 +666,29 @@ never as an issue.
 
 ---
 
-## 📇 Record types
+## Status & limitations
 
-23 types, validated by their RDATA in presentation format — the same text a zone
-file puts after the type:
+**What works.** One desired state projected into an internal and an external view;
+HMAC-signed ownership markers; `preview` and `apply` with an explicit count of the
+records left untouched; an authoritative DNS listener over UDP and TCP; numbered
+revisions with snapshot restore and an audit trail; `zone adopt`; roles, issued
+access tokens and OpenID Connect sign-in; a portal, an HTTP API and a CLI over one
+command layer; PostgreSQL or single-node file state; a container image that runs
+unprivileged.
 
-```
-A · AAAA · CAA · CERT · CNAME · DNAME · DNSKEY · DS · HINFO · HTTPS · LOC · MX
-NAPTR · NS · OPENPGPKEY · PTR · SMIMEA · SRV · SSHFP · SVCB · TLSA · TXT · URI
-```
+**What doesn't yet.** Authorization is route-based, not zone-based — an `editor`
+may act on every zone this deployment can see, so multi-team use needs separate
+control planes until a per-zone layer exists. Cloudflare is the only real provider
+adapter; the local file provider is for deployments with no provider configured.
+`restore` is not a merge and refuses a store that already holds zones or tokens.
 
-`SOA` is excluded, and so are the DNSSEC records a signer produces for the zone
-it signs — `RRSIG`, `NSEC`, `NSEC3`. Every provider generates those itself, and
-publishing our own would overwrite an answer we never asked for. `DS` and
-`DNSKEY` *are* here: a `DS` sits in the parent and delegates to a signed child,
-which is an operator's decision about somebody else's zone.
-
-> [!WARNING]
-> Publishing a non-global address in the **external** view requires setting
-> `acknowledgeNonGlobalIp` on that record. It is refused otherwise — putting
-> `10.0.0.11` on the public internet is usually a mistake, and when it isn't, it
-> should be one somebody made on purpose.
+**Deliberately out of scope.** `SOA` and the DNSSEC records a signer produces for
+the zone it signs — `RRSIG`, `NSEC`, `NSEC3` — are never published, because every
+provider generates those itself. `backup` and `restore` have no HTTP route and are
+not given one.
 
 ---
 
-<div align="center">
+## License
 
-**Apache-2.0** · [LICENSE](LICENSE)
-
-</div>
+Apache-2.0. See [LICENSE](LICENSE).
