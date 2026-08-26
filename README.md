@@ -675,11 +675,6 @@ control planes until a per-zone layer exists. Cloudflare is the only real provid
 adapter; the local file provider is for deployments with no provider configured.
 `restore` is not a merge and refuses a store that already holds zones or tokens.
 
-**Deliberately out of scope.** `SOA` and the DNSSEC records a signer produces for
-the zone it signs — `RRSIG`, `NSEC`, `NSEC3` — are never published, because every
-provider generates those itself. `backup` and `restore` have no HTTP route and are
-not given one.
-
 ---
 
 ## License
