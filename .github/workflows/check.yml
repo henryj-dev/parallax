@@ -294,9 +294,30 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: gitleaks
-        # Fetch the binary rather than use the action: the checksum says what arrived,
-        # and no token is handed to code we have not read.
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        # A licence is required for organisation-owned repositories (personal
+        # accounts are free). It lives as an org secret: one value, one place.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          # Pin the config explicitly. Left to auto-detection, a `.gitleaks.toml`
+          # that fails to load passes silently — and a check that vanished reads
+          # exactly like a check that passed.
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+      # **A second pass — the whole history.** The action above scopes by event: the pushed
+      # commits on `push`, the pull-request commits on `pull_request`. That never re-reads
+      # what is already in the history, so a rule added tomorrow will not light up a commit
+      # from last year.
+      #
+      # Same scanner, different scope, run again. Both have to pass. `!cancelled()` keeps it
+      # running when the step above is red — one failure hiding the other means you cannot
+      # see what actually broke in a single run.
+      #
+      # ⚠️ Dependabot cannot update the version and checksum here (it is a URL download).
+      #    Whenever the action above moves, read these two lines in the same pull request.
+      - name: gitleaks (full history)
+        if: ${{ !cancelled() }}
         env:
           GITLEAKS_VERSION: "8.30.1"
           GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
@@ -306,7 +327,7 @@ jobs:
           curl -fsSL --retry 3 -o /tmp/gitleaks.tgz "$url"
           echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
           tar xzf /tmp/gitleaks.tgz -C /tmp gitleaks
-          /tmp/gitleaks git --no-banner --redact --exit-code 1 .
+          /tmp/gitleaks git --no-banner --redact --exit-code 1 --config .gitleaks.toml .
 
   # The workflows are themselves an attack surface: the runner executes code that came
   # from outside, and a `${{ }}` inside a `run:` body is shell code by the time the
