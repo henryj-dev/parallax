@@ -1,13 +1,6 @@
 <div align="center">
 
-<pre>
-██████╗  █████╗ ██████╗  █████╗ ██╗     ██╗      █████╗ ██╗  ██╗
-██╔══██╗██╔══██╗██╔══██╗██╔══██╗██║     ██║     ██╔══██╗╚██╗██╔╝
-██████╔╝███████║██████╔╝███████║██║     ██║     ███████║ ╚███╔╝
-██╔═══╝ ██╔══██║██╔══██╗██╔══██║██║     ██║     ██╔══██║ ██╔██╗
-██║     ██║  ██║██║  ██║██║  ██║███████╗███████╗██║  ██║██╔╝ ██╗
-╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
-</pre>
+<h1>parallax</h1>
 
 ### **A split-horizon DNS control plane and operations portal.**
 
@@ -18,9 +11,6 @@ it moves, and applied only to the records it owns.
 
 [![check](https://github.com/henryj-dev/parallax/actions/workflows/check.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/check.yml)
 [![codeql](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml)
-[![dependency-review](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml)
-[![docker](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml)
-[![scripts](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml)
 
 <br/>
 
@@ -681,11 +671,6 @@ may act on every zone this deployment can see, so multi-team use needs separate
 control planes until a per-zone layer exists. Cloudflare is the only real provider
 adapter; the local file provider is for deployments with no provider configured.
 `restore` is not a merge and refuses a store that already holds zones or tokens.
-
-**Deliberately out of scope.** `SOA` and the DNSSEC records a signer produces for
-the zone it signs — `RRSIG`, `NSEC`, `NSEC3` — are never published, because every
-provider generates those itself. `backup` and `restore` have no HTTP route and are
-not given one.
 
 ---
 

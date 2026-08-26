@@ -1,13 +1,6 @@
 <div align="center">
 
-<pre>
-██████╗  █████╗ ██████╗  █████╗ ██╗     ██╗      █████╗ ██╗  ██╗
-██╔══██╗██╔══██╗██╔══██╗██╔══██╗██║     ██║     ██╔══██╗╚██╗██╔╝
-██████╔╝███████║██████╔╝███████║██║     ██║     ███████║ ╚███╔╝
-██╔═══╝ ██╔══██║██╔══██╗██╔══██║██║     ██║     ██╔══██║ ██╔██╗
-██║     ██║  ██║██║  ██║██║  ██║███████╗███████╗██║  ██║██╔╝ ██╗
-╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
-</pre>
+<h1>parallax</h1>
 
 ### **split-horizon DNS 컨트롤 플레인이자 운영 포털.**
 
@@ -18,9 +11,6 @@
 
 [![check](https://github.com/henryj-dev/parallax/actions/workflows/check.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/check.yml)
 [![codeql](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/codeql.yml)
-[![dependency-review](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/dependency-review.yml)
-[![docker](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/docker.yml)
-[![scripts](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml/badge.svg)](https://github.com/henryj-dev/parallax/actions/workflows/scripts.yml)
 
 <br/>
 
@@ -670,10 +660,6 @@ UDP·TCP 권한 있는 DNS 리스너, 번호가 매겨진 리비전과 스냅샷
 파일 프로바이더는 프로바이더가 설정되지 않은 배포용입니다. `restore`는 병합이 아니며,
 이미 존이나 토큰이 있는 저장소는 거부합니다.
 
-**의도적으로 범위 밖인 것.** `SOA`와, 서명자가 자기가 서명하는 존에 대해 생성하는
-DNSSEC 레코드(`RRSIG`, `NSEC`, `NSEC3`)는 발행하지 않습니다. 모든 프로바이더가 그것을
-스스로 만들기 때문입니다. `backup`과 `restore`는 HTTP 라우트가 없고, 앞으로도 주지
-않습니다.
 
 ---
 
