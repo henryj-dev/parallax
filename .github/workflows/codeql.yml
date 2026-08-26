@@ -41,13 +41,13 @@ jobs:
       actions: read
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This job never pushes. Leaving the token in `.git/config` would
           # hand it to anything the analysis subsequently runs.
           persist-credentials: false
 
-      - uses: github/codeql-action/init@v4
+      - uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           # One language. `javascript-typescript` covers both the `src/` server
           # and the browser code under `public/`.
@@ -61,6 +61,29 @@ jobs:
       # `check.yml` already proves the project builds -- running `pnpm build`
       # again here would only add a way for this workflow to fail for a reason
       # that has nothing to do with security.
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           category: "/language:javascript-typescript"
+
+  # The one check name the branch ruleset requires. Naming the analysis job directly
+  # means that the day the name changes, that required check becomes a check that does
+  # not exist — and the protection quietly disappears.
+  #
+  # This asks whether the analysis ran, not whether it found nothing. Findings land in
+  # the Security tab and do not block a merge; what is blocked is a broken query pack
+  # going green while scanning nothing.
+  codeql:
+    name: codeql
+    needs: [analyze]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: the analysis ran to completion
+        env:
+          RESULT: ${{ needs.analyze.result }}
+        run: |
+          set -euo pipefail
+          echo "analyze: $RESULT"
+          test "$RESULT" = "success" \
+            || { echo "::error::CodeQL analysis did not complete ($RESULT)"; exit 1; }
