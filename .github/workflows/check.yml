@@ -53,7 +53,7 @@ concurrency:
 # trying -- and it costs this repository nothing, because none of these checks
 # reach the deployment's network.
 jobs:
-  gate:
+  verify:
     runs-on: ubuntu-latest
     # A hung test would otherwise sit for six hours. Bounded, it reports.
     timeout-minutes: 15
@@ -66,7 +66,7 @@ jobs:
       matrix:
         node: [24, 26]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Nothing in this job pushes. By default checkout leaves the job's
           # token in `.git/config` as an auth header, where every subsequent
@@ -81,7 +81,7 @@ jobs:
       # warning rather than a failure -- so the 26 leg died at the first step
       # that actually wanted node. Hosted images carry the library, so the step
       # is gone. If this ever moves back to an image of our own, it comes back.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
       # `corepack enable` stood here, and on the 24 leg it still would work:
@@ -90,7 +90,7 @@ jobs:
       # exit 127, on every run since the leg was added -- it has never once been
       # green. This action reads the same `packageManager` field corepack read,
       # so the pnpm version stays declared in exactly one place.
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm run check:portal
@@ -114,10 +114,287 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - run: node --test test/infrastructure/schema-surface.test.ts
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          # No registry credentials exist in this workflow and none should. A
+          # pull request from a fork would otherwise be able to publish under
+          # this repository's name by editing this file, which it is allowed to
+          # do -- the workflow that runs for a `pull_request` is the one the
+          # pull request defines.
+          push: false
+          # Keep it in the runner's docker daemon so the smoke step below can
+          # actually run it. Without this the build result stays in buildx's
+          # cache and `docker run` finds no such image.
+          load: true
+          tags: parallax:ci
+          # GitHub's own cache backend. `mode=max` keeps the intermediate stages
+          # too -- the `deps` stage in particular, which is a full `pnpm install`
+          # that changes only when the lockfile does.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: the image runs, and runs as nobody special
+        # A build that succeeds proves the layers assembled. It does not prove
+        # the entrypoint resolves, that `findPublicDirectory()` finds `public/`
+        # from where the compiled entry point ended up, or that the unprivileged
+        # uid the Dockerfile creates is the one the process gets. Three cheap
+        # assertions, because "the image built" is a weaker claim than it sounds.
+        run: |
+          set -euo pipefail
+
+          uid=$(docker run --rm --entrypoint id parallax:ci -u)
+          echo "runtime uid: $uid"
+          test "$uid" = "10001" || { echo "expected to run as uid 10001, got $uid"; exit 1; }
+
+          # The portal's assets have to be reachable from the compiled entry
+          # point's directory -- the Dockerfile's own comment explains the walk.
+          docker run --rm --entrypoint ls parallax:ci -1 /app/public >/dev/null
+
+          # `migrations/` stays root-owned and unwritable by the serving uid on
+          # purpose: compromising the service must not let it plant SQL for a
+          # later privileged `parallax migrate`. That is a security property of
+          # the image, so it gets asserted rather than assumed.
+          if docker run --rm --entrypoint sh parallax:ci -c 'touch /app/migrations/evil.sql' 2>/dev/null; then
+            echo "migrations/ is writable by the serving uid -- it must not be"
+            exit 1
+          fi
+
+  # `scripts/**/test-*.py` -- the hook guards.
+  #
+  # These are not unit tests. `test-pre-commit.py` stands up a throwaway git
+  # repository in a temp directory and runs real `git commit` calls against it,
+  # because how git invokes the hook -- and from which cwd -- is the entire
+  # judgement being tested. So this job needs git configured with an identity,
+  # and it needs to run somewhere the suites can create worktrees.
+  hooks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # `test-pre-commit.py` derives a base ref from the upstream branch and
+          # falls back to the local tip. A depth-1 checkout leaves it deriving
+          # from a history with one commit in it, which is not the shape the
+          # suite is written against.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # The suites use `ast` to read the hook's own source and check the
+          # agent-environment list is what it claims. Nothing newer is needed.
+          python-version: "3.12"
+
+      - name: give the runner the git environment these suites assume
+        # Three settings, each of which a developer's machine supplies without
+        # anyone noticing and a runner does not. All three were found by running
+        # this job, not by reading the suites -- which is the argument for the
+        # job existing.
+        run: |
+          # 1. An identity. `git commit` refuses without one. The suites commit
+          #    inside their own temp repositories, never this checkout.
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 2. `init.defaultBranch`. `test-session-start-pull.py` builds its
+          #    fixture as `git init --bare origin`, then pushes `main` to it and
+          #    clones it. With this unset git names the bare repo's HEAD
+          #    `refs/heads/master`, nothing ever creates that branch, and the
+          #    clone checks out an empty tree -- "warning: remote HEAD refers to
+          #    nonexistent ref". The suite then dies reading `work/A.md`, whose
+          #    absence says nothing about the hook it is testing.
+          #
+          #    ⚠️ This is why the suite passes on a Mac and failed here: Apple's
+          #    /Library/Developer/CommandLineTools/.../gitconfig sets it to
+          #    `main` system-wide, so the fixture is silently correct there.
+          git config --global init.defaultBranch main
+
+          # 3. `refs/remotes/origin/HEAD`. `git clone` creates it; actions/checkout
+          #    does not, because it fetches refs rather than cloning. The worktree
+          #    the session-end suite creates resolves its base through origin/HEAD
+          #    and dies on "fatal: invalid reference: origin/HEAD".
+          git remote set-head origin --auto || git remote set-head origin main
+          git symbolic-ref refs/remotes/origin/HEAD
+
+      - name: run the hook suites
+        # Every suite prints "실패 N 건" and exits non-zero on a failure, so the
+        # loop can simply let a non-zero exit stop the step. `set -e` is on by
+        # default in the `bash -e` shell Actions uses, but the loop would
+        # swallow it -- hence the explicit exit.
+        #
+        # ⚠️ The suites' own docstrings warn that they must not inherit an agent
+        # session's environment: `test-pre-commit.py` builds a "this is a human"
+        # fixture, and a stray `CLAUDECODE` or `GROK_AGENT` in the environment
+        # turns that fixture into an agent and the suite reports a failure that
+        # is really about where it was run. A runner has none of those set, which
+        # is exactly why this is the right place for them to run.
+        run: |
+          status=0
+          for suite in scripts/claude-hooks/test-*.py scripts/git-hooks/test-pre-commit.py; do
+            echo "::group::$suite"
+            python3 "$suite" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+  # `scripts/*.sh` -- the verifiers `pnpm verify:integration` drives.
+  #
+  # Scoped to this repository's own shell scripts on purpose. `scripts/git-hooks/`
+  # and `scripts/claude-hooks/` are a snapshot of stardust's and are kept
+  # byte-identical there deliberately (see AGENTS.md); linting them here would
+  # produce findings whose only available fix is to break the property that makes
+  # drift checkable with one `cmp`. `scripts/git-hooks/pre-commit` is python
+  # despite having no extension, and shellcheck errors out on it (SC1071), so the
+  # glob would have to exclude it in any case.
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        # `severity=warning` lets three long-standing `info` findings stand --
+        # SC2015 in verify-dns.sh, SC2016 there too, SC2012 in verify-postgres.sh
+        # -- all of which are correct as written for what those scripts do. The
+        # bar is set where a finding means "fix this", so that a red result here
+        # is worth reading.
+        run: |
+          shellcheck --version
+          shellcheck --severity=warning scripts/*.sh
+
+  # Did a credential ever enter the history? What a deleted commit held is not deleted:
+  # on a public repository a value is outside the moment it is pushed.
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks
+        # Fetch the binary rather than use the action: the checksum says what arrived,
+        # and no token is handed to code we have not read.
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o /tmp/gitleaks.tgz "$url"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks git --no-banner --redact --exit-code 1 .
+
+  # The workflows are themselves an attack surface: the runner executes code that came
+  # from outside, and a `${{ }}` inside a `run:` body is shell code by the time the
+  # shell sees it. A reviewer will miss it.
+  workflow-audit:
+    name: workflow audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o /tmp/actionlint.tgz "$url"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tgz" | sha256sum -c -
+          tar xzf /tmp/actionlint.tgz -C /tmp actionlint
+          /tmp/actionlint -color .github/workflows/*.yml
+      - name: zizmor
+        env:
+          ZIZMOR_VERSION: "1.29.0"
+          ZIZMOR_SHA256: "dd96df044a6e8538d5f423790f453bdd03d49e5b2bcc38214acc41a2f1297839"
+        run: |
+          set -euo pipefail
+          url="https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL --retry 3 -o /tmp/zizmor.tgz "$url"
+          echo "${ZIZMOR_SHA256}  /tmp/zizmor.tgz" | sha256sum -c -
+          tar xzf /tmp/zizmor.tgz -C /tmp
+          /tmp/zizmor --no-progress --persona=regular .github/workflows
+
+  # What is this pull request dragging in? `npm ci` stands the lockfile up as written,
+  # so CI says nothing about a package that arrived today — green reads as "this
+  # dependency is fine" when nobody asked.
+  dependency-review:
+    name: dependency review
+    # Only meaningful on a pull request: without a base there is no "what is new".
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Say inside the pull request what was blocked and why. A contributor who has to
+      # open the log to find out just feels blocked.
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # Blocking from `moderate` buries the signal in transitive noise. The line is
+          # drawn at what cannot be taken back.
+          fail-on-severity: high
+          # Copyleft is refused. If something genuinely needed is caught here, say why in
+          # the pull request and change this line — do not add a one-off exception.
+          deny-licenses: AGPL-1.0-only, AGPL-1.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later, GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later, SSPL-1.0
+          comment-summary-in-pr: on-failure
+
+  # The one check name the branch ruleset requires.
+  #
+  # Listing job names one by one means that the day a name changes, that required check
+  # becomes a check that does not exist — and the protection quietly disappears. GitHub
+  # says nothing when it happens. Collecting them here makes adding or removing a job a
+  # one-line change to `needs:`, and leaves the ruleset alone.
+  gate:
+    name: gate
+    needs: [verify, deployment-gate, docker, hooks, shellcheck, secret-scan, workflow-audit, dependency-review]
+    # This job must run even when something upstream is red. Otherwise it is a check that
+    # never reported, the rule waits forever, and nothing records what broke.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: every upstream job settled green
+        # Never interpolate `${{ }}` into a `run:` body: it is substituted before the
+        # shell reads the script, so a quote or a `$(...)` in the value becomes shell code.
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "  \(.key): \(.value.result)"' <<<"$NEEDS"
+          # `skipped` passes: some jobs do not apply to this event (dependency review only
+          # means something on a pull request). Skipped and failed are different words.
+          bad="$(jq '[.[] | select(.result == "failure" or .result == "cancelled")] | length' <<<"$NEEDS")"
+          test "$bad" = "0" || { echo "::error::$bad upstream job(s) did not pass"; exit 1; }
+          echo "gate passed"
