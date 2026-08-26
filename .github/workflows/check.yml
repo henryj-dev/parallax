@@ -23,22 +23,6 @@ on:
 permissions:
   contents: read
 
-# One run per ref at a time, newest wins. This was written when runs queued
-# behind a self-hosted scale set that served roughly one job at a time: five
-# pushes to main inside forty minutes left five runs queued, and the oldest was
-# gating a commit four behind the tip by the time a runner reached it. Hosted
-# runners took that queue away, and the setting stays for the reason that
-# outlived it -- a superseded run is answering about a commit nobody will ship.
-#
-# The cost is that an intermediate commit on main no longer gets its own
-# verdict -- only the tip does. That is a real loss for bisecting, and it is
-# accepted here because what ships is the tip: a superseded commit's changes
-# are contained in the run that replaces it. The alternative was a queue whose
-# answers arrived after they had stopped being about anything.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 # Everything runs on GitHub-hosted runners.
 #
 # It used to be a self-hosted scale set, and for one commit this file split the

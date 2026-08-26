@@ -20,10 +20,6 @@ on:
     # minutes before a runner picks it up.
     - cron: "17 5 * * 1"
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
 
