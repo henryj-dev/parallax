@@ -1,0 +1,15 @@
+# gitleaks configuration — allow narrowly, and say why
+#
+# The default rule pack stands as it is (`useDefault`); this file only records what is
+# taken out of it. Exceptions name both the path and the value rather than switching a
+# rule off, because an exception cut wide enough swallows a real credential later, and
+# nobody notices when it does. A new exception belongs here with its reason.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The ownership secret the adapter tests and the verify scripts pass in. HMAC needs a value of a certain length to run at all, and these say what they are in the value itself — `an-ownership-secret-of-at-least-32-bytes`. Nothing outside this repository accepts them; the real one arrives from the environment."
+condition = "AND"
+paths = ['''^(test|scripts)/''']
+regexes = ['''ownership-secret-(that-is|of)-at-least-32-bytes''']
