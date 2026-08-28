@@ -301,7 +301,7 @@ jobs:
   # ⚠️ Pinned by commit SHA. At `@main`, one line over there changes this gate.
   #    Dependabot updates this SHA.
   policy:
-    uses: henryj-dev/.github/.github/workflows/policy-checks.yml@f8eab7393216bd0054e6b65297a0cc5baa865630
+    uses: henryj-dev/.github/.github/workflows/policy-checks.yml@391d644e162cfd1290239b8a1681268dc865a80c
     permissions:
       contents: read
       # dependency-review says inside the pull request what was blocked and why.
