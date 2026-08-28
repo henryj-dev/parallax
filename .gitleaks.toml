@@ -5,6 +5,14 @@
 # rule off, because an exception cut wide enough swallows a real credential later, and
 # nobody notices when it does. A new exception belongs here with its reason.
 
+# ⚠️ The exception below means anything only under **gitleaks 8.25.0 or newer**. A top-level
+# `[[allowlists]]` -- the plural, array-of-tables form -- is parsed from that version on;
+# 8.24.3 has only the singular `Allowlist` at the top level and drops keys it does not know
+# with neither an error nor a warning. **It still logs that it read this file.** Run an older
+# binary and twenty-seven test fixtures come back as findings, exactly as if this file were
+# not here. That happened on 2026-08-27, when the shared policy layer's action installed its
+# own default 8.24.3; the version is pinned there now.
+
 [extend]
 useDefault = true
 
