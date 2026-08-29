@@ -149,33 +149,33 @@ describe("게이트 장치가 자기 규칙을 지킨다", () => {
   });
 });
 
-describe("기준선 검사가 대상을 실제로 잡는다", () => {
-  const baseline = GATES.P0!.checks;
-  const find = (id: string) => baseline.find((check) => check.id === id);
-
-  it("TC-P0.T2.a — 기준선 검사는 지금 상태를 통과로 기록한다", () => {
-    // 지금 > 0 이어야 나중에 0 이 의미가 있다. 패턴이 대상을 못 잡으면 P1 이 문장을
-    // 고쳐도 게이트가 초록에서 초록으로 가고, 「고쳤다」가 증명되지 않는다.
-    for (const id of ["G-P0.3", "G-P0.4", "G-P0.5"]) {
-      const check = find(id);
-      assert.ok(check, `${id} 가 검사표에 있다`);
-      const result = measure(check);
-      assert.ok((result.measured as number) > 0, `${id}: 측정 ${result.measured} — 대상 문장을 잡았다`);
-      assert.equal(verdict(check, result), true, `${id}: 지금은 통과다`);
-    }
-    for (const id of ["G-P0.1", "G-P0.2"]) {
-      const result = measure(find(id)!);
-      assert.ok((result.measured as number) >= 1, `${id}: 측정 ${result.measured}`);
-    }
-  });
+describe("기준선 패턴이 대상을 잡는 방식", () => {
+  const find = (id: string) => GATES.P0!.checks.find((check) => check.id === id);
 
   it("TC-P0.T2.b — 줄바꿈이 패턴을 가르지 않는다", () => {
     // README 가 「provider」와 「adapter」 사이에서 줄바꿈된다. 두 단어를 붙여 찾으면
     // 등장 수가 0 이고, 그 0 은 「이미 고쳐졌다」로 읽힌다.
+    //
+    // 픽스처에 대고 재는 이유는 살아 있는 README 가 P1 뒤에 두 패턴 모두 0 이 되어
+    // 「붙여 찾으면 0」이 아무것도 증명하지 않게 되기 때문이다. 이 TC 는 문서의 지금
+    // 상태가 아니라 패턴의 성질을 묻는다.
     assert.equal(find("G-P0.3")?.pattern, "only real provider", "패턴에 adapter 가 붙어 있지 않다");
-    const joined: Check = { id: "t.13", how: "grep", pattern: "only real provider adapter", in: "README.md" };
+    const wrapped = join(scratch(), "wrapped.md");
+    writeFileSync(wrapped, "Cloudflare is the only real provider\nadapter; the local file provider …\n");
+    const joined: Check = { id: "t.13", how: "grep", pattern: "only real provider adapter", in: wrapped };
+    const split: Check = { id: "t.14", how: "grep", pattern: "only real provider", in: wrapped };
     assert.equal(measure(joined).measured, 0, "붙여 찾으면 0 이다 — 그래서 붙이지 않는다");
-    const split: Check = { id: "t.14", how: "grep", pattern: "only real provider", in: "README.md" };
     assert.equal(measure(split).measured, 1, "끊어 찾으면 잡힌다");
+  });
+
+  it("TC-P0.T2.c — 기준선 검사가 셋 다 검사표에 있고 제약을 가진다", () => {
+    // P0 시점의 측정값 자체는 봉인이 들고 있고, 그 봉인을 읽는 것은 `G-P1.12` 다 —
+    // 봉인을 만드는 검사가 자기 출력을 읽을 수는 없다. 여기서 확인하는 것은 셋이 검사표에
+    // 있고 제약이 붙어 있다는 것뿐이다: 제약 없는 검사는 측정만 하고 판정하지 않는다.
+    for (const id of ["G-P0.3", "G-P0.4", "G-P0.5"]) {
+      const check = find(id);
+      assert.ok(check, `${id} 가 검사표에 있다`);
+      assert.equal(check.equals, 1, `${id}: 「정확히 1」을 요구한다 — 0 도 2 도 통과하지 않는다`);
+    }
   });
 });

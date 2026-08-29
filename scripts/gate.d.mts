@@ -34,6 +34,7 @@ export interface Check {
   /** `json` */
   readonly path?: string;
   readonly op?: ">=" | "<=" | "==";
+  /** 없으면 봉인 값 자체에 `min`·`limit`·`equals` 를 건다 — 「그때 이랬다」를 묻는 검사 */
   readonly measure?: Check;
   /** 판정 제약. 여럿이면 전부 만족해야 한다 */
   readonly equals?: number;

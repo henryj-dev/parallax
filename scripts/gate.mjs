@@ -74,10 +74,16 @@ const GATES = {
       { id: "G-P1.5", what: "낡은 CI 문장", how: "grep", pattern: "`scripts` · `docker`", in: "docs/todo.md", limit: 0 },
       { id: "G-P1.6", what: "요구 체크 이름", how: "grep", pattern: "gate", in: "docs/todo.md", min: 1 },
       { id: "G-P1.7", what: "소스 무변경", how: "diff-empty", paths: ["src/", "test/", "migrations/"], since: "seal:P0" },
-      { id: "G-P1.8", what: "설정 표 무변경", how: "diff-empty", paths: ["README.md", "README.ko.md"], since: "seal:P0", grep: "PARALLAX_DNS_INTERNAL_UPDATE" },
+      { id: "G-P1.8", what: "설정 표 무변경", how: "diff-empty", paths: ["README.md", "README.ko.md"], since: "seal:P0", grep: "| `PARALLAX_DNS_INTERNAL_UPDATE`" },
       { id: "G-P1.8b", what: "타입·빌드·테스트", how: "cmd", cmd: "pnpm check && pnpm run check:portal && pnpm build && pnpm test" },
       { id: "G-P1.9", what: "배포 게이트", how: "test", cmd: "node --test test/infrastructure/schema-surface.test.ts" },
       { id: "G-P1.10", what: "문서 수치 검사", how: "test", cmd: "node --test test/scripts/documented-counts.test.ts" },
+      {
+        // 기준선이 실제로 대상을 잡았다는 역사적 사실. P0 이 자기 봉인을 읽을 수는 없어서
+        // — 봉인을 만드는 검사가 자기 출력을 읽으면 순환이다 — 그 문장을 지운 단계가 읽는다.
+        id: "G-P1.12", what: "P0 기준선이 대상을 잡았다", how: "json", file: "gates/P0.json",
+        path: "checks[id=G-P0.3].measured", min: 1,
+      },
       {
         id: "G-P1.11", what: "테스트 비악화", how: "json", file: "gates/P0.json",
         path: "checks[id=G-P0.6].measured", op: ">=", measure: { how: "cmd", cmd: "pnpm test", capture: "pass" },
@@ -181,6 +187,8 @@ export function measure(check) {
   if (check.how === "json") {
     const stored = readSealValue(check.file, check.path);
     if (stored === undefined) return { measured: -1, detail: `봉인에서 ${check.path} 를 읽지 못했다` };
+    // `measure` 가 없으면 봉인 값 자체에 제약을 건다 — 「그때 이랬다」를 묻는 검사다.
+    if (!check.measure) return { measured: stored, detail: `봉인 기록 ${stored}` };
     const current = measure(check.measure).measured;
     const ok = check.op === ">=" ? current >= stored : check.op === "<=" ? current <= stored : current === stored;
     return { measured: current, limit: stored, forced: ok, detail: `기준선 ${stored} ${check.op} 현재 ${current}` };
