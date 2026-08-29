@@ -13,10 +13,23 @@ yet; the cycle isn't finished until `HEAD` is on `origin/main`.
 
 **2026-08-23 부터는 거기서 한 걸음 더 간다: 푸시하고 CI 가 초록이어야 끝이다.**
 그 전까지 이 저장소에는 워크플로가 `check` 하나뿐이었고, 그래서 이 문단은 푸시를
-종점으로 적을 수 있었다. 지금은 다섯이 돌고 각자 다른 질문에 답한다 —
-`check`(타입·빌드·테스트, Node 24 와 26), `scripts`(파이썬 훅 스위트와 shellcheck),
-`docker`(이미지 빌드와 uid·권한), `codeql`, `dependency-review`(PR 전용). 빨간 결과를
-남기고 떠난 사이클은 끝난 것이 아니라 남에게 넘긴 것이다.
+종점으로 적을 수 있었다. 빨간 결과를 남기고 떠난 사이클은 끝난 것이 아니라 남에게
+넘긴 것이다.
+
+⚠️ **그리고 이 문단도 한 번 뒤처졌다.** 2026-08-23 에는 워크플로가 다섯이었고 여기에
+그 다섯을 나열해 두었다. `#9` 가 PR·머지·배포를 세 층으로 가르면서 `scripts` 와
+`docker` 는 `check.yml` 안의 잡이 되었고, `dependency-review` 는 공용 재사용
+워크플로로 옮겨갔고, `scorecard` 가 새로 붙었다. **측정 2026-08-29:** 워크플로 파일은
+`check.yml` · `codeql.yml` · `scorecard.yml` 세 개, `check.yml` 의 잡은 `verify` ·
+`deployment-gate` · `docker` · `hooks` · `shellcheck` · `policy` · `gate` 일곱 개다.
+숫자를 다시 세는 것 말고 이 문단을 최신으로 유지하는 장치는 없다 — 이 파일의 다른
+경고와 같은 종류다. `README` 쪽 같은 문장은 **`test/scripts/documented-counts.test.ts`
+가 강제한다**; 여기는 그렇지 않으니 `ls .github/workflows` 를 믿을 것.
+
+**또 하나: 푸시가 끝이라고 적힌 위 문단도 지금은 절반이다.** `#9` 이후 `main` 은
+`gate` 를 요구하는 브랜치 규칙 아래 있고, 최근 사이클은 전부 PR 로 들어갔다(`#8`~).
+그래서 실제 종점은 「브랜치 푸시 → PR → `gate` 초록 → 머지」이고, origin 이 배포
+미러로 이어지므로 **머지는 곧 배포다.** 머지 여부는 사람이 결정한다.
 
 에이전트에게 특히 걸리는 지점 둘:
 

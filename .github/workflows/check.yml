@@ -4,17 +4,29 @@ name: check
 # it only sees a commit once somebody pushes the mirror -- sometimes days later.
 # This closes the window at the commit instead of at the deploy.
 #
-# This file's scope is the TypeScript: does it typecheck, does it build, do the
-# `node --test` suites pass. Three things it deliberately does not answer, each
-# with its own workflow and its own verdict, so that a red result names its own
-# cause instead of being one job that failed for any of six reasons:
+# This file collects every verdict that belongs to a commit, one job per
+# question, so that a red result names its own cause instead of being one job
+# that failed for any of six reasons:
 #
-#   scripts.yml   the python hook suites and the shell verifiers -- neither of
-#                 which `node --test` can see
-#   docker.yml    the image, which resolves its dependencies differently than
-#                 this job does and can break while this one stays green
-#   codeql.yml    static analysis, on a schedule as well as at the commit,
-#                 because its queries change without this code changing
+#   verify            the TypeScript: does it typecheck, does it build, do the
+#                     `node --test` suites pass, on Node 24 and 26
+#   deployment-gate   the schema surface, from a bare checkout with nothing
+#                     installed, because that is how a deployment runs it
+#   docker            the image, which resolves its dependencies differently
+#                     than `verify` does and can break while it stays green
+#   hooks             the python hook suites -- which `node --test` cannot see
+#   shellcheck        the shell verifiers, same reason
+#   policy            dependency review, secret scan, workflow audit, from the
+#                     shared reusable workflow so five repositories agree
+#   gate              collects the above; the one name the ruleset requires
+#
+# `codeql.yml` and `scorecard.yml` stay separate on purpose: their verdicts
+# change when this code does not -- query packs update, repository settings
+# drift -- so they run on their own schedules and carry their own verdicts.
+#
+# ⚠️ This comment named `scripts.yml` and `docker.yml` as separate files for six
+#    days after `#9` folded them in here. A list of siblings is exactly the kind
+#    of fact that rots; `needs:` on the `gate` job below is the one that cannot.
 on:
   push:
     branches: [main]

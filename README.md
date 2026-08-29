@@ -197,7 +197,7 @@ flowchart LR
         C["⌨️ CLI"]
     end
 
-    faces --> CMD["command layer<br/>47 commands"]
+    faces --> CMD["command layer<br/>49 commands"]
     CMD --> CP["control plane<br/>zones · revisions · audit"]
 
     CP --> ST[("store")]
@@ -340,7 +340,7 @@ and the defaults are the careful ones.
 
 ## Command line
 
-47 commands. Add `--json` to any of them for machine-readable output; run
+49 commands. Add `--json` to any of them for machine-readable output; run
 `parallax help <command>` for its options.
 
 <details open>
@@ -638,10 +638,17 @@ pnpm build
 pnpm test           # node --test
 ```
 
-Five workflows run in CI, each answering a different question so a red result
-names its own cause: `check` (types, build, tests on Node 24 and 26), `scripts`
-(hook suites and shellcheck), `docker` (the image builds and stays
-unprivileged), `codeql`, and `dependency-review`.
+Three workflows run in CI. `check` collects the jobs whose verdicts belong to a
+commit, each answering a different question so a red result names its own cause:
+`verify` (types, build, tests on Node 24 and 26), `deployment-gate` (schema
+surface, from a bare checkout), `docker` (the image builds and stays
+unprivileged), `hooks` (the Python hook suites), `shellcheck`, and `policy` (a
+shared reusable workflow: dependency review, secret scan, workflow audit). One
+`gate` job collects them, and it is the only check name the branch ruleset
+names -- listing jobs one by one means the day a name changes, the required
+check becomes one that does not exist and the protection quietly disappears.
+`codeql` and `scorecard` run on their own schedules, because their verdicts
+change when the code does not.
 
 The `verify:*` scripts drive real infrastructure and are **not** run in CI:
 
