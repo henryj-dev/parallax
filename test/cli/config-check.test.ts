@@ -7,6 +7,7 @@ import { after, describe, it } from "node:test";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { checkConfig } from "../../src/cli/config-check.ts";
+import { parallaxEnvironment } from "../support/environment.ts";
 
 const execFileAsync = promisify(execFile);
 const ENTRY = join(import.meta.dirname, "../../cmd/parallax/main.ts");
@@ -63,7 +64,7 @@ describe("the preflight", () => {
   it("refuses `idp` with no provider, the way the server would", async () => {
     await assert.rejects(
       () => execFileAsync(process.execPath, [ENTRY, "config", "check"], {
-        env: { ...process.env, DATABASE_URL: "", PARALLAX_PORTAL_SIGN_IN: "idp" },
+        env: { ...parallaxEnvironment(), DATABASE_URL: "", PARALLAX_PORTAL_SIGN_IN: "idp" },
         timeout: CLI_TIMEOUT_MS,
       }),
       (error: { code?: number; stderr?: string }) => {
@@ -78,7 +79,7 @@ describe("the preflight", () => {
     // The control. Without it the refusal above could be something this command
     // does to every environment.
     const { stdout } = await execFileAsync(process.execPath, [ENTRY, "config", "check"], {
-      env: { ...process.env, DATABASE_URL: "", PARALLAX_PORTAL_SIGN_IN: "idp", ...IDENTITY },
+      env: { ...parallaxEnvironment(), DATABASE_URL: "", PARALLAX_PORTAL_SIGN_IN: "idp", ...IDENTITY },
       timeout: CLI_TIMEOUT_MS,
     });
     assert.match(stdout, /environment=ok/u);
@@ -121,7 +122,7 @@ describe("what the preflight must not touch", () => {
 
   it("answers with a database that would refuse and paths that cannot be read", async () => {
     const { stdout } = await execFileAsync(process.execPath, [ENTRY, "config", "check"], {
-      env: { ...process.env, ...HOSTILE },
+      env: { ...parallaxEnvironment(), ...HOSTILE },
       timeout: CLI_TIMEOUT_MS,
     });
     assert.match(stdout, /environment=ok/u);
@@ -141,7 +142,7 @@ describe("what the preflight must not touch", () => {
     holders.push(() => { probe.close(); datagram.close(); });
 
     const { stdout } = await execFileAsync(process.execPath, [ENTRY, "config", "check"], {
-      env: { ...process.env, ...HOSTILE, PARALLAX_DNS_PORT: String(port), PARALLAX_DNS_HOST: "127.0.0.1" },
+      env: { ...parallaxEnvironment(), ...HOSTILE, PARALLAX_DNS_PORT: String(port), PARALLAX_DNS_HOST: "127.0.0.1" },
       timeout: CLI_TIMEOUT_MS,
     });
     assert.match(stdout, new RegExp(`dns=127\\.0\\.0\\.1:${port}`, "u"), "it reported the listener without binding it");

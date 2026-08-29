@@ -166,19 +166,31 @@ no database, no token, no ceremony:
 pnpm dev                       # http://127.0.0.1:3000
 ```
 
-**Or drive it from the command line.** The CLI reaches the store directly:
+**Or drive it from the command line.** The CLI reaches the store directly. A
+record's body arrives as one JSON value, the same shape the HTTP API takes:
 
 ```bash
+pnpm cli settings set --values '{"allowLocalProvider":true}'   # publish to a file, for now
+
 pnpm cli zone create --zone example.com
-pnpm cli record set --zone example.com --view internal \
-                    --id app --name app --type A --content 10.0.0.11 --ttl 300
-pnpm cli record set --zone example.com --view external \
-                    --id app --name app --type A --content 203.0.113.7 --ttl 300
+pnpm cli record set --zone example.com --view internal --id app \
+        --record '{"name":"app","type":"A","content":"10.0.0.11","ttl":300}'
+pnpm cli record set --zone example.com --view external --id app \
+        --record '{"name":"app","type":"A","content":"203.0.113.7","ttl":300,"acknowledgeNonGlobalIp":true}'
 
 pnpm cli preview --zone example.com     # what would change
 pnpm cli apply   --zone example.com     # make it so
 pnpm cli status  --zone example.com     # how far each view got
 ```
+
+Two of those lines are the guards working rather than getting in the way.
+`allowLocalProvider` is off by default, so without it `apply` reports each view
+as `failed` with `no provider is configured` — there is nothing to publish to
+until a Cloudflare credential exists, and a file stands in meanwhile.
+`203.0.113.7` is a documentation address, which is not globally routable, so the
+external view refuses it until somebody says the exposure was reviewed. Both
+refusals are the point; a real deployment reaches a real provider with a real
+address and needs neither line.
 
 > [!IMPORTANT]
 > Parallax **refuses to start on a non-loopback address with no access token**.

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { signSession } from "../../src/security/session-token.ts";
+import { parallaxEnvironment } from "../support/environment.ts";
 
 const ENTRY = join(import.meta.dirname, "../../src/index.ts");
 const START_TIMEOUT_MS = 60_000;
@@ -55,7 +56,7 @@ describe("a deployment whose only credential is an identity provider", () => {
     const port = await freePort();
     const child = spawn(process.execPath, [ENTRY], {
       env: {
-        ...process.env,
+        ...parallaxEnvironment(),
         HOST: "127.0.0.1",
         PORT: String(port),
         DATABASE_URL: "",

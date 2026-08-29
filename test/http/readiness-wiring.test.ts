@@ -6,6 +6,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
+import { parallaxEnvironment } from "../support/environment.ts";
 
 const ENTRY = join(import.meta.dirname, "../../src/index.ts");
 const START_TIMEOUT_MS = 60_000;
@@ -46,7 +47,7 @@ describe("the staleness window reaches the monitor", () => {
     const token = randomBytes(32).toString("base64url");
     const child = spawn(process.execPath, [ENTRY], {
       env: {
-        ...process.env,
+        ...parallaxEnvironment(),
         HOST: "127.0.0.1",
         PORT: String(port),
         DATABASE_URL: "",
