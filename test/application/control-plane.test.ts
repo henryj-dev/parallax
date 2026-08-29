@@ -1705,6 +1705,73 @@ describe("ControlPlane", () => {
       assert.equal(internal?.state, "failed");
       assert.match(internal?.error ?? "", /no provider is configured/u);
     });
+
+    /**
+     * The last of the `pending` that could not move, and the smallest of them.
+     *
+     * The listener reads the desired state and answers from it, and its SOA serial
+     * *is* the zone revision -- so a commit is being served as soon as the snapshot
+     * is re-read. The commit wrote `pending` anyway, and the only way to clear it
+     * was an apply that reaches no provider and writes the same row. The panel
+     * asked an operator to press a button to correct a number that described
+     * nothing outside this process.
+     */
+    function listenerService(adapters: ReturnType<typeof createInMemoryAdapters>): ControlPlane {
+      return new ControlPlane(adapters.zones, adapters.statuses, withoutInternalPublisher(adapters),
+        undefined, undefined, {}, (target) => target.endsWith("/internal") ? "listener" : "provider");
+    }
+
+    const viewOf = async (service: ControlPlane, view: string) =>
+      (await service.status("example.com")).statuses.find((status) => status.view === view);
+
+    it("records the revision as applied when the change is committed, with no apply", async () => {
+      const service = listenerService(createInMemoryAdapters());
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "internal", "app", { name: "app", type: "A", content: "10.0.0.11", ttl: 300 });
+
+      const zone = await service.getZone("example.com");
+      const internal = await viewOf(service, "internal");
+      assert.equal(internal?.state, "applied");
+      assert.equal(internal?.appliedRevision, zone.revision, "which is the revision being answered");
+      assert.equal(internal?.lastAttemptAt, undefined, "nothing was attempted, so nothing claims to have been");
+    });
+
+    it("keeps saying so across a change that does reach it", async () => {
+      // Not the unaffected case -- this edits the internal view directly, and it
+      // is still serving the new revision the moment that lands.
+      const service = listenerService(createInMemoryAdapters());
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "internal", "app", { name: "app", type: "A", content: "10.0.0.11", ttl: 300 });
+      await service.upsertRecord("example.com", "internal", "app", { name: "app", type: "A", content: "10.0.0.12", ttl: 300 });
+
+      const zone = await service.getZone("example.com");
+      const internal = await viewOf(service, "internal");
+      assert.equal(internal?.state, "applied");
+      assert.equal(internal?.appliedRevision, zone.revision);
+    });
+
+    it("leaves the view something does publish waiting, as it should", async () => {
+      // The guard. Only the answered-here view is exempt from waiting for an apply.
+      const service = listenerService(createInMemoryAdapters());
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+
+      assert.equal((await viewOf(service, "external"))?.state, "pending");
+      assert.equal((await viewOf(service, "internal"))?.state, "applied");
+    });
+
+    it("still has nothing to withdraw when the zone is deleted", async () => {
+      // `lastAttemptAt` is what deletion reads to find targets that may be holding
+      // records, and this path must not invent one. Without an apply there is no
+      // attempt, so there is nothing to abandon and no acknowledgement to demand.
+      const service = listenerService(createInMemoryAdapters());
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "internal", "app", { name: "app", type: "A", content: "10.0.0.11", ttl: 300 });
+
+      const result = await service.deleteZone("example.com");
+      assert.deepEqual(result.abandonedProviderTargets, []);
+      await assert.rejects(service.getZone("example.com"), NotFoundError);
+    });
   });
 
 
