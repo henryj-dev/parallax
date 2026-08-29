@@ -270,13 +270,22 @@ const SCHEMAS: Readonly<Record<string, JsonSchema>> = {
   },
   ApplyStatus: {
     type: "object",
-    required: ["zone", "view", "desiredRevision", "appliedRevision", "state"],
+    required: ["zone", "view", "desiredRevision", "appliedRevision", "state", "publisher"],
     properties: {
       zone: { type: "string" },
       view: { type: "string" },
       desiredRevision: { type: "integer" },
       appliedRevision: { type: "integer" },
       state: { type: "string", enum: ["pending", "applied", "failed"] },
+      publisher: {
+        type: "string",
+        enum: ["listener", "provider", "none"],
+        description:
+          "Who answers this view: a provider this control plane publishes to, this process's own DNS listener, "
+          + "or nobody. Derived at read time from how this process is configured, never stored -- so it changes with "
+          + "the configuration and not with the zone. `none` is why a `pending` state may never move: there is no "
+          + "provider for an apply to reach, so the zone's revision rises past this view indefinitely.",
+      },
       lastAttemptAt: { type: "string", format: "date-time" },
       error: { type: "string" },
       completedOperations: { type: "integer", description: "On a failure, how many of the plan's operations the provider had already accepted." },

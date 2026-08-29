@@ -1645,7 +1645,7 @@ describe("ControlPlane", () => {
       // front page while the system was doing exactly what it was configured to.
       const adapters = createInMemoryAdapters();
       const service = new ControlPlane(adapters.zones, adapters.statuses, withoutInternalPublisher(adapters),
-        undefined, undefined, {}, (target) => target.endsWith("/internal"));
+        undefined, undefined, {}, (target) => target.endsWith("/internal") ? "listener" : "provider");
       await service.createZone("example.com");
       await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
       const zone = await service.getZone("example.com");
@@ -1665,7 +1665,7 @@ describe("ControlPlane", () => {
       // stayed red about the same view.
       const adapters = createInMemoryAdapters();
       const service = new ControlPlane(adapters.zones, adapters.statuses, withoutInternalPublisher(adapters),
-        undefined, undefined, {}, (target) => target.endsWith("/internal"));
+        undefined, undefined, {}, (target) => target.endsWith("/internal") ? "listener" : "provider");
       await service.createZone("example.com");
       await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
 
@@ -1683,7 +1683,7 @@ describe("ControlPlane", () => {
       // becomes a demand to acknowledge abandoning records that never existed.
       const adapters = createInMemoryAdapters();
       const service = new ControlPlane(adapters.zones, adapters.statuses, withoutInternalPublisher(adapters),
-        undefined, undefined, {}, (target) => target.endsWith("/internal"));
+        undefined, undefined, {}, (target) => target.endsWith("/internal") ? "listener" : "provider");
       await service.createZone("example.com");
       await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
       await service.apply("example.com");
@@ -1767,6 +1767,137 @@ describe("ControlPlane", () => {
       const { adopted, warnings } = await service.adoptProviderRecords("mail.example", "external", "operator");
       assert.equal(adopted.length, 1, "it did adopt something");
       assert.deepEqual(warnings, [], "and the authority did not change");
+    });
+  });
+
+  describe("which views an external change actually moves", () => {
+    /**
+     * A zone reading `pending · applied revision 47` against desired 49, with an
+     * empty plan beside it. Every external edit marked the internal view pending
+     * because internal inherits from external -- and most external edits change
+     * nothing internal publishes, so the apply that would clear it had no work to
+     * do and nobody ran it. Nothing carries a pending view forward, so the zone
+     * stayed two behind for as long as external kept being edited.
+     */
+    async function zoneWithOverride() {
+      const adapters = createInMemoryAdapters();
+      const service = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider);
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+      await service.upsertRecord("example.com", "internal", "web", { name: "www", type: "A", content: "10.0.0.11", ttl: 60 });
+      await service.apply("example.com");
+      return service;
+    }
+
+    const internalOf = async (service: ControlPlane) =>
+      (await service.status("example.com")).statuses.find((status) => status.view === "internal");
+
+    it("leaves the internal view applied when an overridden external record changes", async () => {
+      const service = await zoneWithOverride();
+      const before = await internalOf(service);
+      assert.equal(before?.state, "applied", "the fixture starts caught up");
+
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.11", ttl: 300 });
+
+      const internal = await internalOf(service);
+      const zone = await service.getZone("example.com");
+      assert.equal(internal?.state, "applied", "the override means internal publishes exactly what it did before");
+      assert.equal(internal?.appliedRevision, zone.revision);
+    });
+
+    it("still marks the internal view pending when the change reaches it", async () => {
+      // The guard must not have quietened an inheritance that does apply. Nothing
+      // overrides this name, so internal inherits it and genuinely moved.
+      const service = await zoneWithOverride();
+      await service.upsertRecord("example.com", "external", "api", { name: "api", type: "A", content: "8.8.8.20", ttl: 300 });
+
+      const internal = await internalOf(service);
+      assert.equal(internal?.state, "pending");
+    });
+
+    it("still marks the internal view pending when an inherited record's value changes", async () => {
+      const service = await zoneWithOverride();
+      await service.upsertRecord("example.com", "external", "api", { name: "api", type: "A", content: "8.8.8.20", ttl: 300 });
+      await service.apply("example.com");
+      assert.equal((await internalOf(service))?.state, "applied");
+
+      await service.upsertRecord("example.com", "external", "api", { name: "api", type: "A", content: "8.8.8.21", ttl: 300 });
+      assert.equal((await internalOf(service))?.state, "pending", "the inherited value moved, so internal did");
+    });
+
+    it("leaves the internal view applied when only the proxy flag changes", async () => {
+      // `proxied` is an external-only concept and does not compose into internal.
+      const adapters = createInMemoryAdapters();
+      const service = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider);
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+      await service.apply("example.com");
+
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 1, proxied: true });
+
+      const internal = await internalOf(service);
+      assert.equal(internal?.state, "applied");
+    });
+
+    it("does not accumulate a lag across successive external changes", async () => {
+      // The report, as it arrived: the audit trail at revision 49 and the internal
+      // view at 47. Two external edits in a row, neither of them reaching internal,
+      // each one marking it pending -- and once a view is pending, no later commit
+      // carries it forward, so the gap only widened.
+      const service = await zoneWithOverride();
+      const start = (await service.getZone("example.com")).revision;
+
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.11", ttl: 300 });
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.12", ttl: 300 });
+
+      const zone = await service.getZone("example.com");
+      assert.equal(zone.revision, start + 2, "two revisions did land");
+      const internal = await internalOf(service);
+      assert.equal(internal?.state, "applied");
+      assert.equal(internal?.appliedRevision, zone.revision, "and the internal view is not two behind");
+    });
+  });
+
+  describe("who answers a view, reported with its status", () => {
+    /**
+     * `pending` said two things and only one of them was worth waiting for. A
+     * view nothing publishes and no listener answers can never record the desired
+     * revision: every change advances the zone's, an apply against it fails for
+     * want of a provider, and the panel said "pending" the whole time. The state
+     * alone could not tell that apart from an apply somebody simply owed.
+     */
+    it("says a view is published, answered here, or published nowhere", async () => {
+      const adapters = createInMemoryAdapters();
+      const service = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider,
+        undefined, undefined, {}, (target) => target.endsWith("/internal") ? "listener" : "provider");
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+
+      const { statuses } = await service.status("example.com");
+      assert.equal(statuses.find((status) => status.view === "internal")?.publisher, "listener");
+      assert.equal(statuses.find((status) => status.view === "external")?.publisher, "provider");
+    });
+
+    it("reports `none` for the view that will never catch up", async () => {
+      const adapters = createInMemoryAdapters();
+      const service = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider,
+        undefined, undefined, {}, (target) => target.endsWith("/internal") ? "none" : "provider");
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+
+      const internal = (await service.status("example.com")).statuses.find((status) => status.view === "internal");
+      assert.equal(internal?.state, "pending", "the stored state is unchanged");
+      assert.equal(internal?.publisher, "none", "and now something says the state cannot move");
+    });
+
+    it("defaults to `provider`, so a deployment that does not say is unaffected", async () => {
+      const { service } = setup();
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "web", { name: "www", type: "A", content: "8.8.8.10", ttl: 300 });
+
+      const { statuses } = await service.status("example.com");
+      assert.ok(statuses.length > 0);
+      for (const status of statuses) assert.equal(status.publisher, "provider");
     });
   });
 

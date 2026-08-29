@@ -326,9 +326,14 @@ function renderSync(state) {
     const label = $(`#${prefix}-sync`);
     label.className = `target-status ${view.state}`;
     label.textContent = t(`status.${view.state}`);
-    $(`#${prefix}-sync-detail`).textContent = view.error
-      ? localizeProviderError(view.error, t)
-      : t("sync.appliedRevision", { revision: view.appliedRevision });
+    // An applied revision is a useless thing to print for a view nothing
+    // publishes: the number cannot move, so it reads as a stalled one. What the
+    // reader needs is that there is nothing to stall.
+    $(`#${prefix}-sync-detail`).textContent = view.state === "unpublished"
+      ? t(prefix === "internal" ? "sync.unpublishedInternal" : "sync.unpublishedExternal")
+      : view.error
+        ? localizeProviderError(view.error, t)
+        : t("sync.appliedRevision", { revision: view.appliedRevision });
   }
   const chip = $("#sync-overall");
   chip.className = `status-chip ${panel.overall}`;

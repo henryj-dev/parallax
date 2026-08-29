@@ -1,5 +1,12 @@
 export interface SyncPanelView {
+  /**
+   * `applied`, `pending`, `failed`, or `unpublished` -- the last displacing
+   * whatever was stored, because nothing publishes this view and no apply can
+   * move it. `""` on a panel that has no per-view answer.
+   */
   state: string;
+  /** `listener`, `provider`, `none`, or `""` when there is no status to ask about. */
+  publisher: string;
   appliedRevision: number;
   error: string;
 }
@@ -7,16 +14,19 @@ export interface SyncPanelView {
 export interface SyncPanel {
   /** `empty` when the zone holds nothing to reconcile; `error` when status could not be read; `status` otherwise. */
   kind: "empty" | "status" | "error";
+  /** `applied`, `pending`, `failed`, `unpublished`, or `""`. A view still owed an apply outranks one nobody publishes. */
   overall: string;
   error?: string;
   views: { internal: SyncPanelView; external: SyncPanelView };
   percent: number;
   desired: number;
+  /** The furthest-behind revision among the views something can advance. */
   applied?: number;
   /**
-   * A view's applied revision trails the desired one, so an apply advances the
-   * status record even when the provider plan is empty. False whenever the
-   * status could not be read: an unknown revision is not a known lag.
+   * A view something can advance trails the desired revision, so an apply moves
+   * the status record even when the provider plan is empty. False whenever the
+   * status could not be read -- an unknown revision is not a known lag -- and
+   * false for a view nothing publishes, which no apply can move.
    */
   behind: boolean;
 }

@@ -203,6 +203,28 @@ export interface Clock {
   now(): Date;
 }
 
+/**
+ * Who answers a `<zone>/<view>` target.
+ *
+ * Not stored. It is a fact about how this process is configured right now, not
+ * about anything that happened to the zone -- setting `PARALLAX_DNS_PORT` or
+ * binding a credential changes it without any revision being written. Persisting
+ * it would make a status row that was true when it was saved and wrong after a
+ * restart, which is the shape of every stale-copy defect in this codebase.
+ */
+export type ProviderViewPublisher = "listener" | "provider" | "none";
+
+/**
+ * An apply status as reported, rather than as stored.
+ *
+ * `publisher` is derived at read time and answers what `state` alone could not:
+ * a `pending` view nothing publishes is not behind, it is unpublished, and no
+ * apply will ever move it.
+ */
+export interface ReportedApplyStatus extends ApplyStatus {
+  publisher: ProviderViewPublisher;
+}
+
 /** Operator-facing retention settings; the repository sees resolved values. */
 export interface RetentionSettings {
   /** Newest snapshots kept per zone. 0 keeps every revision. */
@@ -218,7 +240,7 @@ export class ControlPlane {
   readonly #clock: Clock;
   readonly #applyLock: ApplyLock;
   readonly #retention: RetentionSettings;
-  readonly #answeredHere: (target: string) => boolean;
+  readonly #publisherFor: (target: string) => ProviderViewPublisher;
   readonly #operationTails = new Map<string, Promise<void>>();
 
   constructor(
@@ -229,20 +251,29 @@ export class ControlPlane {
     applyLock: ApplyLock = { withZoneLock: (_zone, operation) => operation() },
     retention: RetentionSettings = {},
     /**
-     * Whether this process answers a target itself and publishes it nowhere.
+     * Who answers a target: a provider this publishes to, this process's own
+     * listener, or nobody.
      *
-     * The built-in listener reads the desired state and answers from it, so
-     * there is nothing to reconcile and no lag between wanting a record and
-     * serving it. Without this, applying such a view finds no provider and
-     * records a failure -- which says the system is broken while it is doing
-     * exactly what it was configured to do, and says it on the front page.
+     * The listener reads the desired state and answers from it, so there is
+     * nothing to reconcile and no lag between wanting a record and serving it.
+     * Without that answer, applying such a view finds no provider and records a
+     * failure -- which says the system is broken while it is doing exactly what
+     * it was configured to do, and says it on the front page.
      *
-     * Both halves of that question -- is anything publishing this, and does the
-     * listener answer for it -- are answered where the process is assembled.
-     * Asking here would mean this knowing which adapter is routed where, which
-     * is the router's business and not the control plane's.
+     * `none` is the third answer, and it used to be indistinguishable from the
+     * second on the way in and from an ordinary lag on the way out. A view
+     * nothing publishes and no listener answers is reported as `pending`
+     * forever: every desired change advances the zone's revision, nothing ever
+     * advances that view's, and an apply cannot -- it fails, because there is no
+     * provider to reach. "Pending" reads as "catching up". Saying which of the
+     * three is the difference between an operator waiting and an operator
+     * configuring something.
+     *
+     * All three are answered where the process is assembled. Asking here would
+     * mean this knowing which adapter is routed where, which is the router's
+     * business and not the control plane's.
      */
-    answeredHere: (target: string) => boolean = () => false,
+    publisherFor: (target: string) => ProviderViewPublisher = () => "provider",
   ) {
     this.#zones = zones;
     this.#statuses = statuses;
@@ -250,7 +281,17 @@ export class ControlPlane {
     this.#clock = clock;
     this.#applyLock = applyLock;
     this.#retention = retention;
-    this.#answeredHere = answeredHere;
+    this.#publisherFor = publisherFor;
+  }
+
+  /**
+   * Whether this process answers a target itself and publishes it nowhere.
+   *
+   * Derived rather than injected separately: two predicates that must agree
+   * about the same target are two predicates that will disagree.
+   */
+  #answeredHere(target: string): boolean {
+    return this.#publisherFor(target) === "listener";
   }
 
   /** Resolves the operator's settings against the current clock for one commit. */
@@ -1136,7 +1177,7 @@ export class ControlPlane {
     return mergeRemovedViews(current, removed);
   }
 
-  async status(zoneName: string): Promise<{ zone: string; desiredRevision: number; statuses: ApplyStatus[] }> {
+  async status(zoneName: string): Promise<{ zone: string; desiredRevision: number; statuses: ReportedApplyStatus[] }> {
     return this.#statusFor(await this.getZone(zoneName));
   }
 
@@ -1163,7 +1204,7 @@ export class ControlPlane {
     return { zones, limit: listed.limit, offset: listed.offset, hasMore: listed.hasMore };
   }
 
-  async #statusFor(zone: Zone): Promise<{ zone: string; desiredRevision: number; statuses: ApplyStatus[] }> {
+  async #statusFor(zone: Zone): Promise<{ zone: string; desiredRevision: number; statuses: ReportedApplyStatus[] }> {
     const stored = await this.#statuses.list(zone.name);
     const effectiveViews = materializeProviderViews(zone.views);
     const statuses: ApplyStatus[] = stored.filter((status) =>
@@ -1179,7 +1220,17 @@ export class ControlPlane {
         zone: zone.name, view: view.name, desiredRevision: 0, appliedRevision: 0, state: "pending",
       }, zone.revision));
     }
-    return { zone: zone.name, desiredRevision: zone.revision, statuses };
+    // Attached here rather than stored, and to every row including the tombstones
+    // of removed views: whoever reads a state needs to know whether anything can
+    // act on it, and that is true of a withdrawal nobody can perform too.
+    return {
+      zone: zone.name,
+      desiredRevision: zone.revision,
+      statuses: statuses.map((status) => ({
+        ...status,
+        publisher: this.#publisherFor(targetKey(zone.name, status.view)),
+      })),
+    };
   }
 
   async audit(zoneName?: string, page?: PageRequest): Promise<Paged<"entries", AuditEntry>> {
@@ -1228,7 +1279,18 @@ export class ControlPlane {
     expectedRevision?: number,
   ): Promise<void> {
     const expandedViews = new Set(affectedViews);
-    if (expandedViews.has("external")) expandedViews.add("internal");
+    // The internal view inherits from the external one, so an external change can
+    // change what internal publishes -- but usually does not. An overridden name,
+    // an apex NS, a `proxied` flag, an external TTL: all of them leave internal's
+    // composed records byte-identical, and marking it pending anyway is how a
+    // view ends up permanently behind. Nothing carries a pending view forward, an
+    // apply against it has no operations to perform, and until somebody runs one
+    // by hand the panel reads `pending` with an empty plan beside it.
+    //
+    // So compare what internal would actually publish. This is desired state
+    // against desired state -- no provider is read, nothing is added to the
+    // commit's cost.
+    if (expandedViews.has("external") && internalWouldChange(before, zone)) expandedViews.add("internal");
     const statuses = await this.#statusesForDesiredChange(before, zone, expandedViews);
     const retention = this.#retentionPolicy();
     try {
@@ -1470,6 +1532,45 @@ function comparableRecord(record: DesiredRecord): string {
 
 function desiredState(zone: Zone): { views: Zone["views"] } {
   return { views: zone.views.map(cloneView) };
+}
+
+/**
+ * Whether the internal view would publish something different after this change.
+ *
+ * The internal view is composed, not stored: it inherits every inheritable
+ * external record and then applies its own overrides. So the question "did the
+ * external edit reach internal" cannot be answered from the edit -- only by
+ * composing both sides and comparing. `id` is part of the comparison because it
+ * is what the ownership marker carries, so a record that keeps its value under a
+ * new id still has to be rewritten at the provider.
+ *
+ * ⚠️ **Fails toward `true`.** A snapshot that cannot be composed -- the invalid
+ * combination an older version admitted, which `#statusesForDesiredChange`
+ * deliberately does not materialize for the same reason -- gives no answer, and
+ * the safe reading of no answer is that the view moved. Marking a view pending
+ * that did not need it costs one apply; skipping one that did leaves a provider
+ * holding records nobody will correct.
+ */
+function internalWouldChange(before: Zone | undefined, zone: Zone): boolean {
+  if (!before) return true;
+  const after = internalPublicationKey(zone);
+  if (after === undefined) return true;
+  const previous = internalPublicationKey(before);
+  if (previous === undefined) return true;
+  return previous !== after;
+}
+
+/** The composed internal view as one comparable string, or `undefined` if it does not compose. */
+function internalPublicationKey(zone: Zone): string | undefined {
+  try {
+    const internal = materializeProviderViews(zone.views).find((view) => view.name === "internal");
+    return JSON.stringify((internal?.records ?? []).map((record) => {
+      const fields = record as unknown as Record<string, unknown>;
+      return Object.keys(fields).sort().map((key) => [key, fields[key]]);
+    }));
+  } catch {
+    return undefined;
+  }
 }
 
 function pendingForRevision(status: ApplyStatus, desiredRevision: number, keepAttempt = false): ApplyStatus {

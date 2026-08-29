@@ -126,4 +126,79 @@ describe("what the sync panel says", () => {
     assert.equal(panel.kind, "empty");
     assert.equal(panel.behind, false);
   });
+
+  it("calls a view nothing publishes unpublished, not pending", () => {
+    // The word on the front page for months. Nothing publishes this view and no
+    // listener answers it, so the zone's revision rises past it forever and an
+    // apply against it fails for want of a provider. "Pending" reads as
+    // "catching up", and the answer was to configure something.
+    const panel = syncPanel({
+      activeZone: { revision: 49 },
+      records: [{ id: "web" }],
+      status: {
+        desiredRevision: 49,
+        statuses: [
+          { view: "internal", state: "pending", appliedRevision: 0, publisher: "none" },
+          { view: "external", state: "applied", appliedRevision: 49, publisher: "provider" },
+        ],
+      },
+    });
+    assert.equal(panel.views.internal.state, "unpublished");
+    assert.equal(panel.views.external.state, "applied");
+    assert.equal(panel.overall, "unpublished", "and the chip says so too");
+  });
+
+  it("does not count a view nothing publishes as behind, or as progress lost", () => {
+    // No apply can move it, so offering one would offer a button that only
+    // fails -- and averaging it into the progress track reported a zone at 0%
+    // that is entirely caught up on every view anything can reach.
+    const panel = syncPanel({
+      activeZone: { revision: 49 },
+      records: [{ id: "web" }],
+      status: {
+        desiredRevision: 49,
+        statuses: [
+          { view: "internal", state: "pending", appliedRevision: 0, publisher: "none" },
+          { view: "external", state: "applied", appliedRevision: 49, publisher: "provider" },
+        ],
+      },
+    });
+    assert.equal(panel.behind, false);
+    assert.equal(panel.applied, 49);
+    assert.equal(panel.percent, 100);
+  });
+
+  it("lets a real lag outrank a view nothing publishes", () => {
+    // Both are true at once, and only one of them is somebody's next action.
+    const panel = syncPanel({
+      activeZone: { revision: 49 },
+      records: [{ id: "web" }],
+      status: {
+        desiredRevision: 49,
+        statuses: [
+          { view: "internal", state: "pending", appliedRevision: 0, publisher: "none" },
+          { view: "external", state: "pending", appliedRevision: 47, publisher: "provider" },
+        ],
+      },
+    });
+    assert.equal(panel.overall, "pending");
+    assert.equal(panel.behind, true, "the external view is still owed an apply");
+    assert.equal(panel.applied, 47);
+  });
+
+  it("still reports a failure on a view something does publish", () => {
+    const panel = syncPanel({
+      activeZone: zone,
+      records: [{ id: "web" }],
+      status: {
+        desiredRevision: 3,
+        statuses: [
+          { view: "internal", state: "failed", appliedRevision: 0, publisher: "listener", error: "provider operation failed" },
+          { view: "external", state: "applied", appliedRevision: 3, publisher: "provider" },
+        ],
+      },
+    });
+    assert.equal(panel.views.internal.state, "failed");
+    assert.equal(panel.overall, "failed");
+  });
 });
