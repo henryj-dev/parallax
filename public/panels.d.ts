@@ -13,9 +13,42 @@ export interface SyncPanel {
   percent: number;
   desired: number;
   applied?: number;
+  /**
+   * A view's applied revision trails the desired one, so an apply advances the
+   * status record even when the provider plan is empty. False whenever the
+   * status could not be read: an unknown revision is not a known lag.
+   */
+  behind: boolean;
 }
 
 export function syncPanel(state: unknown): SyncPanel;
+
+export interface PlanPanelOperation {
+  kind?: string;
+  /** `internal` or `external` -- the view this operation belongs to. */
+  view: string;
+  desired?: { name?: string; type?: string; content?: string };
+  actual?: { name?: string; type?: string; content?: string };
+}
+
+export interface PlanPanel {
+  /** `error` when the plan could not be built; `loading` before it arrives; `plan` otherwise. */
+  kind: "error" | "loading" | "plan";
+  operations: PlanPanelOperation[];
+  unreadable: { view: string; error: string }[];
+  untouched: number;
+  /**
+   * The plan is empty and applying would still advance this zone's status record
+   * from `applied` to `desired`. False whenever a view could not be read.
+   */
+  advancesRecord: boolean;
+  applied: number;
+  desired: number;
+  /** Whether applying from this dialog would do anything at all. */
+  applyEnabled: boolean;
+}
+
+export function planPanel(state: unknown): PlanPanel;
 
 /** One side's answer, and which message stands in when there is none. */
 export interface RecordAnswerView {

@@ -1,5 +1,5 @@
 import { createApiClient } from "./api-client.js";
-import { fallbackPanel, recordOwnership, recordRow, syncPanel } from "./panels.js";
+import { fallbackPanel, planPanel, recordOwnership, recordRow, syncPanel } from "./panels.js";
 import { createStore, isNonGlobalAddress, ERROR_SCOPES, editorControlsVisible, adminControlsVisible } from "./store.js";
 import { effectiveExternalTtl, isValidDnsOnlyTtl } from "./ttl.js";
 import {
@@ -388,48 +388,41 @@ function renderHistory(state) {
 function renderPlan(state) {
   const summary = $("#plan-summary");
   const content = $("#plan-content");
-  if (state.planError) {
+  const panel = planPanel(state);
+  $("#apply-from-plan").disabled = !panel.applyEnabled;
+  if (panel.kind === "error") {
     summary.textContent = t("plan.failed");
     content.innerHTML = `<div class="form-error">${escapeHtml(t("plan.failedHelp", { error: state.planError }))}</div>`;
-    $("#apply-from-plan").disabled = true;
     return;
   }
-  if (!state.plan) {
+  if (panel.kind === "loading") {
     summary.textContent = t("plan.comparing");
     content.innerHTML = '<div class="skeleton plan-skeleton"></div><div class="skeleton plan-skeleton"></div>';
-    $("#apply-from-plan").disabled = true;
     return;
   }
-  const entries = Object.entries(state.plan.views ?? {});
-  const operations = entries
-    .flatMap(([target, plan]) => (plan?.operations ?? []).map((operation) => ({ ...operation, target })));
-  // A view that could not be read produces an empty plan, which would otherwise
-  // be indistinguishable from one with nothing to do -- the reading that would
-  // let an operator apply believing they had seen everything.
-  const unreadable = entries.filter(([, plan]) => plan?.error);
-  summary.textContent = unreadable.length
-    ? t(pluralKey("plan.unreadable", unreadable.length), { count: unreadable.length })
-    : operations.length
-      ? t(pluralKey("plan.operations", operations.length), { count: operations.length })
-      : t("plan.noChanges");
-  const warnings = unreadable
-    .map(([target, plan]) => `<div class="plan-unreadable" role="alert">${escapeHtml(t("plan.viewUnreadable", { view: localizeViewName(target, t), error: String(plan.error) }))}</div>`)
+  summary.textContent = panel.unreadable.length
+    ? t(pluralKey("plan.unreadable", panel.unreadable.length), { count: panel.unreadable.length })
+    : panel.operations.length
+      ? t(pluralKey("plan.operations", panel.operations.length), { count: panel.operations.length })
+      // The plan is empty and the button is live, so say what pressing it does.
+      // Left unsaid, "there is nothing to apply" above an enabled control reads
+      // as a contradiction and gets pressed anyway, or not at all.
+      : panel.advancesRecord
+        ? t("plan.recordBehind", { applied: panel.applied, desired: panel.desired })
+        : t("plan.noChanges");
+  const warnings = panel.unreadable
+    .map(({ view, error }) => `<div class="plan-unreadable" role="alert">${escapeHtml(t("plan.viewUnreadable", { view: localizeViewName(view, t), error }))}</div>`)
     .join("");
-  content.innerHTML = warnings + (operations.length
-    ? operations.map((operation) => {
+  content.innerHTML = warnings + (panel.operations.length
+    ? panel.operations.map((operation) => {
       const kind = String(operation.kind ?? "update").toLowerCase();
       const record = operation.desired ?? operation.actual ?? {};
-      return `<article class="plan-operation"><span class="operation-kind ${escapeHtml(kind)}">${escapeHtml(t(`operation.${kind}`))}</span><div><b>${escapeHtml(displayName(record.name ?? t("plan.record")))} ${escapeHtml(record.type ?? "")}</b><small>${escapeHtml(localizeViewName(operation.target, t))} · ${escapeHtml(record.content ?? t("plan.reconciled"))}</small></div></article>`;
+      return `<article class="plan-operation"><span class="operation-kind ${escapeHtml(kind)}">${escapeHtml(t(`operation.${kind}`))}</span><div><b>${escapeHtml(displayName(record.name ?? t("plan.record")))} ${escapeHtml(record.type ?? "")}</b><small>${escapeHtml(localizeViewName(operation.view, t))} · ${escapeHtml(record.content ?? t("plan.reconciled"))}</small></div></article>`;
     }).join("")
     : `<div class="mini-empty">${escapeHtml(t("plan.noDrift"))}</div>`);
-  // Nothing to do is not the same as nothing being there. Records the provider
-  // holds that Parallax neither owns nor describes produce no operation, so an
-  // empty plan reads as an empty zone unless the count is said out loud.
-  const untouched = entries.reduce((total, [, plan]) => total + Number(plan?.summary?.untouched ?? 0), 0);
-  if (untouched > 0) {
-    content.innerHTML += `<div class="mini-empty">${escapeHtml(t(pluralKey("plan.untouched", untouched), { count: untouched }))}</div>`;
+  if (panel.untouched > 0) {
+    content.innerHTML += `<div class="mini-empty">${escapeHtml(t(pluralKey("plan.untouched", panel.untouched), { count: panel.untouched }))}</div>`;
   }
-  $("#apply-from-plan").disabled = operations.length === 0 && !state.dirty;
 }
 
 /**
