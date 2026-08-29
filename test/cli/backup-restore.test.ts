@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { promisify } from "node:util";
+import { parallaxEnvironment } from "../support/environment.ts";
 
 const execFileAsync = promisify(execFile);
 const CLI_TIMEOUT_MS = 60_000;
@@ -25,7 +26,7 @@ describe("backup and restore across two stores", () => {
   let target: string;
 
   const environmentFor = (directory: string): NodeJS.ProcessEnv => ({
-    ...process.env,
+    ...parallaxEnvironment(),
     DATABASE_URL: "",
     PARALLAX_AUTH_TOKENS: "",
     PARALLAX_STATE_FILE: join(directory, "state.json"),

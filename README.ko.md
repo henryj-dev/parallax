@@ -165,19 +165,30 @@ pnpm install --frozen-lockfile
 pnpm dev                       # http://127.0.0.1:3000
 ```
 
-**또는 명령줄로 다룹니다.** CLI는 저장소에 직접 닿습니다:
+**또는 명령줄로 다룹니다.** CLI는 저장소에 직접 닿습니다. 레코드 본문은 JSON 한 값으로
+넘기며, HTTP API가 받는 것과 같은 모양입니다:
 
 ```bash
+pnpm cli settings set --values '{"allowLocalProvider":true}'   # 우선 파일에 게시
+
 pnpm cli zone create --zone example.com
-pnpm cli record set --zone example.com --view internal \
-                    --id app --name app --type A --content 10.0.0.11 --ttl 300
-pnpm cli record set --zone example.com --view external \
-                    --id app --name app --type A --content 203.0.113.7 --ttl 300
+pnpm cli record set --zone example.com --view internal --id app \
+        --record '{"name":"app","type":"A","content":"10.0.0.11","ttl":300}'
+pnpm cli record set --zone example.com --view external --id app \
+        --record '{"name":"app","type":"A","content":"203.0.113.7","ttl":300,"acknowledgeNonGlobalIp":true}'
 
 pnpm cli preview --zone example.com     # 무엇이 바뀌는지
 pnpm cli apply   --zone example.com     # 반영
 pnpm cli status  --zone example.com     # 각 뷰가 어디까지 적용됐는지
 ```
+
+저 중 두 줄은 가드가 방해하는 것이 아니라 제대로 동작하는 모습입니다.
+`allowLocalProvider`는 기본이 꺼져 있어서, 그 줄이 없으면 `apply`가 각 뷰를
+`no provider is configured`와 함께 `failed`로 보고합니다 — Cloudflare 크리덴셜이 생기기
+전까지 게시할 곳이 없고, 그동안은 파일이 그 자리를 대신합니다. `203.0.113.7`은 문서용
+주소라 전역으로 라우팅되지 않으므로, 노출을 검토했다고 말할 때까지 외부 뷰가 거부합니다.
+두 거부가 바로 요점입니다. 실제 배포는 실제 프로바이더에 실제 주소를 쓰므로 두 줄 다
+필요하지 않습니다.
 
 > [!IMPORTANT]
 > Parallax는 **액세스 토큰 없이 루프백이 아닌 주소로는 기동을 거부합니다.**

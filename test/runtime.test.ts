@@ -14,6 +14,7 @@ import {
   createRuntime,
   RuntimeStartupError,
 } from "../src/runtime.ts";
+import { parallaxEnvironment } from "./support/environment.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -139,7 +140,7 @@ describe("runtime filesystem policy", () => {
         // process that never exits must fail rather than stop the clock.
         timeout: 60_000,
         env: {
-          ...process.env,
+          ...parallaxEnvironment(),
           DATABASE_URL: "",
           PARALLAX_CONFIG_FILE: config.configurationFile,
           PARALLAX_STATE_FILE: config.stateFile,

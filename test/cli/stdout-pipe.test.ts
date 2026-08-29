@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { describe, it } from "node:test";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { parallaxEnvironment } from "../support/environment.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,7 +27,7 @@ const ENTRY = join(import.meta.dirname, "../../cmd/parallax/main.ts");
  */
 describe("what the command line writes to a pipe", () => {
   /** No store is opened: the description is built from the command registry. */
-  const environment: NodeJS.ProcessEnv = { ...process.env, DATABASE_URL: "", PARALLAX_AUTH_TOKENS: "" };
+  const environment: NodeJS.ProcessEnv = { ...parallaxEnvironment(), DATABASE_URL: "", PARALLAX_AUTH_TOKENS: "" };
 
   it("delivers a document larger than the pipe buffer without losing the end of it", async () => {
     const { stdout } = await execFileAsync(process.execPath, [ENTRY, "openapi", "--json"], {
