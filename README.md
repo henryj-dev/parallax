@@ -687,9 +687,12 @@ unprivileged.
 
 **What doesn't yet.** Authorization is route-based, not zone-based — an `editor`
 may act on every zone this deployment can see, so multi-team use needs separate
-control planes until a per-zone layer exists. Cloudflare is the only real provider
-adapter; the local file provider is for deployments with no provider configured.
-`restore` is not a merge and refuses a store that already holds zones or tokens.
+control planes until a per-zone layer exists. The **external** view has one real
+provider adapter, Cloudflare; the **internal** view is either published into a
+server that speaks RFC 2136 (`PARALLAX_DNS_INTERNAL_UPDATE`) or answered by this
+process's own listener, and the local file provider stands in for deployments with
+no provider configured at all. `restore` is not a merge and refuses a store that
+already holds zones or tokens.
 
 ---
 
