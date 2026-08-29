@@ -80,5 +80,50 @@ describe("what the sync panel says", () => {
     assert.equal(panel.overall, "pending");
     assert.equal(panel.applied, 4, "the lower of the two, which is what a reader needs");
     assert.equal(panel.percent, 29);
+    assert.equal(panel.behind, true);
+  });
+
+  it("says whether the status record is behind, which is a separate question from drift", () => {
+    // What `apply` advances is this number. A view answered by this process
+    // publishes nothing, so its plan is empty while this can still trail -- and
+    // the plan dialog needs the two answers apart to know whether to offer.
+    const caughtUp = syncPanel({
+      activeZone: zone,
+      records: [{ id: "web" }],
+      status: {
+        desiredRevision: 3,
+        statuses: [
+          { view: "internal", state: "applied", appliedRevision: 3 },
+          { view: "external", state: "applied", appliedRevision: 3 },
+        ],
+      },
+    });
+    assert.equal(caughtUp.behind, false);
+
+    const trailing = syncPanel({
+      activeZone: { revision: 49 },
+      records: [{ id: "web" }],
+      status: {
+        desiredRevision: 49,
+        statuses: [
+          { view: "internal", state: "pending", appliedRevision: 47 },
+          { view: "external", state: "applied", appliedRevision: 49 },
+        ],
+      },
+    });
+    assert.equal(trailing.behind, true, "one view is enough");
+  });
+
+  it("does not call an unreadable status behind", () => {
+    // `applied: 0` in the error panel is the absence of a reading, not a lag.
+    const panel = syncPanel({ activeZone: zone, records: [{ id: "web" }], statusError: "boom" });
+    assert.equal(panel.kind, "error");
+    assert.equal(panel.behind, false);
+  });
+
+  it("does not call an empty zone behind", () => {
+    const panel = syncPanel({ activeZone: { revision: 1 }, records: [], status: { desiredRevision: 1, statuses: [] } });
+    assert.equal(panel.kind, "empty");
+    assert.equal(panel.behind, false);
   });
 });

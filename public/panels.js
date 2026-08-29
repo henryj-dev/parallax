@@ -215,6 +215,10 @@ export function syncPanel(state) {
       percent: 0,
       desired,
       applied: 0,
+      // Not read, so not evidence. `applied: 0` here is the absence of a
+      // reading, and treating it as "behind by everything" would offer to
+      // reconcile a zone whose state nobody can currently see.
+      behind: false,
     };
   }
   const statuses = Array.isArray(state?.status?.statuses) ? state.status.statuses : [];
@@ -230,6 +234,7 @@ export function syncPanel(state) {
       views: { internal: { state: "", appliedRevision: 0, error: "" }, external: { state: "", appliedRevision: 0, error: "" } },
       percent: 0,
       desired,
+      behind: false,
     };
   }
 
@@ -251,5 +256,79 @@ export function syncPanel(state) {
   const percent = desired > 0
     ? Math.min(100, Math.round((applied / desired) * 100))
     : overall === "applied" ? 100 : 0;
-  return { kind: "status", overall, views, percent, desired, applied };
+  /**
+   * Some view has not recorded the desired revision, so applying would advance
+   * something even when the reconciliation plan is empty.
+   *
+   * The two are separate questions and they were being asked as one. A plan is
+   * about the provider: what has to be written there. This is about the status
+   * record: which revision each view is known to answer. A view this process
+   * answers out of the desired state publishes nothing, so its plan is always
+   * empty and advancing that record is the entire operation -- and a view that
+   * fell behind on one revision is not carried forward by later commits, so it
+   * stays behind until an apply says otherwise.
+   */
+  const behind = desired > 0 && applied < desired;
+  return { kind: "status", overall, views, percent, desired, applied, behind };
+}
+
+/**
+ * What the apply-plan dialog is looking at, and whether applying from it does
+ * anything.
+ *
+ * `applyEnabled` is the part that was decided in the page, and it was decided on
+ * the plan alone: an empty plan disabled the button. That reads as "there is
+ * nothing to do", and for one deployment shape it was never true. A view this
+ * process answers out of its own desired state publishes nothing, so its plan is
+ * empty every time -- while the panel beside this dialog said `pending`, because
+ * the status record still named an older revision. Applying is what advances that
+ * record, and the only control that applies was the one being disabled. The
+ * portal said a thing was wrong and locked the door to fixing it.
+ *
+ * A view that could not be read holds the button shut regardless. It may be
+ * hiding operations, and offering to advance the record over an unknown is the
+ * reading this dialog exists to prevent.
+ *
+ * @param {{
+ *   plan?: { views?: Record<string, {
+ *     operations?: { kind?: string }[], error?: string, summary?: { untouched?: number },
+ *   }> } | null,
+ *   planError?: string,
+ *   dirty?: boolean,
+ *   status?: { desiredRevision?: number, statuses?: { view?: string, state?: string, appliedRevision?: number, error?: string }[] },
+ *   activeZone?: { revision?: number },
+ *   records?: unknown[],
+ *   statusError?: string,
+ * }} state
+ */
+export function planPanel(state) {
+  const empty = { operations: [], unreadable: [], untouched: 0, advancesRecord: false, applied: 0, desired: 0 };
+  if (state?.planError) return { ...empty, kind: "error", applyEnabled: false };
+  if (!state?.plan) return { ...empty, kind: "loading", applyEnabled: false };
+  const entries = Object.entries(state.plan.views ?? {});
+  const operations = entries
+    .flatMap(([view, plan]) => (plan?.operations ?? []).map((operation) => ({ ...operation, view })));
+  // A view that could not be read produces an empty plan, which would otherwise
+  // be indistinguishable from one with nothing to do -- the reading that would
+  // let an operator apply believing they had seen everything.
+  const unreadable = entries
+    .filter(([, plan]) => plan?.error)
+    .map(([view, plan]) => ({ view, error: String(plan.error) }));
+  // Nothing to do is not the same as nothing being there. Records the provider
+  // holds that Parallax neither owns nor describes produce no operation, so an
+  // empty plan reads as an empty zone unless the count is said out loud.
+  const untouched = entries.reduce((total, [, plan]) => total + Number(plan?.summary?.untouched ?? 0), 0);
+  const sync = syncPanel(state);
+  const dirty = state?.dirty === true;
+  const advancesRecord = operations.length === 0 && !dirty && unreadable.length === 0 && sync.behind;
+  return {
+    kind: "plan",
+    operations,
+    unreadable,
+    untouched,
+    advancesRecord,
+    applied: Number(sync.applied ?? 0),
+    desired: sync.desired,
+    applyEnabled: operations.length > 0 || dirty || advancesRecord,
+  };
 }
