@@ -162,13 +162,23 @@ export async function createRuntime(config: ParallaxConfig, options: RuntimeOpti
     get maxRevisionsPerZone() { return settings.current().revisionRetention; },
     get auditRetentionDays() { return settings.current().auditRetentionDays; },
   },
-  // The listener answers the internal view and only that, out of the desired
-  // state. Where it is running and nothing publishes that view, applying it has
-  // nothing to reconcile -- so the revision being served is the desired one.
+  // Who answers each target. The listener answers the internal view and only
+  // that, out of the desired state: where it is running and nothing publishes
+  // that view, applying it has nothing to reconcile -- so the revision being
+  // served is the desired one. Where neither is true the answer is `none`, and
+  // saying so is what keeps a view nobody publishes from reading as a view that
+  // is merely catching up.
+  //
+  // A configured provider takes precedence over the listener, because a view
+  // being published is what makes reconciliation real: with `allowLocalProvider`
+  // on, the internal view goes to a JSON file and an apply has work to do.
   //
   // A zone whose views cannot be composed never reaches this: `apply`
   // materializes them first and fails before any target is considered.
-  (target) => config.dns !== undefined && target.endsWith("/internal") && !provider.isConfigured(target));
+  (target) => {
+    if (provider.isConfigured(target)) return "provider";
+    return config.dns !== undefined && target.endsWith("/internal") ? "listener" : "none";
+  });
 
   return {
     controlPlane,

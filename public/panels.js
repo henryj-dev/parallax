@@ -198,7 +198,7 @@ export function recordRow(record, records) {
  * The sync panel: one verdict per view, one overall, and the progress line.
  *
  * @param {{
- *   status?: { desiredRevision?: number, statuses?: { view?: string, state?: string, appliedRevision?: number, error?: string }[] },
+ *   status?: { desiredRevision?: number, statuses?: { view?: string, state?: string, publisher?: string, appliedRevision?: number, error?: string }[] },
  *   activeZone?: { revision?: number },
  *   records?: unknown[],
  *   statusError?: string,
@@ -211,7 +211,7 @@ export function syncPanel(state) {
       kind: "error",
       error: String(state.statusError),
       overall: "failed",
-      views: { internal: { state: "", appliedRevision: 0, error: "" }, external: { state: "", appliedRevision: 0, error: "" } },
+      views: { internal: { state: "", publisher: "", appliedRevision: 0, error: "" }, external: { state: "", publisher: "", appliedRevision: 0, error: "" } },
       percent: 0,
       desired,
       applied: 0,
@@ -231,7 +231,7 @@ export function syncPanel(state) {
     return {
       kind: "empty",
       overall: "",
-      views: { internal: { state: "", appliedRevision: 0, error: "" }, external: { state: "", appliedRevision: 0, error: "" } },
+      views: { internal: { state: "", publisher: "", appliedRevision: 0, error: "" }, external: { state: "", publisher: "", appliedRevision: 0, error: "" } },
       percent: 0,
       desired,
       behind: false,
@@ -240,8 +240,21 @@ export function syncPanel(state) {
 
   const forView = (view) => {
     const found = statuses.find((status) => status?.view === view);
+    const publisher = String(found?.publisher ?? "provider").toLowerCase();
+    const stored = String(found?.state ?? "pending").toLowerCase();
     return {
-      state: String(found?.state ?? "pending").toLowerCase(),
+      /**
+       * `unpublished` displaces whatever was stored, because nothing that was
+       * stored can be acted on. This view has no provider to reconcile with and
+       * no listener answering it, so the zone's revision rises past it forever
+       * and an apply against it fails for want of a provider. Reported as
+       * `pending` it read as "catching up" -- for months, on the front page, in
+       * a deployment where the answer was to set `PARALLAX_DNS_PORT` or bind a
+       * credential. And reported as `failed`, which is what an apply then wrote,
+       * it read as an outage.
+       */
+      state: publisher === "none" ? "unpublished" : stored,
+      publisher,
       appliedRevision: Number(found?.appliedRevision ?? 0),
       error: String(found?.error ?? ""),
     };
@@ -250,15 +263,24 @@ export function syncPanel(state) {
   const states = [views.internal.state, views.external.state];
   const overall = states.includes("failed")
     ? "failed"
-    : states.every((value) => value === "applied") ? "applied" : "pending";
-  // The lower of the two: a zone is only as caught up as its furthest-behind view.
-  const applied = Math.min(views.internal.appliedRevision, views.external.appliedRevision);
+    : states.every((value) => value === "applied")
+      ? "applied"
+      // A view still owed an apply outranks one nobody publishes: the first is
+      // work somebody can finish, and the chip is where they look for it.
+      : states.includes("pending") ? "pending" : "unpublished";
+  // The lower of the two, counting only views something can advance: a zone is
+  // only as caught up as its furthest-behind view, and a view nothing publishes
+  // is not behind at any number.
+  const advanceable = [views.internal, views.external].filter((view) => view.publisher !== "none");
+  const applied = advanceable.length > 0
+    ? Math.min(...advanceable.map((view) => view.appliedRevision))
+    : 0;
   const percent = desired > 0
     ? Math.min(100, Math.round((applied / desired) * 100))
     : overall === "applied" ? 100 : 0;
   /**
-   * Some view has not recorded the desired revision, so applying would advance
-   * something even when the reconciliation plan is empty.
+   * Some view that can be advanced has not recorded the desired revision, so
+   * applying would advance something even when the reconciliation plan is empty.
    *
    * The two are separate questions and they were being asked as one. A plan is
    * about the provider: what has to be written there. This is about the status
@@ -267,8 +289,11 @@ export function syncPanel(state) {
    * empty and advancing that record is the entire operation -- and a view that
    * fell behind on one revision is not carried forward by later commits, so it
    * stays behind until an apply says otherwise.
+   *
+   * A view nothing publishes is excluded. It is behind by every number and an
+   * apply cannot move it, so counting it would offer a button that only fails.
    */
-  const behind = desired > 0 && applied < desired;
+  const behind = desired > 0 && advanceable.length > 0 && applied < desired;
   return { kind: "status", overall, views, percent, desired, applied, behind };
 }
 
@@ -295,7 +320,7 @@ export function syncPanel(state) {
  *   }> } | null,
  *   planError?: string,
  *   dirty?: boolean,
- *   status?: { desiredRevision?: number, statuses?: { view?: string, state?: string, appliedRevision?: number, error?: string }[] },
+ *   status?: { desiredRevision?: number, statuses?: { view?: string, state?: string, publisher?: string, appliedRevision?: number, error?: string }[] },
  *   activeZone?: { revision?: number },
  *   records?: unknown[],
  *   statusError?: string,

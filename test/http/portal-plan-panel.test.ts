@@ -123,4 +123,40 @@ describe("whether the apply plan offers to apply", () => {
     assert.equal(panel.advancesRecord, false);
     assert.equal(panel.applyEnabled, false);
   });
+
+  it("stays shut when the only view behind is one nothing publishes", () => {
+    // It is behind by every number and no apply can move it: applying would fail
+    // for want of a provider, so the button would offer a failure. The sync panel
+    // says `unpublished` instead, which names the thing to configure.
+    const panel = planPanel({
+      plan: readablePlan,
+      records,
+      status: {
+        desiredRevision: 49,
+        statuses: [
+          { view: "internal", state: "pending", appliedRevision: 0, publisher: "none" },
+          { view: "external", state: "applied", appliedRevision: 49, publisher: "provider" },
+        ],
+      },
+    });
+    assert.equal(panel.advancesRecord, false);
+    assert.equal(panel.applyEnabled, false);
+  });
+
+  it("still opens for a published view that is behind beside an unpublished one", () => {
+    const panel = planPanel({
+      plan: readablePlan,
+      records,
+      status: {
+        desiredRevision: 49,
+        statuses: [
+          { view: "internal", state: "pending", appliedRevision: 0, publisher: "none" },
+          { view: "external", state: "pending", appliedRevision: 47, publisher: "provider" },
+        ],
+      },
+    });
+    assert.equal(panel.advancesRecord, true);
+    assert.equal(panel.applyEnabled, true);
+    assert.equal(panel.applied, 47, "and it names the revision anything can be advanced from");
+  });
 });
