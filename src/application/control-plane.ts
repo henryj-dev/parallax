@@ -1347,6 +1347,40 @@ export class ControlPlane {
     const statuses: ApplyStatus[] = [];
     for (const view of [...names].sort()) {
       const current = stored.find((status) => status.view === view);
+      /**
+       * A view this process answers out of its own desired state is serving this
+       * revision the moment the commit lands -- the listener reads the desired
+       * state and answers from it, and its SOA serial *is* the zone revision. So
+       * there is no branch to take: whatever happened to this view, the revision
+       * being answered is the new one.
+       *
+       * Written here because `pending` was the honest-looking wrong answer. It
+       * says "not there yet" about a view that is already there, and the only way
+       * to clear it was an apply that reaches no provider and writes this same
+       * row. The panel asked an operator to press a button to correct a number
+       * that described nothing outside this process.
+       *
+       * This is the claim `apply` already makes on the same path, moved to where
+       * the fact is established rather than where somebody notices it. It is off
+       * by the snapshot refresh interval, which is the same approximation apply
+       * makes -- it does not wait for the listener to re-read either.
+       *
+       * ⚠️ **No `lastAttemptAt` is invented.** That field means an apply was
+       * attempted and nothing else, and zone deletion reads it to decide which
+       * targets may be holding records to withdraw. An existing one is carried,
+       * because it still records that a provider was once reached here.
+       */
+      if (this.#answeredHere(targetKey(zone.name, view))) {
+        statuses.push({
+          zone: zone.name,
+          view,
+          desiredRevision: zone.revision,
+          appliedRevision: zone.revision,
+          state: "applied",
+          ...(current?.lastAttemptAt ? { lastAttemptAt: current.lastAttemptAt } : {}),
+        });
+        continue;
+      }
       const removedNow = previousViews.has(view) && !nextViews.has(view);
       const addedNow = !previousViews.has(view) && nextViews.has(view);
       if (!current || affectedViews.has(view) || removedNow || addedNow) {
