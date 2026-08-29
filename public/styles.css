@@ -184,6 +184,10 @@ table tbody tr.provider-owned td { background: #edf4f5; color: var(--muted); }
 .status-chip.applied { color: var(--success); background: #e8f4ef; }
 .status-chip.pending { color: #94631f; background: #fff3dd; }
 .status-chip.failed { color: var(--danger); background: #fff0ef; }
+/* Neutral on purpose. Nothing publishes this view, which is a configuration
+   fact rather than a fault or a delay -- amber would say "wait" and red would
+   say "broken", and it had been saying "wait" for months. */
+.status-chip.unpublished { color: var(--muted); background: #eef1f3; }
 .sync-target { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 10px; margin-top: 17px; }
 .target-icon { display: grid; place-items: center; width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 8px; font: 9px var(--mono); color: var(--muted); }
 .sync-target b, .sync-target small { display: block; }
@@ -193,6 +197,7 @@ table tbody tr.provider-owned td { background: #edf4f5; color: var(--muted); }
 .target-status.applied { color: var(--success); }
 .target-status.pending { color: #94631f; }
 .target-status.failed { color: var(--danger); }
+.target-status.unpublished { color: var(--muted); }
 .revision-track { height: 4px; margin-top: 20px; overflow: hidden; border-radius: 2px; background: #e6edef; }
 .revision-track span { display: block; width: 0; height: 100%; background: var(--blue); transition: width .45s ease; }
 .track-caption { display: block; margin-top: 8px; color: var(--muted); line-height: 1.4; }
