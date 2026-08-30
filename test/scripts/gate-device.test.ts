@@ -144,16 +144,27 @@ describe("게이트 장치가 자기 규칙을 지킨다", () => {
     // README 를 바꿨으므로, 그것을 산출로 대는 가짜 단계는 봉인 없이 걸린다.
     const seals = scratch();
     const gates: Record<string, Phase> = { P9: { needs: [], outputs: ["README.md"], checks: [] } };
-    assert.notEqual(assertOrder({ gates, seals }), 0, "봉인 없이 산출이 바뀌면 실패한다");
+    // ⚠️ 기준을 **명시로** 넘긴다. 넘기지 않으면 `merge-base(origin/main, HEAD)` 를 쓰는데,
+    // CI 의 얕은 체크아웃에는 `origin/main` 이 없다 — 이 단언이 CI 에서만 빨개져서 그
+    // 사실을 알려 줬고, 그때 함수는 조용히 0 을 내고 있었다.
+    const base = execFileSync("git", ["rev-parse", "HEAD~1"], { cwd: ROOT, encoding: "utf8" }).trim();
+    const touched = execFileSync("git", ["diff", "--name-only", `${base}..HEAD`], { cwd: ROOT, encoding: "utf8" });
+    const output = touched.split("\n").find((line) => line !== "") ?? "README.md";
+    const naming: Record<string, Phase> = { P9: { needs: [], outputs: [output], checks: [] } };
+    assert.notEqual(assertOrder({ gates: naming, seals, base }), 0, "봉인 없이 산출이 바뀌면 실패한다");
 
     // 같은 단계를 봉인하면 통과한다 — 순서를 지킨 경우다.
     writeSeal(seals, "P9", { head: head() });
-    assert.equal(assertOrder({ gates, seals }), 0, "봉인된 단계의 산출 변경은 문제가 아니다");
+    assert.equal(assertOrder({ gates: naming, seals, base }), 0, "봉인된 단계의 산출 변경은 문제가 아니다");
 
     // 아무 산출도 대지 않는 단계는 무엇이 바뀌어도 걸리지 않는다 — 이 검사가 「무엇을
     // 보는지」가 `outputs` 뿐임을 못 박는다.
     const blind: Record<string, Phase> = { P9: { needs: [], outputs: [], checks: [] } };
-    assert.equal(assertOrder({ gates: blind, seals: scratch() }), 0);
+    assert.equal(assertOrder({ gates: blind, seals: scratch(), base }), 0);
+
+    // 기준을 못 찾으면 실패한다 — 「비교하지 않았다」가 「문제가 없다」로 읽히면 안 된다.
+    assert.notEqual(assertOrder({ gates, seals: scratch(), base: "" }), 0, "기준 없이는 통과하지 않는다");
+    void gates;
   });
 
   it("TC-P0.T1.h — 금지 표식 면제는 이름으로만 걸린다", () => {

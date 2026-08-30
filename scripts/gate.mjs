@@ -368,8 +368,26 @@ export function status(context = {}) {
  * 묻는 검사이기 때문이다. 봉인 없이 산출이 바뀌었다면 순서가 지켜지지 않았다.
  */
 export function assertOrder(context = {}) {
-  let base;
-  try { base = git("merge-base", "origin/main", "HEAD"); } catch { base = git("rev-parse", "HEAD"); }
+  /**
+   * 비교 기준을 못 찾으면 **실패한다.**
+   *
+   * 이전 판은 `origin/main` 이 없으면 `HEAD` 로 떨어졌고, 그러면 `HEAD..HEAD` 가 빈 diff 라
+   * 무엇을 했든 초록이었다. CI 의 얕은 체크아웃에는 `origin/main` 이 없으므로 이 검사는
+   * 정확히 그것을 걸어야 하는 자리에서 조용히 통과한다 — 그리고 이 함수의 음성 대조가
+   * CI 에서만 빨개져 그것을 알려 줬다.
+   *
+   * 「비교하지 않았다」와 「문제가 없다」는 같은 답이 아니다. 기준은 명시로 받을 수 있고
+   * (`base`), 받지 못하면 이유를 말하고 비영으로 끝낸다.
+   */
+  // 빈 문자열도 「없음」이다. `git diff ..HEAD` 는 git 이 양쪽을 HEAD 로 채워 빈 diff 를
+  // 내므로, 빈 기준을 그대로 넘기면 이 검사가 우연히 초록이 된다.
+  const base = context.base || (() => {
+    try { return git("merge-base", "origin/main", "HEAD"); } catch { return null; }
+  })();
+  if (!base) {
+    process.stderr.write("비교 기준을 찾지 못했다 — `origin/main` 이 없다. base 를 명시하거나 전체 이력을 받을 것\n");
+    return 2;
+  }
   const changed = git("diff", "--name-only", `${base}..HEAD`).split("\n").filter((line) => line !== "");
   const problems = [];
   for (const [phase, gate] of Object.entries(context.gates ?? GATES)) {

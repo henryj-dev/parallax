@@ -82,6 +82,11 @@ export interface Context {
    * 초록 실행에 섞이면 읽는 사람이 무엇이 진짜 실패인지 가릴 수 없다.
    */
   readonly quiet?: boolean;
+  /**
+   * `--assert-order` 의 비교 기준. 없으면 `merge-base(origin/main, HEAD)` 를 쓰고, 그것도
+   * 없으면 **실패한다** — 「비교하지 않았다」가 「문제가 없다」로 읽히면 안 된다.
+   */
+  readonly base?: string;
 }
 
 export declare const GATES: Record<string, Phase>;
