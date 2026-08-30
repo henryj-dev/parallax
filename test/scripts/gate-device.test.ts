@@ -144,13 +144,17 @@ describe("게이트 장치가 자기 규칙을 지킨다", () => {
     // README 를 바꿨으므로, 그것을 산출로 대는 가짜 단계는 봉인 없이 걸린다.
     const seals = scratch();
     const gates: Record<string, Phase> = { P9: { needs: [], outputs: ["README.md"], checks: [] } };
-    // ⚠️ 기준을 **명시로** 넘긴다. 넘기지 않으면 `merge-base(origin/main, HEAD)` 를 쓰는데,
-    // CI 의 얕은 체크아웃에는 `origin/main` 이 없다 — 이 단언이 CI 에서만 빨개져서 그
-    // 사실을 알려 줬고, 그때 함수는 조용히 0 을 내고 있었다.
-    const base = execFileSync("git", ["rev-parse", "HEAD~1"], { cwd: ROOT, encoding: "utf8" }).trim();
-    const touched = execFileSync("git", ["diff", "--name-only", `${base}..HEAD`], { cwd: ROOT, encoding: "utf8" });
-    const output = touched.split("\n").find((line) => line !== "") ?? "README.md";
-    const naming: Record<string, Phase> = { P9: { needs: [], outputs: [output], checks: [] } };
+    // ⚠️ 기준을 **명시로** 넘기고, 그 기준은 **빈 트리**다.
+    //
+    // 두 번 틀렸다. 처음에는 기준을 안 넘겨 `merge-base(origin/main, HEAD)` 에 맡겼는데
+    // CI 의 얕은 체크아웃에는 `origin/main` 이 없어 함수가 조용히 0 을 냈다. 그다음에는
+    // `HEAD~1` 을 넘겼는데 `fetch-depth: 1` 에는 부모 커밋이 없다. 둘 다 **로컬에서만
+    // 통과하고 CI 에서만 빨개졌다** — 주변 git 상태에 기댄 단언이 그렇게 된다.
+    //
+    // 빈 트리는 어디에나 있다. 그것과의 diff 는 추적되는 모든 파일이므로, 어떤 산출을
+    // 대든 「바뀐 것」에 포함된다 — 이 단언이 묻는 것은 변경의 내용이 아니라 봉인 여부다.
+    const base = execFileSync("git", ["hash-object", "-t", "tree", "/dev/null"], { cwd: ROOT, encoding: "utf8" }).trim();
+    const naming: Record<string, Phase> = { P9: { needs: [], outputs: ["README.md"], checks: [] } };
     assert.notEqual(assertOrder({ gates: naming, seals, base }), 0, "봉인 없이 산출이 바뀌면 실패한다");
 
     // 같은 단계를 봉인하면 통과한다 — 순서를 지킨 경우다.
