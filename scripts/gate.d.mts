@@ -20,6 +20,11 @@ export interface Check {
   readonly between?: readonly [string, string];
   /** `grep` — 등장 줄 수 대신 파일 수를 센다 */
   readonly count?: "files" | "lines";
+  /**
+   * `grep` — 이 경로들은 보지 않는다. 금지 표식을 **정의하는** 파일은 그 표식을 담을
+   * 수밖에 없기 때문이고, 이름으로만 면제한다 — 규칙으로 면제하면 다음 면제가 조용히 는다.
+   */
+  readonly except?: readonly string[];
   /** `cmd` · `test` */
   readonly cmd?: string;
   /** `cmd` — 종료코드가 0 이 아니어야 통과 */

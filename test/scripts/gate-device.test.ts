@@ -140,12 +140,36 @@ describe("게이트 장치가 자기 규칙을 지킨다", () => {
   });
 
   it("TC-P0.T1.g — --assert-order 는 봉인 없이 바뀐 산출을 잡는다", () => {
-    // 이 저장소를 대상으로 돌린다. 실패 조건을 인위로 만들 수 없으므로(커밋되지 않은
-    // 변경은 보이지 않는다) 최소한 종료코드를 내는 것과, 봉인 상태를 읽는 것을 본다.
+    // 봉인되지 않은 단계의 산출이 이 브랜치에서 바뀌었으면 실패해야 한다. 이 브랜치는
+    // README 를 바꿨으므로, 그것을 산출로 대는 가짜 단계는 봉인 없이 걸린다.
     const seals = scratch();
     const gates: Record<string, Phase> = { P9: { needs: [], outputs: ["README.md"], checks: [] } };
-    const code = assertOrder({ gates, seals });
-    assert.equal(typeof code, "number", "종료코드를 낸다");
+    assert.notEqual(assertOrder({ gates, seals }), 0, "봉인 없이 산출이 바뀌면 실패한다");
+
+    // 같은 단계를 봉인하면 통과한다 — 순서를 지킨 경우다.
+    writeSeal(seals, "P9", { head: head() });
+    assert.equal(assertOrder({ gates, seals }), 0, "봉인된 단계의 산출 변경은 문제가 아니다");
+
+    // 아무 산출도 대지 않는 단계는 무엇이 바뀌어도 걸리지 않는다 — 이 검사가 「무엇을
+    // 보는지」가 `outputs` 뿐임을 못 박는다.
+    const blind: Record<string, Phase> = { P9: { needs: [], outputs: [], checks: [] } };
+    assert.equal(assertOrder({ gates: blind, seals: scratch() }), 0);
+  });
+
+  it("TC-P0.T1.h — 금지 표식 면제는 이름으로만 걸린다", () => {
+    // 금지 표식을 정의하는 파일은 그 표식을 담을 수밖에 없다. 면제가 규칙(예: 「검사 파일은
+    // 모두 면제」)이 되면 다음 면제가 조용히 늘고, 그러면 금지가 아니라 권고가 된다.
+    const scratchDir = scratch();
+    const guilty = join(scratchDir, "guilty.md");
+    const quoting = join(scratchDir, "quoting.md");
+    writeFileSync(guilty, "여기에 GATE-TEMP 가 남아 있다\n");
+    writeFileSync(quoting, "이 파일은 GATE-TEMP 를 정의한다\n");
+    const both: Check = { id: "t.20", how: "grep", pattern: "GATE-TEMP", in: join(scratchDir, "*.md"), limit: 0 };
+    assert.equal(verdict(both, measure(both)), false, "면제가 없으면 둘 다 걸린다");
+    const exempted: Check = { ...both, id: "t.21", except: [quoting] };
+    assert.equal(measure(exempted).measured, 1, "면제한 파일만 빠진다 — 나머지는 그대로 걸린다");
+    const all: Check = { ...both, id: "t.22", except: [quoting, guilty] };
+    assert.equal(measure(all).measured, 0, "둘 다 면제하면 0 이다 — 그래서 면제는 이름으로만 쓴다");
   });
 });
 
