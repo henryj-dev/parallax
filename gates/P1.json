@@ -1,0 +1,88 @@
+{
+  "phase": "P1",
+  "head": "a0cf7c2a3c723492475ff52f76ef69cfb5f4b55a",
+  "at": "2026-08-30T10:03:41.524Z",
+  "sealed": true,
+  "waived": false,
+  "reason": null,
+  "checks": [
+    {
+      "id": "G-P1.1",
+      "ok": true,
+      "measured": 0,
+      "limit": 0
+    },
+    {
+      "id": "G-P1.2",
+      "ok": true,
+      "measured": 0,
+      "limit": 0
+    },
+    {
+      "id": "G-P1.3",
+      "ok": true,
+      "measured": 1,
+      "limit": "≥ 1"
+    },
+    {
+      "id": "G-P1.4",
+      "ok": true,
+      "measured": 1,
+      "limit": "≥ 1"
+    },
+    {
+      "id": "G-P1.5",
+      "ok": true,
+      "measured": 0,
+      "limit": 0
+    },
+    {
+      "id": "G-P1.6",
+      "ok": true,
+      "measured": 1,
+      "limit": "≥ 1"
+    },
+    {
+      "id": "G-P1.7",
+      "ok": true,
+      "measured": 0,
+      "limit": 0
+    },
+    {
+      "id": "G-P1.8",
+      "ok": true,
+      "measured": 0,
+      "limit": 0
+    },
+    {
+      "id": "G-P1.8b",
+      "ok": true,
+      "measured": 0,
+      "limit": 0
+    },
+    {
+      "id": "G-P1.9",
+      "ok": true,
+      "measured": 0,
+      "limit": 0
+    },
+    {
+      "id": "G-P1.10",
+      "ok": true,
+      "measured": 0,
+      "limit": 0
+    },
+    {
+      "id": "G-P1.12",
+      "ok": true,
+      "measured": 1,
+      "limit": "≥ 1"
+    },
+    {
+      "id": "G-P1.11",
+      "ok": true,
+      "measured": 1076,
+      "limit": 1076
+    }
+  ]
+}
