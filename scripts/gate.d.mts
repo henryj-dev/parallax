@@ -83,10 +83,13 @@ export interface Context {
    */
   readonly quiet?: boolean;
   /**
-   * `--assert-order` 의 비교 기준. 없으면 `merge-base(origin/main, HEAD)` 를 쓰고, 그것도
-   * 없으면 **실패한다** — 「비교하지 않았다」가 「문제가 없다」로 읽히면 안 된다.
+   * `--assert-order` 의 비교 기준.
+   *
+   * **지정하지 않으면** `merge-base(origin/main, HEAD)` 를 찾는다. **빈 값을 지정하면**
+   * 찾지 않고 없는 것으로 본다 — 그리고 기준이 없으면 실패한다. 「비교하지 않았다」가
+   * 「문제가 없다」로 읽히면 안 되고, 그 상태를 테스트가 **말할 수 있어야** 한다.
    */
-  readonly base?: string;
+  readonly base?: string | null;
 }
 
 export declare const GATES: Record<string, Phase>;
@@ -98,8 +101,12 @@ export declare function sealState(phase: string, context?: Context): string;
 export declare function blockedBy(phase: string, context?: Context): string[];
 export declare function runPhase(
   phase: string,
-  options?: Context & { explain?: boolean },
-): { ok: boolean; results: CheckResult[]; blocked?: string[] };
+  options?: Context & {
+    explain?: boolean;
+    /** 봉인된 단계도 지금 다시 재라. 기본값은 봉인을 읽는 것 — 창이 지나간 단계의 빨강은 회귀가 아니다 */
+    recheck?: boolean;
+  },
+): { ok: boolean; results: CheckResult[]; blocked?: string[]; sealed?: boolean };
 export declare function seal(phase: string, waived?: string, context?: Context): number;
 export declare function status(context?: Context): number;
 export declare function assertOrder(context?: Context): number;
