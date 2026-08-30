@@ -199,10 +199,11 @@ T18-b · T19 · T20 · T21 은 2026-08-24 에 「한다」로 결정되어 아�
 근거와 판정은 [`docs/2026-08-29-unimplemented-review.md`](2026-08-29-unimplemented-review.md)
 에 있다. 셋 중 둘은 이미 판단된 것이라 아래로 오지 않는다 — 아래는 실제 작업 하나뿐이다.
 
-- [ ] **R1** · `XS` · README 의 「실제 프로바이더 어댑터는 Cloudflare 하나뿐」이 거짓 —
+- [x] **R1** · `XS` · README 의 「실제 프로바이더 어댑터는 Cloudflare 하나뿐」이 거짓 —
       `src/adapters/rfc2136.ts` 가 있고 같은 문서의 설정 표가 그것을 설명한다
       <br>축을 옳게: 「어댑터가 하나」가 아니라 「**외부 뷰의** 어댑터가 하나」
-      <br>같이: 이 파일 맨 끝의 「CI 넷」 한 줄 — `#16` 이 형제 넷을 고치고 이 다섯 번째를 놓쳤다
+      <br>같이: 이 파일 맨 끝의 CI 문단 — `#16` 이 형제 넷을 고치고 이 다섯 번째를 놓쳤다
+      <br>✅ `P1.T1`·`P1.T2` 로 닫았다. 통과는 게이트가 판정한다(`G-P1.1`~`G-P1.6`)
 - [ ] **R1 뒤에** · `S` · 어댑터 이름을 문서와 대조하는 검사 — R1 이 생긴 경로를 막는다.
       **별도 PR.** 정정과 그 정정을 지키는 장치는 되돌릴 단위가 다르다
 
@@ -227,4 +228,6 @@ pnpm check && pnpm run check:portal && pnpm build && pnpm test
 DNS 를 건드리는 **T4 · T7 · T8 · T16** 은 `pnpm verify:dns` 를 추가로 돌린다 —
 Docker 도 네트워크도 쓰지 않으므로 돌리지 않을 이유가 없다.
 
-푸시 후 CI 넷(`check` · `scripts` · `docker` · `codeql`)이 초록일 것.
+푸시 후 CI 가 초록일 것. 워크플로 파일은 `check.yml` · `codeql.yml` · `scorecard.yml`
+셋이고, 브랜치 규칙이 요구하는 체크 이름은 `check.yml` 의 `gate` **하나**다 — 그 잡의
+`needs:` 가 나머지를 모은다.
