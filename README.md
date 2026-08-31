@@ -654,8 +654,11 @@ Three workflows run in CI. `check` collects the jobs whose verdicts belong to a
 commit, each answering a different question so a red result names its own cause:
 `verify` (types, build, tests on Node 24 and 26), `deployment-gate` (schema
 surface, from a bare checkout), `docker` (the image builds and stays
-unprivileged), `hooks` (the Python hook suites), `shellcheck`, and `policy` (a
-shared reusable workflow: dependency review, secret scan, workflow audit). One
+unprivileged), `hooks` (the Python hook suites), `shellcheck`, `policy` (a
+shared reusable workflow: dependency review, secret scan, workflow audit), and
+`flake-watch` (the suite three times over, on the weekly schedule only — an
+intermittent failure is the kind of verdict that changes while the code does not).
+One
 `gate` job collects them, and it is the only check name the branch ruleset
 names -- listing jobs one by one means the day a name changes, the required
 check becomes one that does not exist and the protection quietly disappears.

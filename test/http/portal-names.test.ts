@@ -14,7 +14,17 @@ const root = fileURLToPath(new URL("../../", import.meta.url));
  * for the name the other files gave the function rather than for the thing
  * itself -- and this one calls it `run`.
  */
-const TSC_TIMEOUT_MS = 120_000;
+/**
+ * `tsc` 하나에 허용하는 시간. **러너의 마감보다 짧아야 한다.**
+ *
+ * `pnpm test` 는 `--test-timeout=120000` 으로 돈다. 이 값이 그것과 **같으면** 두 마감이
+ * 경합하고, 먼저 시작한 러너가 대개 이긴다 — 그러면 결과는 「`tsc` 가 시간 안에 끝나지
+ * 않았다」가 아니라 **취소된 테스트**이고, 취소된 테스트는 왜 취소됐는지 말하지 않는다.
+ *
+ * 90초로 두면 `tsc` 가 걸렸을 때 이 파일이 먼저 답한다. 실제 소요는 0.5초 안쪽이라
+ * (측정 2026-08-31) 여유는 문제가 아니고, 문제는 **누가 먼저 말하느냐**였다.
+ */
+const TSC_TIMEOUT_MS = 90_000;
 
 /** How a problem is picked out of `tsc` output, in one place so it can be tested. */
 function problemsIn(output: string): string[] {
