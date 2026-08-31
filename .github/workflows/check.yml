@@ -322,6 +322,41 @@ jobs:
       # A licence is required for organisation-owned repositories. It is an org secret.
       GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
+  # **간헐 실패는 코드가 그대로여도 판정이 바뀌는 종류다** — 이 워크플로가 주기 실행을 두고
+  # 있는 이유와 같은 종류다. 그래서 여기 붙인다.
+  #
+  # `pnpm test` 가 2026-08-31 에 두 번, 각각 정확히 한 건씩 통과도 스킵도 아닌 상태로
+  # 끝났다. 로컬 41회로 재현되지 않았고 이름을 잡지 못했다 — `docs/test-flakes.md` 가 그
+  # 관찰과 배제된 가설을 들고 있다. 한 번 돌려서 안 나는 것을 세 번 돌려 본다.
+  #
+  # ⚠️ **PR 에는 붙지 않는다.** 관측 두 건으로 모든 PR 을 세 배로 만들면, 얻는 정보보다
+  # 사람이 기다리는 시간이 먼저 는다. `if` 가 걸린 잡은 PR 에서 skipped 이고, `gate` 는
+  # skipped 를 통과로 읽는다(그 잡의 주석이 그렇게 적어 놨다).
+  #
+  # 실패하면 어느 반복에서 났는지가 로그에 남는다. `test:ci` 가 TAP 이므로 실패의 이유가
+  # 그 자리에 인라인으로 찍힌다 — 요약을 기다리다 잘리는 것이 1·2차 관찰의 구멍이었다.
+  flake-watch:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - run: pnpm install --frozen-lockfile
+      - name: 스위트를 세 번 돌린다
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "::group::반복 $attempt"
+            pnpm run test:ci
+            echo "::endgroup::"
+          done
+
   # The one check name the branch ruleset requires.
   #
   # Listing job names one by one means that the day a name changes, that required check
@@ -330,7 +365,7 @@ jobs:
   # one-line change to `needs:`, and leaves the ruleset alone.
   gate:
     name: gate
-    needs: [verify, deployment-gate, docker, hooks, shellcheck, policy]
+    needs: [verify, deployment-gate, docker, hooks, shellcheck, policy, flake-watch]
     # This job must run even when something upstream is red. Otherwise it is a check that
     # never reported, the rule waits forever, and nothing records what broke.
     if: always()
