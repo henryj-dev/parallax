@@ -34,12 +34,26 @@ bash scripts/git-hooks/install.sh
 They are hygiene rather than a boundary — `--no-verify` bypasses them, and they
 say so — but they catch the common accident before it becomes a commit.
 
+## When the suite is red or a total changed
+
+Two records exist so a reader does not have to guess whether what they are seeing
+has been seen before.
+
+- [`docs/test-skips.md`](docs/test-skips.md) — the three intentional skips. Compare
+  the `skipped N` total against it; a different total means a new skip to look at.
+- [`docs/test-flakes.md`](docs/test-flakes.md) — failures observed **once** and not
+  reproduced, with what was ruled out and how. If `pnpm test` goes red and passes on
+  the next run, look here first, then add to it.
+
+⚠️ **Keep the output.** `pnpm test 2>&1 | tee /tmp/px-test.log`. An intermittent
+failure whose name was not captured cannot be narrowed at all — that is exactly the
+gap the current entry in `test-flakes.md` records about itself.
+
 ## Running the real verifiers
 
 `pnpm test` is hermetic. The scripts under `scripts/verify-*.sh` are not: they
 drive a real Postgres, a real DNS listener, a real proxy, and a real Cloudflare
 account.
-
 ```bash
 pnpm verify:postgres
 pnpm verify:dns

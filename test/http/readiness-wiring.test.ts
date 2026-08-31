@@ -2,22 +2,15 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { parallaxEnvironment } from "../support/environment.ts";
+import { AddressInUse, isAddressInUse, onFreePort } from "../support/ports.ts";
 
 const ENTRY = join(import.meta.dirname, "../../src/index.ts");
 const START_TIMEOUT_MS = 60_000;
 
-async function freePort(): Promise<number> {
-  const probe = createServer();
-  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-  const { port } = probe.address() as { port: number };
-  await new Promise<void>((resolve) => probe.close(() => resolve()));
-  return port;
-}
 
 /**
  * That the setting reaches the monitor, which its own tests cannot show.
@@ -41,41 +34,47 @@ describe("the staleness window reaches the monitor", () => {
   });
 
   async function readiness(extra: Record<string, string>): Promise<Record<string, unknown>> {
-    const directory = await mkdtemp(join(tmpdir(), "parallax-staleness-"));
-    directories.push(directory);
-    const port = await freePort();
-    const token = randomBytes(32).toString("base64url");
-    const child = spawn(process.execPath, [ENTRY], {
-      env: {
-        ...parallaxEnvironment(),
-        HOST: "127.0.0.1",
-        PORT: String(port),
-        DATABASE_URL: "",
-        PARALLAX_STATE_FILE: join(directory, "state.json"),
-        PARALLAX_CONFIG_FILE: join(directory, "config.json"),
-        PARALLAX_PROVIDER_STATE_FILE: join(directory, "provider.json"),
-        PARALLAX_AUTH_TOKENS: JSON.stringify([{ token, subject: "staleness-test", role: "admin" }]),
-        ...extra,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    running.push(child);
-    let log = "";
-    child.stdout?.on("data", (chunk: Buffer) => { log += chunk.toString(); });
-    child.stderr?.on("data", (chunk: Buffer) => { log += chunk.toString(); });
+    // 포트를 잃으면 다시 고른다 — 창을 닫을 수는 없고, 지면 다시 시도할 수는 있다.
+    return onFreePort(async (port) => {
+      const directory = await mkdtemp(join(tmpdir(), "parallax-staleness-"));
+      directories.push(directory);
+      const token = randomBytes(32).toString("base64url");
+      const child = spawn(process.execPath, [ENTRY], {
+        env: {
+          ...parallaxEnvironment(),
+          HOST: "127.0.0.1",
+          PORT: String(port),
+          DATABASE_URL: "",
+          PARALLAX_STATE_FILE: join(directory, "state.json"),
+          PARALLAX_CONFIG_FILE: join(directory, "config.json"),
+          PARALLAX_PROVIDER_STATE_FILE: join(directory, "provider.json"),
+          PARALLAX_AUTH_TOKENS: JSON.stringify([{ token, subject: "staleness-test", role: "admin" }]),
+          ...extra,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      running.push(child);
+      let log = "";
+      child.stdout?.on("data", (chunk: Buffer) => { log += chunk.toString(); });
+      child.stderr?.on("data", (chunk: Buffer) => { log += chunk.toString(); });
 
-    const deadline = Date.now() + START_TIMEOUT_MS;
-    for (;;) {
-      if (child.exitCode !== null) assert.fail(`the server exited before it served: ${log}`);
-      if (Date.now() > deadline) assert.fail(`no answer within ${START_TIMEOUT_MS}ms: ${log}`);
-      try {
-        const answer = await fetch(`http://127.0.0.1:${port}/health/ready`, {
-          headers: { authorization: `Bearer ${token}` },
-        });
-        if (answer.ok) return await answer.json() as Record<string, unknown>;
-      } catch { /* not listening yet */ }
-      await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-    }
+      const deadline = Date.now() + START_TIMEOUT_MS;
+      for (;;) {
+        if (child.exitCode !== null) {
+            // 포트를 누가 먼저 잡았다면 이 실행의 결함이 아니다 — 다른 포트로 다시 시작한다.
+            if (isAddressInUse(log)) throw new AddressInUse(log);
+            assert.fail(`the server exited before it served: ${log}`);
+          }
+        if (Date.now() > deadline) assert.fail(`no answer within ${START_TIMEOUT_MS}ms: ${log}`);
+        try {
+          const answer = await fetch(`http://127.0.0.1:${port}/health/ready`, {
+            headers: { authorization: `Bearer ${token}` },
+          });
+          if (answer.ok) return await answer.json() as Record<string, unknown>;
+        } catch { /* not listening yet */ }
+        await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
+      }
+    });
   }
 
   it("reports the window it was configured with", async () => {

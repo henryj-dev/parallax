@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { signSession } from "../../src/security/session-token.ts";
 import { parallaxEnvironment } from "../support/environment.ts";
+import { AddressInUse, isAddressInUse, onFreePort } from "../support/ports.ts";
 
 const ENTRY = join(import.meta.dirname, "../../src/index.ts");
 const START_TIMEOUT_MS = 60_000;
@@ -33,13 +33,6 @@ const IDENTITY = {
   PARALLAX_OIDC_SESSION_SECRET: SESSION_SECRET,
 };
 
-async function freePort(): Promise<number> {
-  const probe = createServer();
-  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-  const { port } = probe.address() as { port: number };
-  await new Promise<void>((resolve) => probe.close(() => resolve()));
-  return port;
-}
 
 describe("a deployment whose only credential is an identity provider", () => {
   const running: ChildProcess[] = [];
@@ -51,39 +44,45 @@ describe("a deployment whose only credential is an identity provider", () => {
   });
 
   async function start(): Promise<string> {
-    const directory = await mkdtemp(join(tmpdir(), "parallax-identity-only-"));
-    directories.push(directory);
-    const port = await freePort();
-    const child = spawn(process.execPath, [ENTRY], {
-      env: {
-        ...parallaxEnvironment(),
-        HOST: "127.0.0.1",
-        PORT: String(port),
-        DATABASE_URL: "",
-        PARALLAX_STATE_FILE: join(directory, "state.json"),
-        PARALLAX_CONFIG_FILE: join(directory, "config.json"),
-        PARALLAX_PROVIDER_STATE_FILE: join(directory, "provider.json"),
-        // Deliberately absent: PARALLAX_AUTH_TOKENS. That absence is the point.
-        ...IDENTITY,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    running.push(child);
-    let log = "";
-    child.stdout?.on("data", (chunk: Buffer) => { log += chunk.toString(); });
-    child.stderr?.on("data", (chunk: Buffer) => { log += chunk.toString(); });
+    // 포트를 잃으면 다시 고른다 — 창을 닫을 수는 없고, 지면 다시 시도할 수는 있다.
+    return onFreePort(async (port) => {
+      const directory = await mkdtemp(join(tmpdir(), "parallax-identity-only-"));
+      directories.push(directory);
+      const child = spawn(process.execPath, [ENTRY], {
+        env: {
+          ...parallaxEnvironment(),
+          HOST: "127.0.0.1",
+          PORT: String(port),
+          DATABASE_URL: "",
+          PARALLAX_STATE_FILE: join(directory, "state.json"),
+          PARALLAX_CONFIG_FILE: join(directory, "config.json"),
+          PARALLAX_PROVIDER_STATE_FILE: join(directory, "provider.json"),
+          // Deliberately absent: PARALLAX_AUTH_TOKENS. That absence is the point.
+          ...IDENTITY,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      running.push(child);
+      let log = "";
+      child.stdout?.on("data", (chunk: Buffer) => { log += chunk.toString(); });
+      child.stderr?.on("data", (chunk: Buffer) => { log += chunk.toString(); });
 
-    const origin = `http://127.0.0.1:${port}`;
-    const deadline = Date.now() + START_TIMEOUT_MS;
-    for (;;) {
-      if (child.exitCode !== null) assert.fail(`the server exited before it served: ${log}`);
-      if (Date.now() > deadline) assert.fail(`the server did not answer within ${START_TIMEOUT_MS}ms: ${log}`);
-      try {
-        const alive = await fetch(`${origin}/health/live`);
-        if (alive.ok) return origin;
-      } catch { /* not listening yet */ }
-      await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-    }
+      const origin = `http://127.0.0.1:${port}`;
+      const deadline = Date.now() + START_TIMEOUT_MS;
+      for (;;) {
+        if (child.exitCode !== null) {
+            // 포트를 누가 먼저 잡았다면 이 실행의 결함이 아니다 — 다른 포트로 다시 시작한다.
+            if (isAddressInUse(log)) throw new AddressInUse(log);
+            assert.fail(`the server exited before it served: ${log}`);
+          }
+        if (Date.now() > deadline) assert.fail(`the server did not answer within ${START_TIMEOUT_MS}ms: ${log}`);
+        try {
+          const alive = await fetch(`${origin}/health/live`);
+          if (alive.ok) return origin;
+        } catch { /* not listening yet */ }
+        await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
+      }
+    });
   }
 
   function session(role: "admin" | "editor" | "viewer"): string {

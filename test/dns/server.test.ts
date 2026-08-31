@@ -15,6 +15,7 @@ import {
 } from "../../src/dns/tsig.ts";
 import { RCODE, TYPE, readName } from "../../src/dns/wire.ts";
 import { shutdownProcess } from "../../src/shutdown.ts";
+import { freePort as pickPort } from "../support/ports.ts";
 
 function encodeName(name: string): Buffer {
   if (name === "") return Buffer.of(0);
@@ -84,35 +85,13 @@ function rcodeOf(reply: Buffer | undefined): number {
 }
 
 /**
- * A port free for both transports, because the listener binds both.
+ * 포트 고르기는 `test/support/ports.ts` 로 옮겼다.
  *
- * A TCP probe alone certifies the wrong thing: every caller here goes on to
- * bind UDP, and the two have separate port spaces. A port this said was free
- * could already be held by another UDP socket, and the bind that followed
- * neither answered nor failed -- the test simply stopped, which is how it
- * reached a timeout on a loaded machine and never on this one.
+ * 이 스위트가 재시도와 UDP 재확인을 갖춘 유일한 사본이었다 — 「부하가 걸린 기계에서
+ * 타임아웃에 이르고 이 기계에서는 절대 안 나는」 실패를 겪고 나서 붙인 것이다. 같은
+ * 함수가 `test/http/**` 에 네 벌 더 있었고 그 넷은 이 교훈을 받지 못했다. 합의해야 하는
+ * 다섯 사본은 결국 합의하지 않으므로, 하나로 모으고 그 이유를 그쪽에 적었다.
  */
-async function freePort(host = "127.0.0.1"): Promise<number> {
-  for (let attempt = 8; ; attempt -= 1) {
-    const probe = createServer();
-    await new Promise<void>((resolve) => probe.listen(0, host, resolve));
-    const port = (probe.address() as AddressInfo).port;
-    await new Promise<void>((resolve) => probe.close(() => resolve()));
-    const datagram = createSocket(isIP(host) === 6 ? "udp6" : "udp4");
-    try {
-      await bound(datagram, port, host);
-    } catch (error) {
-      // Free for TCP and taken for UDP is a real answer, not an error: ask the
-      // kernel for another one rather than handing back a port half of the
-      // caller cannot have.
-      datagram.close();
-      if (attempt <= 1 || (error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-      continue;
-    }
-    await new Promise<void>((resolve) => datagram.close(resolve));
-    return port;
-  }
-}
 
 /**
  * Binds, and fails when it cannot.
@@ -274,7 +253,7 @@ describe("DNS server", () => {
     // listener now leaves nothing bound when it fails, so trying again is safe
     // -- and a collision is rare enough that a second attempt settles it.
     for (let attempt = 3; ; attempt -= 1) {
-      const port = await freePort(host);
+      const port = await pickPort(host, { udp: true });
       const server = createDnsServer(options);
       try {
         await server.listen(port, host);
@@ -297,7 +276,7 @@ describe("DNS server", () => {
     // That is what the eight-minute silence was: every test in this file had
     // finished and the process would not leave, holding a UDP socket and a TCP
     // server that no `after` hook knew about.
-    const port = await freePort();
+    const port = await pickPort("127.0.0.1", { udp: true });
     const squatter = createServer();
     await new Promise<void>((resolve) => squatter.listen(port, "127.0.0.1", resolve));
     closers.push(async () => { await new Promise<void>((resolve) => squatter.close(() => resolve())); });
@@ -343,7 +322,7 @@ describe("DNS server", () => {
   });
 
   it("binds UDP and TCP to the same resolved address for a hostname", async () => {
-    const port = await freePort("::1");
+    const port = await pickPort("::1", { udp: true });
     const resolutions: string[] = [];
     const server = createDnsServer({
       zones: () => [EXAMPLE],
@@ -1088,7 +1067,7 @@ describe("DNS server", () => {
   it("closes so a subsequent bind on the same ports can succeed", async () => {
     const { port, server } = await start({ zones: () => [EXAMPLE] });
     const http = createServer((socket) => socket.end());
-    const httpPort = await freePort();
+    const httpPort = await pickPort("127.0.0.1", { udp: true });
     await new Promise<void>((resolve) => http.listen(httpPort, "127.0.0.1", resolve));
     const runtime = { close: async () => undefined };
     await shutdownProcess({ dns: server, http, runtime, timers: [] });
@@ -1634,7 +1613,7 @@ describe("DNS server", () => {
   });
 
   it("answers SERVFAIL when the upstream says nothing", async () => {
-    const deadPort = await freePort();
+    const deadPort = await pickPort("127.0.0.1", { udp: true });
     const { port } = await start({
       zones: () => [EXAMPLE],
       forwardTo: [`127.0.0.1#${deadPort}`],
