@@ -143,7 +143,6 @@ describe("게이트 장치가 자기 규칙을 지킨다", () => {
     // 봉인되지 않은 단계의 산출이 이 브랜치에서 바뀌었으면 실패해야 한다. 이 브랜치는
     // README 를 바꿨으므로, 그것을 산출로 대는 가짜 단계는 봉인 없이 걸린다.
     const seals = scratch();
-    const gates: Record<string, Phase> = { P9: { needs: [], outputs: ["README.md"], checks: [] } };
     // ⚠️ 기준을 **명시로** 넘기고, 그 기준은 **빈 트리**다.
     //
     // 두 번 틀렸다. 처음에는 기준을 안 넘겨 `merge-base(origin/main, HEAD)` 에 맡겼는데
@@ -166,9 +165,46 @@ describe("게이트 장치가 자기 규칙을 지킨다", () => {
     const blind: Record<string, Phase> = { P9: { needs: [], outputs: [], checks: [] } };
     assert.equal(assertOrder({ gates: blind, seals: scratch(), base }), 0);
 
-    // 기준을 못 찾으면 실패한다 — 「비교하지 않았다」가 「문제가 없다」로 읽히면 안 된다.
-    assert.notEqual(assertOrder({ gates, seals: scratch(), base: "" }), 0, "기준 없이는 통과하지 않는다");
-    void gates;
+    // 기준이 없으면 실패한다 — 「비교하지 않았다」가 「문제가 없다」로 읽히면 안 된다.
+    //
+    // ⚠️ `base: null` 은 「명시적으로 없음」이다. 이전 판은 `base: ""` 를 주고 함수가 주변에서
+    // 기준을 못 찾기를 기대했는데, 그것은 `origin/main` 이 없는 체크아웃에서만 참이다 —
+    // main 브랜치 CI 에서는 있어서 폴백이 성공했고 이 단언이 빨개졌다. 폴백 경로를 단언하면
+    // 그 환경에서만 맞는다.
+    assert.notEqual(assertOrder({ gates: naming, seals: scratch(), base: null }), 0, "기준 없이는 통과하지 않는다");
+  });
+
+  it("TC-P0.T1.i — 봉인된 단계는 다시 재지 않고 봉인을 읽는다", () => {
+    // 검사는 그 단계의 창 안에서만 뜻이 있다. 창이 지나간 뒤 그냥 돌리면 빨강이 나오는데,
+    // 그 빨강은 회귀가 아니라 질문이 틀린 것이다 — 읽는 사람이 그 구별을 문서에서 찾아야
+    // 했다. 이제 장치가 말한다.
+    const seals = scratch();
+    writeSeal(seals, "F0", { head: head(), checks: [{ id: "G-F0.1", ok: true, measured: 0, limit: 0 }] });
+    // 검사는 지금 **실패**하는 상태다. 그래도 봉인을 읽으므로 초록으로 답한다.
+    const read = runPhase("F0", { gates: fixture(false), seals, quiet: true });
+    assert.equal(read.ok, true, "봉인의 기록을 읽는다");
+    assert.equal(read.sealed, true, "봉인을 읽었다고 말한다");
+    // `--recheck` 는 지금 잰다.
+    const now = runPhase("F0", { gates: fixture(false), seals, quiet: true, recheck: true });
+    assert.equal(now.ok, false, "--recheck 는 현재 상태를 낸다");
+    assert.notEqual(now.sealed, true);
+  });
+
+  it("TC-P0.T1.j — 봉인은 스쿼시 머지를 견딘다", () => {
+    // 이 저장소는 모든 PR 을 스쿼시로 머지한다. 스쿼시는 원래 커밋을 이력에서 지우므로,
+    // `head` 조상 관계로 판정하면 **머지되는 순간** 모든 봉인이 무효가 된다 — 일이 정상적으로
+    // landed 한 바로 그때. main 에서 실제로 그렇게 됐고, 그래서 판정 기준이 봉인 파일의 이력
+    // 존재로 바뀌었다.
+    for (const phase of ["P0", "P1", "P2"]) {
+      const seal = JSON.parse(readFileSync(new URL(`../../gates/${phase}.json`, import.meta.url), "utf8")) as
+        { head: string };
+      let reachable = true;
+      try {
+        execFileSync("git", ["merge-base", "--is-ancestor", seal.head, "HEAD"], { cwd: ROOT, stdio: "ignore" });
+      } catch { reachable = false; }
+      // 스쿼시된 뒤에는 `head` 가 닿지 않는다. 그래도 봉인이어야 한다.
+      assert.equal(sealState(phase), "봉인", `${phase}: head 도달=${reachable} 인데도 봉인으로 읽힌다`);
+    }
   });
 
   it("TC-P0.T1.h — 금지 표식 면제는 이름으로만 걸린다", () => {

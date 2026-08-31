@@ -263,20 +263,46 @@ function readSeal(phase, seals = DEFAULT_SEALS) {
 }
 
 /**
- * R2 — 봉인의 head 가 지금 이력에 없으면 무효다.
+ * R2 — 봉인이 지금 이력의 것인지.
  *
  * 되돌리면 자동으로 풀린다는 것이 요점이다. 손으로 봉인 파일을 지우게 만들면 그 자동성을
  * 아무도 믿지 않게 되고, 믿지 않는 자동성은 없는 것과 같다.
+ *
+ * ⚠️ **처음에는 `head` 가 `HEAD` 의 조상인지로 판정했다. 그것이 이 저장소에서 틀렸다.**
+ * 여기는 모든 PR 을 **스쿼시**로 머지한다(`#8`~`#21` 전부 커밋 하나). 스쿼시는 원래 커밋을
+ * 이력에서 지우므로, 머지되는 순간 모든 봉인의 `head` 가 조상이 아니게 되어 세 단계가 한꺼번에
+ * 무효가 된다 — 일이 정상적으로 landed 한 바로 그 순간에. main 에서 실제로 그렇게 됐다.
+ *
+ * 그래서 기준은 **봉인 파일이 지금 이력에 있는가**다: 그 파일을 마지막으로 건드린 커밋이
+ * `HEAD` 의 조상인가. 단계를 되돌리면 봉인 파일도 함께 되돌려지므로(같은 커밋에 들어 있다)
+ * 자동으로 풀리는 성질은 남고, 스쿼시·리베이스는 견딘다.
+ *
+ * `head` 는 판정에서 **출처**로 내려앉는다 — 그때 무엇을 재었는지 가리키는 값이다.
  */
 export function sealState(phase, context = {}) {
-  const seal = readSeal(phase, context.seals ?? DEFAULT_SEALS);
+  const seals = context.seals ?? DEFAULT_SEALS;
+  const seal = readSeal(phase, seals);
   if (!seal?.sealed) return "열림";
+  // 주입된 봉인 디렉터리(음성 대조)는 추적되지 않으므로 `head` 로 판정한다 — 테스트가
+  // 「되돌려서 사라진 봉인」을 만들 수 있어야 한다.
+  const reference = seals === DEFAULT_SEALS ? lastCommitTouching(`gates/${phase}.json`) : seal.head;
+  if (!reference) return "무효";
   try {
-    execFileSync("git", ["merge-base", "--is-ancestor", seal.head, "HEAD"], { cwd: ROOT, stdio: "ignore" });
+    execFileSync("git", ["merge-base", "--is-ancestor", reference, "HEAD"], { cwd: ROOT, stdio: "ignore" });
   } catch {
     return "무효";
   }
   return seal.waived ? "면제" : "봉인";
+}
+
+/** 그 경로를 마지막으로 건드린 커밋. 추적되지 않으면 `null`. */
+function lastCommitTouching(path) {
+  try {
+    const found = git("log", "-1", "--format=%H", "--", path);
+    return found === "" ? null : found;
+  } catch {
+    return null;
+  }
 }
 
 function sealed(phase, context = {}) {
@@ -291,9 +317,34 @@ export function blockedBy(phase, context = {}) {
 
 // ---- 명령 ------------------------------------------------------------------
 
-export function runPhase(phase, { explain = false, quiet = false, ...context } = {}) {
+export function runPhase(phase, { explain = false, quiet = false, recheck = false, ...context } = {}) {
   const gate = (context.gates ?? GATES)[phase];
   if (!gate) throw new Error(`알 수 없는 단계: ${phase}`);
+  /**
+   * 봉인된 단계는 **봉인을 읽는다.** 다시 재지 않는다.
+   *
+   * 검사는 그 단계의 창 안에서만 뜻이 있다. 기준선은 다음 단계가 소진하고(P0 의 「낡은
+   * 문장이 아직 있다」), 무변경 검사는 다음 단계가 그 경로를 건드리는 순간 깨진다(P1 의
+   * `since: seal:P0`). 그래서 봉인 뒤에 그냥 돌리면 빨강이 나오는데, 그 빨강은 회귀가
+   * 아니라 **질문이 틀린 것**이다 — 이 명령은 「지금 이 단계를 통과할 수 있나」를 묻고,
+   * 지나간 단계에 그 질문은 뜻이 없다.
+   *
+   * 읽는 사람이 그 구별을 문서에서 찾아야 했다. 이제 장치가 말한다. `--recheck` 는 그래도
+   * 지금 재라는 뜻이고, 그때의 빨강은 위의 이유일 수 있다.
+   */
+  if (!recheck && (sealState(phase, context) === "봉인" || sealState(phase, context) === "면제")) {
+    const seal = readSeal(phase, context.seals ?? DEFAULT_SEALS);
+    if (!quiet) {
+      const width = Math.max(1, ...(seal.checks ?? []).map((row) => row.id.length));
+      for (const row of seal.checks ?? []) {
+        process.stdout.write(`${row.ok ? "✔" : "✖"} ${row.id.padEnd(width)}  측정 ${String(row.measured).padStart(5)}  기준 ${row.limit}\n`);
+      }
+      process.stdout.write(seal.waived
+        ? `🔏 ${phase} 면제 — ${seal.reason}\n`
+        : `🔏 ${phase} 봉인 (${seal.head.slice(0, 7)}, ${seal.at}) — 위는 그때의 측정이다. 지금 다시 재려면 --recheck\n`);
+    }
+    return { ok: (seal.checks ?? []).every((row) => row.ok), results: seal.checks ?? [], sealed: true };
+  }
   // R1 — 선행 봉인이 없으면 검사를 돌리지 않는다. 돌린 결과를 기록할 곳이 없다.
   const blocked = blockedBy(phase, context);
   if (blocked.length > 0) {
@@ -334,7 +385,11 @@ export function seal(phase, waived, context = {}) {
     return 0;
   }
   // R3 — 이전 결과를 읽지 않는다. 지금 돌린다.
-  const { ok, results } = runPhase(phase, context);
+  //
+  // ⚠️ `recheck` 를 반드시 넘긴다. `runPhase` 는 이미 봉인된 단계에 대해 봉인을 **읽는데**,
+  // 그 편의가 여기까지 오면 옛 초록으로 다시 봉인된다 — R3 가 막으려는 바로 그것이다.
+  // 음성 대조 `TC-P0.T1.c` 가 이 줄이 없을 때 빨개진다.
+  const { ok, results } = runPhase(phase, { ...context, recheck: true });
   if (!ok) {
     if (!context.quiet) process.stderr.write(`${phase} 는 봉인되지 않았다 — 빨간 검사가 있다\n`);
     return 1;
@@ -379,11 +434,23 @@ export function assertOrder(context = {}) {
    * 「비교하지 않았다」와 「문제가 없다」는 같은 답이 아니다. 기준은 명시로 받을 수 있고
    * (`base`), 받지 못하면 이유를 말하고 비영으로 끝낸다.
    */
-  // 빈 문자열도 「없음」이다. `git diff ..HEAD` 는 git 이 양쪽을 HEAD 로 채워 빈 diff 를
-  // 내므로, 빈 기준을 그대로 넘기면 이 검사가 우연히 초록이 된다.
-  const base = context.base || (() => {
-    try { return git("merge-base", "origin/main", "HEAD"); } catch { return null; }
-  })();
+  /**
+   * 「지정하지 않음」과 「명시적으로 없음」을 가른다.
+   *
+   * `base` 를 주지 않으면 주변에서 찾는다(`merge-base(origin/main, HEAD)`). 주면 그대로
+   * 쓰고, **빈 값을 주면 찾지 않고 없는 것으로 본다.**
+   *
+   * ⚠️ 이 구분이 없어서 같은 음성 대조가 세 번 틀렸다. 셋 다 **주변 git 상태를 단언**한
+   * 결과다: `origin/main` 이 없는 곳에서 폴백이 조용히 통과했고, `HEAD~1` 이 없는 곳에서
+   * 던졌고, `origin/main` 이 **있는** 곳(main 브랜치 CI)에서 폴백이 성공해 「기준 없음」을
+   * 만들 수 없었다. 폴백은 정의상 환경에 달렸으므로, 그 경로를 단언하면 그 환경에서만
+   * 맞는다. 없음을 **말할 수 있게** 만드는 것이 답이다.
+   */
+  const base = Object.hasOwn(context, "base")
+    ? (context.base || null)
+    : (() => {
+      try { return git("merge-base", "origin/main", "HEAD"); } catch { return null; }
+    })();
   if (!base) {
     process.stderr.write("비교 기준을 찾지 못했다 — `origin/main` 이 없다. base 를 명시하거나 전체 이력을 받을 것\n");
     return 2;
@@ -412,17 +479,25 @@ const invokedDirectly = process.argv[1] && resolve(process.argv[1]) === resolve(
 const argv = invokedDirectly ? process.argv.slice(2) : [];
 if (invokedDirectly) {
 if (argv.includes("--status")) process.exitCode = status();
-else if (argv.includes("--assert-order")) process.exitCode = assertOrder();
+else if (argv.includes("--assert-order")) {
+  // `--base <커밋>` 은 CI 용이다. 얕은 체크아웃에는 `origin/main` 이 없고, 기준을 못 찾으면
+  // 이 명령은 비영으로 끝난다 — 그래서 CI 는 기준을 스스로 말해야 한다.
+  const at = argv.indexOf("--base");
+  process.exitCode = assertOrder(at < 0 ? {} : { base: argv[at + 1] ?? null });
+}
 else {
   const phase = argv.find((argument) => !argument.startsWith("--"));
   if (!phase) {
-    process.stderr.write("사용법: gate.mjs <단계> [--seal [--waived \"사유\"]] [--explain] | --status | --assert-order\n");
+    process.stderr.write("사용법: gate.mjs <단계> [--seal [--waived \"사유\"]] [--explain] [--recheck] | --status | --assert-order [--base <커밋>]\n");
     process.exitCode = 2;
   } else if (argv.includes("--seal")) {
     const at = argv.indexOf("--waived");
     process.exitCode = seal(phase, at < 0 ? undefined : (argv[at + 1] ?? ""));
   } else {
-    process.exitCode = runPhase(phase, { explain: argv.includes("--explain") }).ok ? 0 : 1;
+    process.exitCode = runPhase(phase, {
+      explain: argv.includes("--explain"),
+      recheck: argv.includes("--recheck"),
+    }).ok ? 0 : 1;
   }
 }
 }
