@@ -38,6 +38,9 @@ on:
   # same commit weekly separates the two by date.
   schedule:
     - cron: "13 5 * * 4"
+  # 주기 실행을 기다리지 않고 부를 수 있어야 한다. 간헐을 좇는 중이라면 다음 목요일은
+  # 너무 멀고, `flake-watch` 는 그 목적 하나로 존재한다.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -336,19 +339,31 @@ jobs:
   # 실패하면 어느 반복에서 났는지가 로그에 남는다. `test:ci` 가 TAP 이므로 실패의 이유가
   # 그 자리에 인라인으로 찍힌다 — 요약을 기다리다 잘리는 것이 1·2차 관찰의 구멍이었다.
   flake-watch:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      # 한 다리의 실패가 다른 다리의 답을 가리면, 어느 환경의 문제인지가 사라진다.
+      fail-fast: false
+      matrix:
+        include:
+          # 🔑 **관찰이 난 환경.** 두 번 다 macOS arm64 · Node 26 이었고 CI 는 한 번도 보지
+          #    못했다. ubuntu 만 뒤지는 것은 없던 자리를 뒤지는 것이다.
+          - { os: macos-latest, node: 26 }
+          # 아직 아무도 보지 않은 축. `engines` 의 하한선이고 `verify` 도 여기서 돈다.
+          - { os: ubuntu-latest, node: 24 }
+          # 지금 개발이 서 있는 곳. 세 다리가 갈리면 그 갈림이 곧 단서다.
+          - { os: ubuntu-latest, node: 26 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 26
+          node-version: ${{ matrix.node }}
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - run: pnpm install --frozen-lockfile
-      - name: 스위트를 세 번 돌린다
+      - name: 스위트를 세 번 돌린다 (${{ matrix.os }} · node ${{ matrix.node }})
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
