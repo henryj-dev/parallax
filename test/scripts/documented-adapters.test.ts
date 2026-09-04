@@ -93,6 +93,33 @@ describe("한계 절의 나머지 두 주장이 코드와 맞다", () => {
     return text.slice(start, end < 0 ? undefined : end);
   }
 
+  /**
+   * `authorize` 의 매개변수 목록. 서명을 찾지 못하면 `undefined` 다.
+   *
+   * 「존을 받지 않는다」와 「서명을 못 찾았다」를 같은 답으로 만들면 함수 이름이 바뀐 날
+   * 이 짝이 조용히 초록이 된다 — 여기서 갈라 두고, 부르는 쪽이 둘을 따로 단언한다.
+   */
+  function authorizeParameters(source: string): string | undefined {
+    return /export function authorize\(([^)]*)\)/u.exec(source)?.[1];
+  }
+
+  /**
+   * 그 서명이 존을 받는가.
+   *
+   * ⚠️ **본 검사와 음성 대조가 이 함수 하나를 함께 지난다.** 대조 안에 정규식을 다시 적으면
+   * 입력도 매처도 그 자리의 리터럴이라 언제나 참이고, 진짜 매처가 바뀌어 아무것도 못 잡게
+   * 된 날에도 대조는 초록으로 남는다 — 대조가 지키기로 한 그것을 대조가 못 보게 된다.
+   */
+  function takesZone(source: string): boolean {
+    const parameters = authorizeParameters(source);
+    return parameters !== undefined && /zone/iu.test(parameters);
+  }
+
+  /** 거부 테스트가 그 스위트에 남아 있는가. 위와 같은 이유로 표기는 여기 한 곳에만 있다. */
+  function keepsRefusal(source: string): boolean {
+    return /it\("refuses to restore over the store it came from"/u.test(source);
+  }
+
   it("TC-P2.T2.a — 라우트 단위 주장이 코드와 맞다", () => {
     // 존별 RBAC 을 구현하고 한계 절을 안 지우는 것이 §R1 의 거울상이다. **있는 기능을
     // 없다고 적은 문서는 없는 기능을 있다고 적은 것과 같은 크기의 거짓이다.**
@@ -100,11 +127,13 @@ describe("한계 절의 나머지 두 주장이 코드와 맞다", () => {
       /route-based,\s+not zone-based|존 단위가\s+아니라 라우트 단위/u.test(limitation(file, from, to)));
     assert.deepEqual(claims, [true, true], "두 README 가 같은 주장을 한다");
 
-    const signature = /export function authorize\(([^)]*)\)/u.exec(read("src/security/http-authorization.ts"));
-    assert.ok(signature, "authorize 가 있다");
-    assert.ok(
-      !/zone/iu.test(signature[1] as string),
-      `주장은 「라우트 단위」인데 authorize 가 존을 받는다: ${signature[1]} — 어느 쪽이 움직였는지 확인할 것`,
+    const authorization = read("src/security/http-authorization.ts");
+    const parameters = authorizeParameters(authorization);
+    assert.ok(parameters !== undefined, "authorize 가 있다");
+    assert.equal(
+      takesZone(authorization),
+      false,
+      `주장은 「라우트 단위」인데 authorize 가 존을 받는다: ${parameters} — 어느 쪽이 움직였는지 확인할 것`,
     );
   });
 
@@ -117,10 +146,8 @@ describe("한계 절의 나머지 두 주장이 코드와 맞다", () => {
     assert.deepEqual(claims, [true, true], "두 README 가 같은 주장을 한다");
 
     // 거부를 없애면서 문서를 안 고치면 두 스토어를 합치는 사고가 조용히 가능해진다.
-    const suite = read("test/cli/backup-restore.test.ts");
-    assert.match(
-      suite,
-      /it\("refuses to restore over the store it came from"/u,
+    assert.ok(
+      keepsRefusal(read("test/cli/backup-restore.test.ts")),
       "주장을 지키는 테스트가 사라졌다 — 주장과 사실 중 어느 쪽이 움직였는지 확인할 것",
     );
   });
@@ -139,18 +166,21 @@ describe("한계 절의 나머지 두 주장이 코드와 맞다", () => {
       "지우면 그 경로가 잡힌다",
     );
 
-    // ② RBAC 짝 — 서명에 존이 붙으면 잡힌다
+    // ② RBAC 짝 — 서명에 존이 붙으면 잡힌다. **TC-P2.T2.a 가 쓰는 그 `takesZone` 으로**
+    //    잰다: 여기 정규식을 다시 적으면 진짜 매처가 무엇을 하든 이 줄은 참이다.
     const withZone = "export function authorize(principal: Principal, request: Request, zones: Set<string>): boolean {";
-    const zoned = /export function authorize\(([^)]*)\)/u.exec(withZone);
-    assert.ok(/zone/iu.test(zoned?.[1] ?? ""), "존을 받는 서명은 대조에 걸린다");
+    const withoutZone = "export function authorize(principal: Principal, request: Request): boolean {";
+    assert.equal(takesZone(withZone), true, "존을 받는 서명은 대조에 걸린다");
+    assert.equal(takesZone(withoutZone), false, "받지 않는 서명은 걸리지 않는다 — 둘 다 참이면 대조가 아니다");
 
-    // ③ restore 짝 — 테스트 이름이 사라지면 잡힌다
+    // ③ restore 짝 — 테스트 이름이 사라지면 잡힌다. 같은 이유로 `keepsRefusal` 을 지난다.
     const withoutTest = join(scratchDir, "no-refusal.test.ts");
     writeFileSync(withoutTest, 'it("moves a store into an empty one", async () => {});\n');
-    assert.doesNotMatch(
-      readFileSync(withoutTest, "utf8"),
-      /it\("refuses to restore over the store it came from"/u,
-      "거부 테스트가 없는 파일은 대조에 걸린다",
+    assert.equal(keepsRefusal(readFileSync(withoutTest, "utf8")), false, "거부 테스트가 없는 파일은 대조에 걸린다");
+    assert.equal(
+      keepsRefusal('it("refuses to restore over the store it came from", async () => {});\n'),
+      true,
+      "있는 파일은 걸리지 않는다 — 없음만 잡는 매처인지 여기서 본다",
     );
   });
 });

@@ -401,9 +401,22 @@ export class PostgresApplyLock implements ApplyLock {
           await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 1))", [zone]);
         } catch (error) {
           // Never return a session that might still own an advisory lock to the pool.
+          // Releasing with an error destroys the connection, and an advisory lock
+          // dies with the session that took it -- so the lock is gone either way.
           client.release(error instanceof Error ? error : true);
           released = true;
-          throw error;
+          // ⚠️ **This deliberately does not re-throw, and it used to.**
+          //
+          // A `throw` inside `finally` replaces whatever was already in flight.
+          // So when the operation failed *and* the unlock then also failed, the
+          // caller was handed the unlock error -- a symptom of the first failure
+          // -- and the failure that actually mattered was discarded, with no
+          // trace. Found by `no-unsafe-finally` (oxlint) on 2026-09-04.
+          //
+          // `migrations.ts:129-138` already made this call the other way, and its
+          // test says so by name: "preserves the migration failure even when
+          // unlock also fails and destroys the session". Two locking paths in one
+          // repository should not disagree about which error survives.
         }
       }
       if (!released) client.release();

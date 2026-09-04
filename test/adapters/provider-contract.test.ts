@@ -65,6 +65,31 @@ function desired(overrides: Partial<DesiredRecord> = {}): DesiredRecord {
   return { id: "web", name: "www", type: "A", content: "192.0.2.10", ttl: 300, ...overrides };
 }
 
+/**
+ * That a rejection is a refusal, and not the code falling over on the way to
+ * one.
+ *
+ * `assert.rejects(fn, "…")` reads a string as the *message* rather than as a
+ * check on the error -- Node's own documentation calls that the easy mistake --
+ * so the rules below accepted **any** rejection at all. A `TypeError` raised
+ * before the ownership check had run satisfied "somebody else's record was not
+ * overwritten" exactly as well as the refusal did, which is the one rule this
+ * file calls the product's promise.
+ *
+ * Four adapters refuse in four sentences, so there is no single regex to pin
+ * here. What can be pinned is the shape: an `Error` that says something, and
+ * not one of the classes a runtime raises when the code itself is wrong.
+ */
+function aRefusal(error: unknown): true {
+  assert.ok(error instanceof Error, `the operation failed with something that is not an Error: ${String(error)}`);
+  assert.ok(
+    !(error instanceof TypeError) && !(error instanceof ReferenceError),
+    `the operation broke before it could refuse: ${error.stack ?? error.message}`,
+  );
+  assert.notEqual(error.message.trim(), "", "a refusal with no sentence in it tells an operator nothing");
+  return true;
+}
+
 function describeProviderContract(harness: ProviderContractHarness): void {
   describe(harness.name, () => {
     /** Runs a rule, or records why this implementation is excused from it. */
@@ -142,10 +167,12 @@ function describeProviderContract(harness: ProviderContractHarness): void {
       const absent: ProviderRecord = { ...desired(), providerId: "no-such-record", managed: true };
       await assert.rejects(
         () => adapter.apply(target, { kind: "update", providerId: absent.providerId, desired: desired() }),
+        aRefusal,
         "an update against a missing record reported success",
       );
       await assert.rejects(
         () => adapter.apply(target, { kind: "delete", providerId: absent.providerId, actual: absent }),
+        aRefusal,
         "a delete against a missing record reported success",
       );
     });
@@ -178,10 +205,12 @@ function describeProviderContract(harness: ProviderContractHarness): void {
 
       await assert.rejects(
         () => adapter.apply(target, { kind: "update", providerId: theirs.providerId, desired: desired({ name: "legacy", content: "192.0.2.99" }) }),
+        aRefusal,
         "somebody else's record was overwritten",
       );
       await assert.rejects(
         () => adapter.apply(target, { kind: "delete", providerId: theirs.providerId, actual: theirs }),
+        aRefusal,
         "somebody else's record was deleted",
       );
       // ...and it is still there, unchanged.
@@ -236,13 +265,34 @@ function describeProviderContract(harness: ProviderContractHarness): void {
      * -- so that comment now says both.
      */
     rule("not knowing who owns a name is never reported as nobody owning it", async ({ adapter, target }) => {
-      if (!adapter.serviceOwnership) return;
+      // ⚠️ 여기 있던 `if (!adapter.serviceOwnership) return;` 이 이 규칙을 넷 중
+      // 둘에게 **통과로 기록**했다 -- 단언 하나 없이. 구현이 없다는 것은 답이지만
+      // 그 답의 이름은 「통과」가 아니라 「면제」이고, 면제는 이유가 옆에 적힌다.
+      assert.ok(adapter.serviceOwnership, "this rule was neither answered nor exempted; say which in the harness's `exempt`");
       // Every harness opens un-configured, so this is exactly the state where
       // the wrong answer would be `[]`.
-      const answer = await adapter.serviceOwnership(target).catch(() => "threw" as const);
-      assert.notEqual(answer === "threw" ? "threw" : JSON.stringify(answer), "[]",
+      const answer = await adapter.serviceOwnership(target).then(
+        (said) => ({ said }),
+        (threw: unknown) => ({ threw }),
+      );
+
+      if ("threw" in answer) {
+        // 던지기가 `undefined` 보다 나은 답인 이유는 오로지 이유를 실어 나르기
+        // 때문이다. 그 문장이 고칠 곳을 대지 못하면 운영자에게 남는 것은 침묵과
+        // 같고, 그러면 굳이 던질 이유도 없다 -- 그래서 문장 자체를 못 박는다.
+        assert.ok(answer.threw instanceof Error, `a provider that cannot answer threw something that is not an Error: ${String(answer.threw)}`);
+        assert.match(answer.threw.message, /account id/iu, "the throw does not name the configuration that is missing");
+        assert.match(answer.threw.message, /Read on its token/u, "the throw does not name the token permissions that would repair it");
+        return;
+      }
+      // `[]` 하나만이 금지된 답이다: 「어떤 서비스도 이 이름들을 갖고 있지
+      // 않다」로 읽히고, 그것이 레코드를 푼다. `undefined` 는 포트가 문서로
+      // 인정한 「말할 수 없다」이므로 여기서 실패가 아니다.
+      assert.notDeepEqual(answer.said, [],
         "a provider that cannot answer reported that no service owns anything, which unlocks records");
-      if (answer !== "threw" && answer !== undefined) assert.ok(Array.isArray(answer));
+      if (answer.said !== undefined) {
+        assert.ok(Array.isArray(answer.said), "an answer that is not `undefined` has to be the list it claims to be");
+      }
     });
 
     /**
@@ -271,6 +321,13 @@ function describeProviderContract(harness: ProviderContractHarness): void {
 
 describeProviderContract({
   name: "the file provider",
+  exempt: {
+    // 파일 하나가 곧 프로바이더라, 이름을 발행하는 서비스라는 것이 없다.
+    // `serviceOwnership` 을 두지 않는 것이 이 어댑터의 답이고 -- 포트에서 이
+    // 메서드가 선택인 이유가 그것이다 -- 그러니 통과가 아니라 면제로 센다.
+    "not knowing who owns a name is never reported as nobody owning it":
+      "저장소가 파일 하나뿐이라 바인딩을 물어볼 서비스가 없다",
+  },
   async open() {
     const directory = await mkdtemp(join(tmpdir(), "parallax-provider-contract-"));
     const path = join(directory, "provider.json");
@@ -421,6 +478,12 @@ describeProviderContract({
  */
 describeProviderContract({
   name: "the RFC 2136 provider",
+  exempt: {
+    // 프로토콜이 존에 실린 레코드밖에 모른다. 어떤 서비스가 어떤 이름을 발행
+    // 중인지는 DNS 바깥의 사실이고, RFC 2136 에는 그것을 물을 자리가 없다.
+    "not knowing who owns a name is never reported as nobody owning it":
+      "존에 실린 레코드가 전부이고, 바인딩을 물어볼 자리가 프로토콜에 없다",
+  },
   async open() {
     const key = parseTsigKey(`update.key:hmac-sha256:${Buffer.alloc(32, 3).toString("base64")}`, "TEST");
     const primary = await startFakePrimary({ zone: "example.com", key });

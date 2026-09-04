@@ -1,0 +1,53 @@
+# 린터가 왜 있고, 왜 이 설정인가
+
+**측정 2026-09-04.** 그전까지 `src/` 전체와 테스트 78개 파일에 걸린 정적 검사는
+`tsc --noEmit` 하나뿐이었다. 타입은 린트가 아니다 — floating promise 도, `finally`
+안의 `throw` 도, 자기 자신과의 비교도 타입 검사를 통과한다.
+
+도구는 `oxlint` 다. 설정 파일 없이 돌고, 단일 바이너리이고, 플러그인 생태계를 물고
+들어오지 않는다. 직접 의존이 셋뿐인 저장소에 ESLint 의 플러그인 트리를 들이는 것보다
+이쪽이 맞다.
+
+## 도입하자마자 실제 결함을 하나 잡았다
+
+`src/infrastructure/postgres.ts` 의 `withZoneLock` 이 `finally` 안에서 `throw` 했다
+(`no-unsafe-finally`). `finally` 안의 `throw` 는 **이미 날아가고 있던 예외를 대체한다.**
+그래서 apply 작업이 실패하고 그 다음 unlock 도 실패하면, 호출자는 unlock 실패 —
+첫 실패의 *증상* — 를 받고 정작 중요한 실패는 흔적도 없이 사라졌다.
+
+같은 저장소의 `src/infrastructure/migrations.ts:129-138` 은 **이미 반대로** 결정해
+두었고, 그 결정에는 이름 붙은 테스트까지 있었다("preserves the migration failure even
+when unlock also fails and destroys the session"). 한 저장소의 두 잠금 경로가 어느
+에러가 살아남는지를 두고 서로 다르게 답하고 있었던 것이다.
+
+📌 **아무 테스트도 이 방향을 재고 있지 않았기 때문에 살아남았다.** `postgres.test.ts` 는
+「unlock 이 호출됐는가」와 「클라이언트가 반납됐는가」는 재고 있었지만, `release()` 에
+**무엇이 전달됐는지**는 페이크가 인자를 버려서 볼 수 없었다. 그 페이크도 같이 고쳤다.
+
+## 기준선은 `correctness` 하나다
+
+`suspicious` 와 `perf` 까지 켜면 200건 가까이 나오는데, 대부분 이 코드베이스에서는
+틀린 지적이다 — 순차 폴링 루프의 `no-await-in-loop` 이 대표적이다. 그걸 다 끄거나 다
+고치는 대신 **결함을 잡는 범주 하나만 error 로 두고**, 값이 확인된 규칙 몇 개를 이름으로
+켠다. 바를 올리는 것은 나중에 일부러 하는 결정이지, 도입할 때 딸려오는 부작용이 아니다.
+
+## 끈 규칙과 그 이유
+
+| 규칙 | 왜 껐나 |
+|---|---|
+| `no-control-regex` | 9건 전부 **의도한 것**이다. 제어문자를 *거부*하려면 정규식이 제어문자를 명명해야 한다 — `SUBJECT_PATTERN` 이 `[^\u0000-\u001f\u007f]+` 로 적혀 있는 것이 그 예다. 이 규칙을 켜면 입력 검증을 지우라고 요구하는 셈이 된다. |
+| `unicorn/no-new-array` | `src/dns/rdata.ts:129` 의 `new Array(8 - left - right)` 가 음수 길이로 `RangeError` 를 낼 수 있어 보였다. **재어 봤다** — `1:2:3:4:5:6:7:8::9` 도 `1:2:3:4:5:6:7:8:9::a` 도 상류 가드에 먼저 걸려 `WireFormatError` 로 끝난다. 결함이 아니라 취향이라 껐다. |
+| `unicorn/prefer-string-starts-ends-with` | `src/config.ts:429` 는 한 줄에 정규식 두 개가 나란히 서 있다. 하나만 `startsWith` 로 바꾸면 짝이 어긋나 오히려 읽기 나빠진다. |
+
+## 돌리는 법
+
+```bash
+pnpm lint          # 이 저장소 소스 전부
+```
+
+CI 에서는 `verify` 잡의 스텝으로 돈다 — 별도 잡이 아닌 이유는, 이것이 `pnpm check` 와
+같은 질문("이 커밋의 소스가 성한가")의 다른 절반이고 같은 체크아웃과 같은
+`node_modules` 를 쓰기 때문이다. 잡을 하나 더 두면 설치를 한 번 더 하게 된다.
+
+`public/` 는 제외한다 — 그쪽은 `tsconfig.portal.json` 과 `pnpm run check:portal` 이
+자기 기준으로 본다. 두 도구가 같은 파일을 다른 엄격도로 보면 둘 중 하나는 무시된다.

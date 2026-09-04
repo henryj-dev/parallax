@@ -24,13 +24,28 @@ class FakeClient implements PgClient {
   readonly calls: Call[] = [];
   readonly handler: Handler;
   released = false;
+  /**
+   * What `release()` was handed, which decides whether `pg` returns the session
+   * to the pool or destroys it.
+   *
+   * The fake used to take no argument at all, so every test could see *that* a
+   * client was released and none could see whether it was released as poisoned
+   * -- which is the whole point of the call on the unlock-failure path. A double
+   * release is recorded rather than ignored for the same reason.
+   */
+  releasedWith: unknown;
+  releaseCount = 0;
   constructor(handler: Handler) { this.handler = handler; }
   async query<Row = Record<string, unknown>>(text: string, values?: readonly unknown[]): Promise<PgQueryResult<Row>> {
     const call = { text: normalize(text), ...(values ? { values } : {}) };
     this.calls.push(call);
     return await this.handler(call) as PgQueryResult<Row>;
   }
-  release(): void { this.released = true; }
+  release(destroy?: Error | boolean): void {
+    this.released = true;
+    this.releaseCount += 1;
+    if (destroy !== undefined) this.releasedWith = destroy;
+  }
 }
 
 class FakePool implements PgPool {
@@ -619,6 +634,46 @@ describe("PostgresApplyLock", () => {
     assert.equal(pool.client.calls.length, 2);
     assert.match(pool.client.calls[1]!.text, /pg_advisory_unlock/);
     assert.equal(pool.client.released, true);
+  });
+
+  /**
+   * The failure that matters survives the failure that follows it.
+   *
+   * `withZoneLock` used to `throw` from its `finally`, which replaces whatever
+   * exception was already travelling. So a provider failure followed by an
+   * unlock failure reached the caller as *the unlock failure* -- a symptom of
+   * the first problem, standing in for the problem, with the original gone.
+   * Found by `no-unsafe-finally` on 2026-09-04; nothing here had asserted either
+   * way, which is why it survived.
+   *
+   * `migrations.ts` had already answered this, and its suite says so by name:
+   * "preserves the migration failure even when unlock also fails and destroys
+   * the session". This pins the same answer for the other locking path, so the
+   * two cannot drift apart again.
+   */
+  it("preserves the apply failure even when the unlock also fails", async () => {
+    const failure = new Error("provider failed");
+    const unlockFailure = new Error("connection reset while unlocking");
+    const pool = new FakePool(() => ({ rows: [] }), (call) => {
+      if (call.text.includes("pg_advisory_unlock")) throw unlockFailure;
+      return { rows: [] };
+    });
+
+    await assert.rejects(
+      new PostgresApplyLock(pool).withZoneLock("example.com", async () => { throw failure; }),
+      // Identity, not shape: the point is *which* error arrives, and the two
+      // have different messages precisely so a swap cannot pass unnoticed.
+      (error: unknown) => error === failure,
+      "the unlock failure replaced the provider failure that caused it",
+    );
+
+    // The unlock was attempted, and the session was destroyed rather than
+    // returned to the pool -- an advisory lock dies with its session, so
+    // swallowing the unlock error does not leave the lock held.
+    assert.equal(pool.client.calls.length, 2);
+    assert.match(pool.client.calls[1]!.text, /pg_advisory_unlock/);
+    assert.equal(pool.client.released, true);
+    assert.equal(pool.client.releasedWith, unlockFailure);
   });
 });
 

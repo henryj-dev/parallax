@@ -1,12 +1,33 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "noEmit": true
+    "noEmit": true,
+    // `scripts/gate.mjs` is checked here now. Before this, the include was
+    // `scripts/*.ts`, which `.mjs` does not match -- so `gate.mjs` was reached
+    // only through its hand-written `scripts/gate.d.mts`. The declaration was
+    // checked and the implementation it describes was not, which is the one
+    // arrangement where the two can drift apart in silence: a test importing
+    // the module typechecks against a promise nobody verifies the code keeps.
+    //
+    // `checkJs` rather than merely `allowJs`: letting a file in without
+    // checking it buys nothing.
+    //
+    // ⚠️ **Deliberately not extended to `test/**\/*.js`.** The two `.js` suites
+    // there import `public/*.js`, which has its own config on purpose --
+    // `tsconfig.portal.json`, `strict: false`, browser libs, run by
+    // `pnpm run check:portal`. Pulling them in here checks the portal a second
+    // time under a stricter setting than it was written for, and produces ~60
+    // errors that are about that mismatch rather than about any defect. If the
+    // portal is ever meant to be strict, that is a change to `check:portal`.
+    "allowJs": true,
+    "checkJs": true
   },
   "include": [
     "src/**/*.ts",
     "cmd/**/*.ts",
     "test/**/*.ts",
-    "scripts/*.ts"
+    "scripts/*.ts",
+    "scripts/*.mjs",
+    "scripts/*.d.mts"
   ]
 }

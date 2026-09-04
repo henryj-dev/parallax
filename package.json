@@ -9,6 +9,7 @@
     "audit": "pnpm audit --audit-level moderate",
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit -p tsconfig.test.json",
+    "lint": "oxlint src cmd test scripts --deny-warnings",
     "cli": "node --env-file-if-exists=.env cmd/parallax/main.ts",
     "dev": "node --env-file-if-exists=.env --watch src/index.ts",
     "start": "node --env-file-if-exists=.env dist/src/index.js",
@@ -29,6 +30,7 @@
   "packageManager": "pnpm@11.9.0",
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "oxlint": "^1.81.0",
     "typescript": "^7.0.2"
   },
   "dependencies": {

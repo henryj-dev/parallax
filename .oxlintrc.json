@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint", "typescript", "unicorn", "promise", "node"],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "no-unsafe-finally": "error",
+    "no-unsafe-optional-chaining": "error",
+    "no-useless-escape": "error",
+    "no-async-promise-executor": "error",
+    "no-constant-binary-expression": "error",
+    "no-self-compare": "error",
+    "promise/no-return-in-finally": "error",
+    "promise/no-promise-in-callback": "error",
+    "promise/catch-or-return": "error",
+
+    "no-control-regex": "off",
+    "unicorn/no-new-array": "off",
+    "unicorn/prefer-string-starts-ends-with": "off"
+  },
+  "ignorePatterns": ["dist/", "node_modules/", "public/"]
+}

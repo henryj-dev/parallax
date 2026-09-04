@@ -8,7 +8,6 @@
 #    훅 자신이 「메인 트리인가」를 보고 워크트리는 통과시키므로 그래도 된다.
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
 COMMON="$(git rev-parse --path-format=absolute --git-common-dir)"
 MAIN="$(dirname "$COMMON")"
 

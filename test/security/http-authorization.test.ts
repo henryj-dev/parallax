@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { inspect } from "node:util";
 import { describe, it } from "node:test";
 import {
   authenticate,
@@ -72,9 +73,17 @@ describe("HTTP token authentication", () => {
         enabled: true,
         tokens: [{ token: "secret with spaces", role: "admin", subject: "owner" }],
       }, async () => new Response()),
-      (error: unknown) => error instanceof TypeError
-        && error.message === "invalid security configuration"
-        && !error.message.includes("secret with spaces"),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, "invalid security configuration");
+        // ⚠️ `!error.message.includes("secret with spaces")` used to be the
+        // third clause, after the message had already been pinned to a literal
+        // -- so it could not fail, and the one thing this test is named for
+        // ("without echoing secrets") was never measured. `inspect` reads the
+        // whole error rather than the string the line above already fixed.
+        assert.doesNotMatch(inspect(error), /secret with spaces/u);
+        return true;
+      },
     );
 
     assert.throws(

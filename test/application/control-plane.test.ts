@@ -192,10 +192,19 @@ describe("ControlPlane", () => {
     assert.equal((await service.getRevision("example.com", 4)).revision, 4);
     assert.equal((await service.status("example.com")).statuses[0]?.state, "pending");
     const audit = (await service.audit("example.com")).entries;
-    assert.equal(audit.at(0)?.action, "desired.restored");
-    assert.equal(audit.at(0)?.detail.restoredRevision, 2);
-    assert.equal(((audit.at(0)?.detail.before as { views: Array<{ records: Array<{ content: string }> }> }).views[0]?.records[0]?.content), "8.8.8.20");
-    assert.equal(((audit.at(0)?.detail.after as { views: Array<{ records: Array<{ content: string }> }> }).views[0]?.records[0]?.content), "8.8.8.10");
+    // The entry is pinned before it is read into, rather than reached with `?.`
+    // and then indexed. `audit.at(0)?.detail.before` short-circuits to
+    // `undefined` when there is no entry, and `undefined.views` is then a
+    // TypeError -- so an audit trail that recorded nothing failed here as a
+    // crash inside the assertion rather than as "no audit entry was written",
+    // which is the thing that would actually have gone wrong.
+    const restoration = audit.at(0);
+    assert.ok(restoration, "restoring a revision must write an audit entry");
+    assert.equal(restoration.action, "desired.restored");
+    assert.equal(restoration.detail.restoredRevision, 2);
+    type Snapshot = { views: Array<{ records: Array<{ content: string }> }> };
+    assert.equal((restoration.detail.before as Snapshot).views[0]?.records[0]?.content, "8.8.8.20");
+    assert.equal((restoration.detail.after as Snapshot).views[0]?.records[0]?.content, "8.8.8.10");
   });
 
   it("serializes concurrent restore and mutation without reusing a revision", async () => {
@@ -1209,10 +1218,17 @@ describe("ControlPlane", () => {
     // and calling that pending would report a lag against nothing.
     assert.equal(stateOf("empty.example"), "");
 
-    // The same answer the zone's own status page gives, not a second opinion.
-    for (const zone of ["behind.example", "caught-up.example", "empty.example"]) {
-      const own = await service.status(zone);
-      assert.equal(stateOf(zone), overallApplyState(own.statuses), zone);
+    // The same answer the zone's own status page gives, not a second opinion --
+    // and named rather than compared against the overview. `statusOverview` is
+    // `overallApplyState(statusFor(zone).statuses)` over the rows `status()`
+    // returns, so asserting the two agree asserts an expression against itself:
+    // it holds while both are wrong, which is the one case worth catching.
+    for (const [zone, expected] of [
+      ["behind.example", "pending"],
+      ["caught-up.example", "applied"],
+      ["empty.example", ""],
+    ] as const) {
+      assert.equal(overallApplyState((await service.status(zone)).statuses), expected, zone);
     }
 
     // An apply that the provider refuses reports the failure rather than

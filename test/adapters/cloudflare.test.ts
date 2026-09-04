@@ -241,6 +241,12 @@ describe("CloudflareProviderAdapter", () => {
       zoneId: "zone-1",
       ownershipSecret: OWNERSHIP_SECRET,
       fetch: async () => { throw new Error("Bearer super-secret failed"); },
+      // A transport failure on a GET is retried, and without this the backoff
+      // is a real 500ms + 1000ms -- 1.5 of this file's 1.6 seconds spent
+      // sleeping in a test about what an error message says. Every retry test
+      // below already injects this; this one is about redaction, and the wait
+      // adds nothing to that.
+      sleep: async () => undefined,
     });
     await assert.rejects(() => transport.list("example.com/external"), (error: unknown) => {
       assert.match(String(error), /\[redacted\]/);

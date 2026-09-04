@@ -1,0 +1,46 @@
+# Who gets asked to look.
+#
+# **This file does not block a merge, and that is deliberate.** The branch
+# ruleset has `required_approving_review_count: 0` and
+# `require_code_owner_review: false` (measured 2026-09-04). With one maintainer,
+# requiring an approval would mean approving your own pull request, which is a
+# ceremony rather than a review.
+#
+# What it does do is three real things:
+#
+#   1. It requests a review automatically, so a pull request opened from a
+#      worktree by an agent -- or by somebody months from now -- lands in a
+#      human's queue instead of waiting to be noticed.
+#   2. It states, in a file rather than in somebody's head, which paths have an
+#      owner who has to be told when they change. The paths below are the ones
+#      where a change reaches outside this repository.
+#   3. It is an input to the OpenSSF Scorecard Code-Review check, which
+#      `scorecard.yml` exists to measure. A repository that scores itself and
+#      then leaves the measured thing unset is measuring nothing.
+#
+# ⚠️ If a second maintainer ever appears, the thing to reconsider is the ruleset,
+#    not this file: `required_approving_review_count: 1` plus
+#    `require_code_owner_review: true` is what turns this from a notification
+#    into a control. **Merge is deploy here** -- origin feeds a deploy mirror --
+#    so that is a decision worth making on purpose rather than by default.
+
+*                           @henryj-dev
+
+# The three places a change here breaks something in another repository.
+# `AGENTS.md` explains each: stardust's release gate pins commit shas from this
+# repository, and two of its fixtures pin what `scripts/what-ships.sh` answers
+# for `tsconfig.test.json` and `security-audits/`.
+/scripts/what-ships.sh      @henryj-dev
+/security-audits/           @henryj-dev
+/tsconfig.test.json         @henryj-dev
+
+# A snapshot of stardust's, kept byte-identical on purpose so that drift is
+# checkable with one `cmp`. A local edit here is almost always the wrong fix --
+# it belongs upstream, and comes back with the next snapshot.
+/scripts/claude-hooks/      @henryj-dev
+/scripts/git-hooks/         @henryj-dev
+
+# Merge is deploy. These decide what ships and what is allowed to gate it.
+/.github/                   @henryj-dev
+/Dockerfile                 @henryj-dev
+/migrations/                @henryj-dev

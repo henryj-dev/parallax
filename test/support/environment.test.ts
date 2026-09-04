@@ -67,11 +67,19 @@ describe("a test's environment does not depend on the shell that started it", ()
     // The control. Nine call sites were fixed; a tenth added later would be the
     // same defect, and it would be invisible for the same reason -- green in CI.
     const offenders: string[] = [];
+    let scanned = 0;
     for await (const entry of glob("test/**/*.test.ts")) {
+      scanned += 1;
       if (entry === QUOTES_THE_PATTERN) continue;
       const source = await readFile(entry, "utf8");
       if (source.includes("process.execPath") && source.includes("...process.env")) offenders.push(entry);
     }
+    // `glob` resolves against `process.cwd()`. Run the suite from anywhere but the
+    // repository root and it matches nothing; nothing scanned is no offenders, and
+    // this file is green forever while measuring an empty set. The test below
+    // proves the two search strings still match, which is a different question --
+    // it reads one file by path and would keep passing with the glob dark.
+    assert.ok(scanned >= 50, `scanned ${scanned} test files -- check that the suite is running from the repository root`);
     assert.deepEqual(
       offenders,
       [],

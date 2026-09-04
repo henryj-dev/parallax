@@ -687,7 +687,7 @@ describe("HTTP API", () => {
  * was the whole of it.
  */
 describe("the access log and the request id", () => {
-  function call(headers: Record<string, string>, token?: string): Promise<{
+  async function call(headers: Record<string, string>, token?: string): Promise<{
     logged: Record<string, unknown> | undefined;
     responseHeaders: Record<string, string>;
   }> {
@@ -711,14 +711,19 @@ describe("the access log and the request id", () => {
     const printed: string[] = [];
     const original = console.log;
     console.log = (line: string) => { printed.push(line); };
-    return handler(incoming, response).then(() => {
+    try {
+      await handler(incoming, response);
+    } finally {
+      // `console.log` is process-wide, so restoring it is not this test's
+      // tidiness -- it is every later test's ability to print. Restoring only
+      // on the two settled paths of a promise skipped the third: a synchronous
+      // throw out of `handler` never reaches either, and left the whole run
+      // logging into an array nobody reads.
       console.log = original;
-      const last = printed.at(-1);
-      return { logged: last ? JSON.parse(last) as Record<string, unknown> : undefined, responseHeaders };
-    }, (error: unknown) => {
-      console.log = original;
-      throw error;
-    });
+    }
+
+    const last = printed.at(-1);
+    return { logged: last ? JSON.parse(last) as Record<string, unknown> : undefined, responseHeaders };
   }
 
   it("names every request and echoes a name the caller already had", async () => {

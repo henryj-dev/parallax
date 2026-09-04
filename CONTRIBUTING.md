@@ -67,18 +67,43 @@ edited, never a production one. None of these run in CI, for that reason.
 
 ## What CI will ask of you
 
-Five workflows, each answering a different question so that a red result names
-its own cause:
+Three workflows. `check` carries most of it as **jobs**, one per question, so
+that a red result names its own cause instead of being one job that failed for
+any of nine reasons:
 
-| workflow | what it answers |
+| job in `check` | what it answers |
 |---|---|
-| `check` | typecheck, portal typecheck, build, and `node --test` on Node 24 and 26 |
-| `scripts` | the python hook suites under `scripts/`, and shellcheck on `scripts/*.sh` |
+| `verify` | typecheck, portal typecheck, build, and `node --test` on Node 24 and 26 |
+| `deployment-gate` | the schema surface, from a bare checkout with nothing installed — because that is how a deployment runs it |
 | `docker` | the image builds, runs as uid 10001, and keeps `migrations/` unwritable |
-| `codeql` | static analysis, also weekly on unchanged code |
-| `dependency-review` | whether *this* pull request adds a vulnerable or wrongly-licensed dependency |
+| `hooks` | the Python hook suites under `scripts/`, which `node --test` cannot see |
+| `shellcheck` | `scripts/*.sh` and `scripts/git-hooks/install.sh`, at `--severity=warning` |
+| `policy` | secret scan, workflow audit, dependency review — from a shared reusable workflow, so five repositories agree |
+| `audit` | the installed dependency tree against published advisories |
+| `flake-watch` | the suite three times over on three platforms — **schedule and manual dispatch only** |
+| `gate` | collects the above; this is a required check name |
 
-None of them need secrets, so they all run on a pull request from a fork.
+The other two workflows are separate because their verdicts change while the
+code does not: `codeql` (static analysis, also weekly over unchanged code) and
+`scorecard` (a repository-posture scoreboard).
+
+**The branch ruleset requires two check names: `gate` and `codeql`.** `scorecard`
+is deliberately not required.
+
+Two things worth knowing before you wonder why something is red:
+
+- **A skipped job does not count as a pass.** `gate` accepts `success` only, and
+  names the single job allowed to skip (`flake-watch`). If you add an `if:` to a
+  job, the gate goes red until that job is added to the allowlist on purpose.
+- **`policy` needs an organisation secret** (a gitleaks licence). Everything else
+  runs without secrets. If you are contributing from a fork and `policy` fails
+  for a reason that is clearly not your change, say so in the pull request — that
+  is ours to fix, not yours to work around. The scan itself still happens: the
+  same job runs an unlicensed gitleaks over the full history regardless.
+
+⚠️ **`flake-watch` will not run on your pull request**, by design — three runs on
+every PR would cost more waiting than the information is worth. It runs weekly,
+and anyone can trigger it by hand from the Actions tab.
 
 ## House style
 

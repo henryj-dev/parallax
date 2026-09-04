@@ -40,8 +40,7 @@ describe("private file directories", () => {
     assert.equal((await stat(root)).mode, before);
   });
 
-  it("does not make /tmp private when a data file is configured directly beneath it", async () => {
-    if (process.platform === "win32") return;
+  it("does not make /tmp private when a data file is configured directly beneath it", { skip: posixOnly() }, async () => {
     const before = (await stat("/tmp")).mode;
     await assert.rejects(
       ensurePrivateDirectory("/tmp"),
@@ -203,4 +202,17 @@ function selfStartedAt(): string {
 /** A reason to skip, or `false` to run. Only Linux publishes process start times. */
 function linuxOnly(): string | false {
   return existsSync("/proc/self/stat") ? false : "needs /proc, which only Linux has";
+}
+
+/**
+ * A reason to skip, or `false` to run. `/tmp` and its mode bits are a POSIX
+ * notion, so the case above has nothing to assert on Windows.
+ *
+ * Returning early from the body instead -- which is what this used to do --
+ * makes the platform report a **pass** for a check it never performed, and a
+ * pass is invisible to the `skipped N` count that `docs/test-skips.md` makes
+ * the review mechanism for exactly these gates.
+ */
+function posixOnly(): string | false {
+  return process.platform === "win32" ? "/tmp and its mode bits do not exist on Windows" : false;
 }

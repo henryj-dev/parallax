@@ -65,9 +65,15 @@ jobs:
         with:
           category: "/language:javascript-typescript"
 
-  # The one check name the branch ruleset requires. Naming the analysis job directly
-  # means that the day the name changes, that required check becomes a check that does
-  # not exist — and the protection quietly disappears.
+  # **The second of the two check names the branch ruleset requires**, the other being
+  # `gate` in `check.yml`. Both files used to claim to be "the one", each in its own
+  # comment, and both READMEs repeated one half of that -- measured against the API on
+  # 2026-09-04, `required_status_checks` is `[{"context":"gate"},{"context":"codeql"}]`.
+  # `scorecard` is deliberately not required.
+  #
+  # Naming the analysis job directly would mean that the day the name changes, that
+  # required check becomes a check that does not exist — and the protection quietly
+  # disappears.
   #
   # This asks whether the analysis ran, not whether it found nothing. Findings land in
   # the Security tab and do not block a merge; what is blocked is a broken query pack
@@ -78,6 +84,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Reads `needs.analyze.result` and nothing else -- no checkout, no API call.
+    permissions: {}
     steps:
       - name: the analysis ran to completion
         env:

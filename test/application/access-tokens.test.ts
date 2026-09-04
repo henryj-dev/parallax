@@ -45,6 +45,25 @@ function deferred(): { readonly promise: Promise<void>; readonly resolve: () => 
   return { promise, resolve };
 }
 
+/**
+ * Waits for the thing itself rather than for a length of time.
+ *
+ * `startRefreshing` owns its own `setInterval`, so a test cannot step it -- but
+ * it can stop guessing how long a few ticks take. Sleeping a fixed 30ms for a
+ * 5ms interval assumes six ticks fired in that window, and on a runner that
+ * stalls the assumption is simply false: the test then goes red for a reason
+ * that has nothing to do with refreshing. The deadline here is a ceiling, not
+ * a wait -- it returns the moment the condition holds, which is also why these
+ * cases now finish in single-digit milliseconds.
+ */
+async function until(condition: () => boolean, what: string, deadlineMs = 5_000): Promise<void> {
+  const deadline = Date.now() + deadlineMs;
+  while (!condition()) {
+    if (Date.now() > deadline) assert.fail(`${what} did not happen within ${deadlineMs}ms`);
+    await scheduler.wait(1);
+  }
+}
+
 describe("AccessTokenService", () => {
   // A deployment runs the command line in a separate process (`kubectl exec`),
   // so these two instances stand for the server and that command.
@@ -79,21 +98,23 @@ describe("AccessTokenService", () => {
     assert.equal((await service.list())[0]?.expired, true);
   });
 
-  it("accepts a token another process issued, without being restarted", async () => {
+  it("accepts a token another process issued, without being restarted", async (t) => {
     const repository = new MemoryAccessTokenRepository();
     const { server, cli } = pair(repository);
     await server.load();
     await cli.load();
+    // Registered where the interval is created, not after the assertions: a
+    // failing assertion used to skip `stop()` entirely, and the live interval
+    // then kept the process alive -- turning one red test into a hung run.
     const stop = server.startRefreshing(5);
+    t.after(stop);
 
     const issued = await cli.issue("ops-henry", "admin");
     assert.equal(accepts(server, issued.token), false, "not yet -- the server has not read the store since");
-    await scheduler.wait(30);
-    assert.equal(accepts(server, issued.token), true);
-    stop();
+    await until(() => accepts(server, issued.token), "the server picked up the token from the store");
   });
 
-  it("stops accepting a token another process revoked, without being restarted", async () => {
+  it("stops accepting a token another process revoked, without being restarted", async (t) => {
     const repository = new MemoryAccessTokenRepository();
     const { server, cli } = pair(repository);
     await cli.load();
@@ -102,13 +123,13 @@ describe("AccessTokenService", () => {
     assert.equal(accepts(server, issued.token), true);
 
     const stop = server.startRefreshing(5);
+    t.after(stop);
     await cli.revoke(issued.metadata.id);
-    await scheduler.wait(30);
-    assert.equal(accepts(server, issued.token), false, "a revocation that leaves the token working is not a revocation");
-    stop();
+    await until(() => !accepts(server, issued.token),
+      "the server stopped accepting the revoked token -- a revocation that leaves it working is not a revocation");
   });
 
-  it("keeps the tokens it has when the store cannot be read", async () => {
+  it("keeps the tokens it has when the store cannot be read", async (t) => {
     const repository = new MemoryAccessTokenRepository();
     const { server, cli } = pair(repository);
     await cli.load();
@@ -118,10 +139,10 @@ describe("AccessTokenService", () => {
     const errors: unknown[] = [];
     repository.list = async () => { throw new Error("store is unreachable"); };
     const stop = server.startRefreshing(5, (error) => errors.push(error));
-    await scheduler.wait(30);
+    t.after(stop);
+    await until(() => errors.length > 0, "the failure was reported, not swallowed");
     stop();
 
-    assert.ok(errors.length > 0, "the failure must be reported, not swallowed");
     assert.equal(accepts(server, issued.token), true,
       "an unreachable store must not lock out everyone holding a valid token");
   });
@@ -348,7 +369,7 @@ describe("AccessTokenService", () => {
     assert.deepEqual(errors, []);
   });
 
-  it("does not fan out driver reads after an application-level timeout", async () => {
+  it("does not fan out driver reads after an application-level timeout", async (t) => {
     const repository = new MemoryAccessTokenRepository();
     const service = new AccessTokenService(repository, [], () => new Date(), 20);
     await service.load();
@@ -360,9 +381,27 @@ describe("AccessTokenService", () => {
       return [];
     };
 
-    const stop = service.startRefreshing(1, () => undefined);
-    await scheduler.wait(70);
+    // `calls === 1` is what a working coalescer gives -- and also what a runner
+    // that fired exactly one tick and then stalled gives. Sleeping 70ms and
+    // hoping the ticks in between happened cannot tell those apart, so the
+    // waiting is done on the ticks themselves.
+    //
+    // Only a tick that arrives *after* the 20ms read deadline says "predates
+    // the most recent mutation": it found the expired pending read and refused
+    // it instead of asking the driver again. Seeing that message is the whole
+    // property, and until it arrives this test does not proceed.
+    const failures: string[] = [];
+    const refusedAfterTimeout = deferred();
+    const stop = service.startRefreshing(1, (error) => {
+      failures.push(String(error));
+      if (/predates/u.test(String(error))) refusedAfterTimeout.resolve();
+    });
+    t.after(stop);
+    await refusedAfterTimeout.promise;
     stop();
+
+    assert.ok(failures.some((failure) => /timed out/u.test(failure)),
+      `the read must have hit its deadline first, or the refusal above is about something else: ${failures.join(" | ")}`);
     assert.equal(calls, 1, "later ticks reuse the still-pending driver query");
     release.resolve();
     await scheduler.yield();

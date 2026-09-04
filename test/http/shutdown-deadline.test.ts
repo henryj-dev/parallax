@@ -23,28 +23,40 @@ describe("shutdown with a request still in flight", () => {
     for (const server of servers) server.close();
   });
 
-  /** A server whose handler never answers, so the request stays in flight. */
-  async function stalled(): Promise<{ server: Server; port: number }> {
-    const server = createServer(() => { /* deliberately no response */ });
+  /**
+   * A server whose handler never answers, so the request stays in flight.
+   *
+   * `arrived` resolves when the handler is entered, which is the only moment
+   * that is actually "in flight". Waiting a fixed 50ms instead was the same
+   * claim without the evidence: on a loaded runner the request has not been
+   * accepted yet, `close()` then finds nothing to wait for, and the deadline
+   * assertion below passes while measuring an empty server -- a green result
+   * for a shutdown that was never put under the condition it is about.
+   */
+  async function stalled(): Promise<{ server: Server; port: number; arrived: Promise<void> }> {
+    let arrive!: () => void;
+    const arrived = new Promise<void>((resolve) => { arrive = resolve; });
+    const server = createServer(() => { arrive(); /* deliberately no response */ });
     server.requestTimeout = 60_000;
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const { port } = server.address() as { port: number };
-    return { server, port };
+    return { server, port, arrived };
   }
 
-  async function sendRequest(port: number): Promise<void> {
+  async function sendRequest(port: number, arrived: Promise<void>): Promise<void> {
     const socket = connect(port, "127.0.0.1");
     openSockets.push(socket);
     await new Promise<void>((resolve) => socket.once("connect", () => resolve()));
     socket.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    // Give the server a turn to accept it, so the request really is in flight.
-    await new Promise<void>((resolve) => { setTimeout(resolve, 50); });
+    // The server itself says when it has the request. A slow machine makes this
+    // take longer; it cannot make it proceed without one.
+    await arrived;
   }
 
   it("finishes within its deadline while a request is stuck", async () => {
-    const { server, port } = await stalled();
-    await sendRequest(port);
+    const { server, port, arrived } = await stalled();
+    await sendRequest(port, arrived);
 
     const started = Date.now();
     await shutdownProcess({ http: server, timers: [], graceMs: 250 });

@@ -117,7 +117,7 @@ export function setTrustedClientKey(request: Request, key: string): void {
 
 // RFC 6750 b64token syntax; excluding whitespace and header/cookie delimiters also
 // makes credential extraction unambiguous.
-const TOKEN_PATTERN = /^[A-Za-z0-9._~+\/-]+=*$/u;
+const TOKEN_PATTERN = /^[A-Za-z0-9._~+/-]+=*$/u;
 const COOKIE_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u;
 const SUBJECT_PATTERN = /^[^\u0000-\u001f\u007f]+$/u;
 

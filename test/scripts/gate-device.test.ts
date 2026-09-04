@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -31,6 +31,16 @@ after(() => { for (const path of temporary) rmSync(path, { recursive: true, forc
 const ROOT = new URL("../../", import.meta.url).pathname;
 const head = () => execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).trim();
 
+/**
+ * 빈 트리의 해시 — **어디에나 있는 기준 커밋.**
+ *
+ * `TC-P0.T1.g` 가 같은 이유로 이것을 쓴다. 주변 이력에 기댄 기준은 그 이력이 있는 곳에서만
+ * 맞는데(`fetch-depth: 1` 에는 `HEAD~1` 이 없고, 얕은 체크아웃에는 `origin/main` 이 없다),
+ * 빈 트리는 계산으로 나온다. 그것과의 diff 는 추적되는 모든 파일이므로 **범위가 살아 있다.**
+ */
+const emptyTree = () =>
+  execFileSync("git", ["hash-object", "-t", "tree", "/dev/null"], { cwd: ROOT, encoding: "utf8" }).trim();
+
 /** 통과하는 검사 하나와 실패하는 검사 하나만 가진 최소 검사표. */
 function fixture(passing: boolean): Record<string, Phase> {
   return {
@@ -52,16 +62,42 @@ describe("게이트 장치가 자기 규칙을 지킨다", () => {
     assert.equal(attempt.ok, false, "잠긴 단계는 통과할 수 없다");
     assert.deepEqual(attempt.results, [], "검사를 돌리지도 않는다 — 거부는 실패가 아니다");
 
-    // 실제 CLI 경로도 같은 답을 하는지. 이 저장소의 P1 은 P0 봉인을 요구한다.
-    const cli = (): number => {
+    /**
+     * 실제 CLI 진입점도 같은 답을 하는지.
+     *
+     * ⚠️ 이 단언은 `if (sealState("P0") !== "봉인" && … !== "면제")` 안에 있었다. 이
+     * 체크아웃의 P0 은 **봉인**이고 `TC-P0.T1.j` 가 바로 그것을 단언하므로 조건은 상수
+     * 거짓이었다 — 이 스위트에서 진짜 CLI 를 지나는 **유일한** 단언이 한 번도 돌지 않았다.
+     * 조건부 대조는 대조가 아니다.
+     *
+     * 그래서 봉인 위치를 주입한다. CLI 는 `--seals` 를 받지 않지만, `DEFAULT_SEALS` 는
+     * 스크립트 자기 위치의 `../gates` 다(`gate.mjs` 의 `ROOT`). 스크립트를 임시 디렉터리로
+     * 복사하면 그 옆의 **없는** `gates/` 가 봉인 디렉터리가 되고, 저장소의 진짜 봉인을
+     * 건드리지 않은 채 「P0 이 봉인되지 않은 상태」가 만들어진다 — 파일 계층에서 같은
+     * 이음매를 잡는 것이고, 이 파일 첫머리가 진짜 봉인을 건드리지 않겠다고 한 이유와 같다.
+     * 복사는 매번 **지금의** `gate.mjs` 를 뜨므로, R1 거부가 무뎌지면 여기가 빨개진다.
+     */
+    // ⚠️ `realpathSync` 는 장식이 아니다. `gate.mjs` 는 `argv[1]` 과 자기 모듈 경로를 맞춰
+    // 봐야 CLI 로 돈다(`invokedDirectly`). macOS 의 `mkdtemp` 는 `/var/…` 를 주는데 ESM 이
+    // 보는 자기 경로는 `/private/var/…` 라 둘이 어긋나고, 그러면 스크립트는 **아무것도 하지
+    // 않고 0 으로 끝난다** — 거부를 재려던 대조가 통과로 읽히는 것이다. 처음에 그렇게 됐다.
+    const relocated = join(realpathSync(scratch()), "scripts");
+    mkdirSync(relocated, { recursive: true });
+    copyFileSync(join(ROOT, "scripts", "gate.mjs"), join(relocated, "gate.mjs"));
+    const cli = (): { code: number; stderr: string } => {
       try {
-        execFileSync(process.execPath, ["scripts/gate.mjs", "P1"], { cwd: ROOT, stdio: "ignore" });
-        return 0;
-      } catch (error) { return (error as { status?: number }).status ?? 1; }
+        execFileSync(process.execPath, [join(relocated, "gate.mjs"), "P1"], { cwd: ROOT, stdio: ["ignore", "ignore", "pipe"] });
+        return { code: 0, stderr: "" };
+      } catch (error) {
+        const failed = error as { status?: number; stderr?: Buffer };
+        return { code: failed.status ?? 1, stderr: String(failed.stderr ?? "") };
+      }
     };
-    if (sealState("P0") !== "봉인" && sealState("P0") !== "면제") {
-      assert.notEqual(cli(), 0, "P0 이 봉인되지 않은 동안 CLI 도 P1 을 거부한다");
-    }
+    const refused = cli();
+    assert.notEqual(refused.code, 0, "P0 이 봉인되지 않은 동안 CLI 도 P1 을 거부한다");
+    // 이유까지 본다. 비영은 스크립트가 죽어도 나오고, 그 비영을 거부로 읽으면 이 대조는
+    // CLI 가 부서진 날 가장 초록이다.
+    assert.match(refused.stderr, /🔒 P1 .*P0/u, "무엇이 잠갔는지 말하고 끝낸다");
   });
 
   it("TC-P0.T1.b — 봉인 후 그 단계를 되돌리면 봉인이 무효가 된다", () => {
@@ -106,8 +142,26 @@ describe("게이트 장치가 자기 규칙을 지킨다", () => {
     // 이 검사의 최악이다: 「변경 없음」과 「비교하지 않음」이 같은 답이 된다.
     const missing: Check = { id: "t.9", how: "diff-empty", paths: ["src/"], since: "seal:없는단계", seals: scratchDir };
     assert.equal(verdict(missing, measure(missing)), false, "diff-empty: 기준이 없으면 실패한다");
-    const real: Check = { id: "t.10", how: "diff-empty", paths: ["migrations/"], since: `${head()}` };
-    assert.equal(verdict(real, measure(real)), true, "diff-empty: 변경이 없으면 통과한다");
+
+    // ⚠️ **그 최악을 양성 대조가 스스로 저지르고 있었다.** 기준이 `head()` 였다 — 즉
+    // `HEAD..HEAD`, 구성상 빈 범위다. 트리에 무엇이 있든 측정은 0 이고(`migrations/` 도
+    // `src/` 도 재 봤다), 그러니 통과하는 쪽이 증명한 것은 「변경이 없다」가 아니라
+    // 「비교하지 않았다」였다 — 바로 윗줄이 실패로 보는 그 상태다.
+    //
+    // 기준을 빈 트리로 옮기면 범위가 살아난다. 그리고 **같은 범위**에서 양쪽 답이 다
+    // 나와야 이 짝이 대조가 된다: 경로로 좁히면 비영, `grep` 으로 좁히면 0.
+    const base = emptyTree();
+    const changed: Check = { id: "t.10", how: "diff-empty", paths: ["migrations/"], since: base };
+    assert.ok(measure(changed).measured > 0, "빈 트리와의 diff 는 migrations/ 를 전부 센다 — 0 이면 범위가 죽은 것이다");
+    assert.equal(verdict(changed, measure(changed)), false, "diff-empty: 변경이 있으면 실패한다");
+    const untouched: Check = {
+      id: "t.10b", how: "diff-empty", paths: ["migrations/"], since: base,
+      // 같은 살아 있는 범위에서 0 을 내는 쪽. `grep` 은 그 경로의 패치에서 이 문자열을 담은
+      // 줄만 세므로, 여기서의 0 은 「비교하지 않음」이 아니라 「그런 줄이 없음」이다.
+      grep: "이 문자열은 어떤 마이그레이션에도 없다",
+    };
+    assert.equal(measure(untouched).measured, 0);
+    assert.equal(verdict(untouched, measure(untouched)), true, "diff-empty: 변경이 없으면 통과한다");
 
     // json — 봉인에서 값을 못 읽으면 실패한다.
     writeSeal(scratchDir, "B", { head: head(), checks: [{ id: "G-B.1", ok: true, measured: 10, limit: 10 }] });

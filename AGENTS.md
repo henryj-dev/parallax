@@ -16,22 +16,41 @@ yet; the cycle isn't finished until `HEAD` is on `origin/main`.
 종점으로 적을 수 있었다. 빨간 결과를 남기고 떠난 사이클은 끝난 것이 아니라 남에게
 넘긴 것이다.
 
-⚠️ **그리고 이 문단도 한 번 뒤처졌다.** 2026-08-23 에는 워크플로가 다섯이었고 여기에
+⚠️ **그리고 이 문단은 두 번 뒤처졌다.** 2026-08-23 에는 워크플로가 다섯이었고 여기에
 그 다섯을 나열해 두었다. `#9` 가 PR·머지·배포를 세 층으로 가르면서 `scripts` 와
 `docker` 는 `check.yml` 안의 잡이 되었고, `dependency-review` 는 공용 재사용
-워크플로로 옮겨갔고, `scorecard` 가 새로 붙었다. **측정 2026-08-29:** 워크플로 파일은
-`check.yml` · `codeql.yml` · `scorecard.yml` 세 개, `check.yml` 의 잡은 `verify` ·
-`deployment-gate` · `docker` · `hooks` · `shellcheck` · `policy` · `gate` 일곱 개다.
-숫자를 다시 세는 것 말고 이 문단을 최신으로 유지하는 장치는 없다 — 이 파일의 다른
-경고와 같은 종류다. `README` 쪽 같은 문장은 **`test/scripts/documented-counts.test.ts`
-가 강제한다**; 여기는 그렇지 않으니 `ls .github/workflows` 를 믿을 것.
+워크플로로 옮겨갔고, `scorecard` 가 새로 붙었다. 그렇게 고쳐 적은 뒤 **또 뒤처졌다** —
+`#27` 이 `flake-watch` 를 붙였는데 이 문단은 이틀 동안 일곱을 셌다.
+
+**측정 2026-09-04:** 워크플로 파일은 `check.yml` · `codeql.yml` · `scorecard.yml` 세 개,
+`check.yml` 의 잡은 `verify` · `deployment-gate` · `docker` · `hooks` · `shellcheck` ·
+`policy` · `audit` · `flake-watch` · `gate` **아홉 개**다.
+
+🔑 **그리고 이번에는 장치를 붙였다.** 위 문단은 「숫자를 다시 세는 것 말고 이 문단을
+최신으로 유지하는 장치는 없다」로 끝나 있었고, 그 문장이 맞았기 때문에 이 문단이 두 번
+틀렸다. `test/scripts/documented-counts.test.ts` 의 `CI_DOCUMENTS` 가 이제 **이 파일과
+`CONTRIBUTING.md` 까지** 포함한다 — 잡 수, `gate` 가 모으는 잡 이름, 필수 체크 이름이
+전부 `check.yml` 에서 다시 유도되어 대조된다. 이 문단이 다시 틀리면 `pnpm test` 가
+빨개진다. **이제 이 숫자는 믿어도 된다** — 틀리면 커밋이 들어오지 못한다.
 
 **또 하나: 푸시가 끝이라고 적힌 위 문단도 지금은 절반이다.** `#9` 이후 `main` 은
-`gate` 를 요구하는 브랜치 규칙 아래 있고, 최근 사이클은 전부 PR 로 들어갔다(`#8`~).
-그래서 실제 종점은 「브랜치 푸시 → PR → `gate` 초록 → 머지」이고, origin 이 배포
+브랜치 규칙 아래 있고, 최근 사이클은 전부 PR 로 들어갔다(`#8`~).
+그래서 실제 종점은 「브랜치 푸시 → PR → 필수 체크 초록 → 머지」이고, origin 이 배포
 미러로 이어지므로 **머지는 곧 배포다.** 머지 여부는 사람이 결정한다.
 
-에이전트에게 특히 걸리는 지점 둘:
+⚠️ **필수 체크는 하나가 아니라 둘이다.** 이 문단은 오래 `gate` 하나만 적었고,
+`README` 둘과 `codeql.yml` 의 주석도 각자 자기가 「유일한」 필수 체크라고 적어
+서로를 부정하고 있었다. **API 로 측정 2026-09-04**
+(`gh api repos/henryj-dev/parallax/rulesets/21525670`): `required_status_checks` 는
+`gate` 와 `codeql` **둘**이다. `scorecard` 는 일부러 필수가 아니다.
+squash 전용 머지 · linear history 강제 · `bypass_actors: []` ·
+`current_user_can_bypass: "never"` 도 같이 재어 둔다.
+
+⚠️ **`gate` 는 `skipped` 를 더 이상 무조건 통과로 읽지 않는다.** `success` 만 통과이고,
+스킵이 허용된 잡은 `ALLOWED_SKIP` 에 이름으로 적힌 것뿐이다(지금은 `flake-watch` 하나).
+잡에 `if:` 를 붙이면 게이트가 조용해지는 대신 빨개진다 — 전에는 반대였다.
+
+에이전트에게 특히 걸리는 지점 셋:
 
 - `scripts/claude-hooks/**` 와 `scripts/git-hooks/**` 의 검사가 **이제 CI 에서 돈다.**
   전에는 `pnpm test`(`node --test`)가 `.py` 를 보지 못해 아무도 돌리지 않았다. 그 스냅샷을
@@ -41,6 +60,13 @@ yet; the cycle isn't finished until `HEAD` is on `origin/main`.
   `git diff --name-only ... -- <경로>` 를 파싱해 감시 경로를 읽고, 양쪽 README 가 같은
   경로를 대는지까지 본다. README 를 다시 쓰면서 그 문단을 지우면 이 잡이 빨개진다 —
   실제로 한 번 그렇게 됐다.
+- ⚠️ **`git ls-files` 를 도는 검사들은 새 파일을 `git add` 전에는 못 본다.**
+  `test/source-reviewability.test.ts` 와 `test/scripts/what-ships.test.ts` 는 추적되는
+  파일만 훑는다. 그래서 **새 문서를 쓰고 `pnpm test` 를 돌리면 초록, 커밋한 뒤 CI 에서
+  빨강**이 될 수 있다 — 로컬과 CI 가 다른 코드를 본 것이 아니라 다른 *파일 목록*을 본
+  것이다. 2026-09-04 에 `docs/linting.md` 가 정확히 그렇게 걸렸다(정규식을 설명하려고
+  제어문자를 그대로 붙여 넣었고, 그 검사는 추적되는 파일에 날 제어문자가 있는 것을
+  거부한다). **새 파일을 만들었으면 `git add -A` 를 먼저 하고 스위트를 돌릴 것.**
 
 Raw `git worktree add` remains blocked for agents. The checked-in creator is
 the harness-neutral fallback and records ownership for cleanup.

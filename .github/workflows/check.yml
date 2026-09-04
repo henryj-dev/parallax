@@ -18,15 +18,25 @@ name: check
 #   shellcheck        the shell verifiers, same reason
 #   policy            dependency review, secret scan, workflow audit, from the
 #                     shared reusable workflow so five repositories agree
-#   gate              collects the above; the one name the ruleset requires
+#   audit             the installed tree against published advisories -- which
+#                     dependency review cannot answer, see that job
+#   flake-watch       the suite three times over, on the schedule only
+#   gate              collects the above; one of the two names the ruleset requires
 #
 # `codeql.yml` and `scorecard.yml` stay separate on purpose: their verdicts
 # change when this code does not -- query packs update, repository settings
 # drift -- so they run on their own schedules and carry their own verdicts.
+# `codeql` is the ruleset's **second** required context; `scorecard` is not
+# required, deliberately -- it is a scoreboard, and a scoreboard that blocks a
+# merge stops being read and starts being worked around.
 #
 # ⚠️ This comment named `scripts.yml` and `docker.yml` as separate files for six
-#    days after `#9` folded them in here. A list of siblings is exactly the kind
-#    of fact that rots; `needs:` on the `gate` job below is the one that cannot.
+#    days after `#9` folded them in here, and then omitted `flake-watch` for two
+#    days after `#27` added it. A list of siblings is exactly the kind of fact
+#    that rots; `needs:` on the `gate` job below is the one that cannot -- and
+#    `test/scripts/documented-counts.test.ts` now re-derives the READMEs,
+#    `CONTRIBUTING.md` and `AGENTS.md` from that line, so the prose copies of
+#    this list cannot rot silently any more. This comment still can.
 on:
   push:
     branches: [main]
@@ -45,21 +55,37 @@ on:
 permissions:
   contents: read
 
-# One run per ref at a time, newest wins. This was written when runs queued
-# behind a self-hosted scale set that served roughly one job at a time: five
-# pushes to main inside forty minutes left five runs queued, and the oldest was
-# gating a commit four behind the tip by the time a runner reached it. Hosted
-# runners took that queue away, and the setting stays for the reason that
-# outlived it -- a superseded run is answering about a commit nobody will ship.
+# One run per ref **per event** at a time; on a pull request, newest wins.
 #
-# The cost is that an intermediate commit on main no longer gets its own
-# verdict -- only the tip does. That is a real loss for bisecting, and it is
-# accepted here because what ships is the tip: a superseded commit's changes
-# are contained in the run that replaces it. The alternative was a queue whose
-# answers arrived after they had stopped being about anything.
+# Superseding was written when runs queued behind a self-hosted scale set that
+# served roughly one job at a time: five pushes to main inside forty minutes
+# left five runs queued, and the oldest was gating a commit four behind the tip
+# by the time a runner reached it. Hosted runners took that queue away, and the
+# setting stays for the reason that outlived it -- a superseded run is answering
+# about a commit nobody will ship.
+#
+# That argument holds for a pull request, where a new commit really does replace
+# the question. It does **not** hold for a push to main: cancelling there cost an
+# intermediate commit its own verdict, which is a real loss for bisecting, and it
+# bought nothing once the queue was gone. So superseding is now scoped to pull
+# requests, and every commit that lands on main keeps its own answer.
+#
+# ⚠️ **The group carries `github.event_name`, and that is not cosmetic.** For a
+# `push` to main, for `schedule`, and for `workflow_dispatch`, `github.ref` is
+# `refs/heads/main` for all three -- one shared group. `flake-watch` budgets 45
+# minutes and runs three legs, one of them on the slowest runner in the matrix,
+# and it runs *only* on those last two events. With the event out of the group,
+# any merge landing inside that window killed the whole scheduled run: the job
+# most likely to be cancelled was the one job that only ever runs on the
+# schedule, which defeats the reason it exists. At the merge rate here that is
+# not a corner case.
+#
+# `cancel-in-progress` is now scoped to pull requests for the same reason. A new
+# commit on a PR really does supersede the previous answer. A merge to main does
+# not supersede a scheduled measurement of a *different* question.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Everything runs on GitHub-hosted runners.
 #
@@ -115,6 +141,18 @@ jobs:
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+      # A step in `verify` rather than a job of its own: this is the other half
+      # of the question `pnpm check` asks -- is the source of this commit sound
+      # -- and it wants the same checkout and the same `node_modules`. A separate
+      # job would pay for a second install to answer half a question.
+      #
+      # It earned its place on the first run. `no-unsafe-finally` found a `throw`
+      # inside the `finally` of `PostgresApplyLock.withZoneLock`, which replaced
+      # whatever exception was already in flight: an apply failure followed by an
+      # unlock failure reached the caller as the unlock failure, and the failure
+      # that mattered was gone. `migrations.ts` had already decided this the
+      # other way, with a test that says so by name. See `docs/linting.md`.
+      - run: pnpm lint
       - run: pnpm run check:portal
       - run: pnpm build
       # TAP rather than the readable reporter, because the readable one keeps
@@ -195,10 +233,24 @@ jobs:
           # purpose: compromising the service must not let it plant SQL for a
           # later privileged `parallax migrate`. That is a security property of
           # the image, so it gets asserted rather than assumed.
-          if docker run --rm --entrypoint sh parallax:ci -c 'touch /app/migrations/evil.sql' 2>/dev/null; then
-            echo "migrations/ is writable by the serving uid -- it must not be"
-            exit 1
-          fi
+          # ⚠️ This must distinguish "the write was refused" from "docker did not
+          # run at all". It used to be a bare `if docker run ... 2>/dev/null`,
+          # where *any* non-zero exit read as "the security property holds" --
+          # image not found, daemon error, an entrypoint that cannot start. That
+          # is a bad shape anywhere and a worse one here, because this is the one
+          # assertion in this job stated as a security property.
+          out="$(docker run --rm --entrypoint sh parallax:ci \
+                   -c 'touch /app/migrations/evil.sql 2>&1 && echo WROTE' || true)"
+          case "$out" in
+            *WROTE*)
+              echo "migrations/ is writable by the serving uid -- it must not be"
+              exit 1 ;;
+            *"Permission denied"*|*"Read-only file system"*)
+              echo "refused as expected: $out" ;;
+            *)
+              echo "could not evaluate writability -- docker said: ${out:-<nothing>}"
+              exit 1 ;;
+          esac
 
   # `scripts/**/test-*.py` -- the hook guards.
   #
@@ -269,9 +321,16 @@ jobs:
         # turns that fixture into an agent and the suite reports a failure that
         # is really about where it was run. A runner has none of those set, which
         # is exactly why this is the right place for them to run.
+        #
+        # Both directories are globbed. `scripts/git-hooks/test-pre-commit.py`
+        # used to be named literally while its sibling directory was globbed, so
+        # a second git-hook suite added later would simply not have run -- and
+        # nothing would have said so. A glob that matches nothing still fails
+        # loud here: there is no `nullglob`, so `python3` receives the literal
+        # pattern, exits non-zero, and `status` becomes 1.
         run: |
           status=0
-          for suite in scripts/claude-hooks/test-*.py scripts/git-hooks/test-pre-commit.py; do
+          for suite in scripts/claude-hooks/test-*.py scripts/git-hooks/test-*.py; do
             echo "::group::$suite"
             python3 "$suite" || status=1
             echo "::endgroup::"
@@ -300,10 +359,40 @@ jobs:
         # SC2015 in verify-dns.sh, SC2016 there too, SC2012 in verify-postgres.sh
         # -- all of which are correct as written for what those scripts do. The
         # bar is set where a finding means "fix this", so that a red result here
-        # is worth reading.
+        # is worth reading. **Re-measured 2026-09-04 against 0.11.0: still those
+        # three, still those files.**
+        #
+        # ⚠️ **Pinned by version and checksum, and it did not used to be.** This
+        # step ran whatever shellcheck the `ubuntu-latest` image happened to ship,
+        # which means a runner-image rollout could flip a *required* verdict red,
+        # or quietly stop reporting a finding, with no commit anywhere. Printing
+        # `--version` records that drift; it does not prevent it.
+        #
+        # This repository already paid for that lesson one file over. See
+        # `policy-checks.yml`: gitleaks 8.24.3 read `.gitleaks.toml`, logged that
+        # it had read it, and silently dropped the top-level `[[allowlists]]` it
+        # did not understand -- twenty-seven fixtures came back as findings. The
+        # version and SHA256 are pinned there now, and the same discipline
+        # belongs here, on the tool that decides a required check.
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
         run: |
-          shellcheck --version
-          shellcheck --severity=warning scripts/*.sh
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL --retry 3 -o /tmp/shellcheck.tar.xz "$url"
+          echo "${SHELLCHECK_SHA256}  /tmp/shellcheck.tar.xz" | sha256sum -c -
+          tar xJf /tmp/shellcheck.tar.xz -C /tmp
+          sc="/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          "$sc" --version
+          # `scripts/git-hooks/install.sh` is in scope and its byte-identical
+          # siblings are not, and that is not an inconsistency. AGENTS.md records
+          # that installer as deliberately **divergent** from stardust's -- theirs
+          # installs a `pre-push` hook that does not exist here -- so a finding in
+          # it is actionable. The files that are kept byte-identical are excluded
+          # because their only available fix would break the one property that
+          # makes drift checkable with a single `cmp`.
+          "$sc" --severity=warning scripts/*.sh scripts/git-hooks/install.sh
 
   # **The policy layer does not belong to this repository.** Credential scanning, workflow
   # auditing and dependency review ask the same question of all five repositories, whatever
@@ -325,6 +414,32 @@ jobs:
       # A licence is required for organisation-owned repositories. It is an org secret.
       GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
+  # **이미 설치된 것에 대해 오늘 공표된 권고는 누구도 묻지 않고 있었다.**
+  #
+  # `policy` 의 `dependency-review` 는 **이 PR 이 무엇을 새로 끌고 들어오는가**만 답한다.
+  # 기준점이 있어야 답할 수 있는 질문이라 `pull_request` 에서만 돌고, 그것이 옳다.
+  # 하지만 그 질문은 「어제까지 조용하던 `pg` 버전에 오늘 CVE 가 붙었다」를 절대 잡지 못한다.
+  # 이 저장소는 Cloudflare API 토큰을 쥔 컨트롤 플레인이고, 그 경우에 빨개지는 곳이
+  # 아무 데도 없었다. Dependabot 보안 업데이트는 알림이지 게이트가 아니다.
+  #
+  # `package.json` 에 `audit` 스크립트는 처음부터 있었다. 부르는 곳이 없었을 뿐이다.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # 하한선에서 잰다. 상한선에서만 재면 하한선이 끌어오는 트리는 아무도 안 본다.
+          node-version: 24
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - run: pnpm install --frozen-lockfile
+      # `moderate` 부터 막는다. 직접 의존이 셋뿐이라 전이 의존성의 소음에 파묻힐 트리가
+      # 아니고, 그래서 `dependency-review` 가 `high` 로 잡은 선보다 여기를 낮게 둘 수 있다.
+      - run: pnpm run audit
+
   # **간헐 실패는 코드가 그대로여도 판정이 바뀌는 종류다** — 이 워크플로가 주기 실행을 두고
   # 있는 이유와 같은 종류다. 그래서 여기 붙인다.
   #
@@ -341,7 +456,11 @@ jobs:
   flake-watch:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # ⚠️ 45 분은 넉넉한 값이 아니라 빠듯한 값이었다. `pnpm install` 에 전체 스위트 **세 번**,
+    # 그중 한 다리는 matrix 에서 가장 느린 `macos-latest` 이고, `scripts/watchdog.ts` 는
+    # 테스트 프로세스 하나에 180초를 허용하는데 파일이 80개다. 여기서 나는 타임아웃은
+    # **쫓고 있는 간헐 실패와 구별되지 않는다** — 이 잡의 존재 이유를 정확히 훼손한다.
+    timeout-minutes: 75
     strategy:
       # 한 다리의 실패가 다른 다리의 답을 가리면, 어느 환경의 문제인지가 사라진다.
       fail-fast: false
@@ -380,23 +499,55 @@ jobs:
   # one-line change to `needs:`, and leaves the ruleset alone.
   gate:
     name: gate
-    needs: [verify, deployment-gate, docker, hooks, shellcheck, policy, flake-watch]
+    needs: [verify, deployment-gate, docker, hooks, shellcheck, policy, audit, flake-watch]
     # This job must run even when something upstream is red. Otherwise it is a check that
     # never reported, the rule waits forever, and nothing records what broke.
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Reads `needs` and nothing else. It checks nothing out, so it needs no scope at all --
+    # and a job that holds a token it never uses is a job that hands one to whatever a
+    # future step runs.
+    permissions: {}
     steps:
       - name: every upstream job settled green
         # Never interpolate `${{ }}` into a `run:` body: it is substituted before the
         # shell reads the script, so a quote or a `$(...)` in the value becomes shell code.
         env:
           NEEDS: ${{ toJSON(needs) }}
+          # **The allowlist is the whole point of this step.**
+          #
+          # This used to count only `failure` and `cancelled` as bad, which made every
+          # `skipped` a pass with no questions asked. Today exactly one job legitimately
+          # skips -- `flake-watch`, which runs on the schedule only -- and everything else
+          # is unconditional, so the blanket rule happened to be correct.
+          #
+          # It was correct by coincidence, not by construction. An `if:` added to `verify`
+          # or `docker` tomorrow would turn this gate green while saying nothing, and
+          # GitHub reports nothing when a required check stops checking. `policy` is the
+          # sharpest edge: it is a reusable workflow behind a SHA in another repository,
+          # so an `if:` added *there* would convert this repository's whole policy layer
+          # into a silent pass here.
+          #
+          # So the default is inverted: `success` passes, everything else fails, and a
+          # job may skip only if it is named here. Adding a job that legitimately skips
+          # is then a deliberate one-line edit rather than an omission nobody sees.
+          ALLOWED_SKIP: '["flake-watch"]'
         run: |
           set -euo pipefail
           jq -r 'to_entries[] | "  \(.key): \(.value.result)"' <<<"$NEEDS"
-          # `skipped` passes: some jobs do not apply to this event (dependency review only
-          # means something on a pull request). Skipped and failed are different words.
-          bad="$(jq '[.[] | select(.result == "failure" or .result == "cancelled")] | length' <<<"$NEEDS")"
-          test "$bad" = "0" || { echo "::error::$bad upstream job(s) did not pass"; exit 1; }
+          bad="$(jq --argjson skip "$ALLOWED_SKIP" '
+            [to_entries[]
+             | select(.value.result != "success")
+             | select((.value.result == "skipped" and (.key | IN($skip[]))) | not)]
+            | length' <<<"$NEEDS")"
+          if test "$bad" != "0"; then
+            jq -r --argjson skip "$ALLOWED_SKIP" '
+              to_entries[]
+              | select(.value.result != "success")
+              | select((.value.result == "skipped" and (.key | IN($skip[]))) | not)
+              | "::error::\(.key) settled \(.value.result)"' <<<"$NEEDS"
+            echo "::error::$bad upstream job(s) did not pass"
+            exit 1
+          fi
           echo "gate passed"

@@ -497,9 +497,17 @@ describe("why a zone is or is not covered", () => {
   });
 
   it("agrees with the list a sync writes, because that list is derived from it", () => {
+    // Both zones bound to `main` have something to answer; `stray.test` is bound
+    // to nobody. Spelled out rather than computed: `overridableZones` *is*
+    // `fallbackCoverage(...).filter(covered).map(zone)`, so comparing the two
+    // sides to each other compares an expression with itself and agrees just as
+    // happily when the rule underneath them is wrong. The literal is the only
+    // party here that did not come out of the code under test.
     const zones = [zone("tenant-zone.example", [record]), zone("tenant-mail.example", [record]), zone("stray.test", [record])];
+    const expected = ["tenant-mail.example", "tenant-zone.example"];
     const covered = fallbackCoverage(BINDINGS, zones, "main").filter((row) => row.covered).map((row) => row.zone);
-    assert.deepEqual(covered, overridableZones(BINDINGS, zones, "main"));
+    assert.deepEqual(covered, expected, "the report says which zones are covered");
+    assert.deepEqual(overridableZones(BINDINGS, zones, "main"), expected, "and the sync writes exactly those");
   });
 
   it("needs no provider, so it answers when the credential is the broken thing", () => {

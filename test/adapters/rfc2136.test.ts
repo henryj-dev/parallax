@@ -86,15 +86,29 @@ describe("the RFC 2136 provider", () => {
     const index = primary.records.findIndex((record) => record.type === TYPE.TXT);
     primary.records.splice(index, 1);
 
+    // The refusal is named, not merely counted: a string in the second position
+    // is `assert.rejects`'s *message* parameter, so any rejection at all --
+    // including one raised before the marker was ever looked for -- used to
+    // satisfy this.
+    //
+    // ⚠️ Naming it corrected this test's own account of itself. The sentence
+    // that comes back is `#currentValue`'s: the adapter looks the record up by
+    // its marker first, finds nothing owned, and never sends an UPDATE at all.
+    // The prerequisite section is the second lock -- for a marker that goes
+    // between *that* lookup and the message reaching the server -- and it is
+    // not what refuses here. The comment below used to credit it, and no
+    // assertion in this test could have caught that.
     await assert.rejects(
       () => adapter.apply(TARGET, {
         kind: "update", providerId: listed.providerId,
         desired: { id: "web", name: "www", type: "A", content: "192.0.2.99", ttl: 300 },
       }),
+      /no record owned by web is at www\.example\.com/u,
       "a record whose ownership had been removed was written to anyway",
     );
-    // ...and the record is untouched, because the prerequisite refused the
-    // whole message rather than half of it.
+    // ...and the record is untouched, because nothing was ever sent: still the
+    // one update that created it.
+    assert.equal(primary.updates, 1, "a refused write reached the server anyway");
     assert.equal(primary.records.filter((record) => record.type === TYPE.A).length, 1);
     assert.deepEqual(primary.records.find((record) => record.type === TYPE.A)?.rdata, encodeRdata("A", "192.0.2.10"));
   });
