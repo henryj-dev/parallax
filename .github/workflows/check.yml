@@ -436,8 +436,16 @@ jobs:
           node-version: 24
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - run: pnpm install --frozen-lockfile
+
       # `moderate` 부터 막는다. 직접 의존이 셋뿐이라 전이 의존성의 소음에 파묻힐 트리가
       # 아니고, 그래서 `dependency-review` 가 `high` 로 잡은 선보다 여기를 낮게 둘 수 있다.
+      #
+      # 🔴 **이 스텝은 `- run: pnpm run audit` 한 줄이었고, 머지 직후 main 을 빨갛게
+      # 만들었다.** 실패 이유는 권고가 아니라 레지스트리의 advisories 엔드포인트가
+      # 응답하지 않은 것이었다. 판단은 `scripts/audit.sh` 로 옮겼다 — 거기 이유가 적혀
+      # 있고, 셸에 있으므로 `shellcheck` 잡이 보고 `test/scripts/audit-script.test.ts` 가
+      # 세 결과(권고 있음·없음·물어보지 못함)를 각각 재현해 확인한다. YAML 안에 있었으면
+      # 셋 다 확인할 방법이 없었다.
       - run: pnpm run audit
 
   # **간헐 실패는 코드가 그대로여도 판정이 바뀌는 종류다** — 이 워크플로가 주기 실행을 두고

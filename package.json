@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
-    "audit": "pnpm audit --audit-level moderate",
+    "audit": "bash scripts/audit.sh",
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit -p tsconfig.test.json",
     "lint": "oxlint src cmd test scripts --deny-warnings",
