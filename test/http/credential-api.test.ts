@@ -136,6 +136,7 @@ describe("Cloudflare credential HTTP API", () => {
       const api = createApiHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider), credentials: manager }, security);
       const secret = "account-wide-token";
 
+      const before = Date.now();
       assert.equal((await api(request("/api/v1/credentials/profiles/account-a", "PUT", {
         accountId: "acct-1", token: secret,
       }))).status, 200);
@@ -150,12 +151,19 @@ describe("Cloudflare credential HTTP API", () => {
       const profiles = await (await api(request("/api/v1/credentials/profiles"))).json() as {
         profiles: Array<{ name: string; accountId?: string; updatedAt: string; zones: string[] }>;
       };
-      assert.deepEqual(profiles.profiles, [{
-        name: "account-a",
-        accountId: "acct-1",
-        updatedAt: profiles.profiles[0]?.updatedAt,
-        zones: ["one.example", "two.example"],
-      }] as unknown);
+      const [listed, ...others] = profiles.profiles;
+      assert.deepEqual(others, [], "one profile, listed once");
+      assert.ok(listed, "the profile the token was entered against is listed");
+      // `updatedAt` is held out of the comparison rather than filled in from the
+      // response. Writing `updatedAt: profiles.profiles[0]?.updatedAt` compares
+      // the field to itself, so a route that blanked or garbled the stamp would
+      // pass -- and this stamp is what an operator reads to decide whether a
+      // credential is the one they rotated. Assert its shape, and that it is not
+      // older than the request that created it.
+      const { updatedAt, ...rest } = listed;
+      assert.deepEqual(rest, { name: "account-a", accountId: "acct-1", zones: ["one.example", "two.example"] });
+      assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u, "an ISO-8601 instant in UTC");
+      assert.ok(Date.parse(updatedAt) >= before, `${updatedAt} predates the write that produced it`);
       assert.equal(JSON.stringify(profiles).includes(secret), false);
 
       const bound = await api(request("/api/v1/credentials/profiles/account-a", "DELETE"));

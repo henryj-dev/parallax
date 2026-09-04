@@ -28,7 +28,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions: read-all
+# 이 파일의 잡은 아래에서 자기 권한을 직접 선언한다. 워크플로 기본값을 `read-all` 로 두면
+# 오늘은 무해하지만 — 잡이 덮어쓰므로 — 나중에 붙는 두 번째 잡이 그 넓은 기본값을 조용히
+# 물려받는다. 기본값은 가장 좁게 두고, 필요한 잡이 필요한 만큼만 올린다.
+permissions:
+  contents: read
 
 jobs:
   analysis:

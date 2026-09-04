@@ -11,6 +11,55 @@ import { AddressInUse, isAddressInUse, onFreePort } from "../support/ports.ts";
 const ENTRY = join(import.meta.dirname, "../../src/index.ts");
 const START_TIMEOUT_MS = 60_000;
 
+/**
+ * How long the spawned server may take to stop after SIGTERM before this test
+ * stops being patient. `shutdownProcess` gives its listeners a 10s grace and
+ * then cuts what is left, so anything past that is not slowness.
+ */
+const STOP_TIMEOUT_MS = 15_000;
+
+/**
+ * Stops a spawned server the way a pod manager does, and waits for it.
+ *
+ * This used to be `child.kill("SIGKILL")`, which is the one way to end a
+ * process that leaves nothing behind. **V8 writes its coverage file in an exit
+ * handler**, and SIGKILL runs no handler -- so `src/index.ts`, the 599-line
+ * composition root these four suites are the only exercise of, was *absent from
+ * the coverage table entirely*. Not low: absent. The control was in the same
+ * repository the whole time -- `cmd/parallax/main.ts` is spawned and allowed to
+ * exit, and measures.
+ *
+ * So: SIGTERM, which is the path production takes and which `stop()` in
+ * `src/index.ts` handles by calling `shutdownProcess` and then `process.exit(0)`
+ * -- an exit that does run the handler. SIGKILL stays as the fallback, bounded
+ * by a deadline, and reaching it **fails the suite** rather than passing
+ * quietly: a server that will not answer SIGTERM is the shutdown defect these
+ * tests would otherwise be the last place to notice.
+ *
+ * ⚠️ 같은 함수가 이 디렉터리에 네 벌 있다. `test/support/ports.ts` 가 적어 둔
+ * 교훈이 그대로 적용된다 — 합의해야 하는 사본은 결국 합의하지 않는다. 이건
+ * `test/support/` 로 가야 하고, 그렇게 하는 변경이 이 파일들의 소유권을 넘어서
+ * 아직 여기 남아 있다.
+ */
+async function stopGracefully(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((resolve) => { child.once("exit", () => { resolve(); }); });
+  child.kill("SIGTERM");
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<"expired">((resolve) => {
+    timer = setTimeout(() => { resolve("expired"); }, STOP_TIMEOUT_MS);
+  });
+  try {
+    if (await Promise.race([exited.then(() => "exited" as const), expired]) === "exited") return;
+    child.kill("SIGKILL");
+    await exited;
+    assert.fail(`the server did not exit within ${STOP_TIMEOUT_MS}ms of SIGTERM; it had to be killed`);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+
 
 /**
  * That the setting reaches the monitor, which its own tests cannot show.
@@ -29,8 +78,14 @@ describe("the staleness window reaches the monitor", () => {
   const directories: string[] = [];
 
   after(async () => {
-    for (const child of running) child.kill("SIGKILL");
+    // 실패해도 임시 디렉터리는 지운다. 정리를 건너뛰면 한 번의 시끄러운 실패가
+    // 매 실행마다 조용히 쌓이는 쓰레기로 바뀐다.
+    const failures: unknown[] = [];
+    for (const child of running) {
+      try { await stopGracefully(child); } catch (error) { failures.push(error); }
+    }
     for (const directory of directories) await rm(directory, { recursive: true, force: true });
+    if (failures.length > 0) throw failures[0];
   });
 
   async function readiness(extra: Record<string, string>): Promise<Record<string, unknown>> {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { inspect } from "node:util";
 import { createCipheriv, randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -239,12 +240,19 @@ describe("EncryptedCredentialStore", () => {
     await store.upsertProfile("p", { token: secret });
 
     const wrongKeyStore = new EncryptedCredentialStore({ repository, masterKey: randomBytes(32) });
-    await assert.rejects(
-      wrongKeyStore.listProfiles(),
-      (error: unknown) => error instanceof Error
-        && error.message === "credential store could not be opened"
-        && !error.message.includes(secret),
-    );
+    await assert.rejects(wrongKeyStore.listProfiles(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "credential store could not be opened");
+      // ⚠️ `!error.message.includes(secret)` used to sit on the line after the
+      // `===` above, where it can never be false: the message had already been
+      // pinned to a literal that plainly does not contain the secret. It read
+      // as the leak check and measured nothing. The leak check has to be
+      // independent of the message, and wider than it -- `inspect` walks the
+      // whole error, `cause` and any field a future throw site attaches
+      // included, which is where a secret would actually ride out.
+      assert.doesNotMatch(inspect(error), new RegExp(secret, "u"));
+      return true;
+    });
   });
 
   it("fails closed for corrupt or unsupported documents without leaking their contents", async () => {
@@ -254,12 +262,16 @@ describe("EncryptedCredentialStore", () => {
     const corruptContent = "corrupt-content-secret";
     repository.document = corruptContent;
     const corruptStore = new EncryptedCredentialStore({ repository, masterKey: key });
-    await assert.rejects(
-      corruptStore.getProfile("p"),
-      (error: unknown) => error instanceof Error
-        && error.message === "credential store could not be opened"
-        && !error.message.includes(corruptContent),
-    );
+    await assert.rejects(corruptStore.getProfile("p"), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "credential store could not be opened");
+      // The stored document is what the decoder was holding when it failed, so
+      // it is the thing most likely to be attached to whatever it throws. Same
+      // reasoning as above: the check has to look at the error, not at a string
+      // this test already fixed.
+      assert.doesNotMatch(inspect(error), new RegExp(corruptContent, "u"));
+      return true;
+    });
   });
 
   it("requires an exact 32-byte master key and rejects invalid credentials safely", async () => {

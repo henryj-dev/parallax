@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { join } from "node:path";
 import { checkConfig } from "../../src/cli/config-check.ts";
 import { parallaxEnvironment } from "../support/environment.ts";
+import { AddressInUse, onFreePort } from "../support/ports.ts";
 
 const execFileAsync = promisify(execFile);
 const ENTRY = join(import.meta.dirname, "../../cmd/parallax/main.ts");
@@ -89,7 +90,16 @@ describe("the preflight", () => {
 
   it("is listed where somebody would look for it", async () => {
     // A preflight nobody knows about is not a preflight.
-    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "--help"], { timeout: CLI_TIMEOUT_MS });
+    //
+    // The environment is named even here, where `--help` reads no configuration
+    // at all: omitting `env` hands the child the developer's whole shell, and a
+    // spawn that never says `process.env` is the one shape the control in
+    // `test/support/environment.test.ts` cannot see. The habit is what the
+    // control is for, so this call keeps it rather than being the exception.
+    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "--help"], {
+      env: parallaxEnvironment(),
+      timeout: CLI_TIMEOUT_MS,
+    });
     assert.match(stdout, /config check/u);
   });
 });
@@ -131,21 +141,36 @@ describe("what the preflight must not touch", () => {
 
   it("answers with the DNS port already taken", async () => {
     // Held on both transports, which is what the listener would want.
-    const probe = createServer();
-    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-    const port = (probe.address() as { port: number }).port;
-    const datagram = createSocket("udp4");
-    await new Promise<void>((resolve, reject) => {
-      datagram.once("error", reject);
-      datagram.bind(port, "127.0.0.1", resolve);
-    });
-    holders.push(() => { probe.close(); datagram.close(); });
+    //
+    // This used to hand-roll the choosing: `listen(0)`, read the port, bind the
+    // datagram, and fail the test if that second bind lost. TCP and UDP have
+    // separate port spaces, so a port free on one can be taken on the other --
+    // which makes losing it a normal outcome and not a statement about the
+    // preflight. `onFreePort` is the retry the hand-rolled version lacked.
+    await onFreePort(async (port) => {
+      const probe = createServer();
+      // Registered the moment it exists, before the next `await`. Registering
+      // after the datagram bind meant a rejected bind left this listener open
+      // for the rest of the run, with nothing holding a reference to close it.
+      holders.push(() => probe.close(() => undefined));
+      await claimed((resolve, reject) => {
+        probe.once("error", reject);
+        probe.listen(port, "127.0.0.1", resolve);
+      });
 
-    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "config", "check"], {
-      env: { ...parallaxEnvironment(), ...HOSTILE, PARALLAX_DNS_PORT: String(port), PARALLAX_DNS_HOST: "127.0.0.1" },
-      timeout: CLI_TIMEOUT_MS,
+      const datagram = createSocket("udp4");
+      holders.push(() => { try { datagram.close(); } catch { /* never bound */ } });
+      await claimed((resolve, reject) => {
+        datagram.once("error", reject);
+        datagram.bind(port, "127.0.0.1", resolve);
+      });
+
+      const { stdout } = await execFileAsync(process.execPath, [ENTRY, "config", "check"], {
+        env: { ...parallaxEnvironment(), ...HOSTILE, PARALLAX_DNS_PORT: String(port), PARALLAX_DNS_HOST: "127.0.0.1" },
+        timeout: CLI_TIMEOUT_MS,
+      });
+      assert.match(stdout, new RegExp(`dns=127\\.0\\.0\\.1:${port}`, "u"), "it reported the listener without binding it");
     });
-    assert.match(stdout, new RegExp(`dns=127\\.0\\.0\\.1:${port}`, "u"), "it reported the listener without binding it");
   });
 
   it("reaches nothing but the configuration reader", async () => {
@@ -193,3 +218,19 @@ describe("what the preflight must not touch", () => {
     assert.equal(JSON.stringify(set).includes("o".repeat(40)), false, "no value leaks into the report");
   });
 });
+
+/**
+ * Takes a port, and says "somebody else got there first" in the one word
+ * `onFreePort` retries on.
+ *
+ * Anything else is passed through: retrying every failure is how a retry hides
+ * a real defect, and the point here is only that losing a race is not one.
+ */
+async function claimed(bind: (resolve: () => void, reject: (error: unknown) => void) => void): Promise<void> {
+  try {
+    await new Promise<void>(bind);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") throw new AddressInUse(String(error));
+    throw error;
+  }
+}

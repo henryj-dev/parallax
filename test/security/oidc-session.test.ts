@@ -296,6 +296,15 @@ describe("identity sign-in", () => {
     const victim = cookiesOf(await handler(new Request("https://parallax.example/auth/login?next=/zones")) as Response);
     const attackerState = attacker.get("__Host-parallax_oidc_state") as string;
 
+    // ⚠️ The nonce cookie is the attacker's, and it is sent exactly once, on
+    // purpose. This request used to carry no nonce at all -- and the callback
+    // refuses a missing nonce *before* it can ever reach the duplicate rule, so
+    // deleting that rule outright left this test's 302, its `signin_error` and
+    // its absent session cookie completely unchanged. It was named after a rule
+    // it did not touch. Everything except the shadowed pair is therefore held
+    // valid here, so the refusal has exactly one possible source.
+    lastNonce = attacker.get("__Host-parallax_oidc_nonce") as string;
+
     // The callback carries the attacker's code and the attacker's state. Read
     // first-wins, the pair matches, the exchange completes -- and the session
     // the victim's browser is left holding belongs to the attacker's account.
@@ -304,6 +313,7 @@ describe("identity sign-in", () => {
         cookie: [
           `__Host-parallax_oidc_state=${attackerState}`,
           `__Host-parallax_oidc_verifier=${attacker.get("__Host-parallax_oidc_verifier")}`,
+          `__Host-parallax_oidc_nonce=${lastNonce}`,
           `__Host-parallax_oidc_state=${victim.get("__Host-parallax_oidc_state")}`,
           `__Host-parallax_oidc_verifier=${victim.get("__Host-parallax_oidc_verifier")}`,
         ].join("; "),

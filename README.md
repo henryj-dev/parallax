@@ -650,20 +650,31 @@ pnpm build
 pnpm test           # node --test
 ```
 
-Three workflows run in CI. `check` collects the jobs whose verdicts belong to a
-commit, each answering a different question so a red result names its own cause:
+Three workflows run in CI. `check` carries nine jobs, one per question, so that
+a red result names its own cause instead of being one job that failed for any of
+nine reasons:
 `verify` (types, build, tests on Node 24 and 26), `deployment-gate` (schema
 surface, from a bare checkout), `docker` (the image builds and stays
 unprivileged), `hooks` (the Python hook suites), `shellcheck`, `policy` (a
-shared reusable workflow: dependency review, secret scan, workflow audit), and
-`flake-watch` (the suite three times over, on the weekly schedule only — an
-intermittent failure is the kind of verdict that changes while the code does not).
-One
-`gate` job collects them, and it is the only check name the branch ruleset
-names -- listing jobs one by one means the day a name changes, the required
-check becomes one that does not exist and the protection quietly disappears.
-`codeql` and `scorecard` run on their own schedules, because their verdicts
-change when the code does not.
+shared reusable workflow: dependency review, secret scan, workflow audit),
+`audit` (the installed tree against published advisories — which dependency
+review, being about a diff, cannot answer), and `flake-watch` (the suite three
+times over, on the weekly schedule only — an intermittent failure is the kind of
+verdict that changes while the code does not). One `gate` job collects them:
+listing jobs one by one in the ruleset would mean that the day a name changes,
+that required check becomes one that does not exist and the protection quietly
+disappears.
+
+The branch ruleset requires **two** check names, `gate` and `codeql`.
+`codeql` and `scorecard` are separate workflows because their verdicts change
+when the code does not — query packs update, repository settings drift — and of
+those two only `codeql` is required. `scorecard` is a scoreboard on purpose: a
+scoreboard that blocks a merge stops being read and starts being worked around.
+
+A skipped job is not a passing job. `gate` counts only `success` as a pass and
+names the one job allowed to skip — `flake-watch`, which runs on the schedule
+only — so an `if:` added to any other job turns the gate red instead of turning
+it quiet.
 
 The `verify:*` scripts drive real infrastructure and are **not** run in CI:
 

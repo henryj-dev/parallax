@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createSocket } from "node:dgram";
-import { connect, createServer, isIP, type AddressInfo } from "node:net";
-import { after, describe, it } from "node:test";
+import { connect, createServer, isIP, type AddressInfo, type Socket } from "node:net";
+import { after, afterEach, describe, it } from "node:test";
 import {
   createDnsServer,
   createTimedDnsResolver,
@@ -85,6 +85,26 @@ function rcodeOf(reply: Buffer | undefined): number {
 }
 
 /**
+ * A deadline that stops existing when the thing it bounds finishes first.
+ *
+ * `Promise.race` settles as soon as either side does, but the loser goes on
+ * running: a bare `setTimeout(reject, ...)` beside an awaited close holds the
+ * event loop open for its whole window and then rejects a promise nobody is
+ * listening to any more. The runner reports that as an unhandled rejection,
+ * and it reports it against whichever test happened to be running when the
+ * timer finally fired -- so a stray deadline here fails a test over there,
+ * which is the hardest kind of failure to read. Clearing the timer on the way
+ * out is what keeps the blame local.
+ */
+function within<T>(work: Promise<T>, ms: number, complaint: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(complaint)), ms);
+  });
+  return Promise.race([work, deadline]).finally(() => { clearTimeout(timer); });
+}
+
+/**
  * 포트 고르기는 `test/support/ports.ts` 로 옮겼다.
  *
  * 이 스위트가 재시도와 UDP 재확인을 갖춘 유일한 사본이었다 — 「부하가 걸린 기계에서
@@ -132,16 +152,43 @@ function ask(port: number, message: Buffer, timeoutMs = 2000, host = "127.0.0.1"
   });
 }
 
-/** Sends over TCP, optionally in pieces, to exercise the length-prefix framing. */
-function askOverTcp(port: number, message: Buffer, split = false, host = "127.0.0.1"): Promise<Buffer> {
+/**
+ * Sends over TCP, optionally in pieces, to exercise the length-prefix framing.
+ *
+ * Bounded, and torn down on every path, for the reason the note on `ask()`
+ * gives one paragraph up: `ask()` learned that a client which never settles is
+ * not a listener that said nothing, and its two TCP siblings were left without
+ * either half of that lesson. A server that accepted the connection and then
+ * answered nothing left this promise pending and this socket open, and the
+ * first thing that reported it was the runner's own 120-second timeout on the
+ * whole file -- no name, no line, no errno.
+ *
+ * The deadline is a backstop against that hang rather than an assertion about
+ * latency, so it is generous: a slow machine must still be able to answer.
+ */
+function askOverTcp(
+  port: number, message: Buffer, split = false, host = "127.0.0.1", timeoutMs = 5_000,
+): Promise<Buffer> {
   const framed = Buffer.concat([Buffer.alloc(2), message]);
   framed.writeUInt16BE(message.length, 0);
   return new Promise((resolve, reject) => {
+    // The rest of a split write is a timer too, and it used to outlive the
+    // socket it wrote to: cleared here, so nothing is left pointing at a
+    // connection this test has finished with.
+    let rest: NodeJS.Timeout | undefined;
+    const settle = (finish: () => void): void => {
+      clearTimeout(timer);
+      clearTimeout(rest);
+      socket.destroy();
+      finish();
+    };
+    const timer = setTimeout(() => settle(() => reject(
+      new Error(`no TCP reply within ${timeoutMs}ms; the listener accepted and then said nothing`))), timeoutMs);
     const socket = connect(port, host, () => {
       if (!split) socket.write(framed);
       else {
         socket.write(framed.subarray(0, 3));
-        setTimeout(() => socket.write(framed.subarray(3)), 20);
+        rest = setTimeout(() => { if (!socket.destroyed) socket.write(framed.subarray(3)); }, 20);
       }
     });
     let buffered = Buffer.alloc(0);
@@ -150,10 +197,10 @@ function askOverTcp(port: number, message: Buffer, split = false, host = "127.0.
       if (buffered.length < 2) return;
       const size = buffered.readUInt16BE(0);
       if (buffered.length < size + 2) return;
-      socket.destroy();
-      resolve(buffered.subarray(2, size + 2));
+      const reply = Buffer.from(buffered.subarray(2, size + 2));
+      settle(() => resolve(reply));
     });
-    socket.on("error", reject);
+    socket.on("error", (error) => settle(() => reject(error)));
   });
 }
 
@@ -163,11 +210,28 @@ function askOverTcp(port: number, message: Buffer, split = false, host = "127.0.
  * A transfer spans messages, so a reader that stops at the first frame sees a
  * zone with a SOA and nothing else -- which is indistinguishable from a working
  * transfer of an empty zone. The connection close is what ends the sequence.
+ *
+ * Bounded and torn down on every path for the same reason as `askOverTcp`
+ * above -- more so here, because the end of a transfer is decided by a poll:
+ * a transfer that never reaches its closing SOA left this interval running and
+ * this promise pending forever. The deadline is longer because a transfer is
+ * many messages of real work, and it is a backstop against that hang rather
+ * than a statement about how fast a transfer ought to be.
  */
-function askAllOverTcp(port: number, message: Buffer, host = "127.0.0.1"): Promise<Buffer[]> {
+function askAllOverTcp(
+  port: number, message: Buffer, host = "127.0.0.1", timeoutMs = 15_000,
+): Promise<Buffer[]> {
   const framed = Buffer.concat([Buffer.alloc(2), message]);
   framed.writeUInt16BE(message.length, 0);
   return new Promise((resolve, reject) => {
+    const settle = (finish: () => void): void => {
+      clearTimeout(timer);
+      clearInterval(finished);
+      socket.destroy();
+      finish();
+    };
+    const timer = setTimeout(() => settle(() => reject(
+      new Error(`the transfer did not reach its closing SOA within ${timeoutMs}ms`))), timeoutMs);
     const socket = connect(port, host, () => socket.write(framed));
     const messages: Buffer[] = [];
     let buffered = Buffer.alloc(0);
@@ -186,13 +250,11 @@ function askAllOverTcp(port: number, message: Buffer, host = "127.0.0.1"): Promi
     const finished = setInterval(() => {
       const last = messages.at(-1);
       if (messages.length > 0 && last && readAnswers(last).at(-1)?.type === TYPE.SOA) {
-        clearInterval(finished);
-        socket.destroy();
-        resolve(messages);
+        settle(() => resolve(messages));
       }
     }, 5);
     finished.unref?.();
-    socket.on("error", (error) => { clearInterval(finished); reject(error); });
+    socket.on("error", (error) => settle(() => reject(error)));
   });
 }
 
@@ -208,6 +270,88 @@ async function upstreamOn(host = "127.0.0.1"): Promise<{ socket: ReturnType<type
   const socket = createSocket(isIP(host) === 6 ? "udp6" : "udp4");
   await bound(socket, 0, host);
   return { socket, port: (socket.address() as AddressInfo).port };
+}
+
+/**
+ * A UDP upstream and a TCP upstream on one port number, both already holding it.
+ *
+ * `forwardTo` names a single `address#port` for both transports, so the two
+ * halves have to agree on the number -- and the two port spaces do not, so a
+ * port the kernel has just handed out for a datagram socket can already be
+ * listening on TCP. `listen` reports that by emitting `error`, which is the
+ * exact shape the note on `bound()` warns about: a promise that only resolves
+ * from the callback waits for something that will never come, so the collision
+ * showed up not as a failure but as this file hanging to the runner's timeout.
+ *
+ * A collision is answered the way `start()` answers its own -- let both halves
+ * go and ask the kernel again -- because there is nothing else to do with a
+ * number that is free on one stack and taken on the other.
+ */
+async function bothTransportsOn(
+  onConnection: (socket: Socket) => void,
+  host = "127.0.0.1",
+): Promise<{ socket: ReturnType<typeof createSocket>; server: ReturnType<typeof createServer>; port: number }> {
+  for (let attempt = 3; ; attempt -= 1) {
+    const { socket, port } = await upstreamOn(host);
+    const server = createServer(onConnection);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(port, host, () => { server.removeListener("error", reject); resolve(); });
+      });
+    } catch (error) {
+      socket.close();
+      server.close();
+      if (attempt <= 1 || (error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+      continue;
+    }
+    return { socket, server, port };
+  }
+}
+
+/**
+ * A freshly picked port, and another one if somebody took it first.
+ *
+ * A port is free only until it is taken, and this suite finds ports by probing
+ * and letting go: the gap between the probe and the bind is where another test
+ * -- in this file or in one of the files running beside it -- wins the race.
+ * `start()` has retried around that gap since a loaded machine first lost it.
+ * Every other pre-chosen bind here was written without the retry, and the same
+ * race there surfaces as an unexplained EADDRINUSE in whichever test drew the
+ * short straw, which is not a fact about that test at all.
+ */
+async function onFreshPort<T>(host: string, bind: (port: number) => Promise<T>): Promise<T> {
+  for (let attempt = 3; ; attempt -= 1) {
+    const port = await pickPort(host, { udp: true });
+    try {
+      return await bind(port);
+    } catch (error) {
+      if (attempt <= 1 || (error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+    }
+  }
+}
+
+/**
+ * Binds one particular port, waiting briefly while the kernel still says it is
+ * taken.
+ *
+ * `onFreshPort` answers a collision by moving to another port, which is the
+ * right answer everywhere except where the claim under test is that *this*
+ * port came free again -- moving there would assert nothing. So the retry is
+ * over time instead. The window it actually covers is a sibling file's port
+ * probe passing through, which binds and lets go within a millisecond; a port
+ * somebody is really holding is still held after five tries, and the bind
+ * fails the way it should.
+ */
+async function rebinding<T>(bind: () => Promise<T>): Promise<T> {
+  for (let attempt = 5; ; attempt -= 1) {
+    try {
+      return await bind();
+    } catch (error) {
+      if (attempt <= 1 || (error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+      await delay(20);
+    }
+  }
 }
 
 const EXAMPLE: ServedZone = {
@@ -229,19 +373,44 @@ describe("DNS server", () => {
    * A closer that throws is forgiven; one that never answers is not.
    *
    * `.catch()` forgives an error, which is a different thing from a failure
-   * that produces no error at all -- and this hook is where a socket that will
-   * not close stops the whole file without saying so. Bounded, the file fails
-   * and names the closer that would not finish.
+   * that produces no error at all -- and this is where a socket that will not
+   * close stops the whole file without saying so. Bounded, the file fails and
+   * names the closer that would not finish.
    */
-  after(async () => {
-    for (const [index, close] of closers.entries()) {
+  async function release(): Promise<void> {
+    // Taken rather than read: the backstop below must not run a closer this
+    // has already run, and a test that registers something while this drains
+    // is a test that has not finished, which cannot happen.
+    for (const [index, close] of closers.splice(0).entries()) {
       let timer: NodeJS.Timeout | undefined;
       const stalled = new Promise<"stalled">((resolve) => { timer = setTimeout(() => resolve("stalled"), 5_000); });
       const finished = await Promise.race([close().then(() => "closed" as const).catch(() => "closed" as const), stalled]);
       clearTimeout(timer);
       assert.notEqual(finished, "stalled", `closer ${index} did not finish; something here stays open`);
     }
-  });
+  }
+
+  /**
+   * Every listener goes away with the test that started it.
+   *
+   * This ran only once, at the end of the file, and each of the ninety-odd
+   * tests here starts a listener that is a UDP socket *and* a TCP server. So
+   * the last test in the file ran with about two hundred descriptors held open
+   * by tests that had finished minutes earlier, and every one of those ports
+   * stayed off the table for the files running alongside.
+   *
+   * That pressure is not hypothetical here, it is documented twice in this
+   * file: the note on `ask()` blames exactly it for a phantom "the listener
+   * dropped queries" report -- the test's own descriptors were what ran out --
+   * and `start()` retries around the EADDRINUSE races the same pressure
+   * causes. Draining after each test is what makes both of those notes
+   * describe history rather than the current run.
+   *
+   * The file-level hook stays as a backstop: it catches anything registered
+   * outside a test, and anything a failing `afterEach` left behind.
+   */
+  afterEach(release);
+  after(release);
 
   async function start(
     options: Partial<Parameters<typeof createDnsServer>[0]> & { zones: () => readonly ServedZone[] },
@@ -250,20 +419,15 @@ describe("DNS server", () => {
     // The listener needs one port for both transports, so it cannot be handed a
     // socket already holding one the way the upstreams are. That leaves a gap
     // between asking and binding, and something else can take it there. The
-    // listener now leaves nothing bound when it fails, so trying again is safe
-    // -- and a collision is rare enough that a second attempt settles it.
-    for (let attempt = 3; ; attempt -= 1) {
-      const port = await pickPort(host, { udp: true });
+    // listener leaves nothing bound when it fails, so trying again on a fresh
+    // port is safe -- which is all `onFreshPort` does, for every pre-chosen
+    // bind in this file rather than only for this one.
+    return onFreshPort(host, async (port) => {
       const server = createDnsServer(options);
-      try {
-        await server.listen(port, host);
-      } catch (error) {
-        if (attempt <= 1 || (error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-        continue;
-      }
+      await server.listen(port, host);
       closers.push(() => server.close());
       return { port, server };
-    }
+    });
   }
 
   it("leaves nothing bound when one transport cannot take the port", async () => {
@@ -276,13 +440,30 @@ describe("DNS server", () => {
     // That is what the eight-minute silence was: every test in this file had
     // finished and the process would not leave, holding a UDP socket and a TCP
     // server that no `after` hook knew about.
-    const port = await pickPort("127.0.0.1", { udp: true });
-    const squatter = createServer();
-    await new Promise<void>((resolve) => squatter.listen(port, "127.0.0.1", resolve));
+    const { port, squatter } = await onFreshPort("127.0.0.1", async (candidate) => {
+      const held = createServer();
+      // Rejecting on `error` is the whole reason this goes through the helper:
+      // a squatter that cannot take the port is a collision, and a listen that
+      // only resolves from its callback answers a collision with silence.
+      await new Promise<void>((resolve, reject) => {
+        held.once("error", reject);
+        held.listen(candidate, "127.0.0.1", () => { held.removeListener("error", reject); resolve(); });
+      });
+      return { port: candidate, squatter: held };
+    });
     closers.push(async () => { await new Promise<void>((resolve) => squatter.close(() => resolve())); });
 
     const server = createDnsServer({ zones: () => [EXAMPLE] });
-    await assert.rejects(() => server.listen(port, "127.0.0.1"), "the TCP half cannot have the port");
+    // The matcher goes second and the complaint third. `assert.rejects` reads a
+    // string in the second position as the *message*, never as a predicate, so
+    // written the other way round this accepted any rejection whatsoever --
+    // including a TypeError thrown before the listen was ever attempted, which
+    // is the one outcome that would mean this test is testing nothing.
+    await assert.rejects(
+      () => server.listen(port, "127.0.0.1"),
+      (error: NodeJS.ErrnoException) => error.code === "EADDRINUSE",
+      "the TCP half cannot have the port",
+    );
 
     // The UDP half is the one that would have bound. Take the port without
     // `reuseAddr` -- a socket still holding it makes this fail, which is the
@@ -322,17 +503,25 @@ describe("DNS server", () => {
   });
 
   it("binds UDP and TCP to the same resolved address for a hostname", async () => {
-    const port = await pickPort("::1", { udp: true });
-    const resolutions: string[] = [];
-    const server = createDnsServer({
-      zones: () => [EXAMPLE],
-      resolveHost: async (host) => {
-        resolutions.push(host);
-        return { address: "::1", family: 6 };
-      },
+    // The port is chosen against `::1` because that is where `resolveHost`
+    // sends the bind, and taken through the same retry every other listen here
+    // goes through: this one was written as a bare pick-then-bind, which is the
+    // pair `start()` exists to retry around. The tally of resolutions belongs
+    // to the attempt rather than to the test, so a retried bind counts its own
+    // resolutions instead of adding them to a previous attempt's.
+    const { port, resolutions } = await onFreshPort("::1", async (candidate) => {
+      const resolved: string[] = [];
+      const server = createDnsServer({
+        zones: () => [EXAMPLE],
+        resolveHost: async (host) => {
+          resolved.push(host);
+          return { address: "::1", family: 6 };
+        },
+      });
+      await server.listen(candidate, "localhost");
+      closers.push(() => server.close());
+      return { port: candidate, resolutions: resolved };
     });
-    await server.listen(port, "localhost");
-    closers.push(() => server.close());
 
     assert.equal(readAnswers(received(await ask(port, buildQuery("www.example.com"), 2_000, "::1"))).length, 2);
     assert.equal(readAnswers(await askOverTcp(port, buildQuery("www.example.com"), false, "::1")).length, 2);
@@ -673,14 +862,6 @@ describe("DNS server", () => {
       assert.equal(readAnswers(chased)[0]?.type, TYPE.CNAME);
     });
 
-    it("leaves a chain that ends somewhere real alone", async () => {
-      const { port } = await start({ zones: () => [ALIASED] });
-      // A target that exists but holds nothing of the asked type is NODATA.
-      const reply = await ask(port, buildQuery("mail.example.com", TYPE.MX));
-      assert.ok(reply);
-      assert.equal(rcodeOf(reply), RCODE.NOERROR);
-    });
-
     /**
      * ⚠️ The other half of the rule, and the one a mutation check found nothing
      * covering: a target outside this zone is not ours to call nonexistent.
@@ -729,10 +910,21 @@ describe("DNS server", () => {
       assert.equal(readAnswers(reply)[0]?.type, TYPE.CNAME);
     });
 
+    /**
+     * A target that exists but holds nothing of the asked type is NODATA: the
+     * CNAME is true and goes back, and the rcode says the name is there.
+     *
+     * ⚠️ There were two of these, over the same zone and the same query, and
+     * the only thing the other one asserted that this one did not was the
+     * rcode -- so that is a line here now rather than a second listener. Two
+     * tests differing by one assertion agree about nothing extra; they cost a
+     * port, and this file's problem was never a shortage of assertions.
+     */
     it("returns the CNAME alone when the target holds nothing of that type", async () => {
       const { port } = await start({ zones: () => [ALIASED] });
       const reply = await ask(port, buildQuery("mail.example.com", TYPE.MX));
       assert.ok(reply);
+      assert.equal(rcodeOf(reply), RCODE.NOERROR);
       const answers = readAnswers(reply);
       assert.equal(answers.length, 1);
       assert.equal(answers[0]?.type, TYPE.CNAME);
@@ -1067,18 +1259,33 @@ describe("DNS server", () => {
   it("closes so a subsequent bind on the same ports can succeed", async () => {
     const { port, server } = await start({ zones: () => [EXAMPLE] });
     const http = createServer((socket) => socket.end());
-    const httpPort = await pickPort("127.0.0.1", { udp: true });
-    await new Promise<void>((resolve) => http.listen(httpPort, "127.0.0.1", resolve));
+    // Registered before it is needed, because the thing that closes it is the
+    // subject of this test: if `shutdownProcess` is what breaks, this is the
+    // only record that the port was ever taken.
+    closers.push(async () => { await new Promise<void>((resolve) => http.close(() => resolve())); });
+    const httpPort = await onFreshPort("127.0.0.1", async (candidate) => {
+      await new Promise<void>((resolve, reject) => {
+        http.once("error", reject);
+        http.listen(candidate, "127.0.0.1", () => { http.removeListener("error", reject); resolve(); });
+      });
+      return candidate;
+    });
     const runtime = { close: async () => undefined };
     await shutdownProcess({ dns: server, http, runtime, timers: [] });
+
+    // Both re-binds retry in place rather than moving to another port: what is
+    // being asserted is that *these two* came free, so a helper that answered a
+    // collision by choosing different ones would assert nothing at all. What
+    // the wait covers is a sibling file's port probe passing through in the
+    // instant after the shutdown released them.
     const rebound = createDnsServer({ zones: () => [EXAMPLE] });
-    await rebound.listen(port, "127.0.0.1");
+    await rebinding(() => rebound.listen(port, "127.0.0.1"));
     closers.push(() => rebound.close());
     const probe = createServer();
-    await new Promise<void>((resolve, reject) => {
+    await rebinding(() => new Promise<void>((resolve, reject) => {
       probe.once("error", reject);
-      probe.listen(httpPort, "127.0.0.1", resolve);
-    });
+      probe.listen(httpPort, "127.0.0.1", () => { probe.removeListener("error", reject); resolve(); });
+    }));
     await new Promise<void>((resolve) => probe.close(() => resolve()));
     assert.equal(readAnswers(received(await ask(port, buildQuery("www.example.com")))).length, 2);
   });
@@ -1127,10 +1334,11 @@ describe("DNS server", () => {
     socket.write(prefix);
     const drip = setInterval(() => { if (!socket.destroyed) socket.write(Buffer.of(0)); }, 10);
     try {
-      await Promise.race([
+      await within(
         new Promise<void>((resolve) => socket.once("close", resolve)),
-        new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("slow-drip DNS TCP socket stayed open")), 300)),
-      ]);
+        300,
+        "slow-drip DNS TCP socket stayed open",
+      );
     } finally {
       clearInterval(drip);
       socket.destroy();
@@ -1313,7 +1521,16 @@ describe("DNS server", () => {
       }
 
       it("answers a cookie-sending client with its own cookie plus a server cookie", async () => {
-        const { port } = await start({ zones: () => [EXAMPLE], cookieSecret: Buffer.alloc(32, 7) });
+        // The clock is injected and the stamp asserted exactly, the way the two
+        // tests below already do it. Read off the real clock this was the one
+        // assertion in the suite that a slow runner alone could fail -- and a
+        // minute-wide window around `Date.now()` is not really an assertion
+        // about the stamp anyway: it passes for any value the server might
+        // plausibly have written, including a wrong one.
+        const clock = Date.UTC(2026, 0, 1, 12, 0, 0);
+        const { port } = await start({
+          zones: () => [EXAMPLE], cookieSecret: Buffer.alloc(32, 7), now: () => clock,
+        });
         const reply = received(await ask(port, withCookie("www.example.com", CLIENT_COOKIE)));
         assert.equal(rcodeOf(reply), RCODE.NOERROR);
         const returned = cookieOf(reply);
@@ -1322,8 +1539,7 @@ describe("DNS server", () => {
         // RFC 9018 §4.3: version, three reserved bytes, then a timestamp.
         assert.equal(returned.readUInt8(8), 1, "version 1");
         assert.deepEqual([...returned.subarray(9, 12)], [0, 0, 0], "reserved bytes stay zero");
-        const stamped = returned.readUInt32BE(12);
-        assert.ok(Math.abs(stamped - Math.floor(Date.now() / 1000)) < 60, `stamped now, got ${stamped}`);
+        assert.equal(returned.readUInt32BE(12), Math.floor(clock / 1000), "stamped from the clock the server was given");
       });
 
       /**
@@ -1557,10 +1773,17 @@ describe("DNS server", () => {
       rateLimitBurst: 1,
       now: () => now,
     });
-    assert.ok(await ask(port, buildQuery("www.example.com"), 200));
-    assert.equal(await ask(port, buildQuery("www.example.com"), 80), undefined);
+    // The clock the limiter reads is injected, so nothing here is measured
+    // against wall time and there is no reason to cut the windows short. The
+    // two positive queries take the file's ordinary deadline -- a 200ms one
+    // turned a slow runner into a rate-limit failure that was really a
+    // scheduling delay -- and the negative one uses the 300ms the other two
+    // proofs-of-silence in this file use, so "nothing came back" means the
+    // same length of nothing everywhere.
+    assert.ok(await ask(port, buildQuery("www.example.com")));
+    assert.equal(await ask(port, buildQuery("www.example.com"), 300), undefined);
     now = 1000;
-    assert.ok(await ask(port, buildQuery("www.example.com"), 200));
+    assert.ok(await ask(port, buildQuery("www.example.com")));
   });
 
   it("bounds simultaneous upstream work and returns SERVFAIL at capacity", async () => {
@@ -1590,26 +1813,54 @@ describe("DNS server", () => {
   });
 
   it("closes idle TCP clients and refuses connections beyond its cap", async () => {
+    // Both halves are torn down from `finally`, the way the slow-drip test
+    // above already does it. Without that, either race rejecting left `first`
+    // connected: the file's closer then waited on a `server.close()` that
+    // cannot finish while a connection is open, tripped its own five-second
+    // "did not finish" assertion, and reported the stall against the hook
+    // rather than against the test that caused it.
     const idle = await start({ zones: () => [EXAMPLE], tcpIdleTimeoutMs: 40 });
     const idleSocket = connect(idle.port, "127.0.0.1");
-    await new Promise<void>((resolve, reject) => { idleSocket.once("connect", resolve); idleSocket.once("error", reject); });
-    await Promise.race([
-      new Promise<void>((resolve) => idleSocket.once("close", () => resolve())),
-      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("idle DNS TCP socket stayed open")), 300)),
-    ]);
+    try {
+      await within(
+        new Promise<void>((resolve, reject) => { idleSocket.once("connect", resolve); idleSocket.once("error", reject); }),
+        2_000,
+        "the idle-timeout listener never accepted the connection",
+      );
+      await within(
+        new Promise<void>((resolve) => idleSocket.once("close", () => resolve())),
+        300,
+        "idle DNS TCP socket stayed open",
+      );
+    } finally {
+      idleSocket.destroy();
+    }
 
     const capped = await start({ zones: () => [EXAMPLE], maxTcpConnections: 1, tcpIdleTimeoutMs: 1000 });
     const first = connect(capped.port, "127.0.0.1");
-    await new Promise<void>((resolve, reject) => { first.once("connect", resolve); first.once("error", reject); });
-    const second = connect(capped.port, "127.0.0.1");
-    await Promise.race([
-      new Promise<void>((resolve) => {
-        second.once("close", () => resolve());
-        second.once("error", () => resolve());
-      }),
-      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("excess DNS TCP connection stayed open")), 300)),
-    ]);
-    first.destroy();
+    // Opened only once `first` holds the one slot there is: dialling both at
+    // once would let the kernel decide which of them is the excess connection.
+    let second: Socket | undefined;
+    try {
+      await within(
+        new Promise<void>((resolve, reject) => { first.once("connect", resolve); first.once("error", reject); }),
+        2_000,
+        "the capped listener never accepted the first connection",
+      );
+      const excess = connect(capped.port, "127.0.0.1");
+      second = excess;
+      await within(
+        new Promise<void>((resolve) => {
+          excess.once("close", () => resolve());
+          excess.once("error", () => resolve());
+        }),
+        300,
+        "excess DNS TCP connection stayed open",
+      );
+    } finally {
+      first.destroy();
+      second?.destroy();
+    }
   });
 
   it("answers SERVFAIL when the upstream says nothing", async () => {
@@ -1758,14 +2009,13 @@ describe("DNS server", () => {
     // Relaying that query over UDP hands back another truncated answer, and the
     // client has no move left -- it already did the thing TC asks for.
     const overUdp: number[] = [];
-    const { socket: udpUpstream, port: upstreamPort } = await upstreamOn();
-    udpUpstream.on("message", (message, remote) => {
-      overUdp.push(1);
-      const truncated = Buffer.from(message.subarray(0, 12));
-      truncated.writeUInt16BE(0x8380, 2);
-      udpUpstream.send(truncated, remote.port, remote.address);
-    });
-    const tcpUpstream = createServer((socket) => {
+    // One `forwardTo` names one port for both transports, so both upstreams
+    // have to be on the same number -- and the number came from a UDP bind, so
+    // taking it on TCP is a bind that can lose. It used to be written as a
+    // `listen` with no `error` listener, which is the failure the note on
+    // `bound()` describes: a collision made this hang to the runner's timeout
+    // rather than fail. `bothTransportsOn` rejects and re-picks instead.
+    const { socket: udpUpstream, server: tcpUpstream, port: upstreamPort } = await bothTransportsOn((socket) => {
       socket.on("data", (request: Buffer) => {
         const querySize = request.readUInt16BE(0);
         const query = request.subarray(2, 2 + querySize);
@@ -1780,7 +2030,12 @@ describe("DNS server", () => {
         socket.write(Buffer.concat([wrong, framed]));
       });
     });
-    await new Promise<void>((resolve) => tcpUpstream.listen(upstreamPort, "127.0.0.1", resolve));
+    udpUpstream.on("message", (message, remote) => {
+      overUdp.push(1);
+      const truncated = Buffer.from(message.subarray(0, 12));
+      truncated.writeUInt16BE(0x8380, 2);
+      udpUpstream.send(truncated, remote.port, remote.address);
+    });
     closers.push(async () => {
       udpUpstream.close();
       await new Promise<void>((resolve) => tcpUpstream.close(() => resolve()));
@@ -1967,7 +2222,12 @@ describe("DNS server", () => {
       }
       await Promise.all(occupying);
       for (let waited = 0; held.length < 3 && waited < 200; waited += 1) {
-        void ask(port, buildQuery("fourth.example.org", TYPE.A, 0x2004), 500);
+        // Fired and not awaited: what is being watched for is the arrival
+        // upstream, not the answer. The rejection is swallowed because the
+        // listener goes away with this test now -- a probe still in flight when
+        // that happens would otherwise reject into nobody, and the runner would
+        // charge the unhandled rejection to whichever test came next.
+        void ask(port, buildQuery("fourth.example.org", TYPE.A, 0x2004), 500).catch(() => undefined);
         await delay(10);
       }
       assert.ok(held.length > 2, "a completed forward frees its slot");

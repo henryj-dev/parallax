@@ -33,16 +33,40 @@ describe("테스트의 마감은 러너의 마감보다 짧다", () => {
     assert.ok(limit > 0, `--test-timeout=${limit}`);
   });
 
+  /**
+   * 소스 한 덩이가 든, 러너보다 먼저 발화하지 못하는 마감. 이름과 값으로 낸다 — 개수로는
+   * 고칠 수 없다.
+   *
+   * ⚠️ **이 함수 하나만 있는 것이 요점이다.** 아래 음성 대조들은 이것을 부르고, 정규식을
+   * 자기 안에 다시 적지 않는다. 다시 적으면 대조는 입력도 매처도 그 자리의 리터럴이라
+   * 언제나 참이고, 표기가 바뀌어 진짜 수집이 0 이 된 날에도 초록으로 남는다 — 대조가
+   * 지키기로 한 바로 그 실패 양식을 대조가 못 보게 된다.
+   */
+  const offending = (source: string, limit: number): Array<{ name: string; value: number }> => {
+    const found: Array<{ name: string; value: number }> = [];
+    for (const [, name, raw] of source.matchAll(/const (\w*TIMEOUT_MS) = ([\d_]+)/gu)) {
+      const value = Number((raw as string).replaceAll("_", ""));
+      if (value >= limit) found.push({ name: name as string, value });
+    }
+    return found;
+  };
+
   it("어떤 테스트도 러너와 같거나 긴 마감을 두지 않는다", async () => {
     const limit = await runnerTimeout();
     const offenders: string[] = [];
+    let scanned = 0;
     for await (const entry of glob("test/**/*.test.ts")) {
+      scanned += 1;
       const source = await readFile(entry, "utf8");
-      for (const [, name, raw] of source.matchAll(/const (\w*TIMEOUT_MS) = ([\d_]+)/gu)) {
-        const value = Number((raw as string).replaceAll("_", ""));
-        if (value >= limit) offenders.push(`${entry}: ${name} = ${value} (러너 ${limit})`);
+      for (const { name, value } of offending(source, limit)) {
+        offenders.push(`${entry}: ${name} = ${value} (러너 ${limit})`);
       }
     }
+    // `glob` 은 `process.cwd()` 에 대고 푼다. 러너를 저장소 루트가 아닌 곳에서 부르면 아무것도
+    // 매치하지 않고, 읽은 파일이 0 이면 위반도 0 이라 이 검사는 영구 초록이 된다 — 「마감이
+    // 다 짧다」와 「아무것도 보지 않았다」가 같은 답이 되는 것이다. 형제 검사들이 같은 자리에
+    // 같은 바닥을 둔다(`documented-adapters`, `source-reviewability`).
+    assert.ok(scanned >= 50, `테스트 파일을 ${scanned}개 읽었다 — 저장소 루트에서 돌고 있는지 확인할 것`);
     assert.deepEqual(
       offenders,
       [],
@@ -51,24 +75,26 @@ describe("테스트의 마감은 러너의 마감보다 짧다", () => {
   });
 
   it("이 검사에 이빨이 있다", async () => {
-    // 러너와 같은 값이 위반으로 잡히는지, 짧은 값은 안 잡히는지. 검사가 정규식으로 소스를
-    // 읽으므로, 표기가 바뀌어 아무것도 못 잡게 되는 것이 이것의 조용한 실패 양식이다.
+    // 러너와 같은 값이 위반으로 잡히는지, 짧은 값은 안 잡히는지. **위 검사가 쓰는 그 함수로**
+    // 잰다 — 검사가 정규식으로 소스를 읽으므로, 표기가 바뀌어 아무것도 못 잡게 되는 것이
+    // 이것의 조용한 실패 양식이고, 그 표기는 한 곳에만 적혀 있어야 여기서 걸린다.
     const limit = await runnerTimeout();
     const sample = `const START_TIMEOUT_MS = ${limit};\nconst OTHER_TIMEOUT_MS = ${limit - 1};\n`;
-    const caught: number[] = [];
-    for (const [, , raw] of sample.matchAll(/const (\w*TIMEOUT_MS) = ([\d_]+)/gu)) {
-      const value = Number((raw as string).replaceAll("_", ""));
-      if (value >= limit) caught.push(value);
-    }
-    assert.deepEqual(caught, [limit], "같은 값만 잡고, 1ms 짧은 값은 통과시킨다");
+    assert.deepEqual(
+      offending(sample, limit),
+      [{ name: "START_TIMEOUT_MS", value: limit }],
+      "같은 값만 잡고, 1ms 짧은 값은 통과시킨다",
+    );
   });
 
   it("밑줄이 들어간 표기도 읽는다", () => {
     // `60_000` 이 이 저장소의 표기다. 밑줄을 지우지 않으면 `Number("60_000")` 는 NaN 이고,
-    // NaN >= limit 는 false 라 **모든 위반이 조용히 통과한다**.
-    const values = [...`const A_TIMEOUT_MS = 60_000;`.matchAll(/const (\w*TIMEOUT_MS) = ([\d_]+)/gu)]
-      .map(([, , raw]) => Number((raw as string).replaceAll("_", "")));
-    assert.deepEqual(values, [60_000]);
-    assert.ok(!Number.isNaN(values[0]), "밑줄을 지우지 않으면 NaN 이 되고 비교가 항상 거짓이 된다");
+    // NaN >= limit 는 false 라 **모든 위반이 조용히 통과한다** — 그래서 빈 배열이 나오는
+    // 것으로 그 회귀가 여기서 드러난다.
+    assert.deepEqual(
+      offending("const A_TIMEOUT_MS = 60_000;", 60_000),
+      [{ name: "A_TIMEOUT_MS", value: 60_000 }],
+      "밑줄을 지우지 않으면 NaN 이 되고 비교가 항상 거짓이 된다",
+    );
   });
 });
