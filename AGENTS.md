@@ -50,7 +50,7 @@ squash 전용 머지 · linear history 강제 · `bypass_actors: []` ·
 스킵이 허용된 잡은 `ALLOWED_SKIP` 에 이름으로 적힌 것뿐이다(지금은 `flake-watch` 하나).
 잡에 `if:` 를 붙이면 게이트가 조용해지는 대신 빨개진다 — 전에는 반대였다.
 
-에이전트에게 특히 걸리는 지점 둘:
+에이전트에게 특히 걸리는 지점 셋:
 
 - `scripts/claude-hooks/**` 와 `scripts/git-hooks/**` 의 검사가 **이제 CI 에서 돈다.**
   전에는 `pnpm test`(`node --test`)가 `.py` 를 보지 못해 아무도 돌리지 않았다. 그 스냅샷을
@@ -60,6 +60,13 @@ squash 전용 머지 · linear history 강제 · `bypass_actors: []` ·
   `git diff --name-only ... -- <경로>` 를 파싱해 감시 경로를 읽고, 양쪽 README 가 같은
   경로를 대는지까지 본다. README 를 다시 쓰면서 그 문단을 지우면 이 잡이 빨개진다 —
   실제로 한 번 그렇게 됐다.
+- ⚠️ **`git ls-files` 를 도는 검사들은 새 파일을 `git add` 전에는 못 본다.**
+  `test/source-reviewability.test.ts` 와 `test/scripts/what-ships.test.ts` 는 추적되는
+  파일만 훑는다. 그래서 **새 문서를 쓰고 `pnpm test` 를 돌리면 초록, 커밋한 뒤 CI 에서
+  빨강**이 될 수 있다 — 로컬과 CI 가 다른 코드를 본 것이 아니라 다른 *파일 목록*을 본
+  것이다. 2026-09-04 에 `docs/linting.md` 가 정확히 그렇게 걸렸다(정규식을 설명하려고
+  제어문자를 그대로 붙여 넣었고, 그 검사는 추적되는 파일에 날 제어문자가 있는 것을
+  거부한다). **새 파일을 만들었으면 `git add -A` 를 먼저 하고 스위트를 돌릴 것.**
 
 Raw `git worktree add` remains blocked for agents. The checked-in creator is
 the harness-neutral fallback and records ownership for cleanup.
