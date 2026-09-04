@@ -35,14 +35,30 @@
 # 레지스트리가 죽은 동안 머지를 못 하는 쪽이 더 위태롭다. 그리고 조용히 넘기지는 않는다 —
 # `::warning::` 이 실행에 남으므로 이것이 계속되면 보이는 상태로 계속된다.
 #
-# 이음매 둘은 테스트를 위한 것이다(`test/scripts/audit-script.test.ts`):
-#   PNPM        호출할 명령. 기본 `pnpm`.
-#   AUDIT_SLEEP 재시도 사이 대기의 배수(초). 기본 30, 테스트는 0.
+# 🔴 **예산은 자기 상한 안에 들어야 한다 — 첫 판은 그러지 못했다.**
+# 처음에는 시도당 120초, 대기 30·60초로 잡았다. 최악 450초에 `pnpm install` 과 체크아웃이
+# 붙어 `audit` 잡의 `timeout-minutes: 10` 을 넘겼고, 잡이 10분 17초에 잘렸다(`rc=124`).
+# **판정은 옳았는데 판정을 내리기 전에 죽었다.** 그건 고치려던 것과 같은 결과다 — 커밋과
+# 무관한 이유로 빨간 필수 게이트.
+#
+# 그리고 오래 기다리는 것 자체가 틀린 모양이다. 이 검사의 요지는 「느린 남의 서비스가
+# 머지를 막지 않게」인데, 「답이 없다」를 말하려고 8분을 쓰면 그 요지를 스스로 어긴다.
+# 레지스트리가 성하면 몇 초에 답한다. 성하지 않으면 빨리 포기하는 편이 낫다.
+#
+#   최악 = ATTEMPTS × ATTEMPT_TIMEOUT + Σ(대기) = 3×45 + (10+20) = 165초
+#
+# `test/scripts/audit-script.test.ts` 가 이 값이 잡의 상한보다 충분히 작은지 강제한다 —
+# `test-deadlines.test.ts` 가 「테스트의 마감 < 러너의 마감」을 강제하는 것과 같은 규칙이다.
+#
+# 이음막 셋은 테스트를 위한 것이다(`test/scripts/audit-script.test.ts`):
+#   PNPM            호출할 명령. 기본 `pnpm`.
+#   AUDIT_SLEEP     재시도 사이 대기의 배수(초). 기본 10, 테스트는 0.
+#   AUDIT_ATTEMPTS  시도 횟수. 기본 3.
 set -uo pipefail
 
 PNPM="${PNPM:-pnpm}"
-ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT:-120}"
-AUDIT_SLEEP="${AUDIT_SLEEP:-30}"
+ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT:-45}"
+AUDIT_SLEEP="${AUDIT_SLEEP:-10}"
 ATTEMPTS="${AUDIT_ATTEMPTS:-3}"
 
 # `timeout` 이 없는 환경(맥의 기본 셸 도구 모음)에서는 그냥 직접 부른다. 상한은 CI 를

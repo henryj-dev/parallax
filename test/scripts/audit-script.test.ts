@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -68,7 +68,6 @@ async function withFakePnpm(body: string): Promise<{ stdout: string; stderr: str
 }
 
 async function countCalls(tally: string): Promise<number> {
-  const { readFile } = await import("node:fs/promises");
   try {
     return (await readFile(tally, "utf8")).trimEnd().split("\n").filter(Boolean).length;
   } catch {
@@ -134,6 +133,43 @@ describe("the advisory check tells apart a finding from a failure to ask", () =>
     const result = await withFakePnpm(`echo '[]'\nexit 1`);
     assert.equal(result.code, 0, "an array is not the report shape; treat it as no answer");
     assert.match(result.stdout, /::warning::/u);
+  });
+
+  it("cannot outlive the job that runs it", async () => {
+    // 🔴 **첫 판이 정확히 여기서 죽었다.** 시도당 120초, 대기 30·60초로 잡아 최악 450초
+    // 였고, `pnpm install` 과 체크아웃이 붙자 `audit` 잡의 `timeout-minutes: 10` 을 넘겨
+    // 10분 17초에 잘렸다(`rc=124`). 판정 로직은 옳았는데 **판정을 내리기 전에 죽었다** —
+    // 고치려던 것과 같은 결과, 커밋과 무관한 이유로 빨간 필수 게이트.
+    //
+    // `test-deadlines.test.ts` 가 「테스트의 마감 < 러너의 마감」을 강제하는 것과 같은
+    // 규칙이다. 여기서는 「스크립트의 최악 소요 < 잡의 상한」이고, 두 값을 각자의 파일에서
+    // 읽어 온다 -- 어느 쪽을 올려도 다른 쪽이 따라오지 않으면 여기서 걸린다.
+    const script = await readFile(SCRIPT, "utf8");
+    const numberOf = (name: string): number => {
+      const found = new RegExp(String.raw`\$\{${name}:-(\d+)\}`, "u").exec(script)?.[1];
+      assert.ok(found, `${name} must have a default in the script`);
+      return Number(found);
+    };
+    const attempts = numberOf("AUDIT_ATTEMPTS");
+    const perAttempt = numberOf("ATTEMPT_TIMEOUT");
+    const sleepUnit = numberOf("AUDIT_SLEEP");
+    // 대기는 시도 번호에 비례한다: 1×unit, 2×unit, ... 마지막 시도 뒤에는 자지 않는다.
+    const waiting = sleepUnit * ((attempts - 1) * attempts) / 2;
+    const worstCase = attempts * perAttempt + waiting;
+
+    const workflow = await readFile(new URL("../../.github/workflows/check.yml", import.meta.url), "utf8");
+    const auditJob = /^ {2}audit:$([\s\S]*?)^ {2}\S/mu.exec(workflow)?.[1];
+    assert.ok(auditJob, "check.yml must define an `audit` job");
+    const limitMinutes = Number(/timeout-minutes:\s*(\d+)/u.exec(auditJob)?.[1]);
+    assert.ok(Number.isFinite(limitMinutes), "the audit job must bound itself");
+
+    // 절반을 남긴다. 나머지는 체크아웃 · setup-node · `pnpm install` 의 몫이고, 그 셋은
+    // 이 스크립트가 통제하지 못한다.
+    const budget = limitMinutes * 60 * 0.5;
+    assert.ok(
+      worstCase < budget,
+      `the script's worst case is ${worstCase}s, which leaves too little of the job's ${limitMinutes}min for install and setup`,
+    );
   });
 
   it("accepts a clean report whatever keys it carries", async () => {
