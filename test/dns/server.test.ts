@@ -2234,4 +2234,230 @@ describe("DNS server", () => {
     });
   });
 
+
+  /**
+   * The fallback: an empty answer in an opted-in zone is asked of the upstream
+   * before it is given.
+   *
+   * ⚠️ Every refusal below is a split-horizon guarantee, and the override one
+   * is the reason the fallback was allowed at all: a host with a private A here
+   * and a public AAAA nobody copied in must not be handed that AAAA -- an
+   * IPv6-first client would go around the private address entirely.
+   */
+  describe("fallback to the upstream for empty answers", () => {
+    const ZONE: ServedZone = {
+      ...EXAMPLE,
+      records: [...EXAMPLE.records, { name: "note", type: "TXT", content: "\"internal\"", ttl: 60 }],
+      overrideNames: new Set(["www", "note"]),
+    };
+    const SOA_TTL = 1800;
+    const SOA_MINIMUM = 1800;
+    /** An RRSIG rdata that only has to be recognisable: type covered SOA, then filler. */
+    const RRSIG_RDATA = Buffer.concat([Buffer.of(0, 6, 13, 2, 0, 0, 0x0e, 0x10), Buffer.alloc(24, 0xab)]);
+
+    /** An upstream negative answer for whatever was asked, SOA (and RRSIG) in authority. */
+    function negativeReply(message: Buffer, rcode: number, withRrsig: boolean): Buffer {
+      const questionEnd = readName(message, 12).offset + 4;
+      const header = Buffer.from(message.subarray(0, 12));
+      header.writeUInt16BE(0x8180 | rcode, 2);
+      header.writeUInt16BE(0, 6);
+      header.writeUInt16BE(withRrsig ? 2 : 1, 8);
+      header.writeUInt16BE(0, 10);
+      const record = (type: number, ttl: number, rdata: Buffer): Buffer => {
+        const fixed = Buffer.alloc(10);
+        fixed.writeUInt16BE(type, 0);
+        fixed.writeUInt16BE(1, 2);
+        fixed.writeUInt32BE(ttl, 4);
+        fixed.writeUInt16BE(rdata.length, 8);
+        return Buffer.concat([encodeName("example.com"), fixed, rdata]);
+      };
+      const numbers = Buffer.alloc(20);
+      numbers.writeUInt32BE(7, 0);
+      numbers.writeUInt32BE(10000, 4);
+      numbers.writeUInt32BE(2400, 8);
+      numbers.writeUInt32BE(604800, 12);
+      numbers.writeUInt32BE(SOA_MINIMUM, 16);
+      const soa = record(TYPE.SOA, SOA_TTL, Buffer.concat([encodeName("ns.example.com"), encodeName("dns.example.com"), numbers]));
+      const sections = withRrsig ? [soa, record(46, SOA_TTL, RRSIG_RDATA)] : [soa];
+      return Buffer.concat([header, message.subarray(12, questionEnd), ...sections]);
+    }
+
+    /** The authority section, decoded to type, TTL and rdata. */
+    function readAuthority(reply: Buffer): { type: number; ttl: number; data: Buffer }[] {
+      let offset = readName(reply, 12).offset + 4;
+      for (let index = 0; index < reply.readUInt16BE(6); index += 1) {
+        offset = readName(reply, offset).offset;
+        offset += 10 + reply.readUInt16BE(offset + 8);
+      }
+      const out: { type: number; ttl: number; data: Buffer }[] = [];
+      for (let index = 0; index < reply.readUInt16BE(8); index += 1) {
+        offset = readName(reply, offset).offset;
+        const size = reply.readUInt16BE(offset + 8);
+        out.push({ type: reply.readUInt16BE(offset), ttl: reply.readUInt32BE(offset + 4), data: reply.subarray(offset + 10, offset + 10 + size) });
+        offset += 10 + size;
+      }
+      return out;
+    }
+
+    /** An upstream that answers every query with `answer` and counts them. */
+    async function countingUpstream(answer: (message: Buffer) => Buffer): Promise<{ port: number; asked: string[] }> {
+      const { socket, port } = await upstreamOn();
+      const asked: string[] = [];
+      socket.on("message", (message, remote) => {
+        asked.push(readName(message, 12).name);
+        socket.send(answer(message), remote.port, remote.address);
+      });
+      closers.push(async () => { socket.close(); });
+      return { port, asked };
+    }
+
+    function aa(reply: Buffer): boolean {
+      return (reply.readUInt16BE(2) & 0x0400) !== 0;
+    }
+
+    it("asks the upstream for a name the zone does not hold, and gives its answer", async () => {
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xfa, 0x11]));
+      const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"], forwardDeny: ["10.0.0.1"] });
+      const reply = received(await ask(port, buildQuery("absent.example.com", TYPE.A)));
+      assert.deepEqual(upstream.asked, ["absent.example.com"]);
+      assert.equal(reply.subarray(-2).toString("hex"), "fa11", "the upstream's bytes, not ours");
+      assert.equal(aa(reply), false);
+    });
+
+    it("asks the upstream for a type the name does not hold", async () => {
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xfa, 0x12]));
+      const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"] });
+      const reply = received(await ask(port, buildQuery("mail.example.com", TYPE.TXT)));
+      assert.deepEqual(upstream.asked, ["mail.example.com"]);
+      assert.equal(reply.subarray(-2).toString("hex"), "fa12");
+    });
+
+    it("caps the negative TTL at the local one, leaving MINIMUM and the RRSIG data as signed", async () => {
+      const upstream = await countingUpstream((message) => negativeReply(message, RCODE.NOERROR, true));
+      const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"], negativeTtl: 60 });
+      const reply = received(await ask(port, buildQuery("absent.example.com", TYPE.A)));
+      const [soa, rrsig] = readAuthority(reply);
+      assert.equal(soa?.type, TYPE.SOA);
+      assert.equal(soa?.ttl, 60, "remembered no longer than a local absence would be");
+      assert.equal(soa?.data.readUInt32BE(soa.data.length - 4), SOA_MINIMUM, "MINIMUM is signed data and stays");
+      assert.equal(rrsig?.type, 46);
+      assert.equal(rrsig?.ttl, 60, "the signature is remembered for as long as what it signs");
+      assert.deepEqual(rrsig?.data, RRSIG_RDATA, "the signature itself is byte for byte");
+    });
+
+    it("★never falls back for a name with an internal override, whatever type is missing", async () => {
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xba, 0xad]));
+      const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"] });
+      // www has a private A here; its AAAA must not come from outside.
+      const aaaa = received(await ask(port, buildQuery("www.example.com", TYPE.AAAA)));
+      assert.equal(rcodeOf(aaaa), RCODE.NOERROR);
+      assert.equal(aa(aaaa), true, "answered here");
+      assert.equal(readAnswers(aaaa).length, 0);
+      // An override of one type holds the whole name, not only that type.
+      const a = received(await ask(port, buildQuery("note.example.com", TYPE.A)));
+      assert.equal(aa(a), true);
+      assert.deepEqual(upstream.asked, [], "the upstream was never asked about an overridden name");
+    });
+
+    it("answers as before in a zone that did not opt in", async () => {
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xba, 0xad]));
+      const plain = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`] });
+      const optedElsewhere = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["other.example"] });
+      const before = received(await ask(plain.port, buildQuery("absent.example.com", TYPE.A, 0x7777)));
+      const after = received(await ask(optedElsewhere.port, buildQuery("absent.example.com", TYPE.A, 0x7777)));
+      assert.equal(rcodeOf(after), RCODE.NXDOMAIN);
+      assert.deepEqual(after, before, "byte for byte what the listener said without the setting");
+      assert.deepEqual(upstream.asked, []);
+    });
+
+    it("keeps an excluded subtree internal, on a label boundary", async () => {
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xfa, 0x13]));
+      const { port } = await start({
+        zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"], fallbackExclude: ["internal.example.com"],
+      });
+      assert.equal(rcodeOf(await ask(port, buildQuery("internal.example.com", TYPE.A))), RCODE.NXDOMAIN);
+      assert.equal(rcodeOf(await ask(port, buildQuery("host.internal.example.com", TYPE.A))), RCODE.NXDOMAIN);
+      assert.deepEqual(upstream.asked, [], "names that exist only inside are not asked about outside");
+      // A name that merely ends in the same letters is not under it.
+      await ask(port, buildQuery("xinternal.example.com", TYPE.A));
+      assert.deepEqual(upstream.asked, ["xinternal.example.com"]);
+    });
+
+    it("gives a client outside forwardAllow the local answer, not REFUSED", async () => {
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xba, 0xad]));
+      const { port } = await start({
+        zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], forwardAllow: ["10.0.0.0/8"], fallbackZones: ["example.com"],
+      });
+      const reply = received(await ask(port, buildQuery("absent.example.com", TYPE.A)));
+      assert.equal(rcodeOf(reply), RCODE.NXDOMAIN);
+      assert.equal(aa(reply), true);
+      assert.deepEqual(upstream.asked, [], "not an open resolver for names under our zones");
+    });
+
+    it("does not relay a signed question, and answers it here", async () => {
+      const key = parseTsigKey(`fallback.key:hmac-sha256:${Buffer.alloc(32, 7).toString("base64")}`, "TEST");
+      // Both transports, counted: a signed question arrives over TCP and would be
+      // relayed over TCP, so a UDP-only upstream would see nothing either way and
+      // this test would pass with the check removed (it did, under mutation).
+      let asked = 0;
+      const { socket, server, port: upstreamPort } = await bothTransportsOn((connection) => {
+        asked += 1;
+        connection.destroy();
+      });
+      socket.on("message", () => { asked += 1; });
+      closers.push(async () => { socket.close(); await new Promise<void>((resolve) => server.close(() => resolve())); });
+      const { port } = await start({
+        zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstreamPort}`], fallbackZones: ["example.com"], tsigKeys: [key],
+      });
+      const request = signRequest(buildQuery("absent.example.com", TYPE.A), key);
+      assert.equal(rcodeOf(await askOverTcp(port, request.message)), RCODE.NXDOMAIN);
+      assert.equal(asked, 0, "our peer's credential does not go to the upstream");
+    });
+
+    it("keeps the local answer when the upstream does not answer", async () => {
+      const deadPort = await pickPort();
+      const { port } = await start({
+        zones: () => [ZONE], forwardTo: [`127.0.0.1#${deadPort}`], fallbackZones: ["example.com"], forwardTimeoutMs: 200,
+      });
+      const reply = received(await ask(port, buildQuery("absent.example.com", TYPE.A), 3000));
+      assert.equal(rcodeOf(reply), RCODE.NXDOMAIN, "a gap left unfilled, not a SERVFAIL that used to be an answer");
+      assert.equal(aa(reply), true);
+    });
+
+    it("keeps the local answer when every forwarding slot is taken", async () => {
+      // Hold the only slot with a query to an upstream that never answers.
+      const silent = await upstreamOn();
+      closers.push(async () => { silent.socket.close(); });
+      const held = await start({
+        zones: () => [ZONE], forwardTo: [`127.0.0.1#${silent.port}`], fallbackZones: ["example.com"], maxConcurrentForwards: 1, forwardTimeoutMs: 1000,
+      });
+      const occupying = ask(held.port, buildQuery("first.example.org", TYPE.A), 3000).catch(() => undefined);
+      for (let waited = 0; waited < 20; waited += 1) await delay(5);
+      const reply = received(await ask(held.port, buildQuery("absent.example.com", TYPE.A)));
+      assert.equal(rcodeOf(reply), RCODE.NXDOMAIN);
+      assert.equal(aa(reply), true);
+      await occupying;
+    });
+
+    it("does not relay to an upstream that resolves to a denied address", async () => {
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xba, 0xad]));
+      const { port } = await start({
+        zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"], forwardDeny: ["127.0.0.1"],
+      });
+      assert.equal(rcodeOf(await ask(port, buildQuery("outside.example.org", TYPE.A))), RCODE.SERVFAIL, "out of zone: no other upstream");
+      assert.equal(rcodeOf(await ask(port, buildQuery("absent.example.com", TYPE.A))), RCODE.NXDOMAIN, "in zone: the local answer stands");
+      assert.deepEqual(upstream.asked, [], "a resolver that forwards back here is never asked");
+    });
+
+    it("leaves a positive local answer and the out-of-zone relay as they were", async () => {
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xfa, 0x14]));
+      const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"] });
+      const www = received(await ask(port, buildQuery("www.example.com", TYPE.A)));
+      assert.equal(readAnswers(www).length, 2);
+      assert.equal(aa(www), true);
+      const outside = received(await ask(port, buildQuery("outside.example.org", TYPE.A)));
+      assert.equal(outside.subarray(-2).toString("hex"), "fa14");
+      assert.deepEqual(upstream.asked, ["outside.example.org"]);
+    });
+  });
 });

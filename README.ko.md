@@ -320,6 +320,10 @@ Cloudflare 코멘트는 100자로 제한되는데, 호출자가 이미 아는 �
 | `PARALLAX_DNS_HOST` | 기본값은 `HOST`, 그다음 `127.0.0.1` |
 | `PARALLAX_DNS_FORWARD_TO` | 모든 존 밖 이름의 상위. 비우면 `REFUSED`로 답함 |
 | `PARALLAX_DNS_FORWARD_ALLOW` | 재귀를 허용할 클라이언트 CIDR. 기본은 루프백이고, 리스너가 루프백이 아니면서 포워딩이 켜져 있으면 **필수** |
+| `PARALLAX_DNS_FALLBACK_ZONES` | 빈 답(NXDOMAIN, NODATA)을 내기 전에 상위에 먼저 물어볼 존. 비우면 꺼짐. 내부 override가 있는 이름, `FORWARD_ALLOW` 밖 클라이언트, 서명된 질의, `FALLBACK_EXCLUDE` 아래 이름은 절대 묻지 않는다. 상위가 실패하면 로컬 답을 준다. 상위의 부정 TTL은 로컬 값으로 상한을 둔다 |
+| `PARALLAX_DNS_FALLBACK_EXCLUDE` | 그 이름과 아래 전부를 폴백하지 않는다 — 내부에만 있는 하위 트리. 각 항목은 폴백 존 안이어야 함 |
+| `PARALLAX_DNS_FORWARD_DENY` | 상위가 되거나 그 주소로 풀려서는 안 되는 주소: 여기로 되돌려 보내는 리졸버(게이트웨이, 클러스터 DNS, 이 리스너의 서비스 주소). `FALLBACK_ZONES`와 함께 **필수** |
+| `PARALLAX_DNS_DRIFT_INTERVAL_MS` | 프로바이더엔 있는데 서빙 존의 내부 뷰가 답하지 않는 레코드를 세는 주기(`parallax_dns_provider_only_records`, 이름은 로그로). 기본 900000, `0`이면 끔 |
 | `PARALLAX_DNS_TRANSFER_ALLOW` | `AXFR`·`IXFR`를 허용할 클라이언트 CIDR. **기본은 전부 거부** |
 | `PARALLAX_DNS_TSIG_KEYS` | `name:algorithm:base64secret`, 쉼표 구분. 키를 하나라도 두면 `AXFR`에 유효한 TSIG 서명이 **필수**가 된다. `hmac-sha256`/`hmac-sha512`만 |
 | `PARALLAX_DNS_NOTIFY_TO` | 서빙 중인 존의 serial이 오를 때 NOTIFY를 받을 호스트. `host`, `host:port`, 또는 서명할 키를 지정하는 `host:port#keyname` |

@@ -228,9 +228,92 @@ describe("configuration", () => {
       port: 5353,
       forwardTo: [],
       forwardAllow: ["127.0.0.0/8", "::1/128"],
+      fallbackZones: [],
+      fallbackExclude: [],
+      forwardDeny: [],
+      driftIntervalMs: 900_000,
       transferAllow: [],
       tsigKeys: [],
       limits: {},
+    });
+  });
+
+  /**
+   * The fallback opens a hole in split-horizon on purpose, so every way of
+   * opening it wider than meant is a refusal to start rather than a surprise.
+   */
+  describe("fallback to the upstream", () => {
+    const FALLING_BACK = {
+      PARALLAX_DNS_PORT: "5353",
+      PARALLAX_DNS_HOST: "0.0.0.0",
+      PARALLAX_DNS_FORWARD_TO: "1.1.1.1,1.0.0.1",
+      PARALLAX_DNS_FORWARD_ALLOW: "10.0.0.0/8",
+      PARALLAX_DNS_FORWARD_DENY: "10.0.0.1,10.0.0.10,10.0.0.70",
+      PARALLAX_DNS_FALLBACK_ZONES: "Example.com.,example.net",
+      PARALLAX_DNS_FALLBACK_EXCLUDE: "internal.example.com",
+    };
+
+    it("reads zones, exclusions and the deny list, normalized", () => {
+      const dns = readConfig(FALLING_BACK).dns;
+      assert.deepEqual(dns?.fallbackZones, ["example.com", "example.net"]);
+      assert.deepEqual(dns?.fallbackExclude, ["internal.example.com"]);
+      assert.deepEqual(dns?.forwardDeny, ["10.0.0.1", "10.0.0.10", "10.0.0.70"]);
+    });
+
+    it("refuses to fall back with nowhere to go", () => {
+      assert.throws(() => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_TO: "" }), /needs PARALLAX_DNS_FORWARD_TO/u);
+    });
+
+    it("refuses to fall back without naming the resolvers that forward back here", () => {
+      assert.throws(() => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_DENY: "" }), /needs PARALLAX_DNS_FORWARD_DENY/u);
+    });
+
+    it("refuses an exclusion that excludes nothing", () => {
+      assert.throws(
+        () => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FALLBACK_EXCLUDE: "internal.exampel.com" }),
+        /internal\.exampel\.com, which is in no PARALLAX_DNS_FALLBACK_ZONES zone/u,
+      );
+      assert.throws(
+        () => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FALLBACK_ZONES: "", PARALLAX_DNS_FORWARD_DENY: "" }),
+        /nothing to exclude from/u,
+      );
+    });
+
+    it("refuses a deny list that names a host rather than an address", () => {
+      assert.throws(() => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_DENY: "gw.example.com" }), /addresses, not names/u);
+    });
+
+    it("★refuses an upstream that forwards back here, or is this listener", () => {
+      // A resolver named as forwarding back here.
+      assert.throws(
+        () => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_TO: "10.0.0.1" }),
+        /PARALLAX_DNS_FORWARD_DENY says forwards back here/u,
+      );
+      assert.throws(
+        () => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_TO: "1.1.1.1,10.0.0.10#53" }),
+        /10\.0\.0\.10#53/u,
+      );
+      // This listener, by loopback or by its own address and port.
+      for (const self of ["127.0.0.1#5353", "localhost#5353", "0.0.0.0#5353", "[::1]#5353"]) {
+        assert.throws(() => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_TO: self }), /which is this listener/u, self);
+      }
+      // Loopback on another port is somebody else -- a local unbound, say.
+      assert.deepEqual(readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_TO: "127.0.0.1#5300" }).dns?.forwardTo, ["127.0.0.1#5300"]);
+    });
+
+    it("refuses this listener as its own upstream even without the fallback", () => {
+      assert.throws(
+        () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_TO: "127.0.0.1" }),
+        /which is this listener/u,
+      );
+    });
+
+    it("bounds the provider-only check interval, and lets it be turned off", () => {
+      assert.equal(readConfig({ ...FALLING_BACK, PARALLAX_DNS_DRIFT_INTERVAL_MS: "0" }).dns?.driftIntervalMs, 0);
+      assert.equal(readConfig({ ...FALLING_BACK, PARALLAX_DNS_DRIFT_INTERVAL_MS: "600000" }).dns?.driftIntervalMs, 600_000);
+      for (const bad of ["1000", "-1", "1.5", "nope", "86400001"]) {
+        assert.throws(() => readConfig({ ...FALLING_BACK, PARALLAX_DNS_DRIFT_INTERVAL_MS: bad }), /PARALLAX_DNS_DRIFT_INTERVAL_MS/u, bad);
+      }
     });
   });
 

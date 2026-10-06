@@ -1984,4 +1984,59 @@ describe("ControlPlane", () => {
     });
   });
 
+
+  /**
+   * The gap the internal view answers for authoritatively: a record created at
+   * the provider directly is public and absent inside. On 2026-09-11 it was an
+   * ACME TXT that a certificate's self-check could never see.
+   */
+  describe("provider-only records", () => {
+    function providerWith(records: Omit<ProviderRecord, "providerId" | "managed" | "id">[]): ProviderAdapter {
+      return {
+        list: async (target) => {
+          assert.equal(target, "example.com/external", "the published view is what is compared");
+          return records.map((record, index) => ({ ...record, id: `p${index}`, providerId: `p${index}`, managed: false }));
+        },
+        apply: async () => { throw new Error("nothing is applied by a read"); },
+      };
+    }
+
+    it("names the records the provider publishes that the internal view does not answer for", async () => {
+      const zones = new InMemoryZoneRepository();
+      const service = new ControlPlane(zones, new InMemoryStatusRepository(), providerWith([
+        { name: "@", type: "NS", content: "ns1.provider.example", ttl: 300 },
+        { name: "@", type: "MX", content: "10 mx.example.com", ttl: 300 },
+        { name: "@", type: "TXT", content: "\"v=spf1 -all\"", ttl: 300 },
+        { name: "_dmarc", type: "TXT", content: "\"v=DMARC1; p=none\"", ttl: 300 },
+        { name: "WWW", type: "A", content: "8.8.8.8", ttl: 300 },
+        { name: "api", type: "A", content: "8.8.8.9", ttl: 300 },
+      ]));
+      await service.createZone("example.com");
+      await service.upsertRecord("example.com", "external", "www", { name: "www", type: "A", content: "8.8.8.8", ttl: 300 });
+      await service.upsertRecord("example.com", "internal", "mx", { name: "@", type: "MX", content: "10 mx.internal.example.com", ttl: 300 });
+
+      assert.deepEqual(await service.providerOnlyRecords("example.com"), [
+        { name: "_dmarc", type: "TXT" },
+        { name: "@", type: "TXT" },
+        { name: "api", type: "A" },
+      ]);
+    });
+
+    it("skips the apex NS, which names the provider's servers and is never inherited", async () => {
+      const service = new ControlPlane(new InMemoryZoneRepository(), new InMemoryStatusRepository(), providerWith([
+        { name: "@", type: "NS", content: "ns1.provider.example", ttl: 300 },
+      ]));
+      await service.createZone("example.com");
+      assert.deepEqual(await service.providerOnlyRecords("example.com"), []);
+    });
+
+    it("lets a provider that cannot be read say so", async () => {
+      const service = new ControlPlane(new InMemoryZoneRepository(), new InMemoryStatusRepository(), {
+        list: async () => { throw new ProviderNotConfiguredError("no provider is configured for example.com/external"); },
+        apply: async () => undefined,
+      });
+      await service.createZone("example.com");
+      await assert.rejects(() => service.providerOnlyRecords("example.com"), ProviderNotConfiguredError);
+    });
+  });
 });

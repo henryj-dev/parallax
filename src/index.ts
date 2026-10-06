@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "./config.ts";
+import { createDriftMonitor } from "./dns/drift.ts";
 import { createDnsServer, type ServedZone } from "./dns/server.ts";
 import { servedZones } from "./dns/snapshot.ts";
 import { PORTAL_ASSETS } from "./http/portal-assets.ts";
@@ -17,7 +18,7 @@ import { createReadinessMonitor } from "./http/readiness.ts";
 import { redirectLocation } from "./http/redirect.ts";
 import { gauge, render as renderMetrics } from "./observability/metrics.ts";
 import {
-  certificateReloadFailed, notifyFailed, recordUnservable, refreshFailed, replyUnanswerable, zoneSkipped,
+  certificateReloadFailed, dnsDriftCheckFailed, notifyFailed, recordUnservable, refreshFailed, replyUnanswerable, zoneSkipped,
 } from "./observability/signals.ts";
 import { createRuntime, type ParallaxRuntime } from "./runtime.ts";
 import { authenticate, withIdentityProvider, type SecurityConfig } from "./security/http-authorization.ts";
@@ -500,6 +501,9 @@ if (config.dns) {
     zones: () => dnsSnapshot,
     forwardTo: dnsConfig.forwardTo,
     forwardAllow: dnsConfig.forwardAllow,
+    fallbackZones: dnsConfig.fallbackZones,
+    fallbackExclude: dnsConfig.fallbackExclude,
+    forwardDeny: dnsConfig.forwardDeny,
     transferAllow: dnsConfig.transferAllow,
     ...(dnsConfig.notifyTo ? { notifyTo: dnsConfig.notifyTo } : {}),
     tsigKeys: dnsConfig.tsigKeys,
@@ -553,6 +557,33 @@ if (config.dns) {
   } catch (error) {
     console.error(`parallax: could not bind the DNS port: ${error instanceof Error ? error.message : "unknown error"}`);
     process.exit(1);
+  }
+  if (dnsConfig.fallbackZones.length > 0) {
+    console.log(`parallax: empty answers in ${dnsConfig.fallbackZones.join(", ")} are asked of the upstream first`);
+  }
+  // Counts the records a provider publishes that the zones answered here do
+  // not hold (`src/dns/drift.ts`). Only the zones this listener serves: a zone
+  // it does not serve is forwarded whole, so it has no gap to count.
+  if (dnsConfig.driftIntervalMs > 0) {
+    const drift = createDriftMonitor({
+      zones: () => dnsSnapshot.map((zone) => zone.name),
+      providerOnly: (zone) => controlPlane.providerOnlyRecords(zone),
+      onFailure: (zone) => {
+        dnsDriftCheckFailed();
+        console.warn(`parallax: could not read the provider for ${zone}; its provider-only count is from the last pass that could`);
+      },
+      log: (line) => console.warn(line),
+    });
+    gauge(
+      "parallax_dns_provider_only_records",
+      "Provider records the internal view of a served zone does not answer for, summed over zones.",
+      () => drift.total(),
+    );
+    const checkDrift = (): void => {
+      drift.runOnce().catch(() => { dnsDriftCheckFailed(); });
+    };
+    checkDrift();
+    setInterval(checkDrift, dnsConfig.driftIntervalMs).unref();
   }
 }
 

@@ -323,6 +323,10 @@ and the defaults are the careful ones.
 | `PARALLAX_DNS_HOST` | Defaults to `HOST`, then to `127.0.0.1` |
 | `PARALLAX_DNS_FORWARD_TO` | Upstreams for names outside every zone. Empty answers `REFUSED` |
 | `PARALLAX_DNS_FORWARD_ALLOW` | Client CIDRs allowed to recurse. Defaults to loopback — and is **required** if the listener is not loopback and forwarding is on |
+| `PARALLAX_DNS_FALLBACK_ZONES` | Zones whose empty answers (NXDOMAIN, or NODATA) are asked of the upstream before being given. Off when empty. Never for a name with an internal override, a client outside `FORWARD_ALLOW`, a signed query, or a name under `FALLBACK_EXCLUDE`; an upstream that fails leaves the local answer. The upstream's negative TTL is capped at the local one |
+| `PARALLAX_DNS_FALLBACK_EXCLUDE` | Names that, with everything below them, never fall back — subtrees that exist only inside. Each must lie in a fallback zone |
+| `PARALLAX_DNS_FORWARD_DENY` | Addresses an upstream may never be or resolve to: the resolvers that forward back here (gateway, cluster DNS, this listener's service address). **Required** with `FALLBACK_ZONES` |
+| `PARALLAX_DNS_DRIFT_INTERVAL_MS` | How often to count records the provider publishes that a served zone's internal view does not answer for (`parallax_dns_provider_only_records`, names in the log). Default 900000; `0` is off |
 | `PARALLAX_DNS_TRANSFER_ALLOW` | Client CIDRs allowed `AXFR` and `IXFR`. **Defaults to deny all** |
 | `PARALLAX_DNS_TSIG_KEYS` | `name:algorithm:base64secret`, comma-separated. Setting any key makes a valid TSIG signature **required** for `AXFR`; `hmac-sha256`/`hmac-sha512` only |
 | `PARALLAX_DNS_NOTIFY_TO` | Hosts that get NOTIFY when a served zone's serial rises. `host`, `host:port`, or `host:port#keyname` to sign it |

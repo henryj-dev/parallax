@@ -70,6 +70,14 @@ export interface DnsListenerSettings {
   readonly forwardTo: readonly string[];
   /** Client networks allowed to use those upstreams. */
   readonly forwardAllow: readonly string[];
+  /** Zones whose empty answers are asked of `forwardTo` first. Empty is off. */
+  readonly fallbackZones: readonly string[];
+  /** Names, with everything below them, that never fall back. Each lies inside a fallback zone. */
+  readonly fallbackExclude: readonly string[];
+  /** Addresses an upstream may never be or resolve to -- resolvers that forward back here. */
+  readonly forwardDeny: readonly string[];
+  /** How often provider-only records are counted. 0 turns the check off. */
+  readonly driftIntervalMs: number;
   /** Client networks allowed to transfer a complete zone over TCP. Empty denies all transfers. */
   readonly transferAllow: readonly string[];
   /**
@@ -268,6 +276,17 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     environment.PARALLAX_DNS_TRANSFER_ALLOW ?? "",
     "PARALLAX_DNS_TRANSFER_ALLOW",
   );
+  const forwardDeny = (environment.PARALLAX_DNS_FORWARD_DENY ?? "")
+    .split(",")
+    .map((address) => address.trim().toLowerCase())
+    .filter((address) => address.length > 0);
+  for (const address of forwardDeny) {
+    if (isIP(address) === 0) throw new Error(`PARALLAX_DNS_FORWARD_DENY must list addresses, not names: ${address}`);
+  }
+  const fallbackZones = readDnsNameList(environment.PARALLAX_DNS_FALLBACK_ZONES, "PARALLAX_DNS_FALLBACK_ZONES");
+  const fallbackExclude = readDnsNameList(environment.PARALLAX_DNS_FALLBACK_EXCLUDE, "PARALLAX_DNS_FALLBACK_EXCLUDE");
+  assertFallbackIsBounded(fallbackZones, fallbackExclude, forwardTo, forwardDeny);
+  assertNoForwardLoop(forwardTo, forwardDeny, host, readPort(port, "PARALLAX_DNS_PORT"));
   const soaPrimary = readDnsName(environment.PARALLAX_DNS_SOA_PRIMARY, "PARALLAX_DNS_SOA_PRIMARY");
   const soaMailbox = readDnsName(environment.PARALLAX_DNS_SOA_MAILBOX, "PARALLAX_DNS_SOA_MAILBOX");
   const tsigKeys = (environment.PARALLAX_DNS_TSIG_KEYS ?? "")
@@ -291,6 +310,10 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
     port: readPort(port, "PARALLAX_DNS_PORT"),
     forwardTo,
     forwardAllow,
+    fallbackZones,
+    fallbackExclude,
+    forwardDeny,
+    driftIntervalMs: readDriftInterval(environment.PARALLAX_DNS_DRIFT_INTERVAL_MS),
     transferAllow,
     ...(notifyTo.length > 0 ? { notifyTo } : {}),
     tsigKeys,
@@ -384,6 +407,87 @@ function readDnsName(value: string | undefined, setting: string): string | undef
     && name.split(".").every((label) => /^(?!-)[a-z0-9_-]{1,63}(?<!-)$/u.test(label));
   if (!valid) throw new Error(`${setting} must be a fully-qualified domain name`);
   return name;
+}
+
+/** Default 15 minutes: one provider read per served zone, well inside any API budget. */
+const DEFAULT_DRIFT_INTERVAL_MS = 15 * 60 * 1000;
+
+function readDriftInterval(value: string | undefined): number {
+  const raw = value?.trim();
+  if (!raw) return DEFAULT_DRIFT_INTERVAL_MS;
+  const parsed = Number(raw);
+  // Zero is off. Anything under a minute is a provider API loop, not a check.
+  if (!Number.isSafeInteger(parsed) || (parsed !== 0 && (parsed < 60_000 || parsed > 86_400_000))) {
+    throw new Error("PARALLAX_DNS_DRIFT_INTERVAL_MS must be 0 (off) or between 60000 and 86400000");
+  }
+  return parsed;
+}
+
+function readDnsNameList(value: string | undefined, setting: string): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((entry) => readDnsName(entry, setting))
+    .filter((name): name is string => name !== undefined);
+}
+
+/**
+ * The fallback is a hole in split-horizon on purpose, so every way of opening
+ * it wider than meant is refused before the listener binds:
+ * - with nowhere to fall back to, the setting would read as on and do nothing;
+ * - without a deny list, nothing stands between an upstream and a resolver
+ *   that sends its own misses back here (the gateway, the cluster DNS, this
+ *   process's own service address) -- a loop that every miss would walk;
+ * - an exclusion outside every fallback zone excludes nothing, which is what a
+ *   typo in the one name meant to keep internal names internal looks like.
+ */
+function assertFallbackIsBounded(
+  zones: readonly string[],
+  exclude: readonly string[],
+  forwardTo: readonly string[],
+  deny: readonly string[],
+): void {
+  if (zones.length === 0) {
+    if (exclude.length > 0) throw new Error("PARALLAX_DNS_FALLBACK_EXCLUDE has nothing to exclude from without PARALLAX_DNS_FALLBACK_ZONES");
+    return;
+  }
+  if (forwardTo.length === 0) throw new Error("PARALLAX_DNS_FALLBACK_ZONES needs PARALLAX_DNS_FORWARD_TO to fall back to");
+  if (deny.length === 0) {
+    throw new Error(
+      "PARALLAX_DNS_FALLBACK_ZONES needs PARALLAX_DNS_FORWARD_DENY naming every resolver that forwards back here"
+      + " (the gateway, the cluster DNS, this listener's own service address)",
+    );
+  }
+  for (const name of exclude) {
+    if (!zones.some((zone) => name === zone || name.endsWith(`.${zone}`))) {
+      throw new Error(`PARALLAX_DNS_FALLBACK_EXCLUDE names ${name}, which is in no PARALLAX_DNS_FALLBACK_ZONES zone`);
+    }
+  }
+}
+
+/**
+ * Refuses an upstream that is this listener, or a resolver named as forwarding
+ * back to it. Checked for every deployment that forwards, not only one that
+ * falls back -- a self-loop was possible before the fallback existed, it is
+ * just that nothing used to send in-zone misses into it.
+ *
+ * Loopback on another port is a legitimate upstream (a local unbound), so only
+ * the listener's own port counts as "this listener".
+ */
+function assertNoForwardLoop(forwardTo: readonly string[], deny: readonly string[], host: string, port: number): void {
+  const listenerAddresses = new Set([host.toLowerCase()]);
+  if (isLoopbackHost(host) || host === "0.0.0.0" || host === "::") {
+    for (const address of ["127.0.0.1", "localhost", "::1", "0.0.0.0", "::"]) listenerAddresses.add(address);
+  }
+  for (const upstream of forwardTo) {
+    const [upstreamHost, upstreamPort] = upstream.split("#") as [string, string | undefined];
+    const address = upstreamHost.replace(/^\[|\]$/gu, "").toLowerCase();
+    if (deny.includes(address)) {
+      throw new Error(`PARALLAX_DNS_FORWARD_TO names ${upstream}, which PARALLAX_DNS_FORWARD_DENY says forwards back here`);
+    }
+    if (listenerAddresses.has(address) && Number(upstreamPort ?? "53") === port) {
+      throw new Error(`PARALLAX_DNS_FORWARD_TO names ${upstream}, which is this listener`);
+    }
+  }
 }
 
 function readDnsClientCidrs(source: string, setting: string): string[] {
