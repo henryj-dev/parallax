@@ -2450,8 +2450,20 @@ describe("DNS server", () => {
 
     it("does not relay to an upstream that resolves to a denied address", async () => {
       const upstream = await countingUpstream((message) => forwardedReply(message, [0xba, 0xad]));
+      // Denied from the start: the listener does not come up at all.
+      const refused = createDnsServer({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], forwardDeny: ["127.0.0.1"] });
+      closers.push(() => refused.close());
+      const unusedPort = await pickPort("127.0.0.1", { udp: true });
+      await assert.rejects(() => refused.listen(unusedPort, "127.0.0.1"), /forwards back here/u);
+      // Allowed at startup, denied once the name has come to resolve there.
+      let lookups = 0;
+      const resolveHost = async (host: string): Promise<ResolvedDnsAddress> => {
+        if (host !== "upstream.test") return { address: host, family: 4 };
+        lookups += 1;
+        return lookups === 1 ? { address: "192.0.2.1", family: 4 } : { address: "127.0.0.1", family: 4 };
+      };
       const { port } = await start({
-        zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"], forwardDeny: ["127.0.0.1"],
+        zones: () => [ZONE], forwardTo: [`upstream.test#${upstream.port}`], fallbackZones: ["example.com"], forwardDeny: ["127.0.0.1"], resolveHost,
       });
       assert.equal(rcodeOf(await ask(port, buildQuery("outside.example.org", TYPE.A))), RCODE.SERVFAIL, "out of zone: no other upstream");
       assert.equal(rcodeOf(await ask(port, buildQuery("absent.example.com", TYPE.A))), RCODE.NXDOMAIN, "in zone: the local answer stands");
@@ -2512,6 +2524,26 @@ describe("DNS server", () => {
       }
     });
 
+    /** Round-2 review: BADVERS lives half in the header and half in OPT, and the header half is 0. */
+    it("keeps the local answer when the upstream's extended RCODE is an error", async () => {
+      const upstream = await countingUpstream((message) => {
+        const header = Buffer.from(message.subarray(0, 12));
+        header.writeUInt16BE(0x8180, 2);
+        header.writeUInt16BE(0, 6);
+        header.writeUInt16BE(0, 8);
+        header.writeUInt16BE(1, 10);
+        const questionEnd = readName(message, 12).offset + 4;
+        // OPT: root owner, type 41, class = UDP size, TTL = extended RCODE 1 (BADVERS = 16), version 0.
+        const opt = Buffer.of(0, 0, 41, 0x10, 0x00, 1, 0, 0, 0, 0, 0);
+        return Buffer.concat([header, message.subarray(12, questionEnd), opt]);
+      });
+      const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"] });
+      const reply = received(await ask(port, buildQuery("absent.example.com", TYPE.A)));
+      assert.equal(rcodeOf(reply), RCODE.NXDOMAIN, "BADVERS is not an answer");
+      assert.equal(aa(reply), true);
+      assert.deepEqual(upstream.asked, ["absent.example.com"]);
+    });
+
     it("gives up on silent upstreams inside the TCP idle timeout, and still answers", async () => {
       // Silent on TCP as well: a TCP query is relayed over TCP, and an upstream
       // with nothing listening there refuses at once -- which is fast, and
@@ -2564,10 +2596,26 @@ describe("DNS server", () => {
       assert.deepEqual(authority[2]?.data, rrsigNsec);
     });
 
-    it("refuses at run time an upstream that is this listener, without waiting out the timeout", async () => {
+    it("refuses to start with an upstream that resolves to this listener", async () => {
+      await onFreshPort("127.0.0.1", async (candidate) => {
+        const server = createDnsServer({ zones: () => [ZONE], forwardTo: [`localhost#${candidate}`] });
+        closers.push(() => server.close());
+        await assert.rejects(() => server.listen(candidate, "127.0.0.1"), /which is this listener/u);
+        return undefined;
+      });
+    });
+
+    it("refuses at run time an upstream that has come to resolve to this listener", async () => {
+      // Elsewhere at startup, here later: the per-query check is what catches it.
+      let lookups = 0;
+      const resolveHost = async (host: string): Promise<ResolvedDnsAddress> => {
+        if (host !== "upstream.test") return { address: host, family: 4 };
+        lookups += 1;
+        return lookups === 1 ? { address: "192.0.2.1", family: 4 } : { address: "127.0.0.1", family: 4 };
+      };
       const { port } = await onFreshPort("127.0.0.1", async (candidate) => {
         const server = createDnsServer({
-          zones: () => [ZONE], forwardTo: [`localhost#${candidate}`], forwardTimeoutMs: 1500,
+          zones: () => [ZONE], forwardTo: [`upstream.test#${candidate}`], forwardTimeoutMs: 1500, resolveHost,
         });
         await server.listen(candidate, "127.0.0.1");
         closers.push(() => server.close());

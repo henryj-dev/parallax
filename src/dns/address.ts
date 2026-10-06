@@ -13,6 +13,11 @@ import { isIP } from "node:net";
 export function canonicalAddress(value: string): string {
   const bare = value.trim().replace(/^\[|\]$/gu, "").toLowerCase();
   if (isIP(bare) !== 6) return bare;
+  // A zone id (`fe80::1%en0`) is part of a link-local address and not something
+  // the URL parser accepts; it is kept, and only the address before it is
+  // compressed.
+  const zone = bare.indexOf("%");
+  if (zone >= 0) return `${canonicalAddress(bare.slice(0, zone))}${bare.slice(zone)}`;
   const compressed = new URL(`http://[${bare}]`).hostname.slice(1, -1);
   const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/u.exec(compressed);
   if (!mapped) return compressed;

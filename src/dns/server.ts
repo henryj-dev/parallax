@@ -228,12 +228,15 @@ export function createDnsServer(options: DnsServerOptions): {
    * including a hostname that resolves here and an interface address behind a
    * wildcard listener.
    */
-  let self: { port: number; addresses: ReadonlySet<string>; loopback: boolean } | undefined;
+  let self: { port: number; bound: ReadonlySet<string>; wildcard: boolean; loopback: boolean } | undefined;
   const refusedUpstream = (address: string, port: number): boolean => {
     const canonical = canonicalAddress(address);
     if (forwardDeny.has(canonical)) return true;
     if (!self || port !== self.port) return false;
-    return self.addresses.has(canonical) || (self.loopback && isLoopbackAddress(canonical));
+    if (self.bound.has(canonical) || (self.loopback && isLoopbackAddress(canonical))) return true;
+    // A wildcard listener answers on whatever addresses the host has *now*, not
+    // the ones it had when it bound -- an address added later is still us.
+    return self.wildcard && interfaceAddresses().has(canonical);
   };
   /**
    * Whether an empty answer from `zone` may be asked of the upstream instead.
@@ -540,7 +543,7 @@ export function createDnsServer(options: DnsServerOptions): {
       // Only an answer replaces ours. An upstream that says SERVFAIL or REFUSED
       // has not answered the question, and relaying that would turn a local
       // "no such record" into a failure the client did not have before.
-      const answered = upstream !== undefined && UPSTREAM_ANSWERS.has(upstream.readUInt16BE(2) & 0x000f);
+      const answered = upstream !== undefined && UPSTREAM_ANSWERS.has(fullRcode(upstream));
       dnsFallback({ outcome: answered ? "relayed" : "local" });
       if (answered) return [capNegativeTtl(upstream, negativeTtl)];
     }
@@ -755,13 +758,25 @@ export function createDnsServer(options: DnsServerOptions): {
     async listen(port, host) {
       const bindings = await bindAddresses(host, resolveHost);
       const wildcard = isWildcardListener(host);
-      const addresses = new Set(bindings.map((binding) => canonicalAddress(binding.address)));
-      if (wildcard) {
-        for (const entries of Object.values(networkInterfaces())) {
-          for (const entry of entries ?? []) addresses.add(canonicalAddress(entry.address));
+      self = {
+        port,
+        bound: new Set(bindings.map((binding) => canonicalAddress(binding.address))),
+        wildcard,
+        loopback: wildcard || isLoopbackAddress(host),
+      };
+      // Refused before binding, so a deployment whose upstream is this listener
+      // never starts. The configuration check sees spellings; this resolves them,
+      // which is the only way to catch a hostname or an interface address that
+      // is this listener. A name that cannot be resolved now is left to the
+      // per-query check -- refusing to start over a resolver outage would be a
+      // new way to take the listener down.
+      for (const upstream of forwardTo) {
+        const [upstreamHost, upstreamPort] = splitUpstream(upstream);
+        const resolved = await resolveHost(upstreamHost).catch(() => undefined);
+        if (resolved && refusedUpstream(resolved.address, upstreamPort)) {
+          throw new Error(`forwardTo ${upstream} resolves to ${resolved.address}, which is this listener or a resolver that forwards back here`);
         }
       }
-      self = { port, addresses, loopback: wildcard || isLoopbackAddress(host) };
       for (const binding of bindings) {
         const udp = createSocket({
           type: binding.family === 6 ? "udp6" : "udp4",
@@ -1406,6 +1421,40 @@ function overrideCovers(zone: ServedZone, name: string): boolean {
 
 /** The upstream RCODEs that are answers: anything else leaves the local one standing. */
 const UPSTREAM_ANSWERS: ReadonlySet<number> = new Set([RCODE.NOERROR, RCODE.NXDOMAIN]);
+
+/**
+ * The whole RCODE: the header's four bits, extended by the OPT record's eight
+ * (RFC 6891 §6.1.3). Read from the header alone, BADVERS (16) is a 0 -- an
+ * error that looks like NOERROR and would replace the local answer. Anything
+ * that cannot be walked is -1, which no caller accepts.
+ */
+function fullRcode(reply: Buffer): number {
+  try {
+    const low = reply.readUInt16BE(2) & 0x000f;
+    const counts = [reply.readUInt16BE(6), reply.readUInt16BE(8), reply.readUInt16BE(10)];
+    let offset = 12;
+    for (let index = 0; index < reply.readUInt16BE(4); index += 1) offset = readName(reply, offset).offset + 4;
+    const records = (counts[0] as number) + (counts[1] as number);
+    for (let index = 0; index < records + (counts[2] as number); index += 1) {
+      offset = readName(reply, offset).offset;
+      const type = reply.readUInt16BE(offset);
+      if (index >= records && type === TYPE.OPT) return (reply.readUInt8(offset + 4) << 4) | low;
+      offset += 10 + reply.readUInt16BE(offset + 8);
+    }
+    return low;
+  } catch {
+    return -1;
+  }
+}
+
+/** Every address on this host's interfaces, read when asked. */
+function interfaceAddresses(): ReadonlySet<string> {
+  const addresses = new Set<string>();
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries ?? []) addresses.add(canonicalAddress(entry.address));
+  }
+  return addresses;
+}
 
 /** `work`, or undefined once `ms` has passed. The work itself goes on and frees its slot when done. */
 function withinBudget<T>(work: Promise<T | undefined>, ms: number): Promise<T | undefined> {
