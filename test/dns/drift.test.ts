@@ -17,7 +17,7 @@ describe("provider-only check", () => {
         if (answer instanceof Error) throw answer;
         return answer ?? [];
       },
-      onFailure: (zone) => failures.push(zone),
+      onFailure: (zone, _error, repeated) => failures.push(repeated ? `${zone} again` : zone),
       log: (line) => lines.push(line),
     });
     return { drift, lines, failures };
@@ -60,6 +60,34 @@ describe("provider-only check", () => {
     await drift.runOnce();
     assert.equal(drift.total(), 1, "the last number that was true, not a zero that is not");
     assert.deepEqual(failures, ["example.com"]);
+  });
+
+  it("says a repeated failure is repeated, so it can be said once", async () => {
+    const { drift, failures } = monitor(new Map([["example.com", new Error("down")]]));
+    await drift.runOnce();
+    await drift.runOnce();
+    assert.deepEqual(failures, ["example.com", "example.com again"]);
+  });
+
+  /** Round-1 review: an older pass finishing last set the count back. */
+  it("does not start a pass while one is still running", async () => {
+    let release: () => void = () => undefined;
+    let calls = 0;
+    const drift = createDriftMonitor({
+      zones: () => ["example.com"],
+      providerOnly: async () => {
+        calls += 1;
+        await new Promise<void>((resolve) => { release = resolve; });
+        return [];
+      },
+      onFailure: () => undefined,
+      log: () => undefined,
+    });
+    const first = drift.runOnce();
+    await drift.runOnce();
+    release();
+    await first;
+    assert.equal(calls, 1);
   });
 
   it("forgets a zone that is no longer served", async () => {

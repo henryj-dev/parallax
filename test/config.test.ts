@@ -301,6 +301,35 @@ describe("configuration", () => {
       assert.deepEqual(readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_TO: "127.0.0.1#5300" }).dns?.forwardTo, ["127.0.0.1#5300"]);
     });
 
+    /** ★Round-1 review: the checks compared spellings, and an address has many. */
+    it("compares addresses, not spellings", () => {
+      assert.throws(
+        () => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_DENY: "2001:db8::10", PARALLAX_DNS_FORWARD_TO: "[2001:0db8:0:0:0:0:0:10]" }),
+        /forwards back here/u,
+      );
+      assert.throws(
+        () => readConfig({ ...FALLING_BACK, PARALLAX_DNS_FORWARD_DENY: "::ffff:10.0.0.1", PARALLAX_DNS_FORWARD_TO: "10.0.0.1" }),
+        /forwards back here/u,
+      );
+      for (const [listener, upstream] of [
+        ["0.0.0.0", "[0:0:0:0:0:0:0:1]#5353"],
+        ["*", "127.0.0.1#5353"],
+        ["[::]", "127.0.0.1#5353"],
+        ["0.0.0.0", "127.0.0.2#5353"],
+      ]) {
+        assert.throws(
+          () => readConfig({ ...FALLING_BACK, PARALLAX_DNS_HOST: listener, PARALLAX_DNS_FORWARD_TO: upstream }),
+          /which is this listener/u,
+          `${listener} / ${upstream}`,
+        );
+      }
+      // A listener on one specific address does not own loopback.
+      assert.deepEqual(
+        readConfig({ ...FALLING_BACK, PARALLAX_DNS_HOST: "10.0.0.5", PARALLAX_DNS_FORWARD_TO: "127.0.0.1#5353" }).dns?.forwardTo,
+        ["127.0.0.1#5353"],
+      );
+    });
+
     it("refuses this listener as its own upstream even without the fallback", () => {
       assert.throws(
         () => readConfig({ PARALLAX_DNS_PORT: "53", PARALLAX_DNS_FORWARD_TO: "127.0.0.1" }),

@@ -14,6 +14,7 @@ import {
   TSIG_ERROR, parseTsigKey, readTsig, signRequest, verifyTsig,
 } from "../../src/dns/tsig.ts";
 import { RCODE, TYPE, readName } from "../../src/dns/wire.ts";
+import { render as renderMetrics } from "../../src/observability/metrics.ts";
 import { shutdownProcess } from "../../src/shutdown.ts";
 import { freePort as pickPort } from "../support/ports.ts";
 
@@ -2315,13 +2316,21 @@ describe("DNS server", () => {
       return (reply.readUInt16BE(2) & 0x0400) !== 0;
     }
 
+    /** One labelled series out of the process registry; absent reads as 0. */
+    function series(name: string, label: string): number {
+      const match = new RegExp(`^${name}\\{[^}]*${label}[^}]*\\} (\\d+)$`, "mu").exec(renderMetrics());
+      return match ? Number(match[1]) : 0;
+    }
+
     it("asks the upstream for a name the zone does not hold, and gives its answer", async () => {
       const upstream = await countingUpstream((message) => forwardedReply(message, [0xfa, 0x11]));
       const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"], forwardDeny: ["10.0.0.1"] });
+      const relayedBefore = series("parallax_dns_fallback_total", 'outcome="relayed"');
       const reply = received(await ask(port, buildQuery("absent.example.com", TYPE.A)));
       assert.deepEqual(upstream.asked, ["absent.example.com"]);
       assert.equal(reply.subarray(-2).toString("hex"), "fa11", "the upstream's bytes, not ours");
       assert.equal(aa(reply), false);
+      assert.equal(series("parallax_dns_fallback_total", 'outcome="relayed"'), relayedBefore + 1, "counted, end to end");
     });
 
     it("asks the upstream for a type the name does not hold", async () => {
@@ -2447,6 +2456,128 @@ describe("DNS server", () => {
       assert.equal(rcodeOf(await ask(port, buildQuery("outside.example.org", TYPE.A))), RCODE.SERVFAIL, "out of zone: no other upstream");
       assert.equal(rcodeOf(await ask(port, buildQuery("absent.example.com", TYPE.A))), RCODE.NXDOMAIN, "in zone: the local answer stands");
       assert.deepEqual(upstream.asked, [], "a resolver that forwards back here is never asked");
+    });
+
+    /**
+     * ★Round-1 review: an override wildcard answers names below it, so their
+     * missing types are its negatives too. `*.private A 10.0.0.5` gives
+     * `host.private` a private A; its AAAA must not come from outside.
+     */
+    it("★never falls back under an override wildcard, or above an overridden name", async () => {
+      const zone: ServedZone = {
+        ...EXAMPLE,
+        records: [
+          ...EXAMPLE.records,
+          { name: "*.private", type: "A", content: "10.0.0.5", ttl: 60 },
+          { name: "host.inside", type: "A", content: "10.0.0.6", ttl: 60 },
+        ],
+        overrideNames: new Set(["*.private", "host.inside"]),
+      };
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xba, 0xad]));
+      const { port } = await start({ zones: () => [zone], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"] });
+      const viaWildcard = received(await ask(port, buildQuery("host.private.example.com", TYPE.AAAA)));
+      assert.equal(aa(viaWildcard), true, "the wildcard's negative, answered here");
+      const deeper = received(await ask(port, buildQuery("a.b.private.example.com", TYPE.AAAA)));
+      assert.equal(aa(deeper), true);
+      const above = received(await ask(port, buildQuery("inside.example.com", TYPE.A)));
+      assert.equal(aa(above), true, "the empty non-terminal over an internal host is not asked about outside");
+      assert.deepEqual(upstream.asked, []);
+    });
+
+    it("does not fall back on an NXDOMAIN that carries this zone's CNAME", async () => {
+      const zone: ServedZone = {
+        ...EXAMPLE,
+        records: [...EXAMPLE.records, { name: "dangling", type: "CNAME", content: "nowhere.example.com", ttl: 60 }],
+      };
+      const upstream = await countingUpstream((message) => forwardedReply(message, [0xba, 0xad]));
+      const { port } = await start({ zones: () => [zone], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"] });
+      const reply = received(await ask(port, buildQuery("dangling.example.com", TYPE.A)));
+      assert.equal(rcodeOf(reply), RCODE.NXDOMAIN);
+      assert.equal(readAnswers(reply).length, 1, "the CNAME this zone holds is the answer");
+      assert.deepEqual(upstream.asked, []);
+    });
+
+    it("keeps the local answer when the upstream answers SERVFAIL or REFUSED", async () => {
+      for (const rcode of [RCODE.SERVFAIL, RCODE.REFUSED]) {
+        const upstream = await countingUpstream((message) => {
+          const reply = Buffer.from(message);
+          reply.writeUInt16BE(0x8180 | rcode, 2);
+          return reply;
+        });
+        const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"] });
+        const reply = received(await ask(port, buildQuery("absent.example.com", TYPE.A)));
+        assert.equal(rcodeOf(reply), RCODE.NXDOMAIN, `an upstream ${rcode} is not an answer`);
+        assert.equal(aa(reply), true);
+        assert.deepEqual(upstream.asked, ["absent.example.com"]);
+      }
+    });
+
+    it("gives up on silent upstreams inside the TCP idle timeout, and still answers", async () => {
+      // Silent on TCP as well: a TCP query is relayed over TCP, and an upstream
+      // with nothing listening there refuses at once -- which is fast, and
+      // would make this pass without the budget it exists to test.
+      const held: Socket[] = [];
+      const hold = (connection: Socket): void => { held.push(connection); };
+      const silentOne = await bothTransportsOn(hold);
+      const silentTwo = await bothTransportsOn(hold);
+      closers.push(async () => {
+        for (const connection of held) connection.destroy();
+        for (const upstream of [silentOne, silentTwo]) {
+          upstream.socket.close();
+          await new Promise<void>((resolve) => upstream.server.close(() => resolve()));
+        }
+      });
+      const { port } = await start({
+        zones: () => [ZONE],
+        forwardTo: [`127.0.0.1#${silentOne.port}`, `127.0.0.1#${silentTwo.port}`],
+        fallbackZones: ["example.com"],
+        forwardTimeoutMs: 1500,
+        tcpIdleTimeoutMs: 1000,
+      });
+      const startedAt = Date.now();
+      // Two silent upstreams at 1.5s each would be 3s -- three idle timeouts.
+      const reply = await askOverTcp(port, buildQuery("absent.example.com", TYPE.A), false, "127.0.0.1", 5_000);
+      assert.equal(rcodeOf(reply), RCODE.NXDOMAIN, "the local answer arrived before the connection was closed");
+      assert.ok(Date.now() - startedAt < 1000, `answered within the idle timeout (${Date.now() - startedAt}ms)`);
+    });
+
+    it("caps the NSEC proof and its RRSIG with the SOA", async () => {
+      const nsecRdata = Buffer.concat([encodeName("zzz.example.com"), Buffer.of(0, 6, 0x40, 0, 0, 0, 0, 3)]);
+      const rrsigNsec = Buffer.concat([Buffer.of(0, 47), RRSIG_RDATA.subarray(2)]);
+      const upstream = await countingUpstream((message) => {
+        const base = negativeReply(message, RCODE.NXDOMAIN, false);
+        base.writeUInt16BE(3, 8);
+        const record = (type: number, rdata: Buffer): Buffer => {
+          const fixed = Buffer.alloc(10);
+          fixed.writeUInt16BE(type, 0);
+          fixed.writeUInt16BE(1, 2);
+          fixed.writeUInt32BE(SOA_TTL, 4);
+          fixed.writeUInt16BE(rdata.length, 8);
+          return Buffer.concat([encodeName("absent.example.com"), fixed, rdata]);
+        };
+        return Buffer.concat([base, record(47, nsecRdata), record(46, rrsigNsec)]);
+      });
+      const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"], negativeTtl: 60 });
+      const authority = readAuthority(received(await ask(port, buildQuery("absent.example.com", TYPE.A))));
+      assert.deepEqual(authority.map((record) => [record.type, record.ttl]), [[TYPE.SOA, 60], [47, 60], [46, 60]]);
+      assert.deepEqual(authority[1]?.data, nsecRdata, "the proof itself is byte for byte");
+      assert.deepEqual(authority[2]?.data, rrsigNsec);
+    });
+
+    it("refuses at run time an upstream that is this listener, without waiting out the timeout", async () => {
+      const { port } = await onFreshPort("127.0.0.1", async (candidate) => {
+        const server = createDnsServer({
+          zones: () => [ZONE], forwardTo: [`localhost#${candidate}`], forwardTimeoutMs: 1500,
+        });
+        await server.listen(candidate, "127.0.0.1");
+        closers.push(() => server.close());
+        return { port: candidate };
+      });
+      // Timing cannot tell the two apart: a self-loop also ends fast, once the
+      // forwarding slots fill with copies of itself. The refusal is counted.
+      const loopsBefore = series("parallax_dns_forward_failures_total", 'reason="loop"');
+      assert.equal(rcodeOf(await ask(port, buildQuery("outside.example.org", TYPE.A), 4000)), RCODE.SERVFAIL);
+      assert.equal(series("parallax_dns_forward_failures_total", 'reason="loop"'), loopsBefore + 1, "refused as this listener");
     });
 
     it("leaves a positive local answer and the out-of-zone relay as they were", async () => {

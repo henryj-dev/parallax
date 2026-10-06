@@ -568,9 +568,11 @@ if (config.dns) {
     const drift = createDriftMonitor({
       zones: () => dnsSnapshot.map((zone) => zone.name),
       providerOnly: (zone) => controlPlane.providerOnlyRecords(zone),
-      onFailure: (zone) => {
+      onFailure: (zone, _error, repeated) => {
         dnsDriftCheckFailed();
-        console.warn(`parallax: could not read the provider for ${zone}; its provider-only count is from the last pass that could`);
+        if (!repeated) {
+          console.warn(`parallax: could not read the provider for ${zone}; its provider-only count is from the last pass that could`);
+        }
       },
       log: (line) => console.warn(line),
     });

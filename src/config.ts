@@ -1,5 +1,6 @@
 import { isIP } from "node:net";
 import { isStrongBootstrapToken } from "./application/access-tokens.ts";
+import { canonicalAddress, isLoopbackAddress, isWildcardListener } from "./dns/address.ts";
 import { parseTsigKey, type TsigKey } from "./dns/tsig.ts";
 import { isPortalSignIn, PORTAL_SIGN_IN, type PortalSignIn } from "./http/portal-entry.ts";
 import type { Role, TokenRecord } from "./security/http-authorization.ts";
@@ -278,11 +279,12 @@ function readDnsListener(environment: NodeJS.ProcessEnv): DnsListenerSettings | 
   );
   const forwardDeny = (environment.PARALLAX_DNS_FORWARD_DENY ?? "")
     .split(",")
-    .map((address) => address.trim().toLowerCase())
-    .filter((address) => address.length > 0);
-  for (const address of forwardDeny) {
-    if (isIP(address) === 0) throw new Error(`PARALLAX_DNS_FORWARD_DENY must list addresses, not names: ${address}`);
-  }
+    .map((address) => address.trim())
+    .filter((address) => address.length > 0)
+    .map((address) => {
+      if (isIP(address.replace(/^\[|\]$/gu, "")) === 0) throw new Error(`PARALLAX_DNS_FORWARD_DENY must list addresses, not names: ${address}`);
+      return canonicalAddress(address);
+    });
   const fallbackZones = readDnsNameList(environment.PARALLAX_DNS_FALLBACK_ZONES, "PARALLAX_DNS_FALLBACK_ZONES");
   const fallbackExclude = readDnsNameList(environment.PARALLAX_DNS_FALLBACK_EXCLUDE, "PARALLAX_DNS_FALLBACK_EXCLUDE");
   assertFallbackIsBounded(fallbackZones, fallbackExclude, forwardTo, forwardDeny);
@@ -474,17 +476,21 @@ function assertFallbackIsBounded(
  * the listener's own port counts as "this listener".
  */
 function assertNoForwardLoop(forwardTo: readonly string[], deny: readonly string[], host: string, port: number): void {
-  const listenerAddresses = new Set([host.toLowerCase()]);
-  if (isLoopbackHost(host) || host === "0.0.0.0" || host === "::") {
-    for (const address of ["127.0.0.1", "localhost", "::1", "0.0.0.0", "::"]) listenerAddresses.add(address);
-  }
+  // Compared as addresses, not strings: `[0:0:0:0:0:0:0:1]` is `::1`, and a
+  // listener written `*` or `[::]` is on every address (the listener reads them
+  // all that way). The listener re-checks at run time against what it actually
+  // bound, which catches the hostname and interface addresses this cannot.
+  const listener = canonicalAddress(host);
+  const everywhere = isWildcardListener(host);
+  const onLoopback = everywhere || isLoopbackAddress(host);
   for (const upstream of forwardTo) {
     const [upstreamHost, upstreamPort] = upstream.split("#") as [string, string | undefined];
-    const address = upstreamHost.replace(/^\[|\]$/gu, "").toLowerCase();
+    const address = canonicalAddress(upstreamHost);
     if (deny.includes(address)) {
       throw new Error(`PARALLAX_DNS_FORWARD_TO names ${upstream}, which PARALLAX_DNS_FORWARD_DENY says forwards back here`);
     }
-    if (listenerAddresses.has(address) && Number(upstreamPort ?? "53") === port) {
+    const self = address === listener || isWildcardListener(address) || (onLoopback && isLoopbackAddress(address));
+    if (self && Number(upstreamPort ?? "53") === port) {
       throw new Error(`PARALLAX_DNS_FORWARD_TO names ${upstream}, which is this listener`);
     }
   }
