@@ -231,12 +231,18 @@ export function createDnsServer(options: DnsServerOptions): {
   let self: { port: number; bound: ReadonlySet<string>; wildcard: boolean; loopback: boolean } | undefined;
   const refusedUpstream = (address: string, port: number): boolean => {
     const canonical = canonicalAddress(address);
-    if (forwardDeny.has(canonical)) return true;
+    // Compared without a link-local zone id (`fe80::1%en0`): interfaces report
+    // the address and the scope apart, so with the zone kept the same address
+    // never matched and a scoped upstream walked past both checks. Ignoring the
+    // zone can only refuse more -- the same link-local address on another link
+    // as a resolver here is not a configuration worth keeping open for.
+    const base = canonical.split("%")[0] as string;
+    if (forwardDeny.has(canonical) || forwardDeny.has(base)) return true;
     if (!self || port !== self.port) return false;
-    if (self.bound.has(canonical) || (self.loopback && isLoopbackAddress(canonical))) return true;
+    if (self.bound.has(base) || (self.loopback && isLoopbackAddress(base))) return true;
     // A wildcard listener answers on whatever addresses the host has *now*, not
     // the ones it had when it bound -- an address added later is still us.
-    return self.wildcard && interfaceAddresses().has(canonical);
+    return self.wildcard && interfaceAddresses().has(base);
   };
   /**
    * Whether an empty answer from `zone` may be asked of the upstream instead.
@@ -772,7 +778,9 @@ export function createDnsServer(options: DnsServerOptions): {
       // new way to take the listener down.
       for (const upstream of forwardTo) {
         const [upstreamHost, upstreamPort] = splitUpstream(upstream);
-        const resolved = await resolveHost(upstreamHost).catch(() => undefined);
+        // Bounded like a query's lookup: a resolver that hangs must not hold the
+        // listener (and the portal behind it) from starting.
+        const resolved = await resolveForwardHost(upstreamHost, forwardTimeoutMs).catch(() => undefined);
         if (resolved && refusedUpstream(resolved.address, upstreamPort)) {
           throw new Error(`forwardTo ${upstream} resolves to ${resolved.address}, which is this listener or a resolver that forwards back here`);
         }
@@ -1435,13 +1443,25 @@ function fullRcode(reply: Buffer): number {
     let offset = 12;
     for (let index = 0; index < reply.readUInt16BE(4); index += 1) offset = readName(reply, offset).offset + 4;
     const records = (counts[0] as number) + (counts[1] as number);
+    let extended = 0;
+    let options = 0;
     for (let index = 0; index < records + (counts[2] as number); index += 1) {
       offset = readName(reply, offset).offset;
+      // Every record whole -- fixed header and RDATA inside the message -- so a
+      // truncated OPT cannot pass for one that says NOERROR.
+      if (offset + 10 > reply.length) return -1;
       const type = reply.readUInt16BE(offset);
-      if (index >= records && type === TYPE.OPT) return (reply.readUInt8(offset + 4) << 4) | low;
-      offset += 10 + reply.readUInt16BE(offset + 8);
+      const end = offset + 10 + reply.readUInt16BE(offset + 8);
+      if (end > reply.length) return -1;
+      if (index >= records && type === TYPE.OPT) {
+        options += 1;
+        extended = reply.readUInt8(offset + 4);
+      }
+      offset = end;
     }
-    return low;
+    // Two OPT records is FORMERR territory (RFC 6891 §6.1.1), not an answer.
+    if (options > 1) return -1;
+    return (extended << 4) | low;
   } catch {
     return -1;
   }

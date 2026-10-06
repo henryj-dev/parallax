@@ -2605,6 +2605,14 @@ describe("DNS server", () => {
       });
     });
 
+    /** Round-3 review: a zone id on the upstream made the same address compare unequal. */
+    it("refuses a scoped link-local upstream whose address is denied", async () => {
+      const server = createDnsServer({ zones: () => [ZONE], forwardTo: ["[fe80::1%lo0]#53"], forwardDeny: ["fe80::1"] });
+      closers.push(() => server.close());
+      const unusedPort = await pickPort("127.0.0.1", { udp: true });
+      await assert.rejects(() => server.listen(unusedPort, "127.0.0.1"), /forwards back here/u);
+    });
+
     it("refuses at run time an upstream that has come to resolve to this listener", async () => {
       // Elsewhere at startup, here later: the per-query check is what catches it.
       let lookups = 0;
