@@ -17,7 +17,7 @@ name: check
 #   hooks             the python hook suites -- which `node --test` cannot see
 #   shellcheck        the shell verifiers, same reason
 #   policy            dependency review, secret scan, workflow audit, from the
-#                     shared reusable workflow so five repositories agree
+#                     shared reusable workflow so every caller agrees
 #   audit             the installed tree against published advisories -- which
 #                     dependency review cannot answer, see that job
 #   flake-watch       the suite three times over, on the schedule only
@@ -395,7 +395,7 @@ jobs:
           "$sc" --severity=warning scripts/*.sh scripts/git-hooks/install.sh
 
   # **The policy layer does not belong to this repository.** Credential scanning, workflow
-  # auditing and dependency review ask the same question of all five repositories, whatever
+  # auditing and dependency review ask the same question of every repository that calls them, whatever
   # each one builds. Kept as copies they drift, and once they drift nothing says which one
   # is the standard.
   #
@@ -403,16 +403,14 @@ jobs:
   # and `.gitleaks.toml` is this repository's. Each keeps its own allowlist with its reasons.
   #
   # ⚠️ Pinned by commit SHA. At `@main`, one line over there changes this gate.
-  #    Dependabot updates this SHA.
+  #    Dependabot cannot update this SHA (a reusable workflow in a repository with no tags).
+  #    It moves by hand: `gh api repos/henryj-dev/.github/commits/main --jq .sha`
   policy:
-    uses: henryj-dev/.github/.github/workflows/policy-checks.yml@391d644e162cfd1290239b8a1681268dc865a80c
+    uses: henryj-dev/.github/.github/workflows/policy-checks.yml@982f0bc15519dc094fa0a4cc8de6724d3f1bba4c
     permissions:
       contents: read
       # dependency-review says inside the pull request what was blocked and why.
       pull-requests: write
-    secrets:
-      # A licence is required for organisation-owned repositories. It is an org secret.
-      GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
   # **이미 설치된 것에 대해 오늘 공표된 권고는 누구도 묻지 않고 있었다.**
   #
