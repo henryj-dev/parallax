@@ -34,7 +34,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "pg": "^8.23.0"
+    "pg": "^8.23.1"
   },
   "bin": {
     "parallax": "dist/cmd/parallax/main.js"
