@@ -78,7 +78,7 @@ any of nine reasons:
 | `docker` | the image builds, runs as uid 10001, and keeps `migrations/` unwritable |
 | `hooks` | the Python hook suites under `scripts/`, which `node --test` cannot see |
 | `shellcheck` | `scripts/*.sh` and `scripts/git-hooks/install.sh`, at `--severity=warning` |
-| `policy` | secret scan, workflow audit, dependency review — from a shared reusable workflow, so five repositories agree |
+| `policy` | secret scan, workflow audit, dependency review — from a shared reusable workflow, so every caller agrees |
 | `audit` | the installed dependency tree against published advisories |
 | `flake-watch` | the suite three times over on three platforms — **schedule and manual dispatch only** |
 | `gate` | collects the above; this is a required check name |

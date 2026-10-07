@@ -103,6 +103,30 @@ export const dnsForwardFailures = counter(
   "DNS forwarding failures by configured upstream index and reason.",
 );
 
+/**
+ * Empty local answers asked of the upstream, by what came of it.
+ *
+ * `relayed` is the upstream's answer given in place of ours; `local` is ours
+ * given anyway because the upstream did not answer. A rising `local` share is
+ * the fallback quietly not working -- the client still gets an answer, so
+ * nothing else would say so.
+ */
+export const dnsFallback = counter(
+  "parallax_dns_fallback_total",
+  "Empty answers in fallback zones that were asked of an upstream, by outcome.",
+);
+
+/**
+ * A pass of the provider-only check that could not read a zone's provider.
+ *
+ * The gauge beside it keeps its last value when that happens, so this is the
+ * only sign that the number has stopped being current.
+ */
+export const dnsDriftCheckFailed = counter(
+  "parallax_dns_drift_check_failures_total",
+  "Zones whose provider records could not be read by the provider-only check.",
+);
+
 /** Answers the API sent, by status. A bounded set: this code chooses them all. */
 export const httpAnswered = counter(
   "parallax_http_responses_total",
