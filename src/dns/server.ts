@@ -1479,7 +1479,7 @@ function withoutZone(address: string): string {
 function interfaceAddresses(): ReadonlySet<string> {
   const addresses = new Set<string>();
   for (const entries of Object.values(networkInterfaces())) {
-    for (const entry of entries ?? []) addresses.add(canonicalAddress(entry.address));
+    for (const entry of entries ?? []) addresses.add(withoutZone(canonicalAddress(entry.address)));
   }
   return addresses;
 }
