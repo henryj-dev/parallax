@@ -952,6 +952,36 @@ export class ControlPlane {
     return { zone: zone.name, revision: zone.revision, views };
   }
 
+  /**
+   * Records the provider publishes for a zone that the internal view does not
+   * answer for, by owner and type.
+   *
+   * The internal view is the external records Parallax *knows* plus the
+   * overrides. A record someone created at the provider directly -- an ACME
+   * challenge, an SPF string, a hand-made MX -- is public and absent inside,
+   * and the listener answers for that absence authoritatively. This is the
+   * count of those gaps, so they are seen rather than discovered.
+   *
+   * Read-only, and nothing is adopted: an unknown record might be a mistake to
+   * remove rather than a fact to copy, and that is a person's call.
+   * Apex NS is skipped for the reason `isInheritable` gives.
+   */
+  async providerOnlyRecords(zoneName: string): Promise<{ name: string; type: string }[]> {
+    const zone = await this.getZone(zoneName);
+    const key = targetKey(zone.name, "external");
+    if (this.#answeredHere(key)) return [];
+    const internal = materializeProviderViews(zone.views).find((view) => view.name === "internal")?.records ?? [];
+    const answered = new Set(internal.map((record) => recordOwnerType({ ...record, name: record.name.toLowerCase() })));
+    const missing = new Map<string, { name: string; type: string }>();
+    for (const record of await this.#provider.list(key)) {
+      if (record.type === "NS" && record.name === "@") continue;
+      const owner = { ...record, name: record.name.toLowerCase() };
+      const ownerKey = recordOwnerType(owner);
+      if (!answered.has(ownerKey)) missing.set(ownerKey, { name: owner.name, type: record.type });
+    }
+    return [...missing.values()].sort((left, right) => `${left.name} ${left.type}`.localeCompare(`${right.name} ${right.type}`));
+  }
+
   apply(zoneName: string, viewName?: string, expectedRevision?: number, actor = "system"): Promise<{ zone: string; revision: number; statuses: ApplyStatus[] }> {
     return this.#exclusive(zoneName, () => this.#apply(zoneName, viewName, expectedRevision, actor));
   }

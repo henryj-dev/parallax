@@ -46,6 +46,12 @@ export function servedZones(zones: readonly Zone[], onSkipped?: (zone: string, r
         content: record.content,
         ttl: record.ttl,
       })),
+      // Read from the overrides as written, not from the composed view: the
+      // composed view also holds everything inherited from `external`, and an
+      // inherited record is exactly the kind of answer the fallback may replace.
+      overrideNames: new Set(
+        (zone.views.find((view) => view.name === "internal")?.records ?? []).map((record) => record.name.toLowerCase()),
+      ),
     });
   }
   return served;

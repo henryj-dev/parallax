@@ -11,7 +11,7 @@ import { createNodeHandler } from "../../src/http/api.ts";
 import { createInMemoryAdapters } from "../../src/infrastructure/in-memory.ts";
 import { render, resetMetrics } from "../../src/observability/metrics.ts";
 import {
-  certificateReloadFailed, notifyFailed, recordUnservable, refreshFailed, replyUnanswerable, zoneSkipped,
+  certificateReloadFailed, dnsDriftCheckFailed, notifyFailed, recordUnservable, refreshFailed, replyUnanswerable, zoneSkipped,
 } from "../../src/observability/signals.ts";
 import { freePort } from "../support/ports.ts";
 
@@ -19,7 +19,7 @@ import { freePort } from "../support/ports.ts";
  * The counters, asked whether they fire.
  *
  * ⚠️ `signals.ts` measured **100% line, branch and function** and this file did
- * not exist. The body of that module is eleven `counter(...)`/`histogram(...)`
+ * not exist. The body of that module was eleven (now thirteen) `counter(...)`/`histogram(...)`
  * declarations, and a declaration executes when anything imports the module --
  * which every one of these suites does, transitively, on the way to something
  * else. So the number was reporting that the file had been *loaded*. The only
@@ -31,17 +31,17 @@ import { freePort } from "../support/ports.ts";
  * against it never fires, and the endpoint keeps looking healthy -- which is
  * exactly the shape of the original defect the whole subsystem exists for.
  *
- * 🔑 **The split below is deliberate and it is not uniform.** Five signals are
+ * 🔑 **The split below is deliberate and it is not uniform.** Six signals are
  * driven end to end: a real API call through the Node handler, and a real DNS
- * query over a real socket. Six are exercised at the registry level, and the
+ * query over a real socket. Seven are exercised at the registry level, and the
  * reason is one fact rather than convenience -- their only caller is
  * `src/index.ts`, a module that starts listeners the moment it is imported, so
  * the only way to reach them is to spawn a process, and a spawned process has
- * its own registry that `render()` here cannot see. Those six are held to:
+ * its own registry that `render()` here cannot see. Those seven are held to:
  * registered under the name a dashboard would query, of the right type, moving
  * by one per call, and carrying the label sets `src/index.ts` actually passes.
  *
- * A uniform shallow test over all eleven would have read better and said less.
+ * A uniform shallow test over all thirteen would have read better and said less.
  */
 
 /** Everything declared, in the order a reader of `signals.ts` meets them. */
@@ -54,6 +54,8 @@ const COUNTERS = [
   "parallax_tls_certificate_reload_failures_total",
   "parallax_dns_answers_total",
   "parallax_dns_forward_failures_total",
+  "parallax_dns_fallback_total",
+  "parallax_dns_drift_check_failures_total",
   "parallax_http_responses_total",
 ] as const;
 
@@ -73,7 +75,7 @@ const HISTOGRAMS = [
 afterEach(() => { resetMetrics(); });
 
 describe("what importing the module alone declares", () => {
-  it("registers all eleven signals, at zero, before any of them has fired", () => {
+  it("registers all thirteen signals, at zero, before any of them has fired", () => {
     const text = render();
 
     for (const name of COUNTERS) {
@@ -91,7 +93,7 @@ describe("what importing the module alone declares", () => {
 });
 
 /**
- * The six whose only caller is `src/index.ts`.
+ * The seven whose only caller is `src/index.ts`.
  *
  * Each one is the sole warning of something that is otherwise silent: a stored
  * record the wire cannot carry, a reply that could not be assembled, a zone
@@ -116,6 +118,7 @@ describe("the failure counters src/index.ts is the only caller of", () => {
       ["parallax_dns_zones_skipped_total", zoneSkipped],
       ["parallax_dns_notify_failures_total", notifyFailed],
       ["parallax_tls_certificate_reload_failures_total", certificateReloadFailed],
+      ["parallax_dns_drift_check_failures_total", dnsDriftCheckFailed],
     ] as const;
 
     for (const [, fire] of unlabelled) { fire(); fire(); }
