@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createSocket } from "node:dgram";
 import { connect, createServer, isIP, type AddressInfo, type Socket } from "node:net";
+import { networkInterfaces } from "node:os";
 import { after, afterEach, describe, it } from "node:test";
 import {
   createDnsServer,
@@ -2544,6 +2545,40 @@ describe("DNS server", () => {
       assert.deepEqual(upstream.asked, ["absent.example.com"]);
     });
 
+    /** A reply that cannot be walked whole is not an answer, whatever its header says. */
+    it("keeps the local answer when the upstream's OPT is duplicated or a record is cut short", async () => {
+      const opt = Buffer.of(0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, 0, 0);
+      const shapes: Array<[string, (message: Buffer) => Buffer]> = [
+        ["two OPT records", (message) => {
+          const questionEnd = readName(message, 12).offset + 4;
+          const header = Buffer.from(message.subarray(0, 12));
+          header.writeUInt16BE(0x8180, 2);
+          header.writeUInt16BE(0, 6);
+          header.writeUInt16BE(0, 8);
+          header.writeUInt16BE(2, 10);
+          return Buffer.concat([header, message.subarray(12, questionEnd), opt, opt]);
+        }],
+        ["an OPT whose RDATA runs past the end", (message) => {
+          const questionEnd = readName(message, 12).offset + 4;
+          const header = Buffer.from(message.subarray(0, 12));
+          header.writeUInt16BE(0x8180, 2);
+          header.writeUInt16BE(0, 6);
+          header.writeUInt16BE(0, 8);
+          header.writeUInt16BE(1, 10);
+          const cut = Buffer.from(opt);
+          cut.writeUInt16BE(4, 9);
+          return Buffer.concat([header, message.subarray(12, questionEnd), cut]);
+        }],
+      ];
+      for (const [shape, answer] of shapes) {
+        const upstream = await countingUpstream(answer);
+        const { port } = await start({ zones: () => [ZONE], forwardTo: [`127.0.0.1#${upstream.port}`], fallbackZones: ["example.com"] });
+        const reply = received(await ask(port, buildQuery("absent.example.com", TYPE.A)));
+        assert.equal(rcodeOf(reply), RCODE.NXDOMAIN, shape);
+        assert.equal(aa(reply), true, shape);
+      }
+    });
+
     it("gives up on silent upstreams inside the TCP idle timeout, and still answers", async () => {
       // Silent on TCP as well: a TCP query is relayed over TCP, and an upstream
       // with nothing listening there refuses at once -- which is fast, and
@@ -2611,6 +2646,32 @@ describe("DNS server", () => {
       closers.push(() => server.close());
       const unusedPort = await pickPort("127.0.0.1", { udp: true });
       await assert.rejects(() => server.listen(unusedPort, "127.0.0.1"), /forwards back here/u);
+    });
+
+    /** Delta review of 1906da7: the bound set kept the zone the upstream had lost. */
+    it("refuses an upstream that resolves to this listener's own scoped address", async () => {
+      const resolveHost = async (host: string): Promise<ResolvedDnsAddress> =>
+        host === "self.test" ? { address: "fe80::1%lo0", family: 6 } : { address: host, family: isIP(host) === 6 ? 6 : 4 };
+      const server = createDnsServer({ zones: () => [ZONE], forwardTo: ["self.test#5353"], resolveHost });
+      closers.push(() => server.close());
+      // The check runs before anything binds, so the scoped address need not exist here.
+      await assert.rejects(() => server.listen(5353, "self.test"), /which is this listener/u);
+    });
+
+    it("refuses an upstream that is one of this host's interface addresses with a zone on it", async () => {
+      const addresses = Object.values(networkInterfaces()).flat().filter((entry) => entry !== undefined);
+      const chosen = addresses.find((entry) => !entry.internal) ?? addresses[0];
+      assert.ok(chosen, "this host has an interface address");
+      const resolveHost = async (host: string): Promise<ResolvedDnsAddress> =>
+        host === "iface.test"
+          ? { address: `${chosen.address}%zone0`, family: chosen.family === "IPv6" ? 6 : 4 }
+          : { address: host, family: isIP(host) === 6 ? 6 : 4 };
+      await onFreshPort("0.0.0.0", async (candidate) => {
+        const server = createDnsServer({ zones: () => [ZONE], forwardTo: [`iface.test#${candidate}`], resolveHost });
+        closers.push(() => server.close());
+        await assert.rejects(() => server.listen(candidate, "0.0.0.0"), /which is this listener/u);
+        return undefined;
+      });
     });
 
     it("refuses at run time an upstream that has come to resolve to this listener", async () => {

@@ -219,7 +219,7 @@ export function createDnsServer(options: DnsServerOptions): {
   const forwardAllow = compileCidrs(options.forwardAllow ?? DEFAULT_FORWARD_ALLOW);
   const fallbackZones = new Set((options.fallbackZones ?? []).map(normalizeOwner));
   const fallbackExclude = (options.fallbackExclude ?? []).map(normalizeOwner);
-  const forwardDeny = new Set((options.forwardDeny ?? []).map(canonicalAddress));
+  const forwardDeny = new Set((options.forwardDeny ?? []).map((address) => withoutZone(canonicalAddress(address))));
   /**
    * Where this listener answers, once it is bound. An upstream resolving to one
    * of these on the listener's port is this process asking itself -- a loop
@@ -236,8 +236,11 @@ export function createDnsServer(options: DnsServerOptions): {
     // never matched and a scoped upstream walked past both checks. Ignoring the
     // zone can only refuse more -- the same link-local address on another link
     // as a resolver here is not a configuration worth keeping open for.
-    const base = canonical.split("%")[0] as string;
-    if (forwardDeny.has(canonical) || forwardDeny.has(base)) return true;
+    // Every set compared against is built the same way (`withoutZone`) -- a
+    // zone kept on one side and dropped on the other is the mismatch twice
+    // over: first the upstream kept it, then the bound set did.
+    const base = withoutZone(canonical);
+    if (forwardDeny.has(base)) return true;
     if (!self || port !== self.port) return false;
     if (self.bound.has(base) || (self.loopback && isLoopbackAddress(base))) return true;
     // A wildcard listener answers on whatever addresses the host has *now*, not
@@ -766,7 +769,7 @@ export function createDnsServer(options: DnsServerOptions): {
       const wildcard = isWildcardListener(host);
       self = {
         port,
-        bound: new Set(bindings.map((binding) => canonicalAddress(binding.address))),
+        bound: new Set(bindings.map((binding) => withoutZone(canonicalAddress(binding.address)))),
         wildcard,
         loopback: wildcard || isLoopbackAddress(host),
       };
@@ -1465,6 +1468,11 @@ function fullRcode(reply: Buffer): number {
   } catch {
     return -1;
   }
+}
+
+/** A canonical address without its link-local zone id, for comparing across sources that disagree about zones. */
+function withoutZone(address: string): string {
+  return address.split("%")[0] as string;
 }
 
 /** Every address on this host's interfaces, read when asked. */
