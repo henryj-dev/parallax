@@ -1,9 +1,11 @@
 import { createSocket, type Socket } from "node:dgram";
 import { lookup } from "node:dns/promises";
 import { connect, createServer, isIP, type Server, type Socket as TcpSocket } from "node:net";
+import { networkInterfaces } from "node:os";
 import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
-import { dnsAnswered, dnsForwardFailures, dnsForwardSeconds } from "../observability/signals.ts";
+import { dnsAnswered, dnsFallback, dnsForwardFailures, dnsForwardSeconds } from "../observability/signals.ts";
+import { canonicalAddress, isLoopbackAddress, isWildcardListener } from "./address.ts";
 import { createDnsCookies } from "./cookies.ts";
 import {
   readTsig, signEnvelope, signErrorReply, signReply, signRequest, tsigOverhead, verifyTsig,
@@ -12,7 +14,7 @@ import {
 import { DEFAULT_SOA_TIMERS, encodeRdata, encodeSoa, rrType, type SoaTimers } from "./rdata.ts";
 import {
   CLASS_ANY, CLASS_IN, MAX_EDNS_VERSION, MAX_RDATA_BYTES, MAX_TCP_MESSAGE_BYTES, MIN_UDP_PAYLOAD, OPCODE, RCODE, TYPE, WireFormatError,
-  isResponseToQuery, opcodeOf, readQuery, readTransferSerial, writeName, writeReply, writeTruncatedReply,
+  isResponseToQuery, opcodeOf, readName, readQuery, readTransferSerial, writeName, writeReply, writeTruncatedReply,
   type ParsedQuery, type ReplyParts, type ResourceRecord,
 } from "./wire.ts";
 
@@ -29,6 +31,14 @@ export interface ServedZone {
   readonly records: readonly { name: string; type: RecordType; content: string; ttl: number }[];
   /** Rises with each published revision so caches and secondaries notice. */
   readonly serial: number;
+  /**
+   * Owner names (relative, as in `records`) that carry an internal override.
+   *
+   * Only the fallback reads this. A name an operator wrote an internal record
+   * for is a name whose internal answer was decided on purpose, so a missing
+   * type there is an answer and not a gap -- see `fallbackApplies`.
+   */
+  readonly overrideNames?: ReadonlySet<string>;
 }
 
 /** A stored record that reached the wire and could not be written to it. */
@@ -46,6 +56,24 @@ export interface DnsServerOptions {
   readonly forwardTo?: readonly string[];
   /** Client CIDRs allowed to use recursion. Defaults to loopback only. */
   readonly forwardAllow?: readonly string[];
+  /**
+   * Zones whose empty local answers (NXDOMAIN, or NOERROR with nothing in it)
+   * are asked of `forwardTo` before being given. Opt-in per zone; empty is off.
+   *
+   * ⚠️ This is a split-horizon hole by construction, which is why it is narrow:
+   * never for a name carrying an internal override, never under
+   * `fallbackExclude`, never for a client outside `forwardAllow`, and an
+   * upstream that fails leaves the local answer standing.
+   */
+  readonly fallbackZones?: readonly string[];
+  /** Names that, together with everything below them, never fall back. */
+  readonly fallbackExclude?: readonly string[];
+  /**
+   * Addresses an upstream must never resolve to -- the resolvers that send
+   * their own misses here. Relaying to one of them is a loop that ends only
+   * when the forward timeout does, on every query it catches.
+   */
+  readonly forwardDeny?: readonly string[];
   /** Client CIDRs allowed to request AXFR over TCP. Defaults to deny all. */
   readonly transferAllow?: readonly string[];
   /**
@@ -189,11 +217,81 @@ export function createDnsServer(options: DnsServerOptions): {
   const forwardTo = options.forwardTo ?? [];
   const forwardTimeoutMs = options.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS;
   const forwardAllow = compileCidrs(options.forwardAllow ?? DEFAULT_FORWARD_ALLOW);
+  const fallbackZones = new Set((options.fallbackZones ?? []).map(normalizeOwner));
+  const fallbackExclude = (options.fallbackExclude ?? []).map(normalizeOwner);
+  const forwardDeny = new Set((options.forwardDeny ?? []).map((address) => withoutZone(canonicalAddress(address))));
+  /**
+   * Where this listener answers, once it is bound. An upstream resolving to one
+   * of these on the listener's port is this process asking itself -- a loop
+   * that holds a forwarding slot for the whole timeout on every query it
+   * catches. The startup check sees only spellings; this sees addresses,
+   * including a hostname that resolves here and an interface address behind a
+   * wildcard listener.
+   */
+  let self: { port: number; bound: ReadonlySet<string>; wildcard: boolean; loopback: boolean } | undefined;
+  const refusedUpstream = (address: string, port: number): boolean => {
+    const canonical = canonicalAddress(address);
+    // Compared without a link-local zone id (`fe80::1%en0`): interfaces report
+    // the address and the scope apart, so with the zone kept the same address
+    // never matched and a scoped upstream walked past both checks. Ignoring the
+    // zone can only refuse more -- the same link-local address on another link
+    // as a resolver here is not a configuration worth keeping open for.
+    // Every set compared against is built the same way (`withoutZone`) -- a
+    // zone kept on one side and dropped on the other is the mismatch twice
+    // over: first the upstream kept it, then the bound set did.
+    const base = withoutZone(canonical);
+    if (forwardDeny.has(base)) return true;
+    if (!self || port !== self.port) return false;
+    if (self.bound.has(base) || (self.loopback && isLoopbackAddress(base))) return true;
+    // A wildcard listener answers on whatever addresses the host has *now*, not
+    // the ones it had when it bound -- an address added later is still us.
+    return self.wildcard && interfaceAddresses().has(base);
+  };
+  /**
+   * Whether an empty answer from `zone` may be asked of the upstream instead.
+   *
+   * Every condition is a refusal, and each one is a way the fallback would
+   * otherwise say something the internal view decided not to:
+   * - a name with an internal override was answered on purpose, whatever type
+   *   is missing there. The case this exists for: a private A written for a
+   *   host whose public AAAA is unknown here. Falling back on the AAAA would
+   *   hand an IPv6-first client the public address and route it around the
+   *   private one -- the whole of split-horizon, undone for one record type.
+   * - excluded subtrees hold names that exist only inside; asking the public
+   *   resolver about them leaks the names themselves.
+   * - a client outside `forwardAllow` may not recurse here. Its answer stays
+   *   the authoritative one -- not REFUSED, which would be a new failure.
+   */
+  const fallbackApplies = (
+    zone: ServedZone,
+    query: ParsedQuery,
+    result: { rcode: number; answers?: readonly unknown[] },
+    clientAddress: string,
+    signed: boolean,
+  ): boolean => {
+    if (signed || forwardTo.length === 0 || !fallbackZones.has(zone.name)) return false;
+    // Empty means nothing in the answer section. An NXDOMAIN that carries a
+    // CNAME is the end of a chain this zone did answer, not a gap.
+    const empty = (result.rcode === RCODE.NXDOMAIN || result.rcode === RCODE.NOERROR) && (result.answers?.length ?? 0) === 0;
+    if (!empty || isTransfer(query.question.type)) return false;
+    const name = query.question.name;
+    if (fallbackExclude.some((suffix) => name === suffix || name.endsWith(`.${suffix}`))) return false;
+    if (overrideCovers(zone, name)) return false;
+    return cidrsContain(forwardAllow, clientAddress);
+  };
   const transferAllow = compileCidrs(options.transferAllow ?? []);
   const tsigKeys = options.tsigKeys ?? [];
   const now = options.now ?? Date.now;
   const maxConcurrentForwards = positiveInteger(options.maxConcurrentForwards ?? DEFAULT_MAX_CONCURRENT_FORWARDS, "maxConcurrentForwards");
   const tcpIdleTimeoutMs = positiveInteger(options.tcpIdleTimeoutMs ?? DEFAULT_TCP_IDLE_TIMEOUT_MS, "tcpIdleTimeoutMs");
+  /**
+   * The whole of a fallback's wait, across every upstream. The forward timeout
+   * restarts per upstream, so three silent ones were twelve seconds -- past the
+   * TCP idle timeout, which closed the connection before the local answer that
+   * was ready all along could be sent. Half the idle timeout leaves room for
+   * the reply to be written after the wait gives up.
+   */
+  const fallbackBudgetMs = Math.max(1, Math.min(forwardTimeoutMs, Math.floor(tcpIdleTimeoutMs / 2)));
   const tcpIncompleteFrameTimeoutMs = positiveInteger(
     options.tcpIncompleteFrameTimeoutMs ?? tcpIdleTimeoutMs,
     "tcpIncompleteFrameTimeoutMs",
@@ -348,17 +446,14 @@ export function createDnsServer(options: DnsServerOptions): {
       Number.MAX_SAFE_INTEGER,
     )];
 
-    const relay = async (): Promise<Buffer[]> => {
-      // A signed question was asked of this server by name. Relaying it would
-      // send our peer's credential to an upstream that does not hold the key,
-      // and the answer that came back could not be signed as ours.
-      if (signed) return answer(RCODE.REFUSED);
-      if (activeForwards >= maxConcurrentForwards) return answer(RCODE.SERVFAIL);
+    /** One relay attempt. Undefined is "nobody answered", for the caller to decide about. */
+    const tryForward = async (): Promise<Buffer | undefined> => {
+      if (activeForwards >= maxConcurrentForwards) return undefined;
       activeForwards += 1;
       let forwarded: Buffer | undefined;
       const startedAt = performance.now();
       try {
-        forwarded = await forward(message, query, forwardTo, forwardTimeoutMs, overTcp, resolveForwardHost);
+        forwarded = await forward(message, query, forwardTo, forwardTimeoutMs, overTcp, resolveForwardHost, refusedUpstream);
       } finally {
         activeForwards -= 1;
         // Timed whether or not an upstream answered: a run of timeouts is
@@ -366,6 +461,14 @@ export function createDnsServer(options: DnsServerOptions): {
         // failures out would flatter the number.
         dnsForwardSeconds((performance.now() - startedAt) / 1000, { outcome: forwarded ? "answered" : "failed" });
       }
+      return forwarded;
+    };
+    const relay = async (): Promise<Buffer[]> => {
+      // A signed question was asked of this server by name. Relaying it would
+      // send our peer's credential to an upstream that does not hold the key,
+      // and the answer that came back could not be signed as ours.
+      if (signed) return answer(RCODE.REFUSED);
+      const forwarded = await tryForward();
       // A relayed answer is the upstream's bytes, cookie and all. Ours would be
       // about a conversation the client is not having with us.
       return forwarded ? [forwarded] : answer(RCODE.SERVFAIL);
@@ -440,6 +543,19 @@ export function createDnsServer(options: DnsServerOptions): {
       ...(incremental ?? answerFromZone(query, zone, negativeTtl, options.onUnservable, soaSettings)),
       ...(cookie ? { cookie } : {}),
     };
+    // An empty local answer in an opted-in zone is asked of the upstream first.
+    // Whatever goes wrong there leaves the local answer standing: the fallback
+    // exists to fill a gap, and must never turn an answer that worked into a
+    // SERVFAIL.
+    if (!incremental && fallbackApplies(zone, query, parts, clientAddress, signed)) {
+      const upstream = await withinBudget(tryForward(), fallbackBudgetMs);
+      // Only an answer replaces ours. An upstream that says SERVFAIL or REFUSED
+      // has not answered the question, and relaying that would turn a local
+      // "no such record" into a failure the client did not have before.
+      const answered = upstream !== undefined && UPSTREAM_ANSWERS.has(fullRcode(upstream));
+      dnsFallback({ outcome: answered ? "relayed" : "local" });
+      if (answered) return [capNegativeTtl(upstream, negativeTtl)];
+    }
     // ⚠️ The floor is applied first and the reservation taken off it, not the
     // other way round. `max(MIN_UDP_PAYLOAD, size - reserved)` handed back the
     // floor whenever the subtraction went under it, so a signed reply to a
@@ -650,6 +766,28 @@ export function createDnsServer(options: DnsServerOptions): {
   return {
     async listen(port, host) {
       const bindings = await bindAddresses(host, resolveHost);
+      const wildcard = isWildcardListener(host);
+      self = {
+        port,
+        bound: new Set(bindings.map((binding) => withoutZone(canonicalAddress(binding.address)))),
+        wildcard,
+        loopback: wildcard || isLoopbackAddress(host),
+      };
+      // Refused before binding, so a deployment whose upstream is this listener
+      // never starts. The configuration check sees spellings; this resolves them,
+      // which is the only way to catch a hostname or an interface address that
+      // is this listener. A name that cannot be resolved now is left to the
+      // per-query check -- refusing to start over a resolver outage would be a
+      // new way to take the listener down.
+      for (const upstream of forwardTo) {
+        const [upstreamHost, upstreamPort] = splitUpstream(upstream);
+        // Bounded like a query's lookup: a resolver that hangs must not hold the
+        // listener (and the portal behind it) from starting.
+        const resolved = await resolveForwardHost(upstreamHost, forwardTimeoutMs).catch(() => undefined);
+        if (resolved && refusedUpstream(resolved.address, upstreamPort)) {
+          throw new Error(`forwardTo ${upstream} resolves to ${resolved.address}, which is this listener or a resolver that forwards back here`);
+        }
+      }
       for (const binding of bindings) {
         const udp = createSocket({
           type: binding.family === 6 ? "udp6" : "udp4",
@@ -1251,6 +1389,158 @@ function absolute(name: string, zone: string): string {
   return name === "@" ? zone : `${name}.${zone}`.toLowerCase();
 }
 
+function normalizeOwner(name: string): string {
+  return name.trim().replace(/\.$/u, "").toLowerCase();
+}
+
+const overrideIndexes = new WeakMap<ServedZone, ReadonlySet<string>>();
+
+/** The override owners of a zone as absolute names, built once per snapshot. */
+function overrideOwners(zone: ServedZone): ReadonlySet<string> {
+  const cached = overrideIndexes.get(zone);
+  if (cached) return cached;
+  const owners = new Set([...(zone.overrideNames ?? [])].map((name) => absolute(name, zone.name)));
+  overrideIndexes.set(zone, owners);
+  return owners;
+}
+
+/**
+ * Whether an internal override decides `name`, so its empty answer is ours.
+ *
+ * Three ways, all conservative:
+ * - an override owned by the name itself, whatever type was asked;
+ * - an override wildcard on an ancestor. `*.private A 10.0.0.5` answers
+ *   `host.private` with a private A, so that name's missing AAAA is the
+ *   wildcard's negative and falling back on it would fetch the public AAAA --
+ *   the exact leak this function exists to stop. Any covering override
+ *   wildcard counts, not only the closest encloser's: refusing a little more
+ *   than RFC 4592 synthesis strictly reaches is the safe side;
+ * - the name sits above an override (an empty non-terminal over internal
+ *   hosts). Asking outside about `private` would say the internal tree exists
+ *   and could bring back a public record for a name inside answers for.
+ */
+function overrideCovers(zone: ServedZone, name: string): boolean {
+  const owners = overrideOwners(zone);
+  if (owners.has(name)) return true;
+  for (let ancestor = name; ancestor !== zone.name && ancestor.includes(".");) {
+    ancestor = ancestor.slice(ancestor.indexOf(".") + 1);
+    if (owners.has(`*.${ancestor}`)) return true;
+  }
+  for (const owner of owners) if (owner.endsWith(`.${name}`)) return true;
+  return false;
+}
+
+/** The upstream RCODEs that are answers: anything else leaves the local one standing. */
+const UPSTREAM_ANSWERS: ReadonlySet<number> = new Set([RCODE.NOERROR, RCODE.NXDOMAIN]);
+
+/**
+ * The whole RCODE: the header's four bits, extended by the OPT record's eight
+ * (RFC 6891 §6.1.3). Read from the header alone, BADVERS (16) is a 0 -- an
+ * error that looks like NOERROR and would replace the local answer. Anything
+ * that cannot be walked is -1, which no caller accepts.
+ */
+function fullRcode(reply: Buffer): number {
+  try {
+    const low = reply.readUInt16BE(2) & 0x000f;
+    const counts = [reply.readUInt16BE(6), reply.readUInt16BE(8), reply.readUInt16BE(10)];
+    let offset = 12;
+    for (let index = 0; index < reply.readUInt16BE(4); index += 1) offset = readName(reply, offset).offset + 4;
+    const records = (counts[0] as number) + (counts[1] as number);
+    let extended = 0;
+    let options = 0;
+    for (let index = 0; index < records + (counts[2] as number); index += 1) {
+      offset = readName(reply, offset).offset;
+      // Every record whole -- fixed header and RDATA inside the message -- so a
+      // truncated OPT cannot pass for one that says NOERROR.
+      if (offset + 10 > reply.length) return -1;
+      const type = reply.readUInt16BE(offset);
+      const end = offset + 10 + reply.readUInt16BE(offset + 8);
+      if (end > reply.length) return -1;
+      if (index >= records && type === TYPE.OPT) {
+        options += 1;
+        extended = reply.readUInt8(offset + 4);
+      }
+      offset = end;
+    }
+    // Two OPT records is FORMERR territory (RFC 6891 §6.1.1), not an answer.
+    if (options > 1) return -1;
+    return (extended << 4) | low;
+  } catch {
+    return -1;
+  }
+}
+
+/** A canonical address without its link-local zone id, for comparing across sources that disagree about zones. */
+function withoutZone(address: string): string {
+  return address.split("%")[0] as string;
+}
+
+/** Every address on this host's interfaces, read when asked. */
+function interfaceAddresses(): ReadonlySet<string> {
+  const addresses = new Set<string>();
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries ?? []) addresses.add(withoutZone(canonicalAddress(entry.address)));
+  }
+  return addresses;
+}
+
+/** `work`, or undefined once `ms` has passed. The work itself goes on and frees its slot when done. */
+function withinBudget<T>(work: Promise<T | undefined>, ms: number): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), ms); });
+  return Promise.race([work, expired]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Lowers the TTL of every SOA in an upstream reply's authority section to `cap`.
+ *
+ * A negative answer is remembered for min(SOA TTL, SOA MINIMUM) (RFC 2308 §5),
+ * so lowering the record's TTL is enough. The public side's 30 minutes would
+ * otherwise hide a record written here for that long in every cache downstream.
+ *
+ * ⚠️ MINIMUM is left alone on purpose. It sits inside the RDATA, which an RRSIG
+ * covers; the TTL does not, and a validator accepts a TTL lowered below the
+ * signed one. The NSEC/NSEC3 proofs and the RRSIGs over all of these are
+ * lowered the same way, their RDATA left byte for byte. Anything that cannot be walked is returned unchanged -- this is a
+ * freshness bound, not a check, and the reply was already validated as a
+ * response to this query.
+ */
+const TYPE_RRSIG = 46;
+/**
+ * The records a negative answer is made of: the SOA, and under DNSSEC the
+ * NSEC/NSEC3 that prove the absence. A validator may synthesize further
+ * negatives from a cached NSEC for as long as it lives (RFC 8198), and RFC 9077
+ * only says a resolver MAY bound that by the SOA -- so they are capped here too.
+ */
+const NEGATIVE_PROOF_TYPES: ReadonlySet<number> = new Set([TYPE.SOA, 47, 50]);
+
+export function capNegativeTtl(reply: Buffer, cap: number): Buffer {
+  try {
+    const out = Buffer.from(reply);
+    const questions = out.readUInt16BE(4);
+    const answers = out.readUInt16BE(6);
+    const authority = out.readUInt16BE(8);
+    let offset = 12;
+    for (let index = 0; index < questions; index += 1) offset = readName(out, offset).offset + 4;
+    for (let index = 0; index < answers + authority; index += 1) {
+      offset = readName(out, offset).offset;
+      const type = out.readUInt16BE(offset);
+      const ttl = out.readUInt32BE(offset + 4);
+      const size = out.readUInt16BE(offset + 8);
+      // The RRSIG over that SOA is lowered with it, so the pair is remembered
+      // for the same time. Its TTL is outside what it signs, like the SOA's.
+      const covered = type === TYPE_RRSIG && size >= 2 ? out.readUInt16BE(offset + 10) : undefined;
+      const negativeProof = NEGATIVE_PROOF_TYPES.has(type) || (covered !== undefined && NEGATIVE_PROOF_TYPES.has(covered));
+      if (index >= answers && negativeProof && ttl > cap) out.writeUInt32BE(cap, offset + 4);
+      offset += 10 + size;
+      if (offset > out.length) return reply;
+    }
+    return out;
+  } catch {
+    return reply;
+  }
+}
+
 /**
  * Hands the query on unchanged and relays what comes back.
  *
@@ -1265,6 +1555,7 @@ async function forward(
   timeoutMs: number,
   overTcp: boolean,
   resolveHost: (host: string, timeoutMs: number) => Promise<ResolvedDnsAddress | undefined>,
+  refused: (address: string, port: number) => boolean,
 ): Promise<Buffer | undefined> {
   for (const [upstreamIndex, upstream] of upstreams.entries()) {
     const [host, port] = splitUpstream(upstream);
@@ -1285,6 +1576,13 @@ async function forward(
       assertResolvedAddress(resolved, host);
     } catch {
       dnsForwardFailures({ upstream: String(upstreamIndex), reason: "address_refused" });
+      continue;
+    }
+    // Checked after resolution as well as at startup: a hostname upstream can
+    // come to resolve to a resolver that forwards back here long after the
+    // configuration that named it was accepted.
+    if (refused(resolved.address, port)) {
+      dnsForwardFailures({ upstream: String(upstreamIndex), reason: "loop" });
       continue;
     }
     const remainingMs = Math.ceil(deadline - performance.now());

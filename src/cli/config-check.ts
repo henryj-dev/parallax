@@ -64,6 +64,9 @@ export function checkConfig(environment: NodeJS.ProcessEnv = process.env): Confi
       ? `${config.dns.host}:${config.dns.port} forward=${config.dns.forwardTo.length}`
         + ` transfer=${config.dns.transferAllow.length ? config.dns.transferAllow.length : "denied"}`
         + ` tsig=${config.dns.tsigKeys.length > 0 ? config.dns.tsigKeys.map((key) => key.name).join("+") : "none"}`
+        // Zone names, because which zones fall back is the thing to check before
+        // a rollout -- and they are already public, unlike the excluded names.
+        + ` fallback=${config.dns.fallbackZones.length > 0 ? config.dns.fallbackZones.join("+") : "off"}`
       : "disabled",
     tls: config.tls ? "on" : "off",
     storage: config.databaseUrl ? "postgresql" : "file",

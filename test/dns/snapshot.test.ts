@@ -30,6 +30,31 @@ describe("served zone snapshot", () => {
     assert.deepEqual(records.filter((record) => record.type === "MX").map((record) => record.content), ["10 mx.example.net"]);
   });
 
+  /**
+   * The fallback refuses names that carry an override. Only the overrides as
+   * written count: an inherited record is exactly what the fallback may stand
+   * in for, so counting it would turn the fallback off for every public name.
+   */
+  it("carries the owners of the overrides as written, and no inherited name", () => {
+    const served = servedZones([zone([
+      {
+        name: "external",
+        records: [
+          { id: "web", name: "www", type: "A", content: "93.184.216.34", ttl: 300 },
+          { id: "api", name: "api", type: "A", content: "93.184.216.35", ttl: 300 },
+        ],
+      },
+      {
+        name: "internal",
+        records: [
+          { id: "web-internal", name: "WWW", type: "A", content: "10.0.0.5", ttl: 60 },
+          { id: "host", name: "host.internal", type: "A", content: "10.0.0.6", ttl: 60 },
+        ],
+      },
+    ])]);
+    assert.deepEqual([...(served[0]?.overrideNames ?? [])].sort(), ["host.internal", "www"]);
+  });
+
   it("leaves out a zone whose internal view is empty, rather than answering NXDOMAIN for all of it", () => {
     // An empty internal view is the normal state right after adopting a zone.
     // Claiming authority for it would take the whole zone down internally at
