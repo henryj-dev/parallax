@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -67,7 +68,9 @@ describe("every file here stays readable as a diff", () => {
 
     const offenders: string[] = [];
     for (const name of names) {
-      const contents = await readFile(join(ROOT, name));
+      const path = join(ROOT, name);
+      if (!existsSync(path)) continue;
+      const contents = await readFile(path);
       const offsets = controlBytesIn(contents);
       if (offsets.length === 0) continue;
       const line = contents.subarray(0, offsets[0]).toString("utf8").split("\n").length;
