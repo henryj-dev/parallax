@@ -654,12 +654,12 @@ pnpm build
 pnpm test           # node --test
 ```
 
-Three workflows run in CI. `check` carries nine jobs, one per question, so that
+Three workflows run in CI. `check` carries eight jobs, one per question, so that
 a red result names its own cause instead of being one job that failed for any of
-nine reasons:
+eight reasons:
 `verify` (types, build, tests on Node 24 and 26), `deployment-gate` (schema
 surface, from a bare checkout), `docker` (the image builds and stays
-unprivileged), `hooks` (the Python hook suites), `shellcheck`, `policy` (a
+unprivileged), `shellcheck`, `policy` (a
 shared reusable workflow: dependency review, secret scan, workflow audit),
 `audit` (the installed tree against published advisories — which dependency
 review, being about a diff, cannot answer), and `flake-watch` (the suite three

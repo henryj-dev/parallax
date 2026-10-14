@@ -36,7 +36,7 @@ const DOCUMENTS = ["README.md", "README.ko.md"] as const;
  * "None of them need secrets, so they all run on a pull request from a fork",
  * which `check.yml` has contradicted since the policy layer moved out. That is
  * the document an outside contributor reads first, and it had been wrong for
- * days. `AGENTS.md` said seven jobs when there were eight.
+ * days.
  *
  * Both were outside `DOCUMENTS` and so outside every check. The READMEs, which
  * were inside it, were correct. That is the whole argument: the mechanism
@@ -148,10 +148,7 @@ describe("what the READMEs count", () => {
   });
 
   it("counts the jobs `check.yml` actually defines", async () => {
-    // `AGENTS.md` said seven when there were eight, because `#27` added
-    // `flake-watch` and nothing re-counted. The paragraph two lines below that
-    // number warned, in that same file, that nothing kept it current. It was
-    // right, and it stayed wrong for two days.
+    // The CI job count is documented in all prose locations below.
     //
     // Counted from the job keys rather than from `gate`'s `needs:`, because
     // `gate` cannot appear in its own `needs:` -- the two numbers differ by one
@@ -164,7 +161,7 @@ describe("what the READMEs count", () => {
     assert.notEqual(start, -1, "check.yml must have a `jobs:` block");
     const jobs = [...workflow.slice(start).matchAll(/^ {2}([a-z][a-z0-9-]*):$/gmu)].map((match) => match[1] as string);
     assert.ok(jobs.includes("gate"), "the job scan must find `gate`; the shape of check.yml changed");
-    const written: Record<number, readonly [string, string]> = { 9: ["nine", "아홉"] };
+    const written: Record<number, readonly [string, string]> = { 8: ["eight", "여덟"] };
     const words = written[jobs.length];
     assert.ok(words, `no spelled-out form is recorded for ${jobs.length} jobs -- add one with the count`);
     // Matched loosely enough that a rewrite of the sentence does not fail, and
@@ -173,8 +170,7 @@ describe("what the READMEs count", () => {
     // record-type assertion above still makes, and it is worth not repeating.
     // Emphasis stripped for the same reason as the required-check assertion
     // below: where the `**` falls is formatting, not a claim. The Korean form
-    // allows a gap because `AGENTS.md` lists all nine names between "잡은" and
-    // the count, which is the more useful sentence to write.
+    // allows a gap because the prose documents list job names alongside their count.
     const [english, korean] = words;
     const claim = new RegExp(
       `${english} jobs|any of ${english} reasons|잡(?:은|이)?.{0,160}${korean} ?개|${korean} 개의 잡`,
@@ -238,8 +234,8 @@ describe("what the READMEs count", () => {
  * Two normalisations, each for a reason a matcher should not care about.
  * Emphasis is stripped because where a writer puts the `**` is formatting -- a
  * check that failed when someone moved an asterisk would be deleted within the
- * month. Line breaks are collapsed because a sentence wraps: `AGENTS.md` names
- * all nine jobs between "잡은" and the count, so the claim genuinely spans lines.
+ * month. Line breaks are collapsed because a sentence wraps: the documents name
+ * job keys between the count and the table, so the claim genuinely spans lines.
  */
 async function prose(name: string): Promise<string> {
   return (await read(name)).replaceAll("**", "").replace(/\s+/gu, " ");

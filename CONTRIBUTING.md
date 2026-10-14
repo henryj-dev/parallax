@@ -25,15 +25,6 @@ Those three are what CI runs, so a green local run is a good predictor.
 `pnpm dev`, `pnpm cli`, and the `verify:*` scripts. Start from `.env.example`,
 which documents every variable.
 
-**Install the git hooks once per clone:**
-
-```bash
-bash scripts/git-hooks/install.sh
-```
-
-They are hygiene rather than a boundary — `--no-verify` bypasses them, and they
-say so — but they catch the common accident before it becomes a commit.
-
 ## When the suite is red or a total changed
 
 Two records exist so a reader does not have to guess whether what they are seeing
@@ -54,6 +45,7 @@ gap the current entry in `test-flakes.md` records about itself.
 `pnpm test` is hermetic. The scripts under `scripts/verify-*.sh` are not: they
 drive a real Postgres, a real DNS listener, a real proxy, and a real Cloudflare
 account.
+
 ```bash
 pnpm verify:postgres
 pnpm verify:dns
@@ -67,17 +59,15 @@ edited, never a production one. None of these run in CI, for that reason.
 
 ## What CI will ask of you
 
-Three workflows. `check` carries most of it as **jobs**, one per question, so
-that a red result names its own cause instead of being one job that failed for
-any of nine reasons:
+Three workflows. `check` carries eight jobs, one per question, so that a red
+result names its own cause instead of being one job that failed for eight reasons:
 
 | job in `check` | what it answers |
 |---|---|
 | `verify` | typecheck, portal typecheck, build, and `node --test` on Node 24 and 26 |
 | `deployment-gate` | the schema surface, from a bare checkout with nothing installed — because that is how a deployment runs it |
 | `docker` | the image builds, runs as uid 10001, and keeps `migrations/` unwritable |
-| `hooks` | the Python hook suites under `scripts/`, which `node --test` cannot see |
-| `shellcheck` | `scripts/*.sh` and `scripts/git-hooks/install.sh`, at `--severity=warning` |
+| `shellcheck` | `scripts/*.sh`, at `--severity=warning` |
 | `policy` | secret scan, workflow audit, dependency review — from a shared reusable workflow, so every caller agrees |
 | `audit` | the installed dependency tree against published advisories |
 | `flake-watch` | the suite three times over on three platforms — **schedule and manual dispatch only** |
@@ -145,11 +135,6 @@ one that does not exist.
   and it reads the watched paths out of the command documented in both READMEs
   rather than repeating them — so if you change where schema lives, the READMEs
   are what you edit. Both of them, identically.
-- **The hook scripts are a snapshot.** Everything under `scripts/claude-hooks/`
-  and `scripts/git-hooks/` is copied from another repository and kept
-  byte-identical on purpose, so that drift is checkable with one `cmp`. A fix
-  that is not specific to Parallax belongs upstream, not here. `AGENTS.md`
-  explains which files are exceptions and why.
 - **No real names in the diff.** Zone names, addresses, and tokens stay out of
   code, tests, and fixtures. `example.com`, `203.0.113.7`, and `10.0.0.11` are
   the house placeholders.

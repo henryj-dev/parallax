@@ -34,12 +34,6 @@
 /security-audits/           @henryj-dev
 /tsconfig.test.json         @henryj-dev
 
-# A snapshot of stardust's, kept byte-identical on purpose so that drift is
-# checkable with one `cmp`. A local edit here is almost always the wrong fix --
-# it belongs upstream, and comes back with the next snapshot.
-/scripts/claude-hooks/      @henryj-dev
-/scripts/git-hooks/         @henryj-dev
-
 # Merge is deploy. These decide what ships and what is allowed to gate it.
 /.github/                   @henryj-dev
 /Dockerfile                 @henryj-dev

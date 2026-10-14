@@ -67,9 +67,6 @@ Out of scope:
 - denial of service through sheer volume against a listener you are expected to
   put behind something
 - findings from an automated scanner with no described path to impact
-- the agent guards under `scripts/claude-hooks/` and `scripts/git-hooks/`. They
-  are hygiene, not a security boundary, and they say so: `git commit
-  --no-verify` bypasses them by design and all three layers fail open.
 
 ## Published audit reports
 

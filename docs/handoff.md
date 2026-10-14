@@ -10,7 +10,7 @@ Parallax는 내부 DNS와 Cloudflare DNS의 desired state를 한곳에서 관리
 
 ```
 테스트          1096 중 1093 통과 · 3 스킵 · tsc 통과 · build 통과 · 포털 타입 검사 통과
-CI              check(verify · deployment-gate · docker · hooks · shellcheck · policy ·
+CI              check(verify · deployment-gate · docker · shellcheck · policy ·
                 flake-watch → gate) · codeql · scorecard — 워크플로 파일은 셋
 실제 의존성      PostgreSQL 17 · nginx TLS 종단 · Cloudflare 실계정
 배포            컨테이너 이미지, read-only 루트, uid 10001, initContainer 로 스키마 적용

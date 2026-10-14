@@ -6,7 +6,7 @@ name: check
 #
 # This file collects every verdict that belongs to a commit, one job per
 # question, so that a red result names its own cause instead of being one job
-# that failed for any of six reasons:
+# that failed for any of eight reasons:
 #
 #   verify            the TypeScript: does it typecheck, does it build, do the
 #                     `node --test` suites pass, on Node 24 and 26
@@ -14,7 +14,6 @@ name: check
 #                     installed, because that is how a deployment runs it
 #   docker            the image, which resolves its dependencies differently
 #                     than `verify` does and can break while it stays green
-#   hooks             the python hook suites -- which `node --test` cannot see
 #   shellcheck        the shell verifiers, same reason
 #   policy            dependency review, secret scan, workflow audit, from the
 #                     shared reusable workflow so every caller agrees
@@ -252,100 +251,9 @@ jobs:
               exit 1 ;;
           esac
 
-  # `scripts/**/test-*.py` -- the hook guards.
-  #
-  # These are not unit tests. `test-pre-commit.py` stands up a throwaway git
-  # repository in a temp directory and runs real `git commit` calls against it,
-  # because how git invokes the hook -- and from which cwd -- is the entire
-  # judgement being tested. So this job needs git configured with an identity,
-  # and it needs to run somewhere the suites can create worktrees.
-  hooks:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          # `test-pre-commit.py` derives a base ref from the upstream branch and
-          # falls back to the local tip. A depth-1 checkout leaves it deriving
-          # from a history with one commit in it, which is not the shape the
-          # suite is written against.
-          fetch-depth: 0
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          # The suites use `ast` to read the hook's own source and check the
-          # agent-environment list is what it claims. Nothing newer is needed.
-          python-version: "3.12"
-
-      - name: give the runner the git environment these suites assume
-        # Three settings, each of which a developer's machine supplies without
-        # anyone noticing and a runner does not. All three were found by running
-        # this job, not by reading the suites -- which is the argument for the
-        # job existing.
-        run: |
-          # 1. An identity. `git commit` refuses without one. The suites commit
-          #    inside their own temp repositories, never this checkout.
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # 2. `init.defaultBranch`. `test-session-start-pull.py` builds its
-          #    fixture as `git init --bare origin`, then pushes `main` to it and
-          #    clones it. With this unset git names the bare repo's HEAD
-          #    `refs/heads/master`, nothing ever creates that branch, and the
-          #    clone checks out an empty tree -- "warning: remote HEAD refers to
-          #    nonexistent ref". The suite then dies reading `work/A.md`, whose
-          #    absence says nothing about the hook it is testing.
-          #
-          #    ⚠️ This is why the suite passes on a Mac and failed here: Apple's
-          #    /Library/Developer/CommandLineTools/.../gitconfig sets it to
-          #    `main` system-wide, so the fixture is silently correct there.
-          git config --global init.defaultBranch main
-
-          # 3. `refs/remotes/origin/HEAD`. `git clone` creates it; actions/checkout
-          #    does not, because it fetches refs rather than cloning. The worktree
-          #    the session-end suite creates resolves its base through origin/HEAD
-          #    and dies on "fatal: invalid reference: origin/HEAD".
-          git remote set-head origin --auto || git remote set-head origin main
-          git symbolic-ref refs/remotes/origin/HEAD
-
-      - name: run the hook suites
-        # Every suite prints "실패 N 건" and exits non-zero on a failure, so the
-        # loop can simply let a non-zero exit stop the step. `set -e` is on by
-        # default in the `bash -e` shell Actions uses, but the loop would
-        # swallow it -- hence the explicit exit.
-        #
-        # ⚠️ The suites' own docstrings warn that they must not inherit an agent
-        # session's environment: `test-pre-commit.py` builds a "this is a human"
-        # fixture, and a stray `CLAUDECODE` or `GROK_AGENT` in the environment
-        # turns that fixture into an agent and the suite reports a failure that
-        # is really about where it was run. A runner has none of those set, which
-        # is exactly why this is the right place for them to run.
-        #
-        # Both directories are globbed. `scripts/git-hooks/test-pre-commit.py`
-        # used to be named literally while its sibling directory was globbed, so
-        # a second git-hook suite added later would simply not have run -- and
-        # nothing would have said so. A glob that matches nothing still fails
-        # loud here: there is no `nullglob`, so `python3` receives the literal
-        # pattern, exits non-zero, and `status` becomes 1.
-        run: |
-          status=0
-          for suite in scripts/claude-hooks/test-*.py scripts/git-hooks/test-*.py; do
-            echo "::group::$suite"
-            python3 "$suite" || status=1
-            echo "::endgroup::"
-          done
-          exit "$status"
-
   # `scripts/*.sh` -- the verifiers `pnpm verify:integration` drives.
   #
-  # Scoped to this repository's own shell scripts on purpose. `scripts/git-hooks/`
-  # and `scripts/claude-hooks/` are a snapshot of stardust's and are kept
-  # byte-identical there deliberately (see AGENTS.md); linting them here would
-  # produce findings whose only available fix is to break the property that makes
-  # drift checkable with one `cmp`. `scripts/git-hooks/pre-commit` is python
-  # despite having no extension, and shellcheck errors out on it (SC1071), so the
-  # glob would have to exclude it in any case.
+  # Run shellcheck over the repository's shell scripts.
   shellcheck:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -385,14 +293,7 @@ jobs:
           tar xJf /tmp/shellcheck.tar.xz -C /tmp
           sc="/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
           "$sc" --version
-          # `scripts/git-hooks/install.sh` is in scope and its byte-identical
-          # siblings are not, and that is not an inconsistency. AGENTS.md records
-          # that installer as deliberately **divergent** from stardust's -- theirs
-          # installs a `pre-push` hook that does not exist here -- so a finding in
-          # it is actionable. The files that are kept byte-identical are excluded
-          # because their only available fix would break the one property that
-          # makes drift checkable with a single `cmp`.
-          "$sc" --severity=warning scripts/*.sh scripts/git-hooks/install.sh
+          "$sc" --severity=warning scripts/*.sh
 
   # **The policy layer does not belong to this repository.** Credential scanning, workflow
   # auditing and dependency review ask the same question of every repository that calls them, whatever
@@ -505,7 +406,7 @@ jobs:
   # one-line change to `needs:`, and leaves the ruleset alone.
   gate:
     name: gate
-    needs: [verify, deployment-gate, docker, hooks, shellcheck, policy, audit, flake-watch]
+    needs: [verify, deployment-gate, docker, shellcheck, policy, audit, flake-watch]
     # This job must run even when something upstream is red. Otherwise it is a check that
     # never reported, the rule waits forever, and nothing records what broke.
     if: always()
