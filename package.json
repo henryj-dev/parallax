@@ -29,8 +29,8 @@
   },
   "packageManager": "pnpm@11.9.0",
   "devDependencies": {
-    "@types/node": "^24.13.6",
-    "oxlint": "^1.85.0",
+    "@types/node": "^24.19.2",
+    "oxlint": "^1.88.0",
     "typescript": "^7.0.2"
   },
   "dependencies": {
