@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { emptyAccountState, MEMBER_ACCOUNTS_FEATURE, readAccountState, readMemberAudit, retainAudit, type AccountState, type AccountStateStore, type AccountTransaction, type MemberAudit } from "../application/accounts/state.ts";
 import { chmod, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type {
@@ -8,15 +9,20 @@ import type {
   StoredAccessToken,
 } from "../application/ports.ts";
 import { ensurePrivateDirectory, withFileLock } from "./atomic-file.ts";
+import { AUTH_FEATURE_NAME, assertRecognizedAuthFeatures, describeStoredNames } from "./auth-storage.ts";
 
 /** The draft `#mutate` hands out is edited in place, so the rows are writable. */
 type MutableAccessToken = { -readonly [K in keyof StoredAccessToken]: StoredAccessToken[K] };
 
 interface ConfigurationDocument {
-  version: 1;
+  version: 1 | 2;
+  accounts?: AccountState;
+  accountAudit?: MemberAudit[];
   settings: Record<string, unknown>;
   credentials?: string;
   accessTokens: MutableAccessToken[];
+  /** 저장소가 켠 인증 기능. 빈 목록도 그대로 다시 쓴다. */
+  authFeatures?: string[];
 }
 
 /**
@@ -31,6 +37,28 @@ export class FileConfigurationStore {
   constructor(path: string) {
     if (path.trim().length === 0) throw new Error("configuration file path must not be empty");
     this.#path = path;
+  }
+
+  get accounts(): AccountStateStore {
+    return {
+      transact: async (operation) => this.#mutate((document) => {
+        const transaction: AccountTransaction = { state: structuredClone(document.accounts ?? emptyAccountState()), audit: [] };
+        const result = operation(transaction);
+        if (result && (typeof result === "object" || typeof result === "function") && "then" in result) throw new Error("account transaction callback must be synchronous");
+        const state = readAccountState(transaction.state);
+        if (document.accounts?.enabled && !state.enabled) throw new Error("account activation cannot be reversed");
+        document.accounts = state;
+        document.accountAudit = retainAudit(readMemberAudit([...(document.accountAudit ?? []), ...transaction.audit]), transaction.retention);
+        document.version = 2;
+        if (state.enabled) document.authFeatures = [...new Set([...(document.authFeatures ?? []), MEMBER_ACCOUNTS_FEATURE])];
+        return structuredClone(result);
+      }),
+      read: async () => structuredClone((await this.#readLatest()).accounts ?? emptyAccountState()),
+      snapshot: async () => {
+        const document = await this.#readLatest();
+        return structuredClone({ state: document.accounts ?? emptyAccountState(), audit: document.accountAudit ?? [] });
+      },
+    };
   }
 
   get settings(): SettingsRepository {
@@ -158,8 +186,27 @@ export class FileConfigurationStore {
   }
 }
 
+/** 이 버전이 읽고 다시 쓸 수 있는 최상위 필드. */
+const DOCUMENT_FIELDS = new Set(["version", "settings", "credentials", "accessTokens", "authFeatures", "accounts", "accountAudit"]);
+
 function parseDocument(value: unknown): ConfigurationDocument {
-  if (!isObject(value) || value.version !== 1) throw new Error("unsupported configuration file");
+  if (!isObject(value) || (value.version !== 1 && value.version !== 2)) throw new Error("unsupported configuration file");
+  // 모르는 필드는 버리지 않고 거절한다. 이 문서는 읽을 때마다 다시 쓰일 수 있다.
+  // 버리면 미래 버전이 남긴 회원 데이터를 받아들인 척하고 다음 쓰기에서 지운다.
+  const unknownFields = Object.keys(value).filter((field) => !DOCUMENT_FIELDS.has(field)).sort();
+  if (unknownFields.length > 0) {
+    // 필드 이름은 파일에서 온 값이다. 따옴표로 감싸고 개수와 길이를 줄여서 적는다.
+    throw new Error(`unsupported configuration file: unknown field ${describeStoredNames(unknownFields)}`);
+  }
+  let authFeatures: string[] | undefined;
+  if (value.authFeatures !== undefined) {
+    if (!Array.isArray(value.authFeatures)
+      || !value.authFeatures.every((feature) => typeof feature === "string" && AUTH_FEATURE_NAME.test(feature))) {
+      throw new Error("unsupported configuration file: authFeatures must be a list of names");
+    }
+    authFeatures = [...(value.authFeatures as string[])];
+    assertRecognizedAuthFeatures(authFeatures, "the configuration file");
+  }
   const settings = isObject(value.settings) ? value.settings : {};
   const credentials = typeof value.credentials === "string" ? value.credentials : undefined;
   const accessTokens = Array.isArray(value.accessTokens) ? value.accessTokens.map(readAccessToken) : [];
@@ -167,7 +214,22 @@ function parseDocument(value: unknown): ConfigurationDocument {
     || new Set(accessTokens.map((token) => token.digest)).size !== accessTokens.length) {
     throw new Error("duplicate stored access token");
   }
-  return { version: 1, settings, ...(credentials ? { credentials } : {}), accessTokens };
+  const accounts = value.accounts === undefined ? undefined : readAccountState(value.accounts);
+  const accountAudit = value.accountAudit === undefined ? undefined : readMemberAudit(value.accountAudit);
+  if ((accounts !== undefined || accountAudit !== undefined || authFeatures?.includes(MEMBER_ACCOUNTS_FEATURE)) && value.version !== 2) {
+    throw new Error("account state requires configuration version 2");
+  }
+  if ((accounts !== undefined) !== (accountAudit !== undefined)
+    || Boolean(accounts?.enabled) !== Boolean(authFeatures?.includes(MEMBER_ACCOUNTS_FEATURE))) throw new Error("incomplete account activation");
+  // 읽은 표식과 회원 상태를 모든 설정 쓰기에서 보존한다.
+  return {
+    version: value.version,
+    ...(accounts ? { accounts, accountAudit } : {}),
+    settings,
+    ...(credentials ? { credentials } : {}),
+    accessTokens,
+    ...(authFeatures ? { authFeatures } : {}),
+  };
 }
 
 function readAccessToken(value: unknown): MutableAccessToken {

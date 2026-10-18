@@ -1,0 +1,19 @@
+/* The account page reuses the portal's tokens and adds only its own layout. */
+.account-shell { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; display: grid; gap: 1rem; }
+.account-panel { padding: 1.25rem 1.5rem; }
+.account-panel h1, .account-panel h2, .account-panel h3 { margin-top: 0; }
+.account-form { display: grid; gap: 0.75rem; margin: 0.75rem 0; }
+.account-form label { display: grid; gap: 0.25rem; }
+.account-form.inline { grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); align-items: end; }
+.account-form fieldset { display: grid; gap: 0.75rem; border: 1px solid currentColor; border-radius: 0.5rem; padding: 0.75rem; }
+.account-notice { padding: 0.75rem 1rem; border-radius: 0.5rem; border: 1px solid currentColor; }
+.account-notice[data-level="error"] { font-weight: 600; }
+.account-secret { word-break: break-all; user-select: all; }
+.account-codes { columns: 2; font-family: ui-monospace, monospace; }
+.account-facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; }
+.account-facts dd { margin: 0; }
+.account-list { list-style: none; padding: 0; display: grid; gap: 0.5rem; }
+.account-list li { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; justify-content: space-between; }
+.account-table { width: 100%; border-collapse: collapse; }
+.account-table th, .account-table td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid currentColor; vertical-align: middle; }
+.account-table td:last-child { white-space: nowrap; }

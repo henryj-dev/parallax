@@ -179,3 +179,39 @@ export const httpSeconds = histogram(
   "Time to answer one API request.",
   [0.005, 0.025, 0.1, 0.5, 1, 2.5, 5, 10, 30],
 );
+
+/**
+ * An attempt limit counted a client by the shared "unidentified" bucket: its address could not be
+ * read as an IPv4 or IPv6 address. Usually a proxy header the deployment trusts but does not set,
+ * or one it sets in a shape this process cannot read. Every such client then shares one limit.
+ */
+export const accountClientUnidentified = counter(
+  "parallax_account_unidentified_clients_total",
+  "Account attempt-limit checks whose client address could not be read and fell into the shared bucket.",
+);
+
+/**
+ * Attempt-limit entries dropped while reading account state, by reason: `shape` (written by an older
+ * build, or broken), `duplicate` (a key repeated) or `member` (a counter for a member no longer there).
+ * This build writes none of them, so anything but `shape` right after an upgrade is a defect to report.
+ */
+export const accountThrottleDropped = counter(
+  "parallax_account_throttle_entries_dropped_total",
+  "Attempt-limit entries dropped while reading account state, once per stored document, by reason: shape (older build or broken), duplicate (repeated key), member (counter for a member no longer present).",
+);
+
+/**
+ * An attempt counter the shared table had no room for -- every slot at its limit -- kept by this
+ * process instead. Any value above zero means a flood is under way, and that each replica is counting
+ * on its own, so the limit is up to the replica count looser. Labelled by kind only. Worth an alert.
+ */
+export const accountThrottleSaturated = counter(
+  "parallax_account_throttle_saturated_total",
+  "Account attempt counters kept per process because the shared table had every slot at its limit.",
+);
+
+/** A per-process fallback counter dropped to stay within its memory bound. */
+export const accountLocalLimiterEvicted = counter(
+  "parallax_account_local_limiter_evictions_total",
+  "Per-process fallback attempt counters dropped, least recently used first, to stay within their memory bound.",
+);

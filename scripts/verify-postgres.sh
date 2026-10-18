@@ -61,8 +61,13 @@ APPLIED=$(apply_migrations | node -e 'let d="";process.stdin.on("data",c=>d+=c).
 [ "$APPLIED" = "$EXPECTED" ] || fail "expected $EXPECTED migrations to be applied, reported $APPLIED"
 TABLES=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'parallax_%'")
-[ "$TABLES" = "8" ] || fail "expected 8 tables, found $TABLES"
+# Seven domain tables, the migration ledger, and the three 006 adds for member accounts.
+[ "$TABLES" = "11" ] || fail "expected 11 tables, found $TABLES"
 ok "schema applied through \`parallax migrate\` ($TABLES tables)"
+ENABLED=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
+  "SELECT (SELECT count(*) FROM parallax_auth_features) || '/' || (SELECT count(*) FROM parallax_account_state)")
+[ "$ENABLED" = "0/0" ] || fail "migration 006 must not enable member accounts, found marker/state $ENABLED"
+ok "006 leaves member accounts off (marker/state rows $ENABLED)"
 
 echo "== re-applying the migrations is idempotent =="
 apply_migrations >/dev/null
@@ -76,7 +81,7 @@ for pid in $(jobs -p); do wait "$pid" || FAILED=1; done
 [ "$FAILED" = "0" ] || fail "a concurrent migration run failed"
 TABLES=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
   "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'parallax_%'")
-[ "$TABLES" = "8" ] || fail "concurrent runs left $TABLES tables"
+[ "$TABLES" = "11" ] || fail "concurrent runs left $TABLES tables"
 ok "three simultaneous runs all succeeded, schema unchanged"
 
 echo "== late apply status merges with a newer desired revision =="
@@ -517,5 +522,160 @@ NODE
 ok "held sessions terminated with and without a query in flight; process alive, query rejected, pool recovered"
 
 stop_app
+
+echo "== member accounts: two instances against one database =="
+# Two pools stand for two replicas. The service clock is shared and moved by
+# hand so a code step can be replayed without waiting thirty seconds; nothing
+# else is simulated -- every check below is a real transaction on this server.
+DATABASE_URL="$DATABASE_URL" PARALLAX_VERIFY_ROOT="$ROOT" node --input-type=module - <<'NODE'
+import { pathToFileURL } from "node:url";
+const load = (path) => import(pathToFileURL(`${process.env.PARALLAX_VERIFY_ROOT}/${path}`).href);
+const { createPostgresPool } = await load("src/infrastructure/postgres.ts");
+const { PostgresAccountStateStore, InMemoryAccountStateStore } = await load("src/infrastructure/account-state.ts");
+const { AccountService } = await load("src/application/accounts/service.ts");
+const { exportBackup, importBackup, readBackupDocument } = await load("src/application/backup.ts");
+const { accountTestPolicy } = await load("test/support/accounts.ts");
+const { TOTP, Secret } = await import("otpauth");
+
+let now = 1800000000000;
+const mail = [];
+const policy = { ...accountTestPolicy, rateLimit: { ...accountTestPolicy.rateLimit, login: { attempts: 3, windowSeconds: 60, baseDelaySeconds: 60, maxDelaySeconds: 60 } } };
+const pools = [createPostgresPool(process.env.DATABASE_URL), createPostgresPool(process.env.DATABASE_URL)];
+const replica = (pool) => AccountService.create({ store: new PostgresAccountStateStore(pool), policy, key: Buffer.alloc(32, 7),
+  publicOrigin: "https://dns.example.com", now: () => now,
+  mailer: { send: async (message) => { mail.push(message); }, sendSecurityNotification: async () => {} } });
+const [a, b] = [await replica(pools[0]), await replica(pools[1])];
+const otp = (secret) => new TOTP({ secret: Secret.fromBase32(secret), digits: 6, period: 30, algorithm: "SHA256" }).generate({ timestamp: now });
+const one = (results, label) => {
+  const won = results.filter((r) => r.status === "fulfilled").length;
+  if (won !== 1) throw new Error(`${label}: expected exactly one winner, got ${won}: ${results.map((r) => r.reason?.message ?? "ok").join(" | ")}`);
+  console.log(`  ok: ${label}`);
+};
+const query = async (sql) => (await pools[0].query(sql)).rows;
+const tick = () => { now += 30_000; };
+
+try {
+  await Promise.allSettled([a.enable(), b.enable()]).then((r) => one(r, "concurrent enable commits once"));
+  const marker = await query("SELECT feature FROM parallax_auth_features");
+  if (marker.length !== 1 || marker[0].feature !== "member-accounts-v1") throw new Error("enable did not write the marker in the same transaction");
+
+  const boot = await Promise.allSettled([a.bootstrap("admin@example.com", "test-password-1", "Admin"), b.bootstrap("other@example.com", "test-password-1", "Other")]);
+  one(boot, "concurrent first-administrator bootstrap admits one");
+  const challenge = boot.find((r) => r.status === "fulfilled").value.challenge;
+  const bootEmail = boot[0].status === "fulfilled" ? "admin@example.com" : "other@example.com";
+  if (await a.resolve("x".repeat(43), AbortSignal.timeout(1000)).then((r) => r.status) !== "rejected") throw new Error("a session existed before enrollment");
+  const enrollment = await b.beginEnrollment({ challenge });
+  const first = await a.confirmEnrollment({ challenge, otp: otp(enrollment.secretBase32), ip: "203.0.113.7" });
+
+  tick();
+  // One open challenge per member: both replicas race the same challenge with the same code step.
+  const c1 = await a.login(bootEmail, "test-password-1", "203.0.113.7");
+  one(await Promise.allSettled([a.completeMfa(c1.challenge, otp(enrollment.secretBase32), "203.0.113.7"), b.completeMfa(c1.challenge, otp(enrollment.secretBase32), "10.0.0.11")]),
+    "the same code step is accepted once across replicas");
+  const older = await a.login(bootEmail, "test-password-1", "203.0.113.7");
+  const newer = await b.login(bootEmail, "test-password-1", "10.0.0.11");
+  tick();
+  if (await a.completeMfa(older.challenge, otp(enrollment.secretBase32), "203.0.113.7").then(() => true, () => false)) throw new Error("a replaced challenge still worked");
+  console.log("  ok: a newer sign-in on another replica replaces the member's earlier challenge");
+  void newer;
+  const c3 = await a.login(bootEmail, "test-password-1", "203.0.113.7");
+  const recovered = await Promise.allSettled([a.completeMfa(c3.challenge, first.recoveryCodes[0], "203.0.113.7"), b.completeMfa(c3.challenge, first.recoveryCodes[0], "10.0.0.11")]);
+  one(recovered, "a recovery code is consumed once across replicas");
+  // A recovery code ends every session and only allows enrolling a new factor.
+  if ((await a.resolve(first.token, AbortSignal.timeout(1000))).status !== "rejected") throw new Error("a recovery code left the old session alive");
+  const reenroll = recovered.find((r) => r.status === "fulfilled").value;
+  if (!reenroll.enrollmentRequired) throw new Error("a recovery code issued a session instead of a re-enrollment");
+  const replacement = await b.beginEnrollment({ challenge: reenroll.challenge });
+  tick();
+  const admin = { token: (await a.confirmEnrollment({ challenge: reenroll.challenge, otp: otp(replacement.secretBase32), ip: "203.0.113.7" })).token };
+  console.log("  ok: the recovery code led to a replacement factor and a fresh session");
+
+  // A second qualified administrator, through the real invitation path.
+  await a.invite(admin, "second@example.com", "admin");
+  const invite = new URL(mail.at(-1).link).searchParams.get("token");
+  await Promise.allSettled([a.acceptInvite(invite, "second@example.com", "test-password-2", "Second", "10.0.0.11"), b.acceptInvite(invite, "second@example.com", "test-password-2", "Second", "10.0.0.11")])
+    .then((r) => one(r, "an invitation is accepted once across replicas"));
+  const second = await b.login("second@example.com", "test-password-2", "10.0.0.11");
+  const secondSeed = await b.beginEnrollment({ challenge: second.challenge });
+  tick();
+  const secondSession = await b.confirmEnrollment({ challenge: second.challenge, otp: otp(secondSeed.secretBase32), ip: "10.0.0.11" });
+
+  const members = await a.listMembers(admin);
+  const [me, other] = [members.find((m) => m.canonicalLoginKey === bootEmail), members.find((m) => m.canonicalLoginKey === "second@example.com")];
+  const demotions = await Promise.allSettled([
+    a.changeMember(admin, other.userId, other.version, { role: "viewer" }),
+    b.changeMember({ token: secondSession.token }, me.userId, me.version, { role: "viewer" }),
+  ]);
+  const surviving = demotions.filter((r) => r.status === "fulfilled").length;
+  const remaining = (await query("SELECT document FROM parallax_account_state"))[0].document.users.filter((u) => u.role === "admin" && u.status === "active").length;
+  if (surviving < 1 || remaining < 1) throw new Error(`last-administrator protection failed: ${surviving} demotions, ${remaining} administrators left`);
+  console.log(`  ok: concurrent cross-demotion leaves an administrator (${remaining} left)`);
+
+  // A change on one replica is what the other sees on its next request.
+  const live = demotions[0].status === "fulfilled" ? admin : { token: secondSession.token };
+  const demotedToken = demotions[0].status === "fulfilled" ? secondSession.token : admin.token;
+  if ((await b.resolve(demotedToken, AbortSignal.timeout(1000))).status !== "rejected") throw new Error("a demoted member's session survived on the other replica");
+  if ((await a.resolve(live.token, AbortSignal.timeout(1000))).status !== "active") throw new Error("the remaining administrator lost its session");
+  console.log("  ok: a role change ends the session on the other replica's next request");
+
+  const attempts = [];
+  for (const service of [a, b, a, b]) attempts.push(await service.login("nobody@example.com", "wrong-password-1", "203.0.113.9").then(() => "ok", (e) => e.code));
+  if (attempts.at(-1) !== "rate-limited" || attempts.slice(0, 3).includes("rate-limited")) throw new Error(`shared attempt limit not enforced: ${attempts}`);
+  console.log("  ok: the attempt limit is shared across replicas");
+
+  const audit = await query("SELECT count(*)::int AS n FROM parallax_account_audit");
+  if (!(audit[0].n > 0)) throw new Error("no account audit rows");
+  const document = JSON.stringify((await query("SELECT document FROM parallax_account_state"))[0].document);
+  for (const secret of [admin.token, first.token, enrollment.secretBase32, replacement.secretBase32, "test-password-1", ...first.recoveryCodes]) if (document.includes(secret)) throw new Error("a raw secret reached the database");
+  console.log(`  ok: ${audit[0].n} audit rows, no raw token, key, password or recovery code stored`);
+
+  // One of each remaining kind, so the round trip below covers reset, mailed-link and provider-start counters too.
+  await a.requestPasswordReset("second@example.com", "198.51.100.30");
+  await a.resetPassword("z".repeat(43), "test-password-9", "198.51.100.31").catch(() => undefined);
+  await a.beginOidc({ issuer: "https://idp.example.com", purpose: "login", verifier: "v".repeat(43), nonce: "n".repeat(43), state: "s".repeat(43), ip: "198.51.100.32" });
+
+  // What this build wrote reads back unchanged: every counter in the row survives a fresh parse.
+  const { readAccountState } = await load("src/application/accounts/state.ts");
+  const written = (await query("SELECT document FROM parallax_account_state"))[0].document;
+  const reparsed = readAccountState(JSON.parse(JSON.stringify(written)));
+  const flat = (entries) => JSON.stringify(entries.map((x) => [x.key, x.count, x.expiresAt]));
+  const memberCounters = (counters) => JSON.stringify(Object.entries(counters).sort().map(([id, c]) => [id, Object.entries(c).sort().map(([k, v]) => [k, v.count, v.expiresAt])]));
+  if (flat(reparsed.throttle) !== flat(written.throttle) || memberCounters(reparsed.memberThrottle) !== memberCounters(written.memberThrottle)) throw new Error("PostgreSQL attempt counters did not read back as written");
+  if (!written.throttle.length || !Object.keys(written.memberThrottle).length) throw new Error("the scenario wrote no attempt counters to check");
+  for (const kind of ["login", "mfa", "reset", "token", "link"]) if (!written.throttle.some((x) => x.key.startsWith(`${kind}:ip:`))) throw new Error(`no ${kind} counter was written`);
+  console.log(`  ok: ${written.throttle.length} attempt counters and ${Object.keys(written.memberThrottle).length} member counters read back as written`);
+
+  // A store written by an earlier build: attempt counters of the old shape and no per-member counters.
+  await pools[0].query("UPDATE parallax_account_state SET document = jsonb_set(document - 'memberThrottle', '{throttle}', $1::jsonb) WHERE id = 1",
+    [JSON.stringify([{ key: `login:acct:${"A".repeat(43)}`, count: 2, expiresAt: now + 60_000 }])]);
+  const reopened = await new PostgresAccountStateStore(pools[0]).read();
+  if (reopened.throttle.length !== 0 || Object.keys(reopened.memberThrottle).length !== 0 || reopened.users.length !== 2) throw new Error("old-shape attempt counters were not dropped cleanly");
+  console.log("  ok: a state with attempt counters of an older shape opens, with only those counters dropped");
+
+  const backup = readBackupDocument(JSON.parse(JSON.stringify(await exportBackup({
+    zones: { list: async () => [], audit: async () => [] }, statuses: { list: async () => [] }, settings: { read: async () => ({}) },
+    accessTokens: { list: async () => [] }, credentials: { read: async () => undefined }, accounts: new PostgresAccountStateStore(pools[0]),
+  }))));
+  if (backup.accounts.state.sessions.length || backup.accounts.state.tokens.length) throw new Error("the backup carried sessions or tokens");
+  const target = new InMemoryAccountStateStore();
+  await importBackup({ zones: { list: async () => [] }, statuses: {}, settings: { read: async () => ({}) }, accessTokens: { list: async () => [] },
+    credentials: { read: async () => undefined }, accounts: target }, backup);
+  if ((await target.read()).users.length !== backup.accounts.state.users.length || backup.accounts.state.users.length !== 2) throw new Error("the restored member set is not the exported one");
+  console.log("  ok: a format 2 backup from PostgreSQL carries the members and no session or token");
+} finally {
+  await Promise.all(pools.map((pool) => pool.end()));
+}
+NODE
+
+echo "== an enabled store refuses to serve in legacy mode =="
+set +e
+DATABASE_URL="$DATABASE_URL" HOST=127.0.0.1 PORT="$APPPORT" PARALLAX_PROVIDER_STATE_FILE="$WORK/provider-state.json" \
+  node "$ROOT/src/index.ts" > "$WORK/legacy.log" 2>&1
+LEGACY_EXIT=$?
+set -e
+[ "$LEGACY_EXIT" = "1" ] || { cat "$WORK/legacy.log" >&2; fail "legacy startup against enabled accounts exited $LEGACY_EXIT"; }
+grep -q "member accounts are enabled; PARALLAX_AUTH_MODE=accounts is required" "$WORK/legacy.log" || { cat "$WORK/legacy.log" >&2; fail "legacy startup did not say why it stopped"; }
+ok "legacy mode stops at startup once member accounts are enabled"
+
 echo
 echo "PostgreSQL integration verification passed."

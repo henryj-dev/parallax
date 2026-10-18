@@ -105,6 +105,8 @@ export interface HealthStatusValue {
 }
 
 export interface StoreState extends Record<string, unknown> {
+  /** The deployment signs people in as members; the account page owns sign-in. */
+  memberAccounts?: boolean;
   records: RecordRow[];
   healthChecks: HealthCheckPolicyValue[];
   healthChecksKnown?: boolean;

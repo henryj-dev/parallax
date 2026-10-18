@@ -103,8 +103,9 @@ describe("database migrations", () => {
       "003_audit_actions.sql",
       "004_security_invariants.sql",
       "005_access_token_lifetime.sql",
+      "006_member_accounts.sql",
     ]);
-    assert.equal(sqlRuns, 5, "one transaction per manifest entry");
+    assert.equal(sqlRuns, 6, "one transaction per manifest entry");
 
     const second = await applyMigrations(pool, directory, "parallax");
     assert.deepEqual(second.applied, []);

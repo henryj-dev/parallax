@@ -1,4 +1,4 @@
-import { readConfig } from "../config.ts";
+import { assertSupportedAuthMode, readConfig } from "../config.ts";
 
 /**
  * What the serving process would refuse to start with, asked before it starts.
@@ -45,7 +45,15 @@ export interface ConfigCheck {
    */
   readonly credentialKey: "set" | "absent";
   readonly ownershipSecret: "set" | "absent";
+  /**
+   * Accounts mode only: the most memory password hashing can take at once (`maxConcurrent` × scrypt
+   * `maxmem`; queued work waits and takes none), and a warning above 512 MiB. Not a failure -- this
+   * process cannot know the container's memory -- but the number to compare with it.
+   */
+  readonly accountHashing?: { readonly peakMiB: number; readonly warning?: string };
 }
+
+const HASHING_WARNING_BYTES = 512 * 1024 * 1024;
 
 /**
  * Names and shapes only. A preflight is run wherever a deployment is run, and
@@ -54,6 +62,8 @@ export interface ConfigCheck {
  */
 export function checkConfig(environment: NodeJS.ProcessEnv = process.env): ConfigCheck {
   const config = readConfig(environment);
+  // 서버가 시작을 거절할 모드라면 사전 점검도 통과시키지 않는다.
+  assertSupportedAuthMode(config);
   return {
     environment: "ok",
     portalSignIn: config.portalSignIn,
@@ -73,5 +83,13 @@ export function checkConfig(environment: NodeJS.ProcessEnv = process.env): Confi
     bootstrapTokens: config.bootstrapTokens.length,
     credentialKey: config.credentialMasterKey ? "set" : "absent",
     ownershipSecret: config.ownershipSecret ? "set" : "absent",
+    ...(config.accounts ? { accountHashing: accountHashing(config.accounts.policy.password) } : {}),
   };
+}
+
+function accountHashing(password: { readonly maxConcurrent: number; readonly scrypt: { readonly maxmem: number } }): NonNullable<ConfigCheck["accountHashing"]> {
+  const peak = password.maxConcurrent * password.scrypt.maxmem, peakMiB = Math.ceil(peak / (1024 * 1024));
+  return peak > HASHING_WARNING_BYTES
+    ? { peakMiB, warning: `password hashing can take up to ${peakMiB} MiB at once (maxConcurrent × scrypt maxmem); check that the container has that to spare` }
+    : { peakMiB };
 }

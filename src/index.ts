@@ -6,13 +6,14 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { isLoopbackHost, readConfig, usesPlaintextPostgres } from "./config.ts";
+import { isLoopbackHost, readConfig, usesPlaintextPostgres, type ParallaxConfig } from "./config.ts";
 import { createDriftMonitor } from "./dns/drift.ts";
 import { createDnsServer, type ServedZone } from "./dns/server.ts";
 import { servedZones } from "./dns/snapshot.ts";
-import { PORTAL_ASSETS } from "./http/portal-assets.ts";
+import { createAccountIdentityHandler } from "./http/account-identity-routes.ts";
+import { ACCOUNT_ONLY_ASSETS, PORTAL_ASSETS, type PortalAsset } from "./http/portal-assets.ts";
 import { portalRedirect } from "./http/portal-entry.ts";
-import { createNodeHandler, requestOrigin } from "./http/api.ts";
+import { createNodeHandler, requestClientKey, requestOrigin } from "./http/api.ts";
 import { createIdentityHandler, IDENTITY_PREFIX } from "./http/identity-routes.ts";
 import { createReadinessMonitor } from "./http/readiness.ts";
 import { redirectLocation } from "./http/redirect.ts";
@@ -21,10 +22,19 @@ import {
   certificateReloadFailed, dnsDriftCheckFailed, notifyFailed, recordUnservable, refreshFailed, replyUnanswerable, zoneSkipped,
 } from "./observability/signals.ts";
 import { createRuntime, type ParallaxRuntime } from "./runtime.ts";
-import { authenticate, withIdentityProvider, type SecurityConfig } from "./security/http-authorization.ts";
+import { assertAccountSessionsNeedAuthentication, setTrustedClientKey, withIdentityProvider, type SecurityConfig } from "./security/http-authorization.ts";
+import { authenticateManagementRequest } from "./http/management-authentication.ts";
 import { shutdownProcess } from "./shutdown.ts";
 
-const config = readConfig();
+// A setting this process cannot honour stops it with one line, the same way a failed runtime does.
+let config: ParallaxConfig;
+try {
+  config = readConfig();
+} catch (error) {
+  console.error(`parallax: ${error instanceof Error ? error.message : "configuration could not be read"}`);
+  process.exit(1);
+  throw error;
+}
 
 /**
  * How long a zone change made somewhere else may take to reach the DNS
@@ -134,12 +144,16 @@ gauge(
 
 const securityConfig = (): SecurityConfig => {
   const tokens = accessTokens.security();
+  if (runtime.accounts) return { ...tokens, enabled: true, accountSessions: runtime.accounts, disableTokenExchange: true };
   const withTokenSessions: SecurityConfig = config.sessionSecret === undefined
     ? tokens
     : { ...tokens, tokenSessionSecret: config.sessionSecret };
   return config.oidc ? withIdentityProvider(withTokenSessions, config.oidc.sessionSecret) : withTokenSessions;
 };
 
+// 꺼진 인증과 회원 세션 확인 장치가 같이 온 설정이면 리스너를 열기 전에 멈춘다.
+// accounts 모드는 언제나 인증을 켜고 확인 장치를 주므로 여기서 걸리지 않는다.
+assertAccountSessionsNeedAuthentication(securityConfig());
 if (!securityConfig().enabled && !isLoopbackHost(config.host)) {
   console.error("parallax: refusing to serve a non-loopback address with no access token. Issue one from a loopback session, or set PARALLAX_AUTH_TOKENS.");
   process.exit(1);
@@ -182,7 +196,9 @@ desiredStateTimer.unref();
 
 // Signing in through an identity provider, when one is configured. It sits
 // ahead of the API because it is how a caller with no credential acquires one.
-const handleIdentity = config.oidc ? createIdentityHandler({ settings: config.oidc }) : undefined;
+const handleIdentity = config.oidc ? runtime.accounts
+  ? createAccountIdentityHandler({ service: runtime.accounts, settings: config.oidc, policy: config.accounts!.oidcPolicy! })
+  : createIdentityHandler({ settings: config.oidc }) : undefined;
 
 const nodeHandlerOptions = {
   get publicOrigin() { return settingsService.current().publicOrigin || undefined; },
@@ -208,7 +224,9 @@ function findPublicDirectory(): string {
 
 const publicDirectory = findPublicDirectory();
 
-const staticFiles = PORTAL_ASSETS;
+// The account page exists only where member accounts do; elsewhere its paths are simply not found.
+const staticFiles: ReadonlyMap<string, PortalAsset> = runtime.accounts ? PORTAL_ASSETS
+  : new Map([...PORTAL_ASSETS].filter(([path]) => !ACCOUNT_ONLY_ASSETS.includes(path)));
 
 const handleRequest: RequestListener = (request, response) => {
   void route(request, response).catch((error: unknown) => {
@@ -299,7 +317,18 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     // Behind authentication for the same reason `/health/ready` keeps its
     // detail there: these numbers describe the deployment. A scraper sends a
     // bearer token the same way it sends one to anything else.
-    if (securityConfig().enabled && !isAuthenticated(request)) {
+    // 인증이 꺼진 배포도 확인을 거친다. 꺼진 인증과 회원 세션 확인 장치가 같이 온
+    // 설정은 그 안에서 거절된다.
+    const security = securityConfig();
+    const checked = await managementCaller(request, security);
+    const caller = security.enabled ? checked : "authenticated";
+    if (caller === "unavailable") {
+      // 회원 세션 저장소가 답하지 못했다. 401 이면 수집기가 토큰이 틀렸다고 읽는다.
+      response.writeHead(503, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      response.end(JSON.stringify({ error: "authentication_unavailable", message: "credentials could not be checked right now" }));
+      return;
+    }
+    if (caller !== "authenticated") {
       response.writeHead(401, {
         "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
@@ -330,6 +359,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       // unauthenticated caller sees anyway when it presses one that is not
       // wired, so saying it here costs nothing and saves a dead button.
       identityProvider: config.oidc ? "available" : "unavailable",
+      memberAccounts: runtime.accounts ? "available" : "unavailable",
     }));
     return;
   }
@@ -338,10 +368,14 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       const tokenReadiness = accessTokens.readiness();
       if (!tokenReadiness.ready) throw new Error("access-token cache is stale");
       if (!readiness.ready()) throw new Error("provider configuration is incomplete");
+      // 판정 자체는 호출자와 상관없다. 회원 세션을 확인하지 못하면 상세만 뺀다.
+      // 준비 상태를 503 으로 바꾸면 인증 저장소 장애 하나로 모든 인스턴스가
+      // 부하 분산에서 빠진다.
+      const detailed = await managementCaller(request) === "authenticated";
       response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       // Backend and provider details describe the deployment, so only an
       // authenticated caller receives them.
-      response.end(JSON.stringify(isAuthenticated(request)
+      response.end(JSON.stringify(detailed
         ? {
           status: "ready",
           service: "parallax",
@@ -383,10 +417,13 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       if (Array.isArray(value)) for (const item of value) headers.append(name, item);
       else if (value !== undefined) headers.set(name, value);
     }
-    const answered = await handleIdentity(new Request(
+    const identityRequest = new Request(
       new URL(request.url ?? "/", requestOrigin(request, nodeHandlerOptions)),
       { method: request.method, headers },
-    ));
+    );
+    // The same client address the API throttles by, so starting a sign-in is limited per address.
+    setTrustedClientKey(identityRequest, requestClientKey(request, nodeHandlerOptions));
+    const answered = await handleIdentity(identityRequest);
     if (answered) {
       const out: Record<string, string | string[]> = {};
       for (const [name, value] of answered.headers) {
@@ -403,12 +440,17 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
   const asset = staticFiles.get(pathname);
   if (request.method === "GET" || request.method === "HEAD") {
-    const location = portalRedirect({
+    const caller = await managementCaller(request);
+    // 확인하지 못한 호출자를 로그인 화면으로 보내지 않는다. 이미 로그인한 사람이
+    // 저장소 장애 동안 로그인을 되풀이하게 된다. 포털 문서는 그대로 내주고, 포털이
+    // API 의 503 을 받아 상태를 보여준다.
+    const location = runtime.accounts && caller !== "authenticated" && caller !== "unavailable" && (pathname === "/" || pathname === "/index.html") ? "/account/login"
+      : caller === "unavailable" || runtime.accounts ? undefined : portalRedirect({
       signIn: config.portalSignIn,
       pathname,
       isDocument: asset?.type.startsWith("text/html") ?? false,
       authenticationRequired: securityConfig().enabled,
-      authenticated: isAuthenticated(request),
+      authenticated: caller === "authenticated",
     });
     if (location) {
       response.writeHead(302, { location, "cache-control": "no-store" });
@@ -461,18 +503,8 @@ function isProxiedRequest(request: IncomingMessage): boolean {
     .some((header) => request.headers[header] !== undefined);
 }
 
-function isAuthenticated(request: IncomingMessage): boolean {
-  const security = securityConfig();
-  if (!security.enabled) return false;
-  const headers = new Headers();
-  for (const name of ["authorization", "cookie"]) {
-    const value = request.headers[name];
-    if (typeof value === "string") headers.set(name, value);
-  }
-  return authenticate(new Request(
-    new URL("/health/ready", requestOrigin(request, nodeHandlerOptions)),
-    { headers },
-  ), security) !== undefined;
+function managementCaller(request: IncomingMessage, security: SecurityConfig = securityConfig()): ReturnType<typeof authenticateManagementRequest> {
+  return authenticateManagementRequest(request.headers, security, requestOrigin(request, nodeHandlerOptions));
 }
 
 // Bound the time a client may take to send headers and a complete request so a

@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>Parallax — Account</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/account.css">
+    <script src="/account.js" type="module"></script>
+  </head>
+  <body>
+    <header class="masthead">
+      <a class="brand" href="/" data-t-aria="nav.dns">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+        <span><strong>PARALLAX</strong><small data-t="brand.account">ACCOUNT</small></span>
+      </a>
+      <div class="masthead-status">
+        <label class="language-picker"><span class="sr-only" data-t="language.label">Language</span><select id="locale-select" data-t-aria="language.label"><option value="en">English</option><option value="ko">한국어</option></select></label>
+        <a class="button compact quiet" href="/" id="dns-link" data-t="nav.dns" hidden>DNS</a>
+        <button class="button compact quiet" type="button" id="logout" data-t="action.logout" hidden>Sign out</button>
+      </div>
+    </header>
+
+    <main class="account-shell" id="workspace">
+      <p id="notice" class="account-notice" role="status" aria-live="polite" hidden></p>
+
+      <section id="view-login" class="panel account-panel" hidden>
+        <h1 data-t="login.title">Sign in</h1>
+        <form id="login-form" class="account-form">
+          <label><span data-t="field.email">Email</span><input name="email" type="email" autocomplete="username" required></label>
+          <label><span data-t="field.password">Password</span><input name="password" type="password" autocomplete="current-password" required></label>
+          <button class="button" type="submit" data-t="login.submit">Sign in</button>
+        </form>
+        <p id="sso-block" hidden><a class="button quiet" href="/auth/login" data-t="login.sso">Sign in with your organization</a></p>
+        <details>
+          <summary data-t="forgot.title">Forgot your password?</summary>
+          <form id="forgot-form" class="account-form">
+            <label><span data-t="field.email">Email</span><input name="email" type="email" autocomplete="email" required></label>
+            <button class="button quiet" type="submit" data-t="forgot.submit">Send a reset link</button>
+          </form>
+        </details>
+      </section>
+
+      <section id="view-challenge" class="panel account-panel" hidden>
+        <h1 data-t="mfa.title">Two-step verification</h1>
+        <p data-t="mfa.body">Enter the code from your authenticator app, or one recovery code.</p>
+        <p class="panel-note" data-t="mfa.recoveryNote">A recovery code ends every session and asks you to set up a new authenticator.</p>
+        <form id="challenge-form" class="account-form">
+          <label><span data-t="field.code">Code</span><input name="otp" autocomplete="one-time-code" inputmode="text" required></label>
+          <button class="button" type="submit" data-t="mfa.verify">Verify</button>
+        </form>
+      </section>
+
+      <section id="view-enroll" class="panel account-panel" hidden>
+        <h1 data-t="enroll.title">Set up an authenticator</h1>
+        <p data-t="enroll.body">Add this key to an authenticator app, then enter the code it shows. The key is shown only on this screen.</p>
+        <label id="enroll-password" hidden><span data-t="field.currentPassword">Current password</span><input name="enroll-password" type="password" autocomplete="current-password"></label>
+        <button class="button" type="button" id="enroll-start" data-t="enroll.start">Show the key</button>
+        <div id="enroll-secret" hidden>
+          <p><span data-t="enroll.key">Key</span> <code id="enroll-seed" class="account-secret"></code></p>
+          <p><span data-t="enroll.uri">Setup link</span> <code id="enroll-uri" class="account-secret"></code></p>
+          <form id="enroll-form" class="account-form">
+            <label><span data-t="field.code">Code</span><input name="otp" autocomplete="one-time-code" required></label>
+            <button class="button" type="submit" data-t="enroll.confirm">Confirm</button>
+          </form>
+        </div>
+      </section>
+
+      <section id="view-recovery" class="panel account-panel" hidden>
+        <h1 data-t="recovery.title">Recovery codes</h1>
+        <p data-t="recovery.body">These are shown once. Keep them somewhere safe; each one works a single time.</p>
+        <ol id="recovery-codes" class="account-codes"></ol>
+        <button class="button" type="button" id="recovery-done" data-t="recovery.done">I have saved them</button>
+      </section>
+
+      <section id="view-invite" class="panel account-panel" hidden>
+        <h1 data-t="invite.title">Accept your invitation</h1>
+        <form id="invite-form" class="account-form">
+          <label><span data-t="field.invitedEmail">The address the invitation was sent to</span><input name="email" type="email" autocomplete="email" required></label>
+          <label><span data-t="field.displayName">Display name</span><input name="displayName" autocomplete="nickname" maxlength="256" required></label>
+          <label><span data-t="field.newPassword">New password</span><input name="password" type="password" autocomplete="new-password" required></label>
+          <p class="panel-note" data-t="password.rule">At least 8 characters, using three of: lower-case letters, upper-case letters, digits, and anything else (spaces and other scripts count).</p>
+          <button class="button" type="submit" data-t="invite.submit">Create my account</button>
+        </form>
+      </section>
+
+      <section id="view-reset" class="panel account-panel" hidden>
+        <h1 data-t="reset.title">Choose a new password</h1>
+        <form id="reset-form" class="account-form">
+          <label><span data-t="field.newPassword">New password</span><input name="password" type="password" autocomplete="new-password" required></label>
+          <button class="button" type="submit" data-t="reset.submit">Set password</button>
+        </form>
+      </section>
+
+      <section id="view-email" class="panel account-panel" hidden>
+        <h1 data-t="emailConfirm.title">Confirm your new email address</h1>
+        <p data-t="emailConfirm.body">Signing in again afterwards is required. Confirming needs a recent verification code.</p>
+        <form id="email-confirm-form" class="account-form">
+          <label><span data-t="field.code">Code</span><input name="otp" autocomplete="one-time-code" required></label>
+          <button class="button" type="submit" data-t="emailConfirm.submit">Confirm the change</button>
+        </form>
+      </section>
+
+      <div id="view-account" hidden>
+        <section class="panel account-panel">
+          <h1 id="me-name"></h1>
+          <dl class="account-facts">
+            <dt data-t="me.email">Email</dt><dd id="me-email"></dd>
+            <dt data-t="me.role">Role</dt><dd id="me-role"></dd>
+            <dt data-t="me.mfa">Recent verification</dt><dd id="me-mfa"></dd>
+          </dl>
+          <p id="legacy-note" class="panel-note" data-t="me.legacy" hidden>You signed in through the temporary legacy sign-in. Sensitive actions need your own account and authenticator.</p>
+        </section>
+
+        <section class="panel account-panel">
+          <h2 data-t="reauth.title">Verify for sensitive actions</h2>
+          <p data-t="reauth.body">Changing passwords, email, sessions, sign-in links and members needs a code entered recently.</p>
+          <form id="reauth-form" class="account-form inline">
+            <label><span data-t="field.code">Code</span><input name="otp" autocomplete="one-time-code" required></label>
+            <button class="button" type="submit" data-t="mfa.verify">Verify</button>
+          </form>
+          <p><button class="button quiet" type="button" id="enroll-self" data-t="enroll.title" hidden>Set up an authenticator</button>
+          <button class="button quiet" type="button" id="recovery-new" data-t="recovery.replace">Replace recovery codes</button></p>
+        </section>
+
+        <section class="panel account-panel">
+          <h2 data-t="password.title">Change password</h2>
+          <p class="panel-note" data-t="password.note">Every session ends, including this one.</p>
+          <form id="password-form" class="account-form">
+            <label><span data-t="field.currentPassword">Current password</span><input name="currentPassword" type="password" autocomplete="current-password" required></label>
+            <label><span data-t="field.newPassword">New password</span><input name="password" type="password" autocomplete="new-password" required></label>
+            <button class="button" type="submit" data-t="password.submit">Change password</button>
+          </form>
+        </section>
+
+        <section class="panel account-panel">
+          <h2 data-t="email.title">Change email</h2>
+          <form id="email-form" class="account-form">
+            <label><span data-t="field.newEmail">New email</span><input name="email" type="email" autocomplete="email" required></label>
+            <button class="button" type="submit" data-t="email.submit">Send a confirmation link</button>
+          </form>
+        </section>
+
+        <section class="panel account-panel">
+          <h2 data-t="leave.title">Delete my account</h2>
+          <p class="panel-note" data-t="leave.note">Your address, name, password and authenticator are removed at once and you are signed out. This needs a recent verification code.</p>
+          <form id="leave-form" class="account-form">
+            <label><span data-t="field.currentPassword">Current password</span><input name="password" type="password" autocomplete="current-password" required></label>
+            <button class="button" type="submit" data-t="leave.submit">Delete my account</button>
+          </form>
+        </section>
+
+        <section class="panel account-panel">
+          <h2 data-t="sessions.title">Sessions</h2>
+          <ul id="sessions" class="account-list"></ul>
+          <button class="button quiet" type="button" id="sessions-revoke-all" data-t="sessions.revokeAll">Sign out everywhere</button>
+        </section>
+
+        <section class="panel account-panel">
+          <h2 data-t="identities.title">Organization sign-in</h2>
+          <p class="panel-note" data-t="identities.note">Linking is matched by the provider's account ID, never by email.</p>
+          <ul id="identities" class="account-list"></ul>
+          <button class="button quiet" type="button" id="identity-link" data-t="identities.link" hidden>Link an organization account</button>
+        </section>
+
+        <section id="admin" class="panel account-panel" hidden>
+          <h2 data-t="admin.title">Members</h2>
+          <form id="invite-member-form" class="account-form inline">
+            <label><span data-t="field.email">Email</span><input name="email" type="email" required></label>
+            <label><span data-t="me.role">Role</span><select name="role"><option value="viewer" data-t="role.viewer">viewer</option><option value="editor" data-t="role.editor">editor</option><option value="admin" data-t="role.admin">admin</option></select></label>
+            <button class="button" type="submit" data-t="admin.invite">Invite</button>
+          </form>
+          <table class="account-table">
+            <thead><tr><th data-t="field.displayName">Name</th><th data-t="field.email">Email</th><th data-t="me.role">Role</th><th data-t="admin.status">Status</th><th></th></tr></thead>
+            <tbody id="members"></tbody>
+          </table>
+
+          <h3 data-t="policy.title">Organization sign-in policy</h3>
+          <form id="policy-form" class="account-form">
+            <label><span data-t="policy.roleSource">Where roles come from</span><select name="roleSource">
+              <option value="local" data-t="policy.local">Parallax (local roles)</option>
+              <option value="idp" disabled data-t="policy.idpUnsupported">Identity provider — not supported: the provider cannot prove a revoked role on the next request</option>
+            </select></label>
+            <label><span data-t="policy.mfaEvidence">What counts as verification</span><select name="mfaEvidence">
+              <option value="local-totp" data-t="policy.localTotp">Parallax authenticator codes</option>
+              <option value="idp" disabled data-t="policy.idpMfaUnsupported">Identity provider MFA — not supported: no provider contract proves a fresh second factor</option>
+            </select></label>
+            <fieldset>
+              <legend data-t="policy.jit">Automatic sign-up on first organization sign-in</legend>
+              <p class="panel-note" data-t="policy.jitNote">Off unless an issuer is named. New people get viewer, an address already in use is refused, and nobody is linked by email.</p>
+              <label><span data-t="policy.issuer">Issuer (blank turns it off)</span><input name="issuer" type="url" autocomplete="off"></label>
+              <label><span data-t="policy.maxUsers">Most people it may admit</span><input name="maxUsers" type="number" min="1" step="1"></label>
+            </fieldset>
+            <button class="button" type="submit" data-t="policy.save">Save policy</button>
+          </form>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>

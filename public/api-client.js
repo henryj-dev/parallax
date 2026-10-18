@@ -18,6 +18,8 @@ export class ApiError extends Error {
 const DEFAULT_ROOT = "/api/v1";
 
 export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fetch.bind(globalThis) } = {}) {
+  /** @type {string | undefined} */
+  let csrf;
   /**
    * @param {string} path
    * @param {{ method?: string, body?: unknown, headers?: Record<string, string> }} [options]
@@ -31,6 +33,9 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
+        // A member session's mutations carry the token /account/me handed out.
+        // Kept in memory only; a reload asks again.
+        ...(csrf && method !== "GET" && method !== "HEAD" ? { "x-parallax-csrf": csrf } : {}),
         ...headers,
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -49,6 +54,37 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
     if (response.status === 204) return null;
     const text = await response.text();
     return text ? JSON.parse(text) : null;
+  }
+
+  /**
+   * `POST /auth/logout`, asking for the next location as JSON: a manual redirect is opaque to page
+   * script, so its location could never be read and the provider's own logout never ran.
+   * @param {Record<string, string>} headers
+   * @returns {Promise<string | undefined>}
+   */
+  async function identityLogout(headers) {
+    const response = await fetchImpl("/auth/logout", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { Accept: "application/json", ...headers },
+    });
+    if (!response.ok) throw new ApiError("sign-out failed", response.status || 503);
+    const body = await response.json().catch(() => ({}));
+    return typeof body?.location === "string" ? body.location : undefined;
+  }
+  /**
+   * Follows only a provider's logout: an https location on another origin. A location on this origin is
+   * never followed, because the next page could sign straight back in through the provider. Reports
+   * whether it left, so the caller can show sign-in instead.
+   * @param {string | undefined} location
+   */
+  function navigate(location) {
+    if (!location || typeof globalThis.location?.assign !== "function") return false;
+    let target;
+    try { target = new URL(location, globalThis.location.href); } catch { return false; }
+    if (target.protocol !== "https:" || target.origin === globalThis.location.origin) return false;
+    globalThis.location.assign(target.href);
+    return true;
   }
 
   const zonePath = (zone) => `/zones/${encodeURIComponent(zone)}`;
@@ -108,7 +144,31 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
       return {
         mode: body?.authentication === "disabled" ? "disabled" : "required",
         identityProvider: body?.identityProvider === "available",
+        memberAccounts: body?.memberAccounts === "available",
       };
+    },
+
+    /** The signed-in member, or an ApiError 403 when there is none. Remembers its CSRF token. */
+    async readAccount() {
+      const account = await request("/account/me");
+      csrf = typeof account?.csrf === "string" ? account.csrf : undefined;
+      return account;
+    },
+    /**
+     * Ends a member session on the server. With an identity provider the
+     * provider's own logout follows as a navigation; either way a failure is
+     * reported rather than drawn as signed out.
+     */
+    /** Reports whether the browser is on its way to the provider's logout, so the caller does not send it elsewhere. */
+    async endMemberSession({ identityProvider = false } = {}) {
+      if (identityProvider) {
+        const location = await identityLogout(csrf ? { "x-parallax-csrf": csrf } : {});
+        csrf = undefined;
+        return navigate(location);
+      }
+      await request("/account/logout", { method: "POST", body: {} });
+      csrf = undefined;
+      return false;
     },
 
     readSession: () => request("/session"),
@@ -120,17 +180,10 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
      * can drop its own session too. `manual` keeps the Set-Cookie on this origin
      * readable; the browser is sent on only when a location is present.
      */
-    async endIdentitySession() {
-      const response = await fetchImpl("/auth/logout", {
-        method: "POST",
-        credentials: "same-origin",
-        redirect: "manual",
-      });
-      const location = response.headers.get("location");
-      if (location && typeof globalThis.location?.assign === "function" && response.status >= 300 && response.status < 400) {
-        globalThis.location.assign(location);
-      }
-    },
+    /** Ends the provider session cookie here and answers where the provider's own logout is, without going there. */
+    endIdentitySession: () => identityLogout({}),
+    /** Follows a location `endIdentitySession` returned, once everything else is done. */
+    followLocation: (location) => navigate(location),
 
     listZones: listAllZones,
     getZone: (zone) => request(zonePath(zone)),

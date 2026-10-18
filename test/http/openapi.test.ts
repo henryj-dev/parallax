@@ -18,6 +18,13 @@ const NOT_OVER_HTTP: Readonly<Record<string, string>> = {
   migrate: "the serving runtime has no migrate capability on purpose, so an HTTP administrator cannot turn this process's database role into a schema-changing one",
   backup: "the serving runtime is not given the repositories, so this cannot read the credential store's document out through a port",
   restore: "the same, in the other direction: it writes revisions and audit entries past every rule the control plane enforces",
+  "accounts enable": "host-local member account operation: the serving runtime is given no account host, so neither a bearer token nor a member session can bootstrap, recover or reset a factor through a port",
+  "accounts bootstrap": "host-local member account operation: the serving runtime is given no account host, so neither a bearer token nor a member session can bootstrap, recover or reset a factor through a port",
+  "accounts status": "host-local member account operation: the serving runtime is given no account host, so neither a bearer token nor a member session can bootstrap, recover or reset a factor through a port",
+  "accounts list": "host-local member account operation: the serving runtime is given no account host, so neither a bearer token nor a member session can bootstrap, recover or reset a factor through a port",
+  "accounts recover": "host-local member account operation: the serving runtime is given no account host, so neither a bearer token nor a member session can bootstrap, recover or reset a factor through a port",
+  "accounts mfa reset": "host-local member account operation: the serving runtime is given no account host, so neither a bearer token nor a member session can bootstrap, recover or reset a factor through a port",
+  "accounts legacy": "host-local member account operation: the serving runtime is given no account host, so neither a bearer token nor a member session can bootstrap, recover or reset a factor through a port",
 };
 
 const document = buildOpenApiDocument();
@@ -109,6 +116,12 @@ describe("the OpenAPI document describes the routes that exist", () => {
       runCommand({ runtime: {}, actor: "test", role: "admin" }, "backup", {}),
       /command line only/u,
     );
+    // Account host commands refuse a runtime the server builds, whatever role reaches them.
+    for (const name of Object.keys(NOT_OVER_HTTP).filter((key) => key.startsWith("accounts "))) {
+      const input = { "accounts bootstrap": { email: "admin@example.com", "display-name": "Admin" }, "accounts recover": { "user-id": "x" },
+        "accounts mfa reset": { "user-id": "x" }, "accounts legacy": { until: "2030-01-01T00:00:00.000Z", "role-cap": "viewer" } }[name] ?? {};
+      await assert.rejects(runCommand({ runtime: {}, actor: "test", role: "admin" }, name, input), /only from the local CLI in accounts mode/u, name);
+    }
   });
 });
 

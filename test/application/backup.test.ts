@@ -237,7 +237,7 @@ describe("backup and restore", () => {
     const before = await contentsOf(source.stores);
 
     const document = await exportBackup(source.stores, () => new Date("2026-08-24T00:00:00.000Z"));
-    assert.equal(document.format, BACKUP_FORMAT);
+    assert.equal(document.format, 1, "a store without member accounts still writes format 1");
     assert.equal(document.takenAt, "2026-08-24T00:00:00.000Z");
 
     // Through JSON, because that is how it travels.
@@ -246,7 +246,7 @@ describe("backup and restore", () => {
 
     assert.deepEqual(summary, {
       zones: 2, revisions: 4, audit: 4, statuses: 2, settings: 2, accessTokens: 1,
-      credentials: true, auditRenumbered: true,
+      credentials: true, members: 0, auditRenumbered: true,
     });
     assert.deepEqual(await contentsOf(target), before);
   });

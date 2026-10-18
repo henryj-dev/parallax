@@ -1,4 +1,7 @@
 import { constants as fsConstants } from "node:fs";
+import { AccountService } from "./application/accounts/service.ts";
+import { AccountMailer } from "./adapters/account-mailer.ts";
+import { PostgresAccountStateStore } from "./infrastructure/account-state.ts";
 import { access } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { AccessTokenService } from "./application/access-tokens.ts";
@@ -16,7 +19,8 @@ import { Rfc2136ProviderAdapter } from "./adapters/rfc2136.ts";
 import type { SettingsRepository } from "./application/ports.ts";
 import type { BackupStores } from "./application/backup.ts";
 import type { CommandRuntime } from "./cli/commands.ts";
-import type { ParallaxConfig } from "./config.ts";
+import { assertSupportedAuthMode, type ParallaxConfig } from "./config.ts";
+import { assertPostgresAuthStorageIsRecognized, readPostgresAuthFeatures, UnrecognizedAuthStorageError } from "./infrastructure/auth-storage.ts";
 import { createFileStateAdapters } from "./infrastructure/file-state.ts";
 import { FileConfigurationStore } from "./infrastructure/file-settings.ts";
 import { FileProviderAdapter } from "./infrastructure/file-provider.ts";
@@ -81,9 +85,17 @@ export interface RuntimeOptions {
    * asks for them; nothing reachable over a port does.
    */
   readonly exposeStores?: boolean;
+  readonly readAccountPassword?: () => Promise<string>;
 }
 
 export async function createRuntime(config: ParallaxConfig, options: RuntimeOptions = {}): Promise<ParallaxRuntime> {
+  // 연결을 만들기 전에 거절한다. 지원하지 않는 인증 모드를 legacy 로 바꿔
+  // 시작하지 않는다.
+  try {
+    assertSupportedAuthMode(config);
+  } catch (error) {
+    throw new RuntimeStartupError(message(error));
+  }
   // One decision picks every backend: a database when DATABASE_URL is set,
   // files otherwise. Settings, credentials and tokens follow the zones.
   const pool: CloseablePgPool | undefined = config.databaseUrl ? createPostgresPool(config.databaseUrl) : undefined;
@@ -98,12 +110,40 @@ export async function createRuntime(config: ParallaxConfig, options: RuntimeOpti
   const healthChecks: HealthCheckSettingsHooks = {};
   const settings = createSettingsService(settingsRepository, config, healthChecks);
   const accessTokens = new AccessTokenService(accessTokenRepository, config.bootstrapTokens);
+  // 미래 버전이 켠 인증 기능이 저장소에 있으면 아무것도 읽기 전에 멈춘다. 읽기만
+  // 한다. 파일 저장소의 표식은 설정 파일을 읽을 때마다 `parseDocument` 가 본다.
+  if (pool) await refuseUnrecognizedAuthStorage(pool);
   try {
     await settings.load();
     await accessTokens.load();
   } catch (error) {
     await pool?.end().catch(() => undefined);
     throw new RuntimeStartupError(`configuration could not be read: ${message(error)}`);
+  }
+
+  const accountStore = pool ? new PostgresAccountStateStore(pool) : fileConfiguration!.accounts;
+  let accountMailer: AccountMailer | undefined;
+  let accounts: AccountService | undefined;
+  let memberAccountsEnabled: boolean;
+  try {
+    accountMailer = config.authMode === "accounts" ? new AccountMailer(config.accounts!.mailer) : undefined;
+    accounts = accountMailer ? await AccountService.create({ store: accountStore, policy: config.accounts!.policy,
+      key: config.accounts!.key, mailer: accountMailer, publicOrigin: config.accounts!.mailer.publicOrigin }) : undefined;
+    // Before 006 the PostgreSQL account tables do not exist, so the marker is read, not the state.
+    memberAccountsEnabled = pool ? (await readPostgresAuthFeatures(pool)).includes("member-accounts-v1") : (await accountStore.read()).enabled;
+    // Accounts mode on a database 006 has not reached would fail on the first sign-in instead of at startup.
+    if (accounts && pool) {
+      const tables = await pool.query<{ present: boolean }>(
+        "SELECT to_regclass('parallax_account_state') IS NOT NULL AND to_regclass('parallax_account_audit') IS NOT NULL AND to_regclass('parallax_auth_features') IS NOT NULL AS present");
+      if (tables.rows[0]?.present !== true) throw new Error("the database has no member account tables; run `parallax migrate` first");
+    }
+  } catch (error) {
+    accountMailer?.close(); await pool?.end().catch(() => undefined);
+    throw new RuntimeStartupError(`member accounts could not be started: ${message(error)}`);
+  }
+  // Activation is a separate host operation. An enabled store must never be served in legacy mode.
+  if (memberAccountsEnabled && !accounts) {
+    await pool?.end().catch(() => undefined); throw new RuntimeStartupError("member accounts are enabled; PARALLAX_AUTH_MODE=accounts is required");
   }
 
   // The `internal` slot, which has stood empty since the CoreDNS and PowerDNS
@@ -209,6 +249,8 @@ export async function createRuntime(config: ParallaxConfig, options: RuntimeOpti
     controlPlane,
     settings,
     accessTokens,
+    ...(accounts ? { accounts } : {}),
+    ...(accounts && options.exposeStores && options.readAccountPassword ? { accountsHost: { service: accounts, store: accountStore, readPassword: options.readAccountPassword } } : {}),
     // Schema changes intentionally exist only on createMigrationRuntime(), which
     // the local CLI selects before it builds the serving runtime. Keeping the
     // capability out of this object also keeps POST /api/v1/cli from turning an
@@ -230,6 +272,8 @@ export async function createRuntime(config: ParallaxConfig, options: RuntimeOpti
             exclusive: (operation) => controlPlane.withHealthCheckLock(operation),
             unsupported: (_zone, stored) => parseSettings(stored).allowLocalProvider || internalUpdate !== undefined,
           },
+          // Only where the account schema is known to exist: accounts mode needs 006, and an enabled store has it.
+          ...(accounts || memberAccountsEnabled ? { accounts: accountStore } : {}),
         },
       }
       : {}),
@@ -237,6 +281,7 @@ export async function createRuntime(config: ParallaxConfig, options: RuntimeOpti
     onZoneChange: (listener) => { zoneChangeListeners.push(listener); },
     close: async () => {
       await healthMonitor.close();
+      accountMailer?.close();
       await pool?.end().catch(() => undefined);
     },
   };
@@ -292,13 +337,40 @@ function createSettingsService(
 }
 
 /**
+ * PostgreSQL 저장소의 인증 기능 표식을 시작할 때 한 번 확인한다. 실패하면 연결을
+ * 닫고 멈춘다. 저장소가 모르는 기능을 켠 경우와 확인 자체를 못 한 경우(연결,
+ * 권한)는 다른 문장으로 알린다. 고칠 곳이 다르기 때문이다. 어느 쪽도 legacy 로
+ * 이어서 시작하지 않는다.
+ *
+ * 서버 런타임과 설정 복구 런타임이 같이 쓴다. `createMigrationRuntime` 은 일부러
+ * 부르지 않는다. 마이그레이션은 표식 테이블을 만드는 쪽이고, 저장소를 읽거나
+ * 관리 포트를 열지 않는다.
+ */
+async function refuseUnrecognizedAuthStorage(pool: CloseablePgPool): Promise<void> {
+  try {
+    await assertPostgresAuthStorageIsRecognized(pool);
+  } catch (error) {
+    await pool.end().catch(() => undefined);
+    if (error instanceof UnrecognizedAuthStorageError) {
+      throw new RuntimeStartupError(`authentication storage is not compatible with this version: ${message(error)}`);
+    }
+    throw new RuntimeStartupError(`authentication storage could not be checked, so this version did not start: ${message(error)}`);
+  }
+}
+
+/**
  * Builds only the local CLI capability needed to correct a stored setting that
  * makes the serving runtime fail closed. It deliberately does not load and
  * publish the stored snapshot: `SettingsService.update()` reads the latest
  * values, merges the patch, and verifies that single repaired candidate.
+ *
+ * 쓰기 전에 서버 런타임과 같은 인증 기능 표식 검사를 거친다. 미래 버전이 켠
+ * 저장소에 이 버전의 설정을 쓰지 않는다. 파일 저장소는 쓰기마다 `parseDocument`
+ * 가 같은 검사를 한다.
  */
-export function createSettingsRecoveryRuntime(config: ParallaxConfig): SettingsRecoveryRuntime {
+export async function createSettingsRecoveryRuntime(config: ParallaxConfig): Promise<SettingsRecoveryRuntime> {
   const pool: CloseablePgPool | undefined = config.databaseUrl ? createPostgresPool(config.databaseUrl) : undefined;
+  if (pool) await refuseUnrecognizedAuthStorage(pool);
   const fileConfiguration = pool ? undefined : new FileConfigurationStore(resolve(config.configurationFile));
   const repository = pool ? new PostgresSettingsRepository(pool) : fileConfiguration!.settings;
   return {
@@ -333,6 +405,11 @@ async function writeFailure(path: string): Promise<string | undefined> {
  * of the store while starting, which cannot work on a database whose tables do
  * not exist yet -- the exact situation migrating exists to resolve. This builds
  * the connection and nothing that reads through it.
+ *
+ * 인증 기능 표식 검사도 하지 않는다. 일부러다. 표식 테이블은 그 기능을 들이는
+ * 마이그레이션이 만들고, 이 런타임은 저장된 설정이나 토큰을 읽지 않으며 관리
+ * 포트를 열지 않는다. 미래 버전이 켠 저장소에서 이 버전의 `migrate` 가 할 수 있는
+ * 일은 이 버전이 아는 마이그레이션을 적용하는 것뿐이다.
  */
 export function createMigrationRuntime(config: ParallaxConfig, target: MigrationTarget = "parallax"): MigrationRuntime {
   // Without a database there is no schema, and the command says so rather than
