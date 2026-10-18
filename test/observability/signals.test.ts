@@ -19,7 +19,7 @@ import { freePort } from "../support/ports.ts";
  * The counters, asked whether they fire.
  *
  * ⚠️ `signals.ts` measured **100% line, branch and function** and this file did
- * not exist. The body of that module was eleven (now thirteen) `counter(...)`/`histogram(...)`
+ * not exist. The body of that module was eleven (now fourteen) `counter(...)`/`histogram(...)`
  * declarations, and a declaration executes when anything imports the module --
  * which every one of these suites does, transitively, on the way to something
  * else. So the number was reporting that the file had been *loaded*. The only
@@ -41,7 +41,12 @@ import { freePort } from "../support/ports.ts";
  * registered under the name a dashboard would query, of the right type, moving
  * by one per call, and carrying the label sets `src/index.ts` actually passes.
  *
- * A uniform shallow test over all thirteen would have read better and said less.
+ * The fourteenth, `parallax_postgres_connection_errors_total`, is only checked
+ * here for being declared at zero. Its caller is `createPostgresPool`, and
+ * `test/infrastructure/postgres.test.ts` drives it through a real `pg` pool,
+ * idle and checked out, and asserts its labels there.
+ *
+ * A uniform shallow test over all fourteen would have read better and said less.
  */
 
 /** Everything declared, in the order a reader of `signals.ts` meets them. */
@@ -50,6 +55,7 @@ const COUNTERS = [
   "parallax_dns_unanswerable_replies_total",
   "parallax_dns_zones_skipped_total",
   "parallax_refresh_failures_total",
+  "parallax_postgres_connection_errors_total",
   "parallax_dns_notify_failures_total",
   "parallax_tls_certificate_reload_failures_total",
   "parallax_dns_answers_total",
@@ -75,7 +81,7 @@ const HISTOGRAMS = [
 afterEach(() => { resetMetrics(); });
 
 describe("what importing the module alone declares", () => {
-  it("registers all thirteen signals, at zero, before any of them has fired", () => {
+  it("registers all fourteen signals, at zero, before any of them has fired", () => {
     const text = render();
 
     for (const name of COUNTERS) {

@@ -10,6 +10,7 @@ import { AUDIT_ACTIONS,
   type Zone,
   type ZoneRevision,
 } from "../domain/dns.ts";
+import { postgresConnectionFailed } from "../observability/signals.ts";
 
 export interface PgQueryResult<Row = Record<string, unknown>> {
   rows: Row[];
@@ -39,8 +40,18 @@ export interface PostgresPoolOptions {
   ssl?: boolean | { rejectUnauthorized?: boolean };
 }
 
+interface PgEmittingClient extends PgClient {
+  on(event: "error", listener: (error: unknown) => void): unknown;
+  removeListener(event: "error", listener: (error: unknown) => void): unknown;
+}
+
+interface PgEmittingPool extends CloseablePgPool {
+  connect(): Promise<PgEmittingClient>;
+  on(event: "error", listener: (error: unknown, client: unknown) => void): unknown;
+}
+
 interface PgPoolConstructor {
-  new (configuration: PostgresPoolOptions & { connectionString: string }): CloseablePgPool;
+  new (configuration: PostgresPoolOptions & { connectionString: string }): PgEmittingPool;
 }
 
 const require = createRequire(import.meta.url);
@@ -72,12 +83,83 @@ export function createPostgresPool(connectionString: string, options: PostgresPo
   if (connectionString.trim().length === 0) throw new Error("PostgreSQL connection string must not be empty");
   const module = require("pg") as { Pool: PgPoolConstructor };
   // Defaults first, so a caller that names one still wins.
-  return new module.Pool({
+  const pool = new module.Pool({
     max: DEFAULT_MAX_CONNECTIONS,
     connectionTimeoutMillis: DEFAULT_CONNECTION_TIMEOUT_MS,
     ...options,
     connectionString,
   });
+  // Clients that already reported a failure while checked out. `pg` puts its
+  // idle listener back on release, so a later error from the same dying
+  // connection would reach the pool listener and be counted a second time.
+  const reported = new WeakSet<object>();
+  pool.on("error", (error, client) => {
+    if (typeof client === "object" && client !== null && reported.has(client)) return;
+    reportConnectionError(error, "idle");
+  });
+  // Only the promise form is wrapped. `pool.query()` checks out through the
+  // callback form and attaches its own listener for the query's duration.
+  const checkout = pool.connect.bind(pool) as (callback?: unknown) => Promise<PgEmittingClient>;
+  pool.connect = ((callback?: unknown) => callback === undefined
+    ? checkout().then((client) => guardCheckedOutClient(client, reported))
+    : checkout(callback)) as PgEmittingPool["connect"];
+  return pool;
+}
+
+/**
+ * A pooled connection that failed -- a backend restart, a terminated session,
+ * a dropped socket -- reported without taking the process down.
+ *
+ * `pg` emits these as `error` events, and Node throws an `error` event nobody
+ * listens for: the process exits. While a client sits idle `pg` listens on it
+ * and re-emits on the pool, which this listens to. While it is checked out
+ * `pg` removes that listener, so `guardCheckedOutClient` holds one for the
+ * duration of the checkout.
+ *
+ * Neither listener retries or reconnects. `pg` removes an idle client that
+ * failed, a checked-out one is destroyed when it is released, and the next
+ * checkout opens a fresh connection. A query in flight on the failing
+ * connection is rejected by `pg` itself; these listeners do not change that.
+ *
+ * Only the error's code is reported. The message can carry server text and
+ * `pg` attaches the client, which holds the connection settings, so neither is
+ * printed. https://node-postgres.com/apis/pool#error
+ */
+function reportConnectionError(error: unknown, state: "idle" | "checked_out"): void {
+  const reason = connectionErrorReason(error);
+  postgresConnectionFailed({ state, reason });
+  const where = state === "idle" ? "an idle" : "a checked-out";
+  console.error(`parallax: ${where} PostgreSQL connection failed and was dropped from the pool (${reason})`);
+}
+
+/**
+ * Listens on a checked-out client until it is released, and destroys it on
+ * release if it failed in between, so the pool never hands it out again.
+ *
+ * Only the first error is reported: a terminated session commonly emits the
+ * server's error and then the socket's close.
+ */
+function guardCheckedOutClient(client: PgEmittingClient, reported: WeakSet<object>): PgEmittingClient {
+  let failure: Error | undefined;
+  const onError = (error: unknown): void => {
+    if (failure) return;
+    failure = error instanceof Error ? error : new Error("PostgreSQL connection failed");
+    reported.add(client);
+    reportConnectionError(error, "checked_out");
+  };
+  client.on("error", onError);
+  const release = client.release;
+  client.release = (destroy) => {
+    client.removeListener("error", onError);
+    release.call(client, destroy || failure);
+  };
+  return client;
+}
+
+/** A SQLSTATE such as `57P01` or a socket code such as `ECONNRESET`, nothing free-form. */
+function connectionErrorReason(error: unknown): string {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && /^[A-Z0-9_]{1,32}$/u.test(code) ? code : "unknown";
 }
 
 export class PostgresZoneRepository implements ZoneRepository {

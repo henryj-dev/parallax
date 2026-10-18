@@ -557,6 +557,7 @@ parallax_dns_unanswerable_replies_total         queries that could not be answer
 parallax_dns_notify_failures_total              NOTIFY sends that failed
 parallax_dns_forward_failures_total             DNS forwarding failures by upstream index and reason
 parallax_refresh_failures_total                 background refresh failures, by subsystem
+parallax_postgres_connection_errors_total       pooled connections that failed, by state (idle, checked_out) and code
 parallax_tls_certificate_reload_failures_total  certificate reloads that failed
 ```
 
