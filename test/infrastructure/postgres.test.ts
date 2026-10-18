@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
+import { createServer, type AddressInfo } from "node:net";
 import { describe, it } from "node:test";
 import type { Zone } from "../../src/domain/dns.ts";
 import { RevisionConflictError } from "../../src/application/ports.ts";
@@ -12,10 +14,13 @@ import {
   PostgresZoneRepository,
   createPostgresAdapters,
   createPostgresPool,
+  type CloseablePgPool,
   type PgClient,
+  type PostgresPoolOptions,
   type PgPool,
   type PgQueryResult,
 } from "../../src/infrastructure/postgres.ts";
+import { render, resetMetrics } from "../../src/observability/metrics.ts";
 
 interface Call { text: string; values?: readonly unknown[] }
 type Handler = (call: Call) => PgQueryResult | Promise<PgQueryResult>;
@@ -749,6 +754,185 @@ describe("the PostgreSQL pool's limits", () => {
 
   it("still refuses an empty connection string", async () => {
     assert.throws(() => createPostgresPool("   "), /connection string must not be empty/u);
+  });
+});
+
+/**
+ * A connection that fails is reported, whether it was idle or checked out.
+ *
+ * `pg` emits `error` on a client whose backend goes away, and Node throws an
+ * `error` event nobody listens for. While the client is idle `pg` listens and
+ * re-emits on the pool; while it is checked out `pg` removes that listener, so
+ * the holder -- an apply lock, a migration -- had none. Either way the process
+ * exited over a terminated session.
+ *
+ * These run the real `pg` pool with a stand-in `Client`, so checkout and
+ * release are `pg`'s own; `pnpm verify:postgres` terminates real backends, idle
+ * and checked out, and checks the server keeps answering.
+ */
+describe("the PostgreSQL pool's connection errors", () => {
+  const SECRET = "s3cr3t-password";
+  const CONNECTION = `postgres://parallax:${SECRET}@127.0.0.1:5432/parallax`;
+  type EmittingPool = CloseablePgPool & {
+    emit(event: string, ...args: unknown[]): boolean;
+    listenerCount(event: string): number;
+    totalCount: number;
+    idleCount: number;
+  };
+
+  /** Just what `pg-pool` calls on a client; it never touches a socket. */
+  class StandInClient extends EventEmitter {
+    static created: StandInClient[] = [];
+    readonly connectionParameters = { connectionString: CONNECTION, password: SECRET };
+    _queryable = true;
+    _ending = false;
+    ended = false;
+    constructor() { super(); StandInClient.created.push(this); }
+    connect(callback: (error?: Error) => void): void { setImmediate(() => callback()); }
+    async query(): Promise<PgQueryResult> { return { rows: [] }; }
+    end(callback?: () => void): void { this.ended = true; this._ending = true; callback?.(); }
+    ref(): void {}
+    unref(): void {}
+  }
+
+  function serverError(code: unknown): Error {
+    // Shaped like what `pg` emits: server text that names the query. `pg`
+    // also attaches the client, which holds the connection settings.
+    return Object.assign(new Error(`terminating connection due to administrator command: SELECT '${SECRET}'`), { code });
+  }
+
+  function standInPool(): EmittingPool {
+    StandInClient.created = [];
+    return createPostgresPool(CONNECTION, { Client: StandInClient } as PostgresPoolOptions) as EmittingPool;
+  }
+
+  function watch(t: { mock: { method: (object: object, name: string, implementation: (...args: unknown[]) => void) => unknown } }) {
+    resetMetrics();
+    const lines: string[] = [];
+    t.mock.method(console, "error", (...args: unknown[]) => { lines.push(args.map(String).join(" ")); });
+    const uncaught: unknown[] = [];
+    const onUncaught = (error: unknown) => { uncaught.push(error); };
+    process.on("uncaughtException", onUncaught);
+    return { lines, uncaught, stop: () => { process.off("uncaughtException", onUncaught); } };
+  }
+
+  function assertNothingSecret(texts: readonly string[]): void {
+    for (const text of texts) {
+      assert.ok(!text.includes(SECRET), "no password, connection string or query text");
+      assert.ok(!text.includes("postgres://"));
+      assert.ok(!text.includes("SELECT"));
+    }
+  }
+
+  it("keeps the process alive on an idle failure and reports only a bounded code", async (t) => {
+    const watched = watch(t);
+    const pool = standInPool();
+    try {
+      assert.ok(pool.listenerCount("error") >= 1, "a pool without a listener crashes on the first idle failure");
+      const client = { connectionParameters: { connectionString: CONNECTION, password: SECRET } };
+      assert.doesNotThrow(() => pool.emit("error", serverError("57P01"), client));
+      assert.doesNotThrow(() => pool.emit("error", serverError(`not a code ${SECRET}`), client));
+      assert.doesNotThrow(() => pool.emit("error", "not even an error", client));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      watched.stop();
+      await pool.end();
+    }
+
+    assert.deepEqual(watched.uncaught, []);
+    assert.deepEqual(watched.lines, [
+      "parallax: an idle PostgreSQL connection failed and was dropped from the pool (57P01)",
+      "parallax: an idle PostgreSQL connection failed and was dropped from the pool (unknown)",
+      "parallax: an idle PostgreSQL connection failed and was dropped from the pool (unknown)",
+    ]);
+    const metrics = render();
+    assert.match(metrics, /^parallax_postgres_connection_errors_total\{reason="57P01",state="idle"\} 1$/mu);
+    assert.match(metrics, /^parallax_postgres_connection_errors_total\{reason="unknown",state="idle"\} 2$/mu);
+    assertNothingSecret([...watched.lines, metrics]);
+  });
+
+  it("keeps the process alive when a checked-out client fails, and destroys it on release", async (t) => {
+    const watched = watch(t);
+    const pool = standInPool();
+    let held: PgClient | undefined;
+    try {
+      held = await pool.connect();
+      const [client] = StandInClient.created;
+      assert.ok(client);
+      assert.equal(client.listenerCount("error"), 1, "pg removed its idle listener; this checkout holds the only one");
+      // A terminated session: the server's error, then the socket closing.
+      assert.doesNotThrow(() => client.emit("error", Object.assign(serverError("57P01"), { client })));
+      assert.doesNotThrow(() => client.emit("error", new Error("Connection terminated unexpectedly")));
+      const releasing = held;
+      held = undefined;
+      releasing.release();
+      assert.equal(client.ended, true, "a client that failed while held is not returned to the pool");
+      assert.equal(pool.totalCount, 0);
+      // `pg` re-attaches its idle listener on release; the same dying client
+      // reaching the pool listener afterwards must not count twice.
+      assert.doesNotThrow(() => client.emit("error", new Error("Connection terminated unexpectedly")));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      watched.stop();
+      // A failed assertion must not leave a client out, or `end()` waits forever.
+      held?.release(true);
+      await pool.end();
+    }
+
+    assert.deepEqual(watched.uncaught, []);
+    assert.deepEqual(watched.lines, [
+      "parallax: a checked-out PostgreSQL connection failed and was dropped from the pool (57P01)",
+    ]);
+    const metrics = render();
+    assert.match(metrics, /^parallax_postgres_connection_errors_total\{reason="57P01",state="checked_out"\} 1$/mu);
+    assert.doesNotMatch(metrics, /state="idle"\} [1-9]/u);
+    assertNothingSecret([...watched.lines, metrics]);
+  });
+
+  it("returns a healthy checked-out client to the pool and leaves the next checkout guarded", async (t) => {
+    const watched = watch(t);
+    const pool = standInPool();
+    let held: PgClient | undefined;
+    try {
+      const first = await pool.connect();
+      first.release();
+      const [client] = StandInClient.created;
+      assert.ok(client);
+      assert.equal(client.ended, false);
+      assert.equal(pool.idleCount, 1, "nothing failed, so the connection is reused");
+      assert.equal(client.listenerCount("error"), 1, "only pg's idle listener while it sits in the pool");
+
+      held = await pool.connect();
+      assert.equal(StandInClient.created.length, 1, "the same connection, checked out again");
+      assert.doesNotThrow(() => client.emit("error", serverError("57P01")));
+      const releasing = held;
+      held = undefined;
+      releasing.release(true);
+      assert.equal(client.ended, true, "an explicit destroy still destroys");
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      watched.stop();
+      held?.release(true);
+      await pool.end();
+    }
+    assert.deepEqual(watched.uncaught, []);
+    assert.equal(watched.lines.length, 1);
+  });
+
+  it("still rejects a query when the connection cannot be made, rather than swallowing it", async () => {
+    // A server that accepts and hangs up before the handshake: the failure
+    // belongs to the caller waiting on it, not to the pool's listener. A query
+    // cut off mid-flight by a terminated backend is `pnpm verify:postgres`.
+    const server = createServer((socket) => { socket.destroy(); });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const pool = createPostgresPool(`postgres://parallax:${SECRET}@127.0.0.1:${port}/parallax`, { connectionTimeoutMillis: 2_000 });
+    try {
+      await assert.rejects(pool.query("SELECT 1"));
+    } finally {
+      await pool.end();
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 });
 

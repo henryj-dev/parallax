@@ -54,6 +54,20 @@ export const refreshFailed = counter(
   "Background refreshes that failed, by subsystem.",
 );
 
+/**
+ * A pooled PostgreSQL connection that failed, by whether it was idle or checked
+ * out, and by error code.
+ *
+ * The connection is dropped and the next checkout opens another. An idle one
+ * failing reaches no caller at all, so this counter is the only sign of it. A
+ * checked-out one also fails whatever was using it. A steady rate means a
+ * database restarting or a network path cutting sessions.
+ */
+export const postgresConnectionFailed = counter(
+  "parallax_postgres_connection_errors_total",
+  "Pooled PostgreSQL connections that failed and were dropped, by state and error code.",
+);
+
 /** NOTIFY is best-effort, so a secondary going unnotified is otherwise silent. */
 export const notifyFailed = counter(
   "parallax_dns_notify_failures_total",

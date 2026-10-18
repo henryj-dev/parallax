@@ -10,6 +10,10 @@ PGPORT="${PGPORT:-55432}"
 APPPORT="${APPPORT:-39150}"
 WORK="$(mktemp -d)"
 DATABASE_URL="postgres://parallax:parallax@127.0.0.1:${PGPORT}/parallax?sslmode=disable"
+# The server's sessions carry a name of their own, so the scenario that
+# terminates them cannot reach anything else connected to the database.
+APP_NAME="parallax-verify-app"
+APP_DATABASE_URL="${DATABASE_URL}&application_name=${APP_NAME}"
 
 cleanup() {
   if [ -n "${APP_PID:-}" ]; then kill "$APP_PID" 2>/dev/null || true; wait "$APP_PID" 2>/dev/null || true; fi
@@ -128,7 +132,7 @@ ok "both status interleavings preserved the newer desired state and provider att
 start_app() {
   # Keep provider state inside the work directory: the default is under the
   # repository, so the run would otherwise write to the developer's own data.
-  DATABASE_URL="$DATABASE_URL" HOST=127.0.0.1 PORT="$APPPORT" \
+  DATABASE_URL="$APP_DATABASE_URL" HOST=127.0.0.1 PORT="$APPPORT" \
     PARALLAX_PROVIDER_STATE_FILE="$WORK/provider-state.json" \
     node "$ROOT/src/index.ts" > "$WORK/app.log" 2>&1 &
   APP_PID=$!
@@ -277,6 +281,112 @@ AUDIT=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c 
   "SELECT count(*) FROM parallax_audit WHERE action='zone.deleted' AND zone_name='example.com'")
 [ "$AUDIT" = "1" ] || fail "expected the deletion to stay audited, found $AUDIT"
 ok "children cascaded to $LEFT, deletion audit retained"
+
+echo "== a terminated idle connection does not take the server down =="
+# `pg` reports an idle client's lost backend as an `error` event on the pool,
+# and an unheard `error` event exits the process. Terminating the app's idle
+# sessions is what a database restart or failover does to it. Only the app's
+# own sessions, by application_name, and retried: an idle session exists only
+# between a request and pg's idle timeout.
+TERMINATED=0
+for _ in $(seq 1 20); do
+  curl -sf "$API/zones" >/dev/null
+  TERMINATED=$(docker exec "$CONTAINER" psql -h 127.0.0.1 -tAU parallax -d parallax -c \
+    "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid)) FROM pg_stat_activity
+     WHERE application_name = '${APP_NAME}' AND state = 'idle'")
+  [ "${TERMINATED:-0}" -ge 1 ] && break
+  sleep 0.25
+done
+[ "${TERMINATED:-0}" -ge 1 ] || fail "expected at least one idle app connection to terminate, found ${TERMINATED:-none}"
+LOGGED=""
+for _ in $(seq 1 40); do
+  grep -q "idle PostgreSQL connection failed" "$WORK/app.log" && { LOGGED=yes; break; }
+  sleep 0.25
+done
+kill -0 "$APP_PID" 2>/dev/null || { cat "$WORK/app.log" >&2; fail "the server exited after its idle connections were terminated"; }
+[ -n "$LOGGED" ] || { cat "$WORK/app.log" >&2; fail "the terminated connection was not reported"; }
+if grep -q "parallax:parallax@" "$WORK/app.log"; then fail "the connection string reached the log"; fi
+curl -sf "$API/zones" >/dev/null || fail "the next request failed after the idle connections were terminated"
+curl -sf "http://127.0.0.1:${APPPORT}/metrics" \
+  | grep -Eq '^parallax_postgres_connection_errors_total\{reason="57P01",state="idle"\} [1-9]' \
+  || fail "the terminated idle connection was not counted under reason=\"57P01\""
+ok "$TERMINATED idle connection(s) terminated, counted, server alive and answering"
+
+echo "== a terminated checked-out connection does not take the process down =="
+# While a client is checked out `pg` takes its own listener off it, so a
+# session held across other work -- the apply lock, the migration lock -- had
+# nothing listening when its backend went away. Driven directly on a pool: an
+# apply against the local provider finishes too fast to terminate mid-way.
+DATABASE_URL="$DATABASE_URL" PARALLAX_VERIFY_ROOT="$ROOT" node --input-type=module - <<'NODE'
+import { pathToFileURL } from "node:url";
+
+const root = process.env.PARALLAX_VERIFY_ROOT;
+const { createPostgresPool } = await import(pathToFileURL(`${root}/src/infrastructure/postgres.ts`).href);
+const { render } = await import(pathToFileURL(`${root}/src/observability/metrics.ts`).href);
+const lines = [];
+console.error = (...args) => { lines.push(args.map(String).join(" ")); };
+const crashes = [];
+process.on("uncaughtException", (error) => { crashes.push(error); });
+
+const held = createPostgresPool(`${process.env.DATABASE_URL}&application_name=parallax-verify-held`, { max: 1 });
+const admin = createPostgresPool(process.env.DATABASE_URL);
+const terminateHeld = async () => {
+  const { rows } = await admin.query(
+    // FILTER, not AND: the planner may evaluate AND in either order, and only
+    // rows the WHERE has already kept may reach pg_terminate_backend.
+    "SELECT (count(*) FILTER (WHERE pg_terminate_backend(pid)))::int AS n FROM pg_stat_activity WHERE application_name = 'parallax-verify-held'",
+  );
+  if (rows[0].n !== 1) throw new Error(`expected to terminate one held session, terminated ${rows[0].n}`);
+};
+const checkedOut = () => (render().match(/^parallax_postgres_connection_errors_total\{reason="[^"]+",state="checked_out"\} (\d+)$/gmu) ?? [])
+  .reduce((sum, line) => sum + Number(line.split(" ").pop()), 0);
+const until = async (condition, what) => {
+  for (let i = 0; i < 40; i++) { if (condition()) return; await new Promise((r) => setTimeout(r, 100)); }
+  throw new Error(`timed out waiting for ${what}`);
+};
+
+// Released in `finally` when a check fails part-way, so the failure is
+// reported instead of `end()` waiting on a client that was never returned.
+let client;
+const release = () => { const out = client; client = undefined; out?.release(); };
+try {
+  // Held with nothing in flight, as an apply holds it across provider calls.
+  client = await held.connect();
+  await client.query("SELECT 1");
+  await terminateHeld();
+  await until(() => checkedOut() >= 1, "the held session's failure to be counted");
+  await client.query("SELECT 1").then(() => { throw new Error("a terminated session still answered"); }, () => undefined);
+  release();
+
+  // Held with a query in flight: the query is rejected to its caller.
+  client = await held.connect();
+  const inFlight = client.query("SELECT pg_sleep(30)").then(() => "answered", (error) => error.code ?? "rejected");
+  await new Promise((r) => setTimeout(r, 300));
+  await terminateHeld();
+  const outcome = await inFlight;
+  if (outcome !== "57P01") throw new Error(`expected the in-flight query to be rejected with 57P01, got ${outcome}`);
+  await until(() => checkedOut() >= 2, "the in-flight session's failure to be counted");
+  release();
+
+  // max is 1, so this only answers if the failed clients were not reused.
+  const { rows } = await held.query("SELECT 1 AS ok");
+  if (rows[0].ok !== 1) throw new Error("the pool did not recover after its held sessions were terminated");
+  if (crashes.length > 0) throw new Error(`uncaught: ${crashes.map(String).join("; ")}`);
+  if (!render().includes('reason="57P01",state="checked_out"')) throw new Error("the held session was not counted under 57P01");
+  if (lines.some((line) => line.includes("postgres://") || line.includes("parallax:parallax@"))) {
+    throw new Error("the connection string reached the log");
+  }
+} catch (error) {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  if (crashes.length > 0) process.stderr.write(`uncaught while held: ${crashes.map((e) => e?.code ?? "unknown").join(", ")}\n`);
+  process.exitCode = 1;
+} finally {
+  try { release(); } catch { /* already released */ }
+  await held.end();
+  await admin.end();
+}
+NODE
+ok "held sessions terminated with and without a query in flight; process alive, query rejected, pool recovered"
 
 stop_app
 echo

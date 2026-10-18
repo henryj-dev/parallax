@@ -549,7 +549,9 @@ parallax_dns_zones_skipped_total                내부 뷰를 구성할 수 없�
 parallax_dns_unservable_records_total           와이어에 닿았으나 쓸 수 없던 저장 레코드
 parallax_dns_unanswerable_replies_total         답할 수 없던 질의
 parallax_dns_notify_failures_total              실패한 NOTIFY 발송
+parallax_dns_forward_failures_total             업스트림 순번·사유별 DNS 포워딩 실패
 parallax_refresh_failures_total                 서브시스템별 백그라운드 갱신 실패
+parallax_postgres_connection_errors_total       상태(idle, checked_out)·코드별로 실패한 풀 연결
 parallax_tls_certificate_reload_failures_total  실패한 인증서 재적재
 ```
 
