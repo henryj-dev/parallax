@@ -141,6 +141,32 @@ export const dnsDriftCheckFailed = counter(
   "Zones whose provider records could not be read by the provider-only check.",
 );
 
+/**
+ * Health check probes that finished, by result: `success` or the failure
+ * category. Never the address or the name -- those are unbounded, and the
+ * status endpoint is where a person reads which address failed.
+ */
+export const dnsHealthProbes = counter(
+  "parallax_dns_health_probes_total",
+  "Health check probes the DNS listener completed, by result.",
+);
+
+/** Addresses whose health status changed, by the status they changed to. */
+export const dnsHealthTransitions = counter(
+  "parallax_dns_health_transitions_total",
+  "Health check status changes, by the status entered.",
+);
+
+/**
+ * Queries answered SERVFAIL because a protected RRset had no address left to
+ * give. A rising count is a name that is down for internal clients, which the
+ * answer counter alone cannot tell apart from a broken zone.
+ */
+export const dnsHealthServfail = counter(
+  "parallax_dns_health_servfail_total",
+  "Queries the DNS listener answered SERVFAIL because no protected address was healthy.",
+);
+
 /** Answers the API sent, by status. A bounded set: this code chooses them all. */
 export const httpAnswered = counter(
   "parallax_http_responses_total",

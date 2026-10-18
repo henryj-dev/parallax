@@ -26,6 +26,31 @@ describe("FileStateRepository", () => {
       ["alpha.example", "bravo.example", "charlie.example"]);
   });
 
+  it("keeps health-check policies across a restart, and refuses them on a view that cannot carry them", async () => {
+    const path = await statePath();
+    const zone: Zone = {
+      ...zoneFixture("example.com", 2),
+      views: [
+        { name: "external", records: [] },
+        {
+          name: "internal",
+          records: [{ id: "app", name: "app", type: "A", content: "10.0.0.11", ttl: 60 }],
+          healthChecks: [{ name: "app", type: "A", enabled: true, probe: { kind: "http", port: 8080, path: "/health/ready" }, responseTtlSeconds: 30 }],
+        },
+      ],
+    };
+    await new FileStateRepository(path).save(zone);
+    assert.deepEqual(await new FileStateRepository(path).get("example.com"), zone);
+
+    const misplaced = { ...zone, views: [{ ...zone.views[1]!, name: "external" }, { name: "internal", records: [] }] };
+    const stored = JSON.parse(await readFile(path, "utf8")) as { zones: Record<string, unknown> };
+    stored.zones["example.com"] = misplaced;
+    await writeFile(path, JSON.stringify(stored));
+    // The file as a whole is refused; the cause names what was wrong in it.
+    await assert.rejects(new FileStateRepository(path).get("example.com"), (error: Error) =>
+      /invalid state file/u.test(error.message) && /only on the internal view/u.test(String((error.cause as Error | undefined)?.message)));
+  });
+
   it("implements both repository ports and restores zones, audit, and status after restart", async () => {
     const path = await statePath();
     const repository = new FileStateRepository(path);

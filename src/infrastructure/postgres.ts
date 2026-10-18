@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { assertPersistedDesiredViewsValid } from "../application/control-plane.ts";
+import { readHealthChecks } from "../domain/health-checks.ts";
 import { RevisionConflictError, type AccessTokenRepository, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type CredentialRepository, type DesiredChange, type PageRequest, type RetentionPolicy, type SettingsRepository, type SettingsRepositoryUpdate, type StatusRepository, type StoredAccessToken, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import { AUDIT_ACTIONS,
   createDesiredRecord,
@@ -463,6 +464,8 @@ class ContextualPgPool implements PgPool {
 export class PostgresApplyLock implements ApplyLock {
   readonly #pool: PgPool;
   readonly #context: ApplyClientContext | undefined;
+  /** Clients whose nested unlock failed, which their outer holder must destroy. */
+  readonly #poisoned = new WeakSet<PgClient>();
 
   constructor(pool: PgPool, context?: ApplyClientContext) {
     this.#pool = pool;
@@ -470,6 +473,12 @@ export class PostgresApplyLock implements ApplyLock {
   }
 
   async withZoneLock<T>(zone: string, operation: () => Promise<T>): Promise<T> {
+    // A lock taken while another is held -- the health-check lock inside a
+    // zone's -- goes on the session already checked out. A second connection
+    // per nested lock would let a full pool of zone-lock holders each wait for
+    // one more, and none ever arrive.
+    const active = this.#context?.current();
+    if (active) return this.#nested(active, zone, operation);
     const client = await this.#pool.connect();
     let locked = false;
     let released = false;
@@ -501,7 +510,23 @@ export class PostgresApplyLock implements ApplyLock {
           // repository should not disagree about which error survives.
         }
       }
-      if (!released) client.release();
+      if (!released) client.release(this.#poisoned.has(client) ? true : undefined);
+    }
+  }
+
+  async #nested<T>(client: PgClient, key: string, operation: () => Promise<T>): Promise<T> {
+    await client.query("SELECT pg_advisory_lock(hashtextextended($1, 1))", [key]);
+    try {
+      return await operation();
+    } finally {
+      try {
+        await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 1))", [key]);
+      } catch {
+        // The session belongs to the outer holder, so it is not released here;
+        // it is marked, and destroyed instead of pooled when that holder lets
+        // go. Not re-thrown, for the reason the outer path gives.
+        this.#poisoned.add(client);
+      }
     }
   }
 }
@@ -824,7 +849,10 @@ function readZone(value: unknown): Zone {
       // the whole zone away instead.
       return createDesiredRecord(id, object, { rehydrate: true });
     });
-    return { name: viewName, records };
+    // Shape only. Whether each policy still names a record is the commit's
+    // question, so a snapshot left dangling stays readable and fixable.
+    const healthChecks = readHealthChecks(view.healthChecks, viewName);
+    return { name: viewName, records, ...(healthChecks !== undefined ? { healthChecks } : {}) };
   });
   assertPersistedDesiredViewsValid(views);
   return { name, revision, views, createdAt, updatedAt };

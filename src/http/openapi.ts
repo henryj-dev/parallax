@@ -1,6 +1,16 @@
 import { AUDIT_ACTIONS, MANAGING_SERVICES, PROVIDER_VIEWS, RECORD_TYPES } from "../domain/dns.ts";
 import { findCommand, type CommandOption } from "../cli/commands.ts";
 import { MAX_BATCH_OPERATIONS } from "../application/control-plane.ts";
+import {
+  DEFAULT_HEALTH_HTTP_PATH,
+  DEFAULT_HEALTH_RESPONSE_TTL_SECONDS,
+  HEALTH_CHECK_TYPES,
+  MAX_HEALTH_CHECK_TARGETS,
+  MAX_HEALTH_CHECKS_PER_ZONE,
+  MAX_HEALTH_PATH_LENGTH,
+  MAX_HEALTH_RESPONSE_TTL_SECONDS,
+  MIN_HEALTH_RESPONSE_TTL_SECONDS,
+} from "../domain/health-checks.ts";
 import { authorize, ROLES, type Role } from "../security/http-authorization.ts";
 
 /**
@@ -103,6 +113,12 @@ const IF_MATCH_PARAM: DocumentedParameter = {
     + "Every write answers with the new revision in an `ETag`, so it can be carried straight into the next one.",
   schema: { type: "string", pattern: '^"[1-9][0-9]*"$' },
 };
+const HEALTH_NAME_PARAM: DocumentedParameter = {
+  name: "name", in: "path", required: true, description: "Owner name of the protected RRset: `@` for the apex, otherwise relative.", schema: { type: "string" },
+};
+const HEALTH_TYPE_PARAM: DocumentedParameter = {
+  name: "type", in: "path", required: true, description: "The protected RRset's type.", schema: { type: "string", enum: [...HEALTH_CHECK_TYPES] },
+};
 const PAGING_PARAMS: readonly DocumentedParameter[] = [
   { name: "limit", in: "query", description: "Entries per page, 1 to 500. Defaults to 50.", schema: { type: "integer", minimum: 1, maximum: 500, default: 50 } },
   { name: "offset", in: "query", description: "Entries to skip.", schema: { type: "integer", minimum: 0, default: 0 } },
@@ -198,7 +214,118 @@ const SCHEMAS: Readonly<Record<string, JsonSchema>> = {
   DnsView: {
     type: "object",
     required: ["name", "records"],
-    properties: { name: ref("View"), records: arrayOf(ref("DesiredRecord")) },
+    properties: {
+      name: ref("View"),
+      records: arrayOf(ref("DesiredRecord")),
+      healthChecks: {
+        ...arrayOf(ref("HealthCheckPolicy")),
+        maxItems: MAX_HEALTH_CHECKS_PER_ZONE,
+        description:
+          "Internal view only. A full replace that leaves this out while the stored view carries policies is refused with "
+          + "`409`, so a writer that does not know about health checks cannot drop them; send `[]` to remove them all.",
+      },
+    },
+  },
+  HealthCheckProbe: {
+    type: "object",
+    required: ["kind", "port"],
+    description:
+      "Connects to each address of the RRset itself, never to a name. `tcp` passes when the connection opens; `http` and "
+      + "`https` pass on any 2xx, with no redirect followed. `https` verifies the certificate against the RRset's name.",
+    properties: {
+      kind: { type: "string", enum: ["tcp", "http", "https"] },
+      port: { type: "integer", minimum: 1, maximum: 65_535, description: "Must also be in `dnsHealthCheckAllowPorts`." },
+      path: {
+        type: "string",
+        maxLength: MAX_HEALTH_PATH_LENGTH,
+        default: DEFAULT_HEALTH_HTTP_PATH,
+        description: "`http` and `https` only. An origin-form path: starts with one `/`, visible ASCII, no fragment.",
+      },
+    },
+  },
+  HealthCheckPolicy: {
+    type: "object",
+    required: ["name", "type", "probe"],
+    description:
+      "Protects one internal A or AAAA RRset. Only the internal DNS listener filters by it; the external view and every "
+      + "provider are unaffected. An enabled policy fails closed: when probing is off, an address is outside the allow-list, "
+      + "or no address has a fresh success, the RRset is answered SERVFAIL rather than with every address.",
+    properties: {
+      name: { type: "string", description: "`@` for the apex, otherwise relative. Wildcards are refused." },
+      type: { type: "string", enum: [...HEALTH_CHECK_TYPES] },
+      enabled: {
+        type: "boolean",
+        default: false,
+        description: "Only an explicit `true` turns the policy on. A policy left out or set to `false` is kept and the RRset is answered in full.",
+      },
+      probe: ref("HealthCheckProbe"),
+      responseTtlSeconds: {
+        type: "integer",
+        minimum: MIN_HEALTH_RESPONSE_TTL_SECONDS,
+        maximum: MAX_HEALTH_RESPONSE_TTL_SECONDS,
+        default: DEFAULT_HEALTH_RESPONSE_TTL_SECONDS,
+        description: "The TTL of a filtered answer, lowered further to the smallest TTL in the RRset.",
+      },
+    },
+  },
+  HealthCheckList: {
+    type: "object",
+    required: ["zone", "revision", "healthChecks"],
+    properties: { zone: { type: "string" }, revision: { type: "integer" }, healthChecks: arrayOf(ref("HealthCheckPolicy")) },
+  },
+  HealthCheckResult: {
+    type: "object",
+    required: ["healthCheck", "revision"],
+    properties: { healthCheck: ref("HealthCheckPolicy"), revision: { type: "integer" } },
+  },
+  HealthCheckStatus: {
+    type: "object",
+    required: ["zone", "revision", "probing", "servedHere", "transfers", "healthChecks"],
+    description:
+      "What the answering process makes of the zone. Verdicts are process-local: each replica probes from where it "
+      + `sits and keeps nothing in the store. At most ${MAX_HEALTH_CHECK_TARGETS} addresses are probed per process.`,
+    properties: {
+      zone: { type: "string" },
+      revision: { type: "integer" },
+      probing: { type: "boolean", description: "Whether `dnsHealthChecksEnabled` is on." },
+      servedHere: { type: "boolean", description: "Whether this process's listener answers for the zone. Without it every answer is `unknown`." },
+      transfers: {
+        type: "string",
+        enum: ["allowed", "refused"],
+        description: "`refused` while any policy is enabled: AXFR and IXFR are refused and NOTIFY is not sent.",
+      },
+      healthChecks: arrayOf({
+        allOf: [ref("HealthCheckPolicy"), {
+          type: "object",
+          required: ["answer"],
+          properties: {
+            answer: {
+              type: "string",
+              enum: ["full", "filtered", "servfail", "unknown"],
+              description: "`full` for a disabled policy, `unknown` when this process does not serve the zone.",
+            },
+            ttl: { type: "integer" },
+            healthyAddresses: { type: "integer" },
+            issue: { type: "string", description: "Why the policy cannot be honoured, e.g. the RRset does not exist." },
+            targets: arrayOf({
+              type: "object",
+              required: ["address", "status"],
+              properties: {
+                address: { type: "string" },
+                status: {
+                  type: "string",
+                  enum: ["healthy", "unhealthy", "unknown", "stale", "disabled", "blocked", "unsupported_target", "over_limit"],
+                },
+                blockedReason: { type: "string" },
+                lastFailure: { type: "string", enum: ["timeout", "connection", "tls", "http-status", "blocked"] },
+                lastStatusCode: { type: "integer" },
+                checkedAt: { type: "string", format: "date-time" },
+              },
+            }),
+          },
+        }],
+      }),
+    },
   },
   Zone: {
     type: "object",
@@ -507,6 +634,54 @@ const OPERATIONS: readonly DocumentedOperation[] = [
     errors: [409],
   },
 
+  // ---- health checks -----------------------------------------------------
+  {
+    method: "GET", path: "/api/v1/zones/{zone}/views/internal/health-checks", tag: "Health checks",
+    source: { kind: "command", command: "health check list" },
+    sample: { path: "/api/v1/zones/example.com/views/internal/health-checks" },
+    parameters: [ZONE_PARAM],
+    success: { status: 200, description: "The internal view's policies and the revision they were read at.", schema: ref("HealthCheckList") },
+  },
+  {
+    method: "PUT", path: "/api/v1/zones/{zone}/views/internal/health-checks/{name}/{type}", tag: "Health checks",
+    source: { kind: "command", command: "health check set" },
+    description:
+      "Creates or replaces the policy for one RRset, as a new revision. Refused while the RRset is missing, holds an address "
+      + "that is not a literal or is provider-owned, or the zone's internal view is published to a provider.",
+    sample: {
+      path: "/api/v1/zones/example.com/views/internal/health-checks/www/A",
+      body: { enabled: true, probe: { kind: "http", port: 8080, path: "/health/ready" }, responseTtlSeconds: 30 },
+    },
+    parameters: [ZONE_PARAM, HEALTH_NAME_PARAM, HEALTH_TYPE_PARAM, IF_MATCH_PARAM],
+    requestBody: {
+      description: "The policy. `name` and `type` may be left out; when given they must match the path.",
+      required: true,
+      schema: ref("HealthCheckPolicy"),
+    },
+    success: { status: 200, description: "The policy as stored and the new revision.", schema: ref("HealthCheckResult") },
+    errors: [409],
+  },
+  {
+    method: "DELETE", path: "/api/v1/zones/{zone}/views/internal/health-checks/{name}/{type}", tag: "Health checks",
+    source: { kind: "command", command: "health check delete" },
+    sample: { path: "/api/v1/zones/example.com/views/internal/health-checks/www/A" },
+    parameters: [ZONE_PARAM, HEALTH_NAME_PARAM, HEALTH_TYPE_PARAM, IF_MATCH_PARAM],
+    success: {
+      status: 200,
+      description: "The new revision.",
+      schema: { type: "object", required: ["revision"], properties: { revision: { type: "integer" } } },
+    },
+    errors: [409],
+  },
+  {
+    method: "GET", path: "/api/v1/zones/{zone}/health-check-status", tag: "Health checks",
+    source: { kind: "command", command: "health check status" },
+    description: "Process-local. Behind a load balancer, two requests can reach two replicas and see two verdicts.",
+    sample: { path: "/api/v1/zones/example.com/health-check-status" },
+    parameters: [ZONE_PARAM],
+    success: { status: 200, description: "Each policy and this process's verdict on each address.", schema: ref("HealthCheckStatus") },
+  },
+
   // ---- reconciliation ----------------------------------------------------
   {
     method: "GET", path: "/api/v1/zones/{zone}/preview", tag: "Reconciliation",
@@ -652,7 +827,11 @@ const OPERATIONS: readonly DocumentedOperation[] = [
   {
     method: "PUT", path: "/api/v1/settings", tag: "Administration",
     source: { kind: "command", command: "settings set" },
-    description: "Writes only the keys the body carries; every other stored setting is retained.",
+    description:
+      "Writes only the keys the body carries; every other stored setting is retained. Health checks are governed by three "
+      + "keys: `dnsHealthChecksEnabled` (default `false`), `dnsHealthCheckAllowCidrs` and `dnsHealthCheckAllowPorts`. An "
+      + "address is probed only when it is inside an allowed network and its port is allowed; reserved and translated "
+      + "ranges are refused whatever the list says.",
     sample: { path: "/api/v1/settings", body: {} },
     requestBody: { description: "The settings to change.", required: true, schema: ref("Opaque") },
     success: { status: 200, description: "The settings after the change.", schema: ref("Opaque") },
@@ -1015,6 +1194,7 @@ const TAG_DESCRIPTIONS: Readonly<Record<string, string>> = {
   Administration: "Settings and the tokens that reach this API. Administrator-only, reads included.",
   Credentials: "Provider credentials. Write-only: a stored secret can never be read back.",
   "Fallback domains": "The provider's client-side resolver overrides.",
+  "Health checks": "Probing the internal listener's A and AAAA answers, and leaving out addresses that fail.",
   Meta: "The dispatcher, this document, and how a browser signs in.",
   Operations: "What a probe, a load balancer and a scraper ask for.",
 };

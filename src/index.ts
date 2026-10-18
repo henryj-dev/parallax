@@ -48,7 +48,7 @@ try {
   throw error;
 }
 
-const { controlPlane, settings: settingsService, accessTokens, credentials, provider } = runtime;
+const { controlPlane, settings: settingsService, accessTokens, credentials, provider, healthMonitor } = runtime;
 const readiness = createReadinessMonitor(
   () => controlPlane.listZones(),
   (target) => provider.isConfigured(target),
@@ -68,6 +68,9 @@ const readiness = createReadinessMonitor(
       const previous = previousDnsSerials;
       previousDnsSerials = new Map(next.map((zone) => [zone.name, zone.serial]));
       dnsSnapshot = next;
+      // The same snapshot the listener answers from, so a policy is probed
+      // exactly while its RRset is served and stops being probed with it.
+      healthMonitor?.update(next);
       void dnsServer?.notifyChanged(previous, next).catch((error: unknown) => {
         notifyFailed();
         console.error(`parallax: NOTIFY failed: ${error instanceof Error ? error.message : "unknown error"}`);
@@ -106,6 +109,27 @@ gauge(
   "parallax_dns_served_zones",
   "Zones the DNS listener answers for. Absent when no listener is configured.",
   () => (config.dns ? dnsSnapshot.length : undefined),
+);
+// One unlabeled series per status rather than one per address: the addresses
+// are unbounded, and the status endpoint is where a person reads which one.
+gauge(
+  "parallax_dns_health_healthy_targets",
+  "Protected addresses this process currently gives out. Absent when no listener is configured.",
+  () => (config.dns && healthMonitor ? healthMonitor.summary().healthy : undefined),
+);
+gauge(
+  "parallax_dns_health_unhealthy_targets",
+  "Protected addresses held back because their probes fail. Absent when no listener is configured.",
+  () => (config.dns && healthMonitor ? healthMonitor.summary().unhealthy : undefined),
+);
+gauge(
+  "parallax_dns_health_unknown_targets",
+  "Protected addresses with no fresh result, or not probed at all. Absent when no listener is configured.",
+  () => {
+    if (!config.dns || !healthMonitor) return undefined;
+    const summary = healthMonitor.summary();
+    return summary.targets - summary.healthy - summary.unhealthy;
+  },
 );
 
 const securityConfig = (): SecurityConfig => {
@@ -328,7 +352,15 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
           // to the forwarder. Somebody checking why a name does not resolve
           // internally needs to see that difference from outside the process.
           dns: config.dns
-            ? { port: config.dns.port, zones: dnsSnapshot.length, forwarding: config.dns.forwardTo.length > 0 }
+            ? {
+              port: config.dns.port,
+              zones: dnsSnapshot.length,
+              forwarding: config.dns.forwardTo.length > 0,
+              // Counts only. Readiness never depends on them: an origin being
+              // down is what health checks exist to absorb, not a reason to
+              // withdraw the listener that is absorbing it.
+              ...(healthMonitor ? { healthChecks: { probing: settingsService.current().dnsHealthChecksEnabled, ...healthMonitor.summary() } } : {}),
+            }
             : "disabled",
           accessTokens: tokenReadiness,
           // Reported even while ready, so a deployment can alert on a snapshot
@@ -541,6 +573,12 @@ if (config.dns) {
       // SERVFAIL, and this line is the only place the reason exists.
       replyUnanswerable();
       console.error(`parallax: ${detail.zone} could not assemble a reply for ${detail.name}: ${detail.reason}`);
+    },
+    // Without a monitor every protected RRset answers SERVFAIL, which is the
+    // listener's own default; this is only ever absent in a reduced runtime.
+    ...(healthMonitor ? { health: () => healthMonitor.verdict() } : {}),
+    onNotifySkipped: (zone) => {
+      console.warn(`parallax: ${zone} has enabled health checks, so it is not transferred and its secondaries are not sent NOTIFY. A secondary keeps serving the copy it already holds, every address included.`);
     },
   });
   try {

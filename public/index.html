@@ -133,6 +133,18 @@
                 <small class="track-caption" id="revision-caption" data-i18n="sync.comparing">Desired and applied revisions are being compared.</small>
               </section>
 
+              <section class="panel health-panel" aria-labelledby="health-title">
+                <div class="section-heading"><div><span class="eyebrow" data-i18n="health.eyebrow">Internal DNS</span><h2 id="health-title" data-i18n="health.title">Health checks</h2></div>
+                  <div class="dialog-actions">
+                    <button class="button quiet compact" id="health-refresh-button" type="button" hidden data-i18n="health.refresh">Refresh</button>
+                    <button class="button compact" id="add-health-check-button" type="button" data-i18n="health.add">Add check</button>
+                  </div>
+                </div>
+                <p class="health-note" data-i18n="health.note">Only the internal listener leaves failing addresses out. External DNS and providers are not affected. Remove a check before removing the records it protects.</p>
+                <small class="health-summary" id="health-summary" role="status"></small>
+                <div class="health-list" id="health-list"></div>
+              </section>
+
               <section class="panel history-panel" aria-labelledby="history-title">
                 <div class="section-heading"><div><span class="eyebrow" data-i18n="history.eyebrow">Audit trail</span><h2 id="history-title" data-i18n="history.title">Recent changes</h2></div>
                   <div class="dialog-actions">
@@ -158,6 +170,26 @@
         <label><span data-i18n="zoneDialog.provider">External provider</span><select name="provider"><option value="cloudflare">Cloudflare</option></select></label>
         <div class="form-error" id="zone-form-error" role="alert" hidden></div>
         <div class="dialog-actions"><button class="button quiet" type="button" data-close-dialog data-i18n="dialog.cancel">Cancel</button><button class="button primary" id="create-zone-submit" value="default" data-i18n="zones.create">Create zone</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="health-dialog">
+      <form id="health-form" method="dialog">
+        <div class="dialog-heading"><span class="eyebrow" data-i18n="healthDialog.eyebrow">Internal view only</span><h2 id="health-dialog-title" data-i18n="healthDialog.add">Add a health check</h2><button class="icon-button" type="button" data-close-dialog aria-label="Close dialog" data-i18n-aria-label="dialog.close">×</button></div>
+        <p data-i18n="health.note">Only the internal listener leaves failing addresses out. External DNS and providers are not affected. Remove a check before removing the records it protects.</p>
+        <div class="form-row">
+          <label><span data-i18n="healthDialog.name">Record name</span><input name="name" type="text" placeholder="@ or app" required data-validation-label="healthDialog.name" autocomplete="off" spellcheck="false"></label>
+          <label><span data-i18n="healthDialog.type">Type</span><select name="type" required><option>A</option><option>AAAA</option></select></label>
+        </div>
+        <label class="check-label settings-toggle"><input name="enabled" type="checkbox"><span><b data-i18n="healthDialog.enabled">Enabled</b><small data-i18n="healthDialog.enabledHelp">When off, the check is kept and every address is answered.</small></span></label>
+        <div class="form-row">
+          <label><span data-i18n="healthDialog.kind">Probe</span><select name="kind"><option value="tcp">TCP</option><option value="http">HTTP</option><option value="https">HTTPS</option></select></label>
+          <label><span data-i18n="healthDialog.port">Port</span><input name="port" type="number" min="1" max="65535" step="1" required data-validation-label="healthDialog.port"></label>
+        </div>
+        <label><span data-i18n="healthDialog.path">Path</span><input name="path" type="text" maxlength="256" placeholder="/health/ready" spellcheck="false" autocomplete="off"><small data-i18n="healthDialog.pathHelp">HTTP and HTTPS only. Any 2xx passes; redirects are not followed.</small></label>
+        <label><span data-i18n="healthDialog.ttl">Answer TTL in seconds</span><input name="responseTtlSeconds" type="number" min="5" max="60" step="1" value="30" required data-validation-label="healthDialog.ttl"><small data-i18n="healthDialog.ttlHelp">5 to 60. Lowered further to the record's own TTL.</small></label>
+        <div class="form-error" id="health-form-error" role="alert" hidden></div>
+        <div class="dialog-actions"><button class="button quiet" type="button" data-close-dialog data-i18n="dialog.cancel">Cancel</button><button class="button primary" id="save-health-check-button" type="submit" data-i18n="healthDialog.save">Save check</button></div>
       </form>
     </dialog>
 
@@ -303,6 +335,9 @@
           <label><span data-i18n="settings.revisionRetention">Revisions kept per zone</span><input name="revisionRetention" type="number" min="0" step="1" required data-validation-label="settings.revisionRetention"></label>
           <label><span data-i18n="settings.auditRetentionDays">Audit history kept (days)</span><input name="auditRetentionDays" type="number" min="0" step="1" required data-validation-label="settings.auditRetentionDays"></label>
           <label><span data-i18n="settings.fallbackResolver">Fallback resolver address</span><input name="fallbackResolver" type="text" autocomplete="off" spellcheck="false" placeholder="10.0.0.11" data-validation-label="settings.fallbackResolver"><small data-i18n="settings.fallbackResolverHelp">Address devices should use for this control plane's zones. Required before device-settings sync can run.</small></label>
+          <label class="check-label settings-toggle"><input name="dnsHealthChecksEnabled" type="checkbox"><span><b data-i18n="settings.dnsHealthChecksEnabled">Internal health checks</b><small data-i18n="settings.dnsHealthChecksEnabledHelp">Probe the addresses health checks protect. While off, every enabled check answers SERVFAIL.</small></span></label>
+          <label><span data-i18n="settings.dnsHealthCheckAllowCidrs">Networks probes may reach</span><textarea name="dnsHealthCheckAllowCidrs" rows="3" autocomplete="off" spellcheck="false" placeholder="10.0.0.0/24"></textarea><small data-i18n="settings.dnsHealthCheckAllowCidrsHelp">CIDRs, one per line or comma separated. Empty allows none; reserved ranges are always refused.</small></label>
+          <label><span data-i18n="settings.dnsHealthCheckAllowPorts">Ports probes may reach</span><input name="dnsHealthCheckAllowPorts" type="text" autocomplete="off" spellcheck="false" placeholder="443, 8080"><small data-i18n="settings.dnsHealthCheckAllowPortsHelp">Comma separated. Empty allows none.</small></label>
           <div class="form-error" id="settings-form-error" role="alert" hidden></div>
           <div class="dialog-actions"><button class="button primary" id="save-settings-button" type="submit" data-i18n="settings.save">Save settings</button></div>
         </form>

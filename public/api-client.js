@@ -145,6 +145,17 @@ export function createApiClient({ root = DEFAULT_ROOT, fetchImpl = globalThis.fe
       ),
 
     zoneStatus: (zone) => request(`${zonePath(zone)}/status`),
+    listHealthChecks: (zone) => request(`${zonePath(zone)}/views/internal/health-checks`),
+    setHealthCheck: (zone, name, type, policy, revision) => request(
+      `${zonePath(zone)}/views/internal/health-checks/${encodeURIComponent(name)}/${encodeURIComponent(type)}`,
+      { method: "PUT", body: policy, headers: ifMatch(revision) },
+    ),
+    deleteHealthCheck: (zone, name, type, revision) => request(
+      `${zonePath(zone)}/views/internal/health-checks/${encodeURIComponent(name)}/${encodeURIComponent(type)}`,
+      { method: "DELETE", headers: ifMatch(revision) },
+    ),
+    // Process-local: what the replica that answers makes of the addresses.
+    healthCheckStatus: (zone) => request(`${zonePath(zone)}/health-check-status`),
     /** One line per zone, walked the same way as the zone list so a second page is not silently dropped. */
     statusOverview: listAllStatus,
     history: (zone, page) => readPage(`${zonePath(zone)}/history`, "entries", "history", page),

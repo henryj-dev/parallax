@@ -193,6 +193,13 @@ export function authorize(principal: Principal, request: Request): boolean {
   if (segments.length === 5 && segments[4] === "adopt" && method === "POST") return true;
   if (segments.length === 7 && segments[4] === "revisions" && segments[6] === "restore" && method === "POST") return true;
 
+  // A health check is the internal view's desired state, written one policy
+  // at a time the way a record is -- the same lock, revision and audit -- so it
+  // takes the role a record edit takes. Only the exact policy path qualifies.
+  if (segments.length === 9 && segments[4] === "views" && segments[5] === "internal" && segments[6] === "health-checks") {
+    return method === "PUT" || method === "DELETE";
+  }
+
   // Individual record mutations are desired-state editing, not zone deletion.
   if (segments[4] !== "views" || segments[6] !== "records") return false;
   // Adding a record the caller did not name an id for.

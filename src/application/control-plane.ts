@@ -20,6 +20,21 @@ import {
   type Zone,
   type ZoneRevision,
 } from "../domain/dns.ts";
+import {
+  cloneHealthCheck,
+  countHealthCheckChanges,
+  createHealthCheckPolicy,
+  healthCheckKey,
+  healthChecksOf,
+  hasEnabledHealthChecks,
+  MAX_HEALTH_CHECK_TARGETS,
+  MAX_HEALTH_CHECKS_PER_ZONE,
+  readHealthChecks,
+  resolveProtectedRRsets,
+  sortHealthChecks,
+  type HealthCheckPolicy,
+  type ProtectedRRset,
+} from "../domain/health-checks.ts";
 import { formatZoneFile, parseZoneFile } from "../domain/zone-file.ts";
 import { buildReconcilePlan, type ProviderRecord, type ReconcilePlan } from "../domain/reconciliation.ts";
 import { ProviderConstraintError, ProviderNotConfiguredError, RevisionConflictError, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type PageRequest, type ProviderAdapter, type RetentionPolicy, type StatusRepository, type ZoneRepository } from "./ports.ts";
@@ -241,6 +256,7 @@ export class ControlPlane {
   readonly #applyLock: ApplyLock;
   readonly #retention: RetentionSettings;
   readonly #publisherFor: (target: string) => ProviderViewPublisher;
+  readonly #healthCheckHooks: HealthCheckHooks;
   readonly #operationTails = new Map<string, Promise<void>>();
 
   constructor(
@@ -274,6 +290,7 @@ export class ControlPlane {
      * business and not the control plane's.
      */
     publisherFor: (target: string) => ProviderViewPublisher = () => "provider",
+    healthChecks: HealthCheckHooks = {},
   ) {
     this.#zones = zones;
     this.#statuses = statuses;
@@ -282,6 +299,7 @@ export class ControlPlane {
     this.#applyLock = applyLock;
     this.#retention = retention;
     this.#publisherFor = publisherFor;
+    this.#healthCheckHooks = healthChecks;
   }
 
   /**
@@ -703,6 +721,7 @@ export class ControlPlane {
     const zone = await this.getZone(zoneName);
     this.#assertExpectedRevision(zone, expectedRevision);
     const views = parseDesiredViews(input);
+    assertHealthChecksNotDropped(zone.views, views);
     assertProviderManagedIntact(zone.views, views);
     materializeProviderViews(views);
     const updated = this.#nextRevision(zone, views);
@@ -925,6 +944,11 @@ export class ControlPlane {
         continue;
       }
       try {
+        if (view.name === "internal" && this.#healthChecksUnsupported(zone.name)
+          && (view.healthChecks ?? healthChecksOf(zone.views.find((candidate) => candidate.name === "internal")))
+            .some((policy) => policy.enabled)) {
+          throw new ConflictError(unsupportedHealthCheckMessage(zone.name));
+        }
         const actual = await this.#provider.list(key);
         views[view.name] = {
           ...buildReconcilePlan(view.records, actual),
@@ -1055,8 +1079,12 @@ export class ControlPlane {
       this.#assertExpectedRevision(zone, expectedRevision);
       const records = parseZoneFile(text, zone.name);
       const view = validateViewName(viewName);
-      const views = zone.views.filter((candidate) => candidate.name !== view);
-      views.push({ name: view, records });
+      const views = zone.views.filter((candidate) => candidate.name !== view).map(cloneView);
+      // A zone file carries records only. The policies beside them are kept, and
+      // the common commit then refuses the import if it removed an address one
+      // of them still protects.
+      const kept = zone.views.find((candidate) => candidate.name === view)?.healthChecks;
+      views.push({ name: view, records, ...(kept ? { healthChecks: kept.map(cloneHealthCheck) } : {}) });
       assertProviderManagedIntact(zone.views, views);
       materializeProviderViews(views);
       const updated = this.#nextRevision(zone, views);
@@ -1095,6 +1123,12 @@ export class ControlPlane {
           await this.#statuses.save(served);
           results.push(served);
           continue;
+        }
+        // A provider would publish every address, failed ones included. That is
+        // this view's failure only: the external view still applies.
+        if (view.name === "internal" && this.#healthChecksUnsupported(zone.name)
+          && healthChecksOf(view).some((policy) => policy.enabled)) {
+          throw new ConflictError(unsupportedHealthCheckMessage(zone.name));
         }
         const plan = buildReconcilePlan(view.records, await this.#provider.list(key));
         if (plan.summary.conflict > 0) throw new ConflictError("unmanaged provider records conflict with desired state");
@@ -1289,6 +1323,138 @@ export class ControlPlane {
     }, this.#auditRetentionPolicy());
   }
 
+  /**
+   * Whether this process's configuration can honour an enabled health check on
+   * a zone's internal view.
+   *
+   * Only the built-in listener filters an answer. A provider that publishes the
+   * internal view -- an RFC 2136 server, or the local file provider -- would
+   * keep handing out every address, so a policy there would be a promise
+   * nothing keeps. That is refused rather than accepted and ignored.
+   */
+  #healthChecksUnsupported(zoneName: string): boolean {
+    return this.#publisherFor(targetKey(zoneName, "internal")) === "provider";
+  }
+
+  async #assertHealthChecksCommittable(zone: Zone): Promise<void> {
+    const internal = zone.views.find((view) => view.name === "internal");
+    const policies = healthChecksOf(internal);
+    if (policies.length === 0) return;
+    const { rrsets, issues } = protectedRRsetsFor(zone.views);
+    if (issues.length > 0) throw new DomainValidationError(issues);
+    if (!policies.some((policy) => policy.enabled)) return;
+    if (this.#healthChecksUnsupported(zone.name)) throw new ConflictError(unsupportedHealthCheckMessage(zone.name));
+    // This process's router answers from the settings it last loaded. Another
+    // replica may have stored a change since, and the settings write takes the
+    // same lock this runs under, so the stored value is the one to trust.
+    if (await this.#healthCheckHooks.unsupported?.(zone.name)) throw new ConflictError(unsupportedHealthCheckMessage(zone.name));
+    // The ceiling is on addresses one process probes, and every listener probes
+    // every zone, so it is counted across the whole store. Exceeding it is
+    // refused here; the monitor never treats an address it could not schedule
+    // as healthy either, so a store filled some other way fails closed.
+    let probed = enabledAddressCount(rrsets);
+    if (probed > MAX_HEALTH_CHECK_TARGETS) throw new DomainValidationError([healthCheckCapacityMessage()]);
+    for (const other of await this.#zones.list()) {
+      if (other.name === zone.name) continue;
+      try {
+        probed += enabledAddressCount(protectedRRsetsFor(other.views).rrsets);
+      } catch {
+        // A zone whose snapshot does not compose probes nothing.
+      }
+      if (probed > MAX_HEALTH_CHECK_TARGETS) throw new DomainValidationError([healthCheckCapacityMessage()]);
+    }
+  }
+
+  /** The zone's health checks, in key order. */
+  async listHealthChecks(zoneName: string): Promise<{ zone: string; revision: number; healthChecks: HealthCheckPolicy[] }> {
+    const zone = await this.getZone(zoneName);
+    const policies = healthChecksOf(zone.views.find((view) => view.name === "internal"));
+    return { zone: zone.name, revision: zone.revision, healthChecks: policies.map(cloneHealthCheck) };
+  }
+
+  /**
+   * Adds the health check for one internal name and type, or replaces it.
+   *
+   * A revision like any record change -- same lock, same `If-Match`, same audit
+   * action -- but it names no provider view as affected: a policy changes what
+   * the listener does with the records, never the records a provider holds.
+   */
+  setHealthCheck(zoneName: string, input: unknown, actor = "system", expectedRevision?: number): Promise<{ healthCheck: HealthCheckPolicy; revision: number }> {
+    return this.#exclusive(zoneName, async () => {
+      const zone = await this.getZone(zoneName);
+      this.#assertExpectedRevision(zone, expectedRevision);
+      const policy = createHealthCheckPolicy(input);
+      const views = zone.views.map(cloneView);
+      let internal = views.find((view) => view.name === "internal");
+      if (!internal) {
+        internal = { name: "internal", records: [] };
+        views.push(internal);
+        views.sort((left, right) => left.name.localeCompare(right.name));
+      }
+      const others = healthChecksOf(internal).filter((candidate) => healthCheckKey(candidate) !== healthCheckKey(policy));
+      if (others.length + 1 > MAX_HEALTH_CHECKS_PER_ZONE) {
+        throw new DomainValidationError([`a zone may carry at most ${MAX_HEALTH_CHECKS_PER_ZONE} health checks`]);
+      }
+      internal.healthChecks = sortHealthChecks([...others, policy]);
+      materializeProviderViews(views);
+      const updated = this.#nextRevision(zone, views);
+      await this.#commitDesiredChange(zone, updated, "desired.replaced", actor,
+        { view: "internal", healthCheck: { name: policy.name, type: policy.type } }, [], expectedRevision);
+      return { healthCheck: cloneHealthCheck(policy), revision: updated.revision };
+    });
+  }
+
+  /**
+   * Removes the health check for one internal name and type, which returns the
+   * name to its full, unfiltered answer.
+   */
+  deleteHealthCheck(zoneName: string, name: string, type: string, actor = "system", expectedRevision?: number): Promise<{ revision: number }> {
+    return this.#exclusive(zoneName, async () => {
+      const zone = await this.getZone(zoneName);
+      this.#assertExpectedRevision(zone, expectedRevision);
+      const key = healthCheckKey({
+        name: name.trim().toLowerCase().replace(/\.$/u, ""),
+        type: type.trim().toUpperCase() as HealthCheckPolicy["type"],
+      });
+      const views = zone.views.map(cloneView);
+      const internal = views.find((view) => view.name === "internal");
+      const existing = healthChecksOf(internal).find((candidate) => healthCheckKey(candidate) === key);
+      if (!internal || !existing) throw new NotFoundError(`health check ${key.replace("/", " ")} was not found in zone ${zone.name}`);
+      const remaining = healthChecksOf(internal).filter((candidate) => candidate !== existing);
+      if (remaining.length > 0) internal.healthChecks = remaining;
+      else delete internal.healthChecks;
+      materializeProviderViews(views);
+      const updated = this.#nextRevision(zone, views);
+      await this.#commitDesiredChange(zone, updated, "desired.replaced", actor,
+        { view: "internal", healthCheck: { name: existing.name, type: existing.type } }, [], expectedRevision);
+      return { revision: updated.revision };
+    });
+  }
+
+  /**
+   * Runs an operation under the lock every commit holding an enabled health
+   * check takes, across processes as well as within this one.
+   *
+   * For writes that decide something about health checks without passing
+   * through a commit here: a settings change that would publish the internal
+   * view, and a restore. Nothing run under it may take a zone's lock -- a
+   * commit takes the zone's first and this one second, so the reverse order
+   * would deadlock.
+   */
+  withHealthCheckLock<T>(operation: () => Promise<T>): Promise<T> {
+    return this.#serialized(HEALTH_CHECK_BUDGET_LOCK, operation);
+  }
+
+  /**
+   * Zones carrying at least one enabled health check, for settings that would
+   * make them unsupported. Reads every zone, so it is for rare writes only.
+   */
+  async zonesWithEnabledHealthChecks(): Promise<string[]> {
+    return (await this.#zones.list())
+      .filter((zone) => healthChecksOf(zone.views.find((view) => view.name === "internal")).some((policy) => policy.enabled))
+      .map((zone) => zone.name);
+  }
+
   #nextRevision(zone: Zone, views: Zone["views"]): Zone {
     return { ...zone, revision: zone.revision + 1, views, updatedAt: this.#clock.now().toISOString() };
   }
@@ -1321,6 +1487,41 @@ export class ControlPlane {
     // against desired state -- no provider is read, nothing is added to the
     // commit's cost.
     if (expandedViews.has("external") && internalWouldChange(before, zone)) expandedViews.add("internal");
+    // The address ceiling is counted across every zone, and each zone's lock
+    // covers only that zone -- so two replicas adding to two zones would each
+    // count the other's old state and together store more than the ceiling.
+    // A commit that leaves an enabled policy behind therefore counts and saves
+    // under one lock shared by all of them. One that leaves none can only lower
+    // the count, and skips it.
+    if (hasEnabledHealthChecks(zone.views)) {
+      await this.#serialized(HEALTH_CHECK_BUDGET_LOCK, () =>
+        this.#commitChecked(before, zone, action, actor, metadata, expandedViews, expectedRevision));
+      return;
+    }
+    await this.#commitChecked(before, zone, action, actor, metadata, expandedViews, expectedRevision);
+  }
+
+  async #commitChecked(
+    before: Zone | undefined,
+    zone: Zone,
+    action: AuditEntry["action"],
+    actor: string,
+    metadata: Record<string, unknown>,
+    expandedViews: ReadonlySet<string>,
+    expectedRevision: number | undefined,
+  ): Promise<void> {
+    // Every way of changing a zone arrives here, so this is where a policy is
+    // held to the records it names: a record edit, an import, a restore and a
+    // full replacement cannot leave a policy pointing at nothing by taking a
+    // route the policy routes do not.
+    await this.#assertHealthChecksCommittable(zone);
+    const healthChanges = countHealthCheckChanges(
+      healthChecksOf(before?.views.find((view) => view.name === "internal")),
+      healthChecksOf(zone.views.find((view) => view.name === "internal")),
+    );
+    const healthMetadata = healthChanges.added + healthChanges.removed + healthChanges.changed > 0
+      ? { healthChecks: healthChanges }
+      : {};
     const statuses = await this.#statusesForDesiredChange(before, zone, expandedViews);
     const retention = this.#retentionPolicy();
     try {
@@ -1335,6 +1536,7 @@ export class ControlPlane {
           at: this.#clock.now().toISOString(),
           detail: {
             ...metadata,
+            ...healthMetadata,
             before: before ? desiredState(before) : null,
             after: desiredState(zone),
           },
@@ -1451,8 +1653,11 @@ export class ControlPlane {
     return statuses;
   }
 
-  async #exclusive<T>(zoneName: string, operation: () => Promise<T>): Promise<T> {
-    const key = normalizeZoneName(zoneName);
+  #exclusive<T>(zoneName: string, operation: () => Promise<T>): Promise<T> {
+    return this.#serialized(normalizeZoneName(zoneName), operation);
+  }
+
+  async #serialized<T>(key: string, operation: () => Promise<T>): Promise<T> {
     const preceding = this.#operationTails.get(key) ?? Promise.resolve();
     let release = (): void => {};
     const current = new Promise<void>((resolve) => { release = resolve; });
@@ -1527,8 +1732,114 @@ function publicProviderError(error: unknown): string {
     : "provider operation failed";
 }
 
+/**
+ * A deep copy of one view, health checks included. Every path that rebuilds a
+ * zone's views goes through here, so a policy is carried by a record edit, a
+ * restore or an adoption without any of them having to know it exists.
+ */
 function cloneView(view: Zone["views"][number]): Zone["views"][number] {
-  return { name: view.name, records: view.records.map((record) => ({ ...record })) };
+  return {
+    name: view.name,
+    records: view.records.map((record) => ({ ...record })),
+    ...(view.healthChecks ? { healthChecks: view.healthChecks.map(cloneHealthCheck) } : {}),
+  };
+}
+
+/**
+ * The RRsets a zone's health checks protect, read from the internal view as the
+ * listener would compose it. Shared with the listener's snapshot so the commit
+ * and the answer agree on what a policy covers.
+ */
+export function protectedRRsetsFor(views: Zone["views"]): { rrsets: ProtectedRRset[]; issues: string[] } {
+  const overrides = views.find((view) => view.name === "internal");
+  const policies = healthChecksOf(overrides);
+  if (policies.length === 0) return { rrsets: [], issues: [] };
+  const composed = materializeProviderViews(views, false).find((view) => view.name === "internal")?.records ?? [];
+  const external = views.find((view) => view.name === "external")?.records ?? [];
+  return resolveProtectedRRsets(policies, composed, external, overrides?.records ?? []);
+}
+
+/**
+ * The key of the lock that serializes every commit holding an enabled health
+ * check. A colon never survives zone-name normalization, so no zone's own lock
+ * can share it on any backend.
+ */
+export const HEALTH_CHECK_BUDGET_LOCK = "parallax:health-check-budget";
+
+/** What the control plane asks the process about health checks it cannot see itself. */
+export interface HealthCheckHooks {
+  /**
+   * Whether stored configuration publishes a zone's internal view elsewhere.
+   * Asked under the health-check lock on every commit that keeps an enabled
+   * policy, beside this process's own router.
+   */
+  readonly unsupported?: (zone: string) => Promise<boolean>;
+}
+
+/**
+ * Why a set of zones stored together would break the health-check rules a
+ * commit enforces: a policy that names nothing, an enabled one where the
+ * internal view is published elsewhere, or more enabled addresses across the
+ * set than one process probes. For a write that does not pass through a commit
+ * -- a restore -- so both refuse the same things.
+ */
+export async function healthCheckStoreIssues(
+  zones: readonly Zone[],
+  unsupported: (zone: string) => boolean | Promise<boolean>,
+): Promise<string[]> {
+  const issues: string[] = [];
+  let probed = 0;
+  for (const zone of zones) {
+    if (healthChecksOf(zone.views.find((view) => view.name === "internal")).length === 0) continue;
+    let rrsets: ProtectedRRset[];
+    try {
+      const resolved = protectedRRsetsFor(zone.views);
+      if (resolved.issues.length > 0) {
+        issues.push(...resolved.issues.map((issue) => `${zone.name}: ${issue}`));
+        continue;
+      }
+      rrsets = resolved.rrsets;
+    } catch (error) {
+      if (!(error instanceof DomainValidationError)) throw error;
+      issues.push(...error.issues.map((issue) => `${zone.name}: ${issue}`));
+      continue;
+    }
+    if (!hasEnabledHealthChecks(zone.views)) continue;
+    if (await unsupported(zone.name)) issues.push(unsupportedHealthCheckMessage(zone.name));
+    probed += enabledAddressCount(rrsets);
+  }
+  if (probed > MAX_HEALTH_CHECK_TARGETS) issues.push(healthCheckCapacityMessage());
+  return issues;
+}
+
+function enabledAddressCount(rrsets: readonly ProtectedRRset[]): number {
+  return rrsets.filter((rrset) => rrset.policy.enabled).reduce((total, rrset) => total + rrset.addresses.length, 0);
+}
+
+function unsupportedHealthCheckMessage(zone: string): string {
+  return `health checks filter only the built-in listener's answers, and the internal view of ${zone} is published to a provider; disable or delete its enabled health checks first`;
+}
+
+function healthCheckCapacityMessage(): string {
+  return `enabled health checks may cover at most ${MAX_HEALTH_CHECK_TARGETS} addresses across all zones`;
+}
+
+/**
+ * Refuses a full replacement that would remove health checks by leaving them out.
+ *
+ * A client written before the field existed reads a zone, edits a record and
+ * sends the views back without it. Treating that as "remove every policy" would
+ * quietly hand failed addresses out again. Removal is said explicitly: an empty
+ * `healthChecks` list, or the dedicated delete.
+ */
+function assertHealthChecksNotDropped(before: readonly DnsView[], after: readonly DnsView[]): void {
+  const existing = healthChecksOf(before.find((view) => view.name === "internal"));
+  if (existing.length === 0) return;
+  const internal = after.find((view) => view.name === "internal");
+  if (internal?.healthChecks !== undefined) return;
+  throw new ConflictError(
+    "the internal view carries health checks this request leaves out; send healthChecks explicitly (an empty list removes them) or reload and retry",
+  );
 }
 
 /**
@@ -2003,7 +2314,11 @@ export function materializeProviderViews(views: Zone["views"], enforceExternalPo
   }
   const records = [...effective.values()].flat().sort((left, right) => left.id.localeCompare(right.id));
   ensureUniqueRecordKeys(records);
-  result.push({ name: "internal", records });
+  result.push({
+    name: "internal",
+    records,
+    ...(overrides?.healthChecks ? { healthChecks: overrides.healthChecks.map(cloneHealthCheck) } : {}),
+  });
   result.sort((left, right) => left.name.localeCompare(right.name));
   return result;
 }
@@ -2080,7 +2395,7 @@ function parseDesiredViews(input: unknown): Zone["views"] {
   }
   const root = input as Record<string, unknown>;
   const rawViews = root.views;
-  const entries: Array<[string, unknown]> = [];
+  const entries: Array<[string, unknown, unknown]> = [];
   if (Array.isArray(rawViews)) {
     for (const rawView of rawViews) {
       if (!rawView || typeof rawView !== "object" || Array.isArray(rawView)) {
@@ -2088,20 +2403,20 @@ function parseDesiredViews(input: unknown): Zone["views"] {
       }
       const object = rawView as Record<string, unknown>;
       if (typeof object.name !== "string") throw new DomainValidationError(["each view requires a name"]);
-      entries.push([object.name, object.records]);
+      entries.push([object.name, object.records, object.healthChecks]);
     }
   } else if (rawViews && typeof rawViews === "object") {
     for (const [name, value] of Object.entries(rawViews as Record<string, unknown>)) {
-      const records = value && typeof value === "object" && !Array.isArray(value)
-        ? (value as Record<string, unknown>).records
-        : value;
-      entries.push([name, records]);
+      const object = value && typeof value === "object" && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : undefined;
+      entries.push([name, object ? object.records : value, object?.healthChecks]);
     }
   } else {
     throw new DomainValidationError(["views must be an array or object"]);
   }
 
-  const views = entries.map(([name, rawRecords]) => {
+  const views = entries.map(([name, rawRecords, rawHealthChecks]): DnsView => {
     const viewName = validateViewName(name);
     if (!Array.isArray(rawRecords)) throw new DomainValidationError([`view ${viewName} records must be an array`]);
     let records = rawRecords.map((rawRecord) => {
@@ -2115,7 +2430,8 @@ function parseDesiredViews(input: unknown): Zone["views"] {
     ensureUniqueRecordKeys(records);
     if (viewName === "external") records = normalizeExternalRecords(records);
     records.sort((left, right) => left.id.localeCompare(right.id));
-    return { name: viewName, records };
+    const healthChecks = readHealthChecks(rawHealthChecks, viewName);
+    return { name: viewName, records, ...(healthChecks !== undefined ? { healthChecks } : {}) };
   });
   if (new Set(views.map((view) => view.name)).size !== views.length) {
     throw new DomainValidationError(["view names must be unique"]);

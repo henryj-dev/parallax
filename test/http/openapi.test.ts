@@ -204,6 +204,28 @@ describe("the document is a document a generator can read", () => {
     assert.equal(paths["/api/v1/zones"]?.get?.summary, findCommand("zone list")?.summary);
   });
 
+  it("agrees with the command line and the domain that a policy is off unless enabled is true", async () => {
+    const schemas = (document.components as { schemas: Record<string, { properties?: Record<string, { default?: unknown }> }> }).schemas;
+    assert.equal(schemas.HealthCheckPolicy?.properties?.enabled?.default, false);
+    const policyOption = findCommand("health check set")?.options.find((option) => option.name === "policy");
+    assert.match(policyOption?.summary ?? "", /enabled is false unless set to true/u);
+
+    const adapters = createInMemoryAdapters();
+    const controlPlane = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider, undefined, undefined, {},
+      (target) => target.endsWith("/internal") ? "listener" : "provider");
+    const parallax = { runtime: { controlPlane }, actor: "test", role: "admin" as const };
+    await runCommand(parallax, "zone create", { zone: "example.com" });
+    await runCommand(parallax, "record set", {
+      zone: "example.com", view: "internal", id: "app", record: { name: "app", type: "A", content: "10.0.0.11", ttl: 300 },
+    });
+    const saved = await runCommand(parallax, "health check set", {
+      zone: "example.com", policy: { name: "app", type: "A", probe: { kind: "tcp", port: 443 } },
+    }) as { healthCheck: { enabled: boolean } };
+    assert.equal(saved.healthCheck.enabled, false, "a policy that leaves enabled out is stored off");
+    const listed = await runCommand(parallax, "health check list", { zone: "example.com" }) as { healthChecks: { enabled: boolean }[] };
+    assert.deepEqual(listed.healthChecks.map((policy) => policy.enabled), [false]);
+  });
+
   it("takes its enumerations from the domain rather than listing them again", () => {
     const schemas = (document.components as { schemas: Record<string, { enum?: string[] }> }).schemas;
     assert.deepEqual(schemas.View?.enum, ["external", "internal"]);

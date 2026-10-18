@@ -298,6 +298,25 @@ describe("PostgresZoneRepository", () => {
     await assert.rejects(repository.get("example.com"), /CNAME record.*cannot coexist/i);
   });
 
+  it("reads health-check policies back from a snapshot and refuses them outside the internal view", async () => {
+    const zone: Zone = {
+      ...zoneFixture(3),
+      views: [
+        { name: "external", records: [] },
+        {
+          name: "internal",
+          records: [{ id: "app", name: "app", type: "A", content: "10.0.0.11", ttl: 60 }],
+          healthChecks: [{ name: "app", type: "A", enabled: false, probe: { kind: "tcp", port: 443 }, responseTtlSeconds: 10 }],
+        },
+      ],
+    };
+    assert.deepEqual(await new PostgresZoneRepository(new FakePool(() => ({ rows: [{ snapshot: zone }] }))).get("example.com"), zone);
+
+    const misplaced = { ...zone, views: [{ ...zone.views[1]!, name: "external" }, { name: "internal", records: [] }] };
+    const repository = new PostgresZoneRepository(new FakePool(() => ({ rows: [{ snapshot: misplaced }] })));
+    await assert.rejects(repository.get("example.com"), /only on the internal view/u);
+  });
+
   it("pushes alphabetical zone pagination into PostgreSQL", async () => {
     const zone = zoneFixture(1);
     const pool = new FakePool(() => ({ rows: [{ snapshot: zone }] }));
@@ -603,6 +622,39 @@ describe("PostgresApplyLock", () => {
     assert.equal(pool.checkedOut, 0);
     assert.equal(pool.clients.length, 2);
     assert.ok(pool.clients.every((client) => client.calls.some((call) => call.text.includes("parallax_apply_statuses"))));
+  });
+
+  it("takes a lock nested in another on the session already checked out", async () => {
+    const pool = new CapacityPool(1);
+    const adapters = createPostgresAdapters(pool);
+    await adapters.applyLock.withZoneLock("example.com", () =>
+      adapters.applyLock.withZoneLock("parallax:health-check-budget", async () => {
+        await adapters.statuses.list("example.com");
+      }));
+
+    assert.equal(pool.clients.length, 1, "a nested lock must not wait for a second connection");
+    assert.equal(pool.checkedOut, 0);
+    const locks = pool.clients[0]!.calls.filter((call) => call.text.includes("advisory"))
+      .map((call) => `${call.text.includes("unlock") ? "unlock" : "lock"} ${String(call.values?.[0])}`);
+    assert.deepEqual(locks, [
+      "lock example.com", "lock parallax:health-check-budget", "unlock parallax:health-check-budget", "unlock example.com",
+    ]);
+  });
+
+  it("destroys the session when a nested unlock fails, and keeps the work's own failure", async () => {
+    const failure = new Error("commit failed");
+    const pool = new FakePool(() => ({ rows: [] }), (call) => {
+      if (call.text.includes("pg_advisory_unlock") && call.values?.[0] === "parallax:health-check-budget") {
+        throw new Error("connection reset while unlocking");
+      }
+      return { rows: [] };
+    });
+    const adapters = createPostgresAdapters(pool);
+    await assert.rejects(adapters.applyLock.withZoneLock("example.com", () =>
+      adapters.applyLock.withZoneLock("parallax:health-check-budget", async () => { throw failure; })),
+    (error: unknown) => error === failure);
+    assert.equal(pool.client.releaseCount, 1);
+    assert.equal(pool.client.releasedWith, true, "a session that may still hold a lock went back to the pool");
   });
 
   it("holds a parameterized per-zone advisory lock on one client across the callback", async () => {

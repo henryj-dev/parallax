@@ -1,4 +1,5 @@
 import { isIP } from "node:net";
+import { compileCidrs } from "../dns/cidr.ts";
 import { DomainValidationError } from "../domain/dns.ts";
 import type { SettingsRepository } from "./ports.ts";
 
@@ -29,6 +30,19 @@ export interface ParallaxSettings {
    * gateway, a published address -- that this process cannot see from inside.
    */
   readonly fallbackResolver: string;
+  /**
+   * Whether the internal listener probes the addresses its health checks name.
+   *
+   * Off does not mean "answer as if there were no policies". An enabled policy
+   * with probing off is a policy whose addresses nobody has looked at, and those
+   * are answered SERVFAIL like any other address in an unknown state. Only
+   * disabling or deleting the policy returns a name to its full answer.
+   */
+  readonly dnsHealthChecksEnabled: boolean;
+  /** Networks a probe may connect to. Empty allows none. */
+  readonly dnsHealthCheckAllowCidrs: readonly string[];
+  /** Ports a probe may connect to. Empty allows none. */
+  readonly dnsHealthCheckAllowPorts: readonly number[];
 }
 
 export const DEFAULT_SETTINGS: ParallaxSettings = Object.freeze({
@@ -38,11 +52,17 @@ export const DEFAULT_SETTINGS: ParallaxSettings = Object.freeze({
   revisionRetention: 100,
   auditRetentionDays: 365,
   fallbackResolver: "",
+  dnsHealthChecksEnabled: false,
+  dnsHealthCheckAllowCidrs: Object.freeze([]) as readonly string[],
+  dnsHealthCheckAllowPorts: Object.freeze([]) as readonly number[],
 });
 
 /** Bounds keep date arithmetic and whole-store retention work predictable. */
 export const MAX_REVISION_RETENTION = 1_000_000;
 export const MAX_AUDIT_RETENTION_DAYS = 36_500;
+/** Bounds on the probe allow-lists, which are matched on every probe. */
+export const MAX_HEALTH_CHECK_ALLOW_CIDRS = 64;
+export const MAX_HEALTH_CHECK_ALLOW_PORTS = 64;
 export const SETTINGS_REFRESH_INTERVAL_MS = 5_000;
 
 export const SETTING_KEYS = Object.freeze(Object.keys(DEFAULT_SETTINGS) as Array<keyof ParallaxSettings>);
@@ -79,13 +99,25 @@ export class SettingsService {
   readonly #listeners: SettingsListener[] = [];
   readonly #verify: SettingsVerifier | undefined;
   readonly #advise: SettingsAdvisor | undefined;
+  readonly #exclusive: (<T>(operation: () => Promise<T>) => Promise<T>) | undefined;
   #settings: ParallaxSettings = DEFAULT_SETTINGS;
   #operationTail: Promise<void> = Promise.resolve();
 
-  constructor(repository: SettingsRepository, verify?: SettingsVerifier, advise?: SettingsAdvisor) {
+  constructor(
+    repository: SettingsRepository,
+    verify?: SettingsVerifier,
+    advise?: SettingsAdvisor,
+    /**
+     * A lock an update holds from its read through its write, shared with
+     * writes elsewhere that the verifier's answer depends on -- so a value the
+     * verifier allowed cannot be stored beside a change it would have refused.
+     */
+    exclusive?: <T>(operation: () => Promise<T>) => Promise<T>,
+  ) {
     this.#repository = repository;
     this.#verify = verify;
     this.#advise = advise;
+    this.#exclusive = exclusive;
   }
 
   load(): Promise<ParallaxSettings> {
@@ -124,6 +156,10 @@ export class SettingsService {
 
   /** Validates and persists a partial update, then lets the process re-wire itself. */
   update(patch: unknown): Promise<SettingsUpdate> {
+    return this.#exclusive ? this.#exclusive(() => this.#update(patch)) : this.#update(patch);
+  }
+
+  #update(patch: unknown): Promise<SettingsUpdate> {
     return this.#enqueue(async () => {
       const changes = readPatch(patch);
       if (Object.keys(changes).length === 0) return { settings: this.#settings, warnings: [] };
@@ -192,8 +228,9 @@ export class SettingsService {
   }
 }
 
+/** By value: the allow-lists are arrays, and a re-read array is never the same object. */
 function sameSettings(left: ParallaxSettings, right: ParallaxSettings): boolean {
-  return SETTING_KEYS.every((key) => left[key] === right[key]);
+  return SETTING_KEYS.every((key) => JSON.stringify(left[key]) === JSON.stringify(right[key]));
 }
 
 /** Applies stored values over the defaults, ignoring anything unrecognized. */
@@ -209,7 +246,47 @@ export function parseSettings(stored: Record<string, unknown>): ParallaxSettings
     revisionRetention: readCount(merged.revisionRetention, "revisionRetention", MAX_REVISION_RETENTION),
     auditRetentionDays: readCount(merged.auditRetentionDays, "auditRetentionDays", MAX_AUDIT_RETENTION_DAYS),
     fallbackResolver: readResolver(merged.fallbackResolver),
+    dnsHealthChecksEnabled: readBoolean(merged.dnsHealthChecksEnabled, "dnsHealthChecksEnabled"),
+    dnsHealthCheckAllowCidrs: readAllowCidrs(merged.dnsHealthCheckAllowCidrs),
+    dnsHealthCheckAllowPorts: readAllowPorts(merged.dnsHealthCheckAllowPorts),
   };
+}
+
+/**
+ * Networks, written the way an operator would write them and stored that way,
+ * after proving each one parses. A zone id is refused: a probe connects to an
+ * address from a record, and a record never carries one.
+ */
+function readAllowCidrs(value: unknown): readonly string[] {
+  const field = "dnsHealthCheckAllowCidrs";
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new DomainValidationError([`${field} must be a list of CIDRs`]);
+  }
+  if (value.length > MAX_HEALTH_CHECK_ALLOW_CIDRS) {
+    throw new DomainValidationError([`${field} may list at most ${MAX_HEALTH_CHECK_ALLOW_CIDRS} CIDRs`]);
+  }
+  const cidrs = [...new Set((value as string[]).map((entry) => entry.trim().toLowerCase()))];
+  for (const cidr of cidrs) {
+    if (cidr.includes("%") || cidr.includes("[")) throw new DomainValidationError([`${field} entry ${cidr} must be a plain CIDR`]);
+    try {
+      compileCidrs([cidr], "health check");
+    } catch (error) {
+      throw new DomainValidationError([`${field}: ${(error as Error).message}`]);
+    }
+  }
+  return Object.freeze(cidrs);
+}
+
+function readAllowPorts(value: unknown): readonly number[] {
+  const field = "dnsHealthCheckAllowPorts";
+  if (!Array.isArray(value)
+    || value.some((entry) => typeof entry !== "number" || !Number.isInteger(entry) || entry < 1 || entry > 65_535)) {
+    throw new DomainValidationError([`${field} must be a list of ports between 1 and 65535`]);
+  }
+  if (value.length > MAX_HEALTH_CHECK_ALLOW_PORTS) {
+    throw new DomainValidationError([`${field} may list at most ${MAX_HEALTH_CHECK_ALLOW_PORTS} ports`]);
+  }
+  return Object.freeze([...new Set(value as number[])].sort((left, right) => left - right));
 }
 
 /**
