@@ -26,7 +26,7 @@ export const HISTORY_PAGE_SIZE = 50;
 export const REVISION_PAGE_SIZE = 50;
 
 /** Scopes a view can surface an inline error against. */
-export const ERROR_SCOPES = ["zone", "record", "credential", "profile", "settings", "token", "auth", "fallback"];
+export const ERROR_SCOPES = ["zone", "record", "credential", "profile", "settings", "token", "auth", "fallback", "health"];
 
 export function editorControlsVisible(state) {
   return !state.authRequired || state.role === "admin" || state.role === "editor";
@@ -55,6 +55,13 @@ export function createStore(client) {
     historyScope: "zone",
     historyHasMore: false,
     loadingMoreHistory: false,
+    healthChecks: [],
+    // Whether the policy list is known rather than merely absent: the read
+    // carried the field, or a policy write here settled it. Only then may an
+    // empty list go out as "remove them all".
+    healthChecksKnown: false,
+    healthStatus: null,
+    healthStatusError: "",
 
     plan: null,
     planError: "",
@@ -260,16 +267,26 @@ export function createStore(client) {
         if (activeName() !== name) return true;
         state.activeZone = detail;
         state.records = readRecords(detail);
+        state.healthChecks = readHealthChecks(detail);
+        state.healthChecksKnown = carriesHealthChecks(detail);
         state.status = statusResult.status;
         state.statusError = statusResult.error;
         state.history = historyResult.history?.entries ?? [];
         state.historyHasMore = historyResult.history?.hasMore === true;
         state.historyError = historyResult.error;
+        state.healthStatus = null;
+        state.healthStatusError = "";
+        // Only a zone that has policies has verdicts worth asking for.
+        if (state.healthChecks.length > 0) await loadHealthStatus(name);
         return true;
       } catch (error) {
         if (activeName() !== name) return true;
         handleUnauthorized(error);
         state.records = [];
+        state.healthChecks = [];
+        state.healthChecksKnown = false;
+        state.healthStatus = null;
+        state.healthStatusError = "";
         state.status = null;
         state.statusError = "";
         state.history = [];
@@ -426,7 +443,7 @@ export function createStore(client) {
       state.previewRevision = null;
       emitChange();
       try {
-        const result = await client.preview(activeName(), desiredState(state.records));
+        const result = await client.preview(activeName(), desiredState(state.records, state.healthChecks, { explicit: state.healthChecksKnown }));
         state.plan = result;
         state.previewRevision = result.revision;
         emitChange();
@@ -445,7 +462,7 @@ export function createStore(client) {
       try {
         let expected = state.previewRevision;
         if (state.dirty) {
-          const saved = await client.replaceDesired(activeName(), desiredState(state.records), activeRevision());
+          const saved = await client.replaceDesired(activeName(), desiredState(state.records, state.healthChecks, { explicit: state.healthChecksKnown }), activeRevision());
           state.activeZone = saved;
           expected = saved.revision;
         }
@@ -645,6 +662,56 @@ export function createStore(client) {
       } catch (error) {
         handleUnauthorized(error);
         setError("fallback", "fallback.deleteFailed", { error: error.message });
+        return false;
+      }
+    },
+
+    /** Re-reads this process's verdicts on the open zone, without reloading it. */
+    async refreshHealthStatus() {
+      const name = activeName();
+      if (!name) return false;
+      await loadHealthStatus(name);
+      emitChange();
+      return !state.healthStatusError;
+    },
+
+    /**
+     * Writes one policy as its own revision. Record edits that are staged stay
+     * staged: the new revision is taken up locally, so the next save is checked
+     * against it and carries the policy instead of being refused or losing it.
+     */
+    async saveHealthCheck(policy) {
+      setError("health", null);
+      const zone = activeName();
+      try {
+        const result = await client.setHealthCheck(zone, policy.name, policy.type, policy, activeRevision());
+        const saved = result?.healthCheck ?? policy;
+        notice("health.saved", { name: String(saved.name), type: String(saved.type) });
+        await settleHealthWrite(zone, result?.revision, [
+          ...state.healthChecks.filter((candidate) => healthCheckKey(candidate) !== healthCheckKey(saved)),
+          saved,
+        ]);
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        setError("health", "health.saveFailed", { error: error.message });
+        return false;
+      }
+    },
+
+    /** Removes one policy; the RRset is answered in full again. */
+    async deleteHealthCheck(name, type) {
+      const zone = activeName();
+      const key = healthCheckKey({ name, type });
+      try {
+        const result = await client.deleteHealthCheck(zone, name, type, activeRevision());
+        notice("health.deleted", { name, type });
+        await settleHealthWrite(zone, result?.revision, state.healthChecks.filter((candidate) => healthCheckKey(candidate) !== key));
+        return true;
+      } catch (error) {
+        handleUnauthorized(error);
+        // Raised as a notice: the remove button has no form to carry an error.
+        notice("health.deleteFailed", { error: error.message }, "error");
         return false;
       }
     },
@@ -926,8 +993,66 @@ export function createStore(client) {
     emitChange();
   }
 
+  /**
+   * What this replica makes of the zone's policies. Advisory and process-local,
+   * so failing to read it never fails the zone: the policies came with the zone
+   * and they are what a save has to carry.
+   */
+  async function loadHealthStatus(name) {
+    try {
+      const status = await client.healthCheckStatus(name);
+      if (activeName() !== name) return;
+      state.healthStatus = status ?? null;
+      state.healthStatusError = "";
+    } catch (error) {
+      if (activeName() !== name) return;
+      handleUnauthorized(error);
+      state.healthStatus = null;
+      state.healthStatusError = error.message;
+    }
+  }
+
+  /**
+   * After a policy write: an editor with nothing staged reloads the zone, and
+   * one with staged edits keeps them and moves to the revision the write made.
+   */
+  async function settleHealthWrite(zone, revision, policies) {
+    if (activeName() !== zone) return;
+    if (!state.dirty || !Number.isInteger(revision)) {
+      await store.selectZone(zone);
+      return;
+    }
+    state.activeZone = { ...state.activeZone, revision };
+    state.healthChecks = [...policies].sort((left, right) => (healthCheckKey(left) < healthCheckKey(right) ? -1 : 1));
+    // The write just made this the list at `revision`; a staged save that
+    // follows sends it as is, an emptied list included.
+    state.healthChecksKnown = true;
+    state.plan = null;
+    state.planError = "";
+    state.previewRevision = null;
+    await loadHealthStatus(zone);
+    emitChange();
+  }
+
   return store;
 
+}
+
+/** The internal view's health-check policies, as the zone detail carries them. */
+function readHealthChecks(zone) {
+  const internal = (Array.isArray(zone?.views) ? zone.views : []).find((view) => view?.name === "internal");
+  return Array.isArray(internal?.healthChecks) ? internal.healthChecks : [];
+}
+
+/** Whether the zone detail says what the internal view's policies are, even none. */
+function carriesHealthChecks(zone) {
+  const internal = (Array.isArray(zone?.views) ? zone.views : []).find((view) => view?.name === "internal");
+  return Array.isArray(internal?.healthChecks);
+}
+
+/** One policy per RRset, keyed the way the server keys them. */
+function healthCheckKey(policy) {
+  return `${String(policy?.name ?? "").toLowerCase()}/${String(policy?.type ?? "").toUpperCase()}`;
 }
 
 /** A route the deployment does not offer is an empty list, not a failure. */
@@ -1083,8 +1208,17 @@ export function isNonGlobalAddress(value) {
     || (a === 203 && b === 0 && c === 113);
 }
 
-/** Turns the edited rows back into the two views the API stores. */
-export function desiredState(records) {
+/**
+ * Turns the edited rows back into the two views the API stores.
+ *
+ * The internal view's health checks ride along whenever the zone has any. The
+ * server refuses a full replace that leaves them out, so saving a record from a
+ * page that forgot them is refused rather than silently deleting every policy.
+ * An empty list is sent only when `explicit` says the page knows it is empty;
+ * it is the removal of every policy, so a page that never saw the field leaves
+ * the field out instead.
+ */
+export function desiredState(records, healthChecks = [], { explicit = false } = {}) {
   const asRecord = (row, view) => ({
     id: row.views[view].id || row.id,
     name: row.name,
@@ -1106,7 +1240,11 @@ export function desiredState(records) {
   });
   return {
     views: [
-      { name: "internal", records: records.filter((row) => row.views.internal.content).map((row) => asRecord(row, "internal")) },
+      {
+        name: "internal",
+        records: records.filter((row) => row.views.internal.content).map((row) => asRecord(row, "internal")),
+        ...(Array.isArray(healthChecks) && (healthChecks.length > 0 || explicit) ? { healthChecks } : {}),
+      },
       { name: "external", records: records.filter((row) => row.views.external.content).map((row) => asRecord(row, "external")) },
     ],
   };

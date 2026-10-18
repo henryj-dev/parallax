@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Verifies Parallax against a real PostgreSQL server: fresh migration, zone
-# lifecycle, restart persistence, concurrent apply under the advisory lock, and
+# lifecycle, restart persistence, concurrent apply under the advisory lock,
+# health-check policies (round trip, a cross-replica race, backup restore), and
 # retention pruning. Requires Docker; the container is removed on exit.
 set -euo pipefail
 
@@ -128,6 +129,133 @@ try {
 }
 NODE
 ok "both status interleavings preserved the newer desired state and provider attempt"
+
+echo "== health-check policies round-trip, race and restore through real PostgreSQL =="
+# Two runtimes on two pools stand in for two replicas: the address ceiling is
+# held by an advisory lock, and only a real server shows that lock is shared.
+# The restore needs a store with no zones in it, so it gets its own database
+# in this throwaway container, migrated the way a deployment would be.
+RESTORE_URL="postgres://parallax:parallax@127.0.0.1:${PGPORT}/parallax_restore?sslmode=disable"
+docker exec "$CONTAINER" psql -h 127.0.0.1 -U parallax -d parallax -c 'CREATE DATABASE parallax_restore' >/dev/null
+DATABASE_URL="$RESTORE_URL" node "$ROOT/cmd/parallax/main.ts" migrate --json >/dev/null
+DATABASE_URL="$DATABASE_URL" RESTORE_URL="$RESTORE_URL" PARALLAX_VERIFY_ROOT="$ROOT" PARALLAX_VERIFY_WORK="$WORK" \
+  node --input-type=module - <<'NODE'
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const load = (path) => import(pathToFileURL(`${process.env.PARALLAX_VERIFY_ROOT}/${path}`).href);
+const { readConfig } = await load("src/config.ts");
+const { createRuntime } = await load("src/runtime.ts");
+const { exportBackup, importBackup, BackupError } = await load("src/application/backup.ts");
+const { createPostgresPool } = await load("src/infrastructure/postgres.ts");
+const { MAX_HEALTH_CHECK_TARGETS } = await load("src/domain/health-checks.ts");
+
+// A DNS port in the configuration makes this process the internal view's
+// listener, which is what lets a policy be enabled at all. Nothing binds it:
+// the runtime does not open sockets, only the server entry point does.
+const runtimeFor = (url) => createRuntime(readConfig({
+  DATABASE_URL: url,
+  PARALLAX_DNS_PORT: "5353",
+  PARALLAX_PROVIDER_STATE_FILE: `${process.env.PARALLAX_VERIFY_WORK}/health-provider-state.json`,
+}), { exposeStores: true });
+
+const policy = { name: "app", type: "A", enabled: true, probe: { kind: "http", port: 8080, path: "/health/ready" }, responseTtlSeconds: 30 };
+const tcp = (name) => ({ name, type: "A", enabled: true, probe: { kind: "tcp", port: 443 } });
+const internalOf = (zone) => zone.views.find((view) => view.name === "internal");
+const enabledAddresses = (zones) => zones.reduce((total, zone) => {
+  const internal = internalOf(zone);
+  const enabled = new Set((internal?.healthChecks ?? []).filter((entry) => entry.enabled).map((entry) => entry.name));
+  return total + (internal?.records ?? []).filter((record) => record.type === "A" && enabled.has(record.name)).length;
+}, 0);
+const ZONES = ["health-a.example.com", "health-b.example.com", "health-c.example.com", "health-d.example.com"];
+
+const one = await runtimeFor(process.env.DATABASE_URL);
+const two = await runtimeFor(process.env.DATABASE_URL);
+const sql = createPostgresPool(process.env.DATABASE_URL);
+let restarted;
+let restored;
+try {
+  // Saved as JSON inside the zone snapshot and every revision row.
+  await one.controlPlane.createZone(ZONES[0]);
+  for (const [id, content] of [["app-1", "10.0.0.11"], ["app-2", "10.0.0.12"]]) {
+    await one.controlPlane.upsertRecord(ZONES[0], "internal", id, { name: "app", type: "A", content, ttl: 300 });
+  }
+  const saved = await one.controlPlane.setHealthCheck(ZONES[0], policy);
+  assert.deepEqual(saved.healthCheck, policy);
+  const stored = await sql.query("SELECT snapshot FROM parallax_zones WHERE name = $1", [ZONES[0]]);
+  assert.deepEqual(internalOf(stored.rows[0].snapshot).healthChecks, [policy], "the policy is in the stored snapshot");
+  const revision = await sql.query(
+    "SELECT snapshot FROM parallax_zone_revisions WHERE zone_name = $1 AND revision = $2", [ZONES[0], saved.revision]);
+  assert.deepEqual(internalOf(revision.rows[0].snapshot).healthChecks, [policy], "and in the revision it made");
+
+  // Read back by a process that never held it in memory.
+  await one.close();
+  restarted = await runtimeFor(process.env.DATABASE_URL);
+  const listed = await restarted.controlPlane.listHealthChecks(ZONES[0]);
+  assert.deepEqual([listed.revision, listed.healthChecks], [saved.revision, [policy]]);
+
+  // 2 + 61 = 63 enabled addresses, then two replicas each add one in a zone of
+  // their own at the same moment. Exactly one may land, every round.
+  await restarted.controlPlane.createZone(ZONES[1]);
+  const records = Array.from({ length: MAX_HEALTH_CHECK_TARGETS - 3 }, (_, index) => ({
+    id: `pool-${index}`, name: "pool", type: "A", content: `10.0.1.${index + 1}`, ttl: 300,
+  }));
+  await restarted.controlPlane.replaceDesiredState(ZONES[1], { views: [{ name: "external", records: [] }, { name: "internal", records }] });
+  await restarted.controlPlane.setHealthCheck(ZONES[1], tcp("pool"));
+  for (const zone of ZONES.slice(2)) {
+    await restarted.controlPlane.createZone(zone);
+    await restarted.controlPlane.upsertRecord(zone, "internal", "web", { name: "web", type: "A", content: "10.0.0.11", ttl: 300 });
+  }
+  assert.equal(enabledAddresses(await restarted.stores.zones.list()), MAX_HEALTH_CHECK_TARGETS - 1);
+  const ROUNDS = 8;
+  for (let round = 0; round < ROUNDS; round += 1) {
+    const outcomes = await Promise.allSettled([
+      restarted.controlPlane.setHealthCheck(ZONES[2], tcp("web")),
+      two.controlPlane.setHealthCheck(ZONES[3], tcp("web")),
+    ]);
+    const won = outcomes.flatMap((outcome, index) => outcome.status === "fulfilled" ? [index] : []);
+    assert.equal(won.length, 1, `round ${round}: ${outcomes.map((outcome) => outcome.status).join(",")}`);
+    const lost = outcomes[1 - won[0]];
+    assert.match(String(lost.reason?.message ?? lost.reason), new RegExp(`at most ${MAX_HEALTH_CHECK_TARGETS} addresses across all zones`, "u"), `round ${round} lost for another reason`);
+    assert.equal(enabledAddresses(await restarted.stores.zones.list()), MAX_HEALTH_CHECK_TARGETS, `round ${round} total`);
+    if (round < ROUNDS - 1) await restarted.controlPlane.deleteHealthCheck(ZONES[2 + won[0]], "web", "A");
+  }
+  // The zones that were already enabled kept their policies throughout.
+  assert.deepEqual((await restarted.controlPlane.listHealthChecks(ZONES[0])).healthChecks, [policy]);
+  assert.equal((await restarted.controlPlane.listHealthChecks(ZONES[1])).healthChecks[0]?.enabled, true);
+
+  // Export, then restore into an empty database: one address too many is
+  // refused before a row is written, the export itself restores whole.
+  const document = await exportBackup(restarted.stores);
+  const zoneA = document.zones.find((zone) => zone.current.name === ZONES[0]);
+  assert.deepEqual(internalOf(zoneA.current).healthChecks, [policy], "the export carries the policy");
+  restored = await runtimeFor(process.env.RESTORE_URL);
+  const over = structuredClone(document);
+  const overA = internalOf(over.zones.find((zone) => zone.current.name === ZONES[0]).current);
+  overA.records.push({ ...overA.records[0], id: "app-3", content: "10.0.0.13" });
+  await assert.rejects(importBackup(restored.stores, over), (error) => error instanceof BackupError && /cannot be restored/u.test(error.message));
+  assert.deepEqual(await restored.stores.zones.list(), [], "the refused restore wrote no zone");
+  await importBackup(restored.stores, document);
+  await restored.close();
+  restored = await runtimeFor(process.env.RESTORE_URL);
+  for (const zone of ZONES) {
+    assert.deepEqual(await restored.controlPlane.listHealthChecks(zone), await restarted.controlPlane.listHealthChecks(zone), zone);
+  }
+  assert.equal(enabledAddresses(await restored.stores.zones.list()), MAX_HEALTH_CHECK_TARGETS);
+  console.log(`  ok: ${ROUNDS} cross-replica rounds each admitted one policy at ${MAX_HEALTH_CHECK_TARGETS} addresses`);
+} finally {
+  // Removed so the settings steps below are not refused for the policies
+  // left enabled here; their audit rows stay behind, scoped by zone name.
+  if (restarted) {
+    for (const zone of ZONES) await restarted.controlPlane.deleteZone(zone).catch(() => undefined);
+    await restarted.close();
+  }
+  await restored?.close();
+  await two.close();
+  await sql.end();
+}
+NODE
+ok "policies saved as JSON, re-read after restart, raced across pools, and restored from a backup"
 
 start_app() {
   # Keep provider state inside the work directory: the default is under the

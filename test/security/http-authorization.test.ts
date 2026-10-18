@@ -135,6 +135,25 @@ describe("HTTP role authorization", () => {
     assert.equal(authorize(viewer, request(`${records}/batch`, "POST")), false);
   });
 
+  it("lets editors write one health check, and nobody below them write any", () => {
+    const editor = { role: "editor", subject: "operator" } as const;
+    const viewer = { role: "viewer", subject: "read-only" } as const;
+    const base = "/api/v1/zones/example.com/views/internal/health-checks";
+    for (const method of ["PUT", "DELETE"]) {
+      assert.equal(authorize(editor, request(`${base}/app/A`, method)), true, method);
+      assert.equal(authorize(viewer, request(`${base}/app/A`, method)), false, method);
+    }
+    assert.equal(authorize(viewer, request(base)), true);
+    assert.equal(authorize(viewer, request("/api/v1/zones/example.com/health-check-status")), true);
+    // Only the exact policy path on the internal view, and only those methods.
+    assert.equal(authorize(editor, request(`${base}/app/A`, "POST")), false);
+    assert.equal(authorize(editor, request(`${base}/app/A`, "PATCH")), false);
+    assert.equal(authorize(editor, request(base, "POST")), false);
+    assert.equal(authorize(editor, request(base, "DELETE")), false);
+    assert.equal(authorize(editor, request(`${base}/app/A/extra`, "PUT")), false);
+    assert.equal(authorize(editor, request("/api/v1/zones/example.com/views/external/health-checks/app/A", "PUT")), false);
+  });
+
   it("keeps zone adopt off the viewer path", () => {
     const viewer = { role: "viewer", subject: "read-only" } as const;
     assert.equal(authorize(viewer, request("/api/v1/zones/example.com/adopt", "POST")), false);

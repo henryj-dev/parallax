@@ -67,8 +67,49 @@ export interface RecordRow {
   views: { internal: RecordViewValue; external: RecordViewValue };
 }
 
+/** One health-check policy on the internal view, as the API stores it. */
+export interface HealthCheckPolicyValue {
+  name: string;
+  type: string;
+  enabled: boolean;
+  probe: { kind: string; port: number; path?: string };
+  responseTtlSeconds: number;
+}
+
+/** One address of a protected RRset, as this process judges it. */
+export interface HealthTargetValue {
+  address: string;
+  status: string;
+  blockedReason?: string;
+  lastFailure?: string;
+  lastStatusCode?: number;
+  checkedAt?: string;
+}
+
+export interface HealthVerdictValue extends HealthCheckPolicyValue {
+  answer: string;
+  ttl?: number;
+  healthyAddresses?: number;
+  issue?: string;
+  targets?: HealthTargetValue[];
+}
+
+/** Process-local: another replica can answer differently. */
+export interface HealthStatusValue {
+  zone: string;
+  revision: number;
+  probing: boolean;
+  servedHere: boolean;
+  transfers: string;
+  healthChecks: HealthVerdictValue[];
+}
+
 export interface StoreState extends Record<string, unknown> {
   records: RecordRow[];
+  healthChecks: HealthCheckPolicyValue[];
+  healthChecksKnown?: boolean;
+  healthStatus?: HealthStatusValue | null;
+  healthStatusError?: string;
   profiles: { name: string; [key: string]: unknown }[];
   bindings: { zone: string; [key: string]: unknown }[];
   tokens: { id: string; [key: string]: unknown }[];
@@ -107,6 +148,12 @@ export interface Store {
   preview(): Outcome;
   apply(): Outcome;
 
+  /** Re-reads this process's verdicts on the open zone's health checks. */
+  refreshHealthStatus(): Outcome;
+  /** Writes one policy as its own revision; staged record edits stay staged. */
+  saveHealthCheck(policy: HealthCheckPolicyValue): Outcome;
+  deleteHealthCheck(name: string, type: string): Outcome;
+
   loadRevisions(): Promise<void>;
   /** Appends the next page of snapshots. Refuses while one is in flight. */
   loadMoreRevisions(): Outcome;
@@ -144,7 +191,7 @@ export function createStore(client: unknown): Store;
 export function readRecords(zone: unknown): RecordRow[];
 export function providerManagedReason(record: unknown): string;
 export function applyVerdict(statuses: unknown): string;
-export function desiredState(state: unknown): unknown;
+export function desiredState(records: unknown, healthChecks?: unknown, options?: { explicit?: boolean }): unknown;
 export function isNonGlobalAddress(value: string): boolean;
 export const ERROR_SCOPES: readonly string[];
 export const HISTORY_PAGE_SIZE: number;

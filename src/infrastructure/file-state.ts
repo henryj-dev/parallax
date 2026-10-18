@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { mergeApplyStatus, RevisionConflictError, type ApplyLock, type ApplyStatus, type AuditRetentionPolicy, type DesiredChange, type PageRequest, type RetentionPolicy, type StatusRepository, type ZoneDeletion, type ZoneRepository } from "../application/ports.ts";
 import { assertPersistedDesiredViewsValid } from "../application/control-plane.ts";
 import { AUDIT_ACTIONS, createDesiredRecord, normalizeZoneName, readPersistedViewName, type AuditEntry, type Zone, type ZoneRevision } from "../domain/dns.ts";
+import { readHealthChecks } from "../domain/health-checks.ts";
 import { ensurePrivateDirectory, withFileLock } from "./atomic-file.ts";
 
 /**
@@ -801,7 +802,10 @@ function readZoneSnapshot(value: unknown): Zone {
       // the whole zone away instead.
       return createDesiredRecord(id, record, { rehydrate: true });
     });
-    return { name, records };
+    // Shape only. Whether each policy still names a record is the commit's
+    // question, so a snapshot left dangling stays readable and fixable.
+    const healthChecks = readHealthChecks(view.healthChecks, name);
+    return { name, records, ...(healthChecks !== undefined ? { healthChecks } : {}) };
   });
   assertPersistedDesiredViewsValid(views);
   return { name, revision, views, createdAt, updatedAt };

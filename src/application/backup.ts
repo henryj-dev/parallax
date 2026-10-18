@@ -1,7 +1,9 @@
 import type {
   AccessTokenRepository, ApplyStatus, CredentialRepository, SettingsRepository, StatusRepository, StoredAccessToken, ZoneRepository,
 } from "./ports.ts";
-import type { AuditEntry, Zone, ZoneRevision } from "../domain/dns.ts";
+import { DomainValidationError, type AuditEntry, type Zone, type ZoneRevision } from "../domain/dns.ts";
+import { readHealthChecks } from "../domain/health-checks.ts";
+import { healthCheckStoreIssues } from "./control-plane.ts";
 
 /**
  * One document holding everything a Parallax store contains, and the two
@@ -47,6 +49,16 @@ export interface BackupStores {
   readonly settings: SettingsRepository;
   readonly accessTokens: AccessTokenRepository;
   readonly credentials: CredentialRepository;
+  /**
+   * The health-check rules a commit enforces, for a restore that bypasses it.
+   * Absent in a store that serves nothing, where only the syntax is checked.
+   */
+  readonly healthChecks?: {
+    /** The lock commits holding an enabled health check take. */
+    readonly exclusive: <T>(operation: () => Promise<T>) => Promise<T>;
+    /** Whether a zone's internal view would be published elsewhere under these settings. */
+    readonly unsupported: (zone: string, settings: Record<string, unknown>) => boolean | Promise<boolean>;
+  };
 }
 
 export class BackupError extends Error {
@@ -127,6 +139,14 @@ export interface RestoreSummary {
  * having to remove a state file or drop a schema on purpose.
  */
 export async function importBackup(stores: BackupStores, document: BackupDocument): Promise<RestoreSummary> {
+  // Held across the check and every write: a commit adding an enabled health
+  // check elsewhere meanwhile would be counted against an empty store.
+  return stores.healthChecks
+    ? stores.healthChecks.exclusive(() => restore(stores, document))
+    : restore(stores, document);
+}
+
+async function restore(stores: BackupStores, document: BackupDocument): Promise<RestoreSummary> {
   await assertEmpty(stores, document);
   // Everything is checked before anything is written, because a restore is not
   // a transaction: it is a sequence of writes into a store that has no way to
@@ -134,6 +154,7 @@ export async function importBackup(stores: BackupStores, document: BackupDocumen
   // there, leaving 299 zones and no audit, no settings, no tokens -- and the
   // refusal above then made the retry impossible.
   assertRestorable(document);
+  await assertHealthChecksRestorable(stores, document);
 
   let revisions = 0;
   for (const zone of document.zones) {
@@ -273,6 +294,53 @@ function assertRestorable(document: BackupDocument): void {
   for (const [index, token] of document.accessTokens.entries()) {
     assertRestorableToken(token, index);
   }
+}
+
+/**
+ * The health-check rules a commit holds every zone to, applied to the zones
+ * this document would leave behind, taken together.
+ *
+ * Every snapshot's policies must read, or the replay stops part way. The
+ * current snapshots must also resolve to the records they protect, keep the
+ * enabled addresses across all of them under the ceiling, and not enable a
+ * policy where the settings in effect after the restore publish the internal
+ * view elsewhere.
+ */
+async function assertHealthChecksRestorable(stores: BackupStores, document: BackupDocument): Promise<void> {
+  const issues: string[] = [];
+  const current: Zone[] = [];
+  for (const [index, zone] of document.zones.entries()) {
+    for (const [position, snapshot] of [zone.current, ...zone.revisions].entries()) {
+      const read = readSnapshotHealthChecks(snapshot as Zone, `zones[${index}]${position === 0 ? ".current" : `.revisions[${position - 1}]`}`, issues);
+      if (position === 0 && read) current.push(read);
+    }
+  }
+  if (issues.length === 0) {
+    const settings = Object.keys(document.settings).length > 0 ? document.settings : await stores.settings.read();
+    const unsupported = stores.healthChecks
+      ? (zone: string) => stores.healthChecks!.unsupported(zone, settings)
+      : () => false;
+    issues.push(...await healthCheckStoreIssues(current, unsupported));
+  }
+  if (issues.length > 0) throw new BackupError(`the backup's health checks cannot be restored: ${issues.join("; ")}`);
+}
+
+function readSnapshotHealthChecks(snapshot: Zone, label: string, issues: string[]): Zone | undefined {
+  if (!Array.isArray(snapshot.views)) return undefined;
+  const views: Zone["views"] = [];
+  for (const view of snapshot.views) {
+    // A view this cannot even name is the repositories' to refuse.
+    if (typeof (view as { name?: unknown } | null)?.name !== "string") return undefined;
+    try {
+      const healthChecks = readHealthChecks((view as { healthChecks?: unknown }).healthChecks, view.name);
+      views.push({ ...view, ...(healthChecks === undefined ? {} : { healthChecks }) });
+    } catch (error) {
+      if (!(error instanceof DomainValidationError)) throw error;
+      issues.push(...error.issues.map((issue) => `${label}: ${issue}`));
+      return undefined;
+    }
+  }
+  return { ...snapshot, views };
 }
 
 /**

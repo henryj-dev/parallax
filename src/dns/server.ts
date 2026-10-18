@@ -4,9 +4,12 @@ import { connect, createServer, isIP, type Server, type Socket as TcpSocket } fr
 import { networkInterfaces } from "node:os";
 import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
-import { dnsAnswered, dnsFallback, dnsForwardFailures, dnsForwardSeconds } from "../observability/signals.ts";
+import { dnsAnswered, dnsFallback, dnsForwardFailures, dnsForwardSeconds, dnsHealthServfail } from "../observability/signals.ts";
 import { canonicalAddress, isLoopbackAddress, isWildcardListener } from "./address.ts";
+import { cidrsContain, compileCidrs, parseIpBytes } from "./cidr.ts";
 import { createDnsCookies } from "./cookies.ts";
+import { probeAddress } from "./health/address.ts";
+import type { HealthVerdict, ServedHealthCheck } from "./health/targets.ts";
 import {
   readTsig, signEnvelope, signErrorReply, signReply, signRequest, tsigOverhead, verifyTsig,
   type TsigKey,
@@ -39,6 +42,13 @@ export interface ServedZone {
    * type there is an answer and not a gap -- see `fallbackApplies`.
    */
   readonly overrideNames?: ReadonlySet<string>;
+  /**
+   * The zone's enabled health checks. An RRset one of these names is answered
+   * with its healthy addresses only, or SERVFAIL when none is healthy, and a
+   * zone holding any is not transferred: a secondary would serve every address
+   * whatever its health.
+   */
+  readonly healthChecks?: readonly ServedHealthCheck[];
 }
 
 /** A stored record that reached the wire and could not be written to it. */
@@ -166,6 +176,21 @@ export interface DnsServerOptions {
   readonly sendNotify?: (packet: Buffer, address: string, port: number) => Promise<void>;
   /** What the synthesized SOA says. Every field falls back to a derived default. */
   readonly soa?: SoaSettings;
+  /**
+   * Which protected addresses may be given out. Asked at most once per query,
+   * so every RRset in one answer is judged against the same moment.
+   *
+   * Absent means none may: a zone's enabled health checks are a promise that
+   * an unchecked address is not handed out, and a listener wired without a
+   * monitor has checked nothing.
+   */
+  readonly health?: () => HealthVerdict;
+  /**
+   * A zone's serial rose and it was not NOTIFYed, because it holds enabled
+   * health checks and is not transferred. Once per zone, until its checks are
+   * gone, so a busy zone does not repeat the line on every revision.
+   */
+  readonly onNotifySkipped?: (zone: string) => void;
 }
 
 export interface SoaSettings {
@@ -280,6 +305,7 @@ export function createDnsServer(options: DnsServerOptions): {
     return cidrsContain(forwardAllow, clientAddress);
   };
   const transferAllow = compileCidrs(options.transferAllow ?? []);
+  const notifySkipped = new Set<string>();
   const tsigKeys = options.tsigKeys ?? [];
   const now = options.now ?? Date.now;
   const maxConcurrentForwards = positiveInteger(options.maxConcurrentForwards ?? DEFAULT_MAX_CONCURRENT_FORWARDS, "maxConcurrentForwards");
@@ -517,7 +543,13 @@ export function createDnsServer(options: DnsServerOptions): {
     // inside a zone we serve, and only those carrying a placeholder. Gating it
     // would break the case it exists for -- a client outside the allowed range
     // asking for one of our own names.
-    if (forwardTo.length > 0 && servedByProvider(zone, query.question.name, query.question.type)) {
+    //
+    // A health check on the asked RRset outranks the placeholder beside it. The
+    // policy is somebody's statement that this name's addresses are given out
+    // only when they answer, and relaying would hand out the public ones
+    // instead, which nothing here has judged.
+    if (forwardTo.length > 0 && servedByProvider(zone, query.question.name, query.question.type)
+      && !healthProtects(zone, query.question.name, query.question.type)) {
       return relay();
     }
     // Only now, once this is a name we answer for ourselves. Every record we
@@ -532,6 +564,12 @@ export function createDnsServer(options: DnsServerOptions): {
     if (query.question.class !== CLASS_IN && query.question.class !== CLASS_ANY) {
       return answer(RCODE.REFUSED);
     }
+    // A secondary holding this zone would answer every protected address
+    // whatever its health, and nothing here could take one back out of it. So a
+    // zone with enabled health checks is answered from this listener alone.
+    if (isTransfer(query.question.type) && (zone.healthChecks?.length ?? 0) > 0) {
+      return answer(RCODE.REFUSED);
+    }
     // An incremental answer, when one can be built. Everything else -- the
     // client is up to date, it asked over UDP, the serial it names is no longer
     // retained -- comes back as a full transfer or a lone SOA, both of which
@@ -540,7 +578,7 @@ export function createDnsServer(options: DnsServerOptions): {
       ? await incrementalAnswer(message, query, zone, overTcp)
       : undefined;
     const parts = {
-      ...(incremental ?? answerFromZone(query, zone, negativeTtl, options.onUnservable, soaSettings)),
+      ...(incremental ?? answerFromZone(query, zone, negativeTtl, options.onUnservable, soaSettings, healthGuard(zone, options.health))),
       ...(cookie ? { cookie } : {}),
     };
     // An empty local answer in an opted-in zone is asked of the upstream first.
@@ -819,9 +857,20 @@ export function createDnsServer(options: DnsServerOptions): {
       if (destinations.length === 0) return;
       const send = options.sendNotify ?? sendNotifyDatagram;
       for (const zone of next) {
+        const protectedZone = (zone.healthChecks?.length ?? 0) > 0;
+        if (!protectedZone) notifySkipped.delete(zone.name);
         const before = previous.get(zone.name);
         if (before !== undefined && before === zone.serial) continue;
         if (before === undefined && previous.size === 0) continue;
+        // Asking a secondary to transfer a zone this listener now refuses to
+        // transfer only produces a failure on the secondary's side.
+        if (protectedZone) {
+          if (!notifySkipped.has(zone.name)) {
+            notifySkipped.add(zone.name);
+            options.onNotifySkipped?.(zone.name);
+          }
+          continue;
+        }
         const packet = writeNotify(zone.name);
         for (const destination of destinations) {
           const parsed = parseNotifyDestination(destination);
@@ -1009,6 +1058,7 @@ function answerFromZone(
   negativeTtl: number,
   onUnservable: DnsServerOptions["onUnservable"],
   soaSettings: SoaSettings,
+  guard?: HealthGuard,
 ) {
   const name = query.question.name;
   const soa = soaRecord(zone, negativeTtl, soaSettings);
@@ -1027,6 +1077,16 @@ function answerFromZone(
     return { query, rcode: RCODE.NOERROR, authoritative: true, answers: [soa, ...records, soa] };
   }
   let atName: ServedZone["records"] = indexOf(zone).byName.get(name) ?? [];
+  // A policy names an RRset this snapshot no longer holds at that exact name.
+  // Answering from what is there instead -- NXDOMAIN, an empty NOERROR, a
+  // wildcard, a CNAME -- would read as an authoritative absence, and in a
+  // fallback zone an empty answer is asked of the upstream, which hands out
+  // the public addresses the policy exists to keep back. Terminal, before
+  // anything else is consulted.
+  if (guard && protectedSetMissing(zone, name, query.question.type, atName)) {
+    dnsHealthServfail();
+    return { query, rcode: RCODE.SERVFAIL, authoritative: true };
+  }
 
   if (atName.length === 0) {
     // The name exists without holding anything of its own when something sits
@@ -1043,10 +1103,18 @@ function answerFromZone(
   }
   // A CNAME answers for every type, which is why it may not share a name.
   const alias = atName.find((record) => record.type === "CNAME");
-  const wanted = query.question.type === TYPE.ANY
+  const selected = query.question.type === TYPE.ANY
     ? atName
     : alias && query.question.type !== TYPE.CNAME ? [alias]
     : atName.filter((record) => rrType(record.type) === query.question.type);
+  // Only the healthy addresses of a protected RRset, or nothing at all. For ANY
+  // that is every protected RRset at the name: an ANY that quietly left one
+  // out would look like the whole name, and a resolver would cache it as such.
+  const wanted = guard ? guardRecords(guard, name, selected) : selected;
+  if (wanted === BLOCKED) {
+    dnsHealthServfail();
+    return { query, rcode: RCODE.SERVFAIL, authoritative: true };
+  }
 
   if (wanted.length === 0) return { query, rcode: RCODE.NOERROR, authoritative: true, authority: [soa] };
   const answers: ResourceRecord[] = [];
@@ -1069,7 +1137,15 @@ function answerFromZone(
   // every other authoritative server does -- and the target's records are ones
   // this zone already holds, so nothing is being asserted that was not ours.
   if (alias && query.question.type !== TYPE.CNAME && query.question.type !== TYPE.ANY) {
-    answers.push(...chaseAlias(zone, name, alias.content, query.question.type, onUnservable));
+    const chased = chaseAlias(zone, name, alias.content, query.question.type, onUnservable, guard);
+    // The alias leads to a protected RRset with nothing healthy in it. The
+    // CNAME alone would send the resolver to ask for that target itself and get
+    // the same SERVFAIL, one round trip later.
+    if (chased === BLOCKED) {
+      dnsHealthServfail();
+      return { query, rcode: RCODE.SERVFAIL, authoritative: true };
+    }
+    answers.push(...chased);
     // ⚠️ The rcode belongs to the end of the chain, not to the name that was
     // asked. RFC 1034 §4.3.2 restarts the lookup at the canonical name and RFC
     // 6604 §2 says the rcode refers to the last name in the chain -- so a chain
@@ -1108,7 +1184,8 @@ function chaseAlias(
   from: string,
   type: number,
   onUnservable: DnsServerOptions["onUnservable"],
-): ResourceRecord[] {
+  guard?: HealthGuard,
+): ResourceRecord[] | typeof BLOCKED {
   const index = indexOf(zone);
   const chased: ResourceRecord[] = [];
   // Seeded with the name already in the answer, so a CNAME pointing at its own
@@ -1122,7 +1199,13 @@ function chaseAlias(
     seen.add(target);
 
     const at = index.byName.get(target) ?? [];
-    const matches = at.filter((record) => rrType(record.type) === type);
+    // The chain leads to a protected RRset that is gone: the same SERVFAIL the
+    // direct question for the target gets, not a CNAME a resolver would follow
+    // to wherever else that name resolves.
+    if (guard && protectedSetMissing(zone, target, type, at)) return BLOCKED;
+    const found = at.filter((record) => rrType(record.type) === type);
+    const matches = guard && found.length > 0 ? guardRecords(guard, target, found) : found;
+    if (matches === BLOCKED) return BLOCKED;
     const next = at.find((record) => record.type === "CNAME");
     const step = matches.length > 0 ? matches : next ? [next] : [];
     if (step.length === 0) return chased;
@@ -1149,6 +1232,98 @@ function chaseAlias(
     target = next.content.replace(/\.$/u, "").toLowerCase();
   }
   return chased;
+}
+
+/** A protected RRset with no address that may be given out. */
+const BLOCKED = Symbol("no healthy address");
+
+type ServedRecords = ServedZone["records"];
+
+/**
+ * The healthy part of one RRset, `BLOCKED` when nothing is left of it, or
+ * `undefined` when no health check covers it.
+ */
+type HealthGuard = (owner: string, type: "A" | "AAAA", records: ServedRecords) => ServedRecords | typeof BLOCKED | undefined;
+
+const healthIndexes = new WeakMap<ServedZone, ReadonlyMap<string, ServedHealthCheck>>();
+
+function healthIndexOf(zone: ServedZone): ReadonlyMap<string, ServedHealthCheck> {
+  const cached = healthIndexes.get(zone);
+  if (cached) return cached;
+  const index = new Map((zone.healthChecks ?? []).map((check) => [`${check.name}/${check.type}`, check]));
+  healthIndexes.set(zone, index);
+  return index;
+}
+
+function healthProtects(zone: ServedZone, name: string, type: number): boolean {
+  if (!zone.healthChecks?.length) return false;
+  const index = healthIndexOf(zone);
+  return ((type === TYPE.A || type === TYPE.ANY) && index.has(`${name}/A`))
+    || ((type === TYPE.AAAA || type === TYPE.ANY) && index.has(`${name}/AAAA`));
+}
+
+/**
+ * Whether a question asks for a protected RRset -- the type itself, or ANY,
+ * which carries every RRset at the name -- that the records at that exact
+ * owner do not hold. Only the owner's own records count: a wildcard or a CNAME
+ * there is not the RRset the policy was written for.
+ */
+function protectedSetMissing(zone: ServedZone, name: string, type: number, atName: ServedRecords): boolean {
+  if (!healthProtects(zone, name, type)) return false;
+  const index = healthIndexOf(zone);
+  return (["A", "AAAA"] as const).some((protectedType) =>
+    (type === TYPE.ANY || type === rrType(protectedType))
+    && index.has(`${name}/${protectedType}`)
+    && !atName.some((record) => record.type === protectedType));
+}
+
+/**
+ * Binds a zone's health checks to one query. The verdict is read lazily and
+ * once: most queries touch no protected RRset and should not pay for it, and
+ * one that touches two must see both judged at the same instant.
+ */
+function healthGuard(zone: ServedZone, health: DnsServerOptions["health"]): HealthGuard | undefined {
+  if (!zone.healthChecks?.length) return undefined;
+  const index = healthIndexOf(zone);
+  const read: { verdict?: HealthVerdict; done: boolean } = { done: false };
+  return (owner, type, records) => {
+    const check = index.get(`${owner}/${type}`);
+    if (!check) return undefined;
+    if (!read.done) {
+      read.done = true;
+      read.verdict = health?.();
+    }
+    const verdict = read.verdict;
+    if (check.issue !== undefined || !verdict) return BLOCKED;
+    const healthy = records.filter((record) => verdict(zone.name, check, probeAddress(record.content)));
+    if (healthy.length === 0) return BLOCKED;
+    // One TTL for the whole answer, no longer than the policy allows: a
+    // resolver must come back soon enough to learn an address went away.
+    return healthy.map((record) => ({ ...record, ttl: check.ttl }));
+  };
+}
+
+/**
+ * Applies the guard to each address RRset among one owner's records, keeping
+ * every other record where it was.
+ */
+function guardRecords(guard: HealthGuard, owner: string, records: ServedRecords): ServedRecords | typeof BLOCKED {
+  let result = records;
+  for (const type of ["A", "AAAA"] as const) {
+    const group = result.filter((record) => record.type === type);
+    if (group.length === 0) continue;
+    const guarded = guard(owner, type, group);
+    if (guarded === undefined) continue;
+    if (guarded === BLOCKED) return BLOCKED;
+    // The guard keeps the group's order, so its survivors are matched up in a
+    // single pass and land where the records they replace stood.
+    const healthy = [...guarded];
+    result = result.flatMap((record) => {
+      if (record.type !== type) return [record];
+      return healthy.length > 0 && healthy[0]!.content === record.content ? [healthy.shift()!] : [];
+    });
+  }
+  return result;
 }
 
 /** A small fixed label set, so the counter cannot grow a series per query. */
@@ -1771,78 +1946,6 @@ function assertResolvedAddress(value: ResolvedDnsAddress, source: string): void 
   if ((family !== 4 && family !== 6) || family !== value.family) {
     throw new Error(`DNS host resolver returned an invalid address for ${source}`);
   }
-}
-
-interface CompiledCidr {
-  readonly address: Uint8Array;
-  readonly prefix: number;
-}
-
-function compileCidrs(values: readonly string[]): CompiledCidr[] {
-  return values.map((source) => {
-    const value = source.trim();
-    const slash = value.lastIndexOf("/");
-    const addressText = slash < 0 ? value : value.slice(0, slash);
-    const address = parseIpBytes(addressText);
-    if (!address) throw new Error(`invalid DNS client CIDR: ${source}`);
-    const bits = address.length * 8;
-    const prefixText = slash < 0 ? String(bits) : value.slice(slash + 1);
-    if (!/^\d{1,3}$/u.test(prefixText)) throw new Error(`invalid DNS client CIDR prefix: ${source}`);
-    const prefix = Number(prefixText);
-    if (!Number.isInteger(prefix) || prefix < 0 || prefix > bits) {
-      throw new Error(`invalid DNS client CIDR prefix: ${source}`);
-    }
-    return { address, prefix };
-  });
-}
-
-function cidrsContain(cidrs: readonly CompiledCidr[], source: string): boolean {
-  const address = parseIpBytes(source);
-  if (!address) return false;
-  return cidrs.some((cidr) => cidr.address.length === address.length
-    && prefixMatches(cidr.address, address, cidr.prefix));
-}
-
-function prefixMatches(network: Uint8Array, address: Uint8Array, prefix: number): boolean {
-  const complete = Math.floor(prefix / 8);
-  for (let index = 0; index < complete; index += 1) {
-    if (network[index] !== address[index]) return false;
-  }
-  const remainder = prefix % 8;
-  if (remainder === 0) return true;
-  const mask = (0xff << (8 - remainder)) & 0xff;
-  return ((network[complete] ?? 0) & mask) === ((address[complete] ?? 0) & mask);
-}
-
-function parseIpBytes(source: string): Uint8Array | undefined {
-  const unbracketed = source.trim().replace(/^\[|\]$/gu, "").split("%")[0] ?? "";
-  if (isIP(unbracketed) === 4) return Uint8Array.from(unbracketed.split(".").map(Number));
-  if (isIP(unbracketed) !== 6) return undefined;
-
-  let value = unbracketed.toLowerCase();
-  const embedded = /(?:^|:)(\d+\.\d+\.\d+\.\d+)$/u.exec(value)?.[1];
-  if (embedded) {
-    const bytes = embedded.split(".").map(Number);
-    const replacement = `${((bytes[0] ?? 0) << 8 | (bytes[1] ?? 0)).toString(16)}:${((bytes[2] ?? 0) << 8 | (bytes[3] ?? 0)).toString(16)}`;
-    value = `${value.slice(0, -embedded.length)}${replacement}`;
-  }
-  const halves = value.split("::");
-  const left = (halves[0] ?? "").split(":").filter(Boolean);
-  const right = (halves[1] ?? "").split(":").filter(Boolean);
-  const missing = 8 - left.length - right.length;
-  const groups = halves.length === 1 ? left : [...left, ...Array.from({ length: missing }, () => "0"), ...right];
-  if (groups.length !== 8) return undefined;
-  const bytes = new Uint8Array(16);
-  for (const [index, group] of groups.entries()) {
-    const parsed = Number.parseInt(group, 16);
-    bytes[index * 2] = parsed >>> 8;
-    bytes[index * 2 + 1] = parsed & 0xff;
-  }
-  // Node commonly reports IPv4 TCP peers in this mapped form.
-  if (bytes.slice(0, 10).every((byte) => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff) {
-    return bytes.slice(12);
-  }
-  return bytes;
 }
 
 function positiveInteger(value: number, name: string): number {

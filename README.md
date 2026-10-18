@@ -110,7 +110,8 @@ never be mistaken for "there is nothing there".
 ### 📡 Answers DNS itself
 An authoritative listener for the internal view over UDP and TCP: EDNS(0), DNS
 cookies, AXFR (denied by default), outbound NOTIFY, allow-listed forwarding,
-and per-client rate limiting.
+per-client rate limiting, and opt-in health checks that leave failing
+addresses out of an internal A or AAAA answer.
 
 </td>
 </tr>
@@ -209,7 +210,7 @@ flowchart LR
         C["⌨️ CLI"]
     end
 
-    faces --> CMD["command layer<br/>49 commands"]
+    faces --> CMD["command layer<br/>53 commands"]
     CMD --> CP["control plane<br/>zones · revisions · audit"]
 
     CP --> ST[("store")]
@@ -349,6 +350,9 @@ and the defaults are the careful ones.
 | `revisionRetention` | Newest snapshots kept per zone; `0` keeps every one |
 | `auditRetentionDays` | Days of audit history kept per zone; `0` keeps everything |
 | `fallbackResolver` | Address a client-side resolver override should point at |
+| `dnsHealthChecksEnabled` | Probe the addresses internal health checks protect. Default `false` |
+| `dnsHealthCheckAllowCidrs` | Networks a probe may connect to. Default empty, which allows none |
+| `dnsHealthCheckAllowPorts` | Ports a probe may connect to. Default empty, which allows none |
 
 </details>
 
@@ -356,7 +360,7 @@ and the defaults are the careful ones.
 
 ## Command line
 
-49 commands. Add `--json` to any of them for machine-readable output; run
+53 commands. Add `--json` to any of them for machine-readable output; run
 `parallax help <command>` for its options.
 
 <details open>
@@ -424,6 +428,23 @@ already holds — nobody types a second token.
 </details>
 
 <details>
+<summary><b>Internal health checks</b></summary>
+
+| Command | |
+|---|---|
+| `health check list` | The policies on a zone's internal view |
+| `health check set` · `health check delete` | One policy per internal A or AAAA RRset, each a new revision |
+| `health check status` | Each policy and **this process's** verdict on each address |
+
+```bash
+pnpm cli health check set --zone example.com \
+  --policy '{"name":"app","type":"A","enabled":true,"probe":{"kind":"tcp","port":443}}'
+pnpm cli health check status --zone example.com
+```
+
+</details>
+
+<details>
 <summary><b>Operations</b></summary>
 
 | Command | |
@@ -460,7 +481,7 @@ DATABASE_URL=postgres://… parallax restore < parallax-backup.json
 
 ## HTTP API
 
-**40 paths**, described by an OpenAPI 3.1 document the process generates from
+**43 paths**, described by an OpenAPI 3.1 document the process generates from
 its own command table — so the description cannot drift from the behaviour.
 
 ```http
@@ -480,6 +501,7 @@ GET /api/v1/openapi.json
 | **Admin** | `GET PUT /settings` · `GET POST /tokens` · `DELETE /tokens/{id}` |
 | **Credentials** | `GET /credentials/profiles` · `GET PUT DELETE /credentials/profiles/{name}` · `POST …/test`<br/>`GET /credentials/cloudflare` · `GET PUT DELETE /credentials/cloudflare/{zone}` · `POST …/test` |
 | **Fallback** | `GET /fallback/{profile}` · `…/coverage` · `…/preview` · `POST …/sync` · `PUT DELETE …/domains/{suffix}` |
+| **Health checks** | `GET /zones/{zone}/views/internal/health-checks` · `PUT DELETE …/health-checks/{name}/{type}`<br/>`GET /zones/{zone}/health-check-status` |
 | **Meta** | `POST /cli` · `GET /openapi.json` · `POST DELETE /session` |
 | **Probes** | `GET /health/live` · `GET /health/ready` · `GET /metrics` |
 
@@ -549,17 +571,68 @@ parallax_ready                                  1 when this process would pass r
 parallax_desired_state_age_seconds              since the desired state was last read
 parallax_desired_state_max_age_seconds          how stale that may get before readiness fails
 parallax_dns_served_zones                       zones the listener answers for
+parallax_dns_health_healthy_targets             protected addresses this process gives out
+parallax_dns_health_unhealthy_targets           protected addresses held back because probes fail
+parallax_dns_health_unknown_targets             protected addresses with no fresh result
 parallax_access_token_cache_ready               tokens fresh enough to authenticate with
 parallax_access_token_cache_age_seconds         since that cache last refreshed
 parallax_dns_zones_skipped_total                zones whose internal view would not compose
 parallax_dns_unservable_records_total           stored records that reached the wire and could not
 parallax_dns_unanswerable_replies_total         queries that could not be answered
 parallax_dns_notify_failures_total              NOTIFY sends that failed
+parallax_dns_health_probes_total                health probes, by result
+parallax_dns_health_transitions_total           health state changes, by the state entered
+parallax_dns_health_servfail_total              protected answers refused because no address qualified
 parallax_dns_forward_failures_total             DNS forwarding failures by upstream index and reason
 parallax_refresh_failures_total                 background refresh failures, by subsystem
 parallax_postgres_connection_errors_total       pooled connections that failed, by state (idle, checked_out) and code
 parallax_tls_certificate_reload_failures_total  certificate reloads that failed
 ```
+
+### Internal health checks
+
+A policy protects one A or AAAA RRset in a zone's **internal** view. The
+internal listener then answers it with only the addresses whose probes pass.
+The external view, every provider, `preview` and `apply` are unaffected:
+nothing about health is published anywhere.
+
+- **Off until two things are set.** `dnsHealthChecksEnabled` turns probing on,
+  and an address is probed only when it falls inside
+  `dnsHealthCheckAllowCidrs` and its port is in `dnsHealthCheckAllowPorts`.
+  Loopback, link-local, multicast, translated (IPv4-compatible, SIIT, NAT64,
+  Teredo, 6to4), known cloud metadata addresses and other reserved ranges are
+  refused whatever the list says. A probe connects to the address itself;
+  nothing is resolved.
+- **It fails closed.** An enabled policy whose RRset has no healthy address —
+  probing off, an address outside the allow-list, or no fresh success — is
+  answered `SERVFAIL`, not with every address. Only `enabled: true` turns a
+  policy on; a policy that leaves `enabled` out, or sets it to `false`, is kept
+  and the RRset is answered in full.
+- **Timing.** Every 10 seconds with jitter, a 2-second deadline per probe, and a
+  result is stale after 30 seconds. An address never seen failing is healthy on
+  its first success; one seen failing needs two successes in a row. A healthy
+  address becomes unhealthy on its third failure in a row. At most 16 probes run
+  at once.
+- **TTL.** A filtered answer carries `responseTtlSeconds` (5–60, default 30),
+  lowered further to the smallest TTL in the RRset.
+- **Limits.** 64 policies per zone, and 64 probed addresses per process. An
+  address past that limit is reported `over_limit` and is not given out.
+- **Transfers stop.** While a zone has an enabled policy, AXFR and IXFR are
+  refused and secondaries are not sent NOTIFY, because a secondary would serve
+  every address. A secondary keeps the copy it already holds.
+- **HTTPS probes** verify the certificate against the RRset's name. A private
+  CA reaches Node through `NODE_EXTRA_CA_CERTS`.
+- **Status is process-local.** Each replica probes from where it sits and keeps
+  nothing in the store, so behind a load balancer two requests can see two
+  verdicts.
+
+Policies live in the internal view of the desired state, so a revision, a
+restore, `backup` and `restore` carry them; none of this adds a table or a
+migration. A full `PUT /zones/{zone}` that leaves `healthChecks` out while the
+stored view carries policies is refused with `409`, so a writer that predates
+health checks cannot drop them silently. Do not run such a writer against a
+store that holds policies: rolling back past this release means deleting the
+policies first.
 
 ### Deployment
 

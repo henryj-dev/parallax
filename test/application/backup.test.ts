@@ -6,7 +6,10 @@ import { afterEach, describe, it } from "node:test";
 import {
   BACKUP_FORMAT, BackupError, exportBackup, importBackup, readBackupDocument, type BackupStores,
 } from "../../src/application/backup.ts";
+import { ControlPlane } from "../../src/application/control-plane.ts";
 import type { CredentialRepository } from "../../src/application/ports.ts";
+import { parseSettings } from "../../src/application/settings.ts";
+import { MAX_HEALTH_CHECK_TARGETS } from "../../src/domain/health-checks.ts";
 import { createFileStateAdapters } from "../../src/infrastructure/file-state.ts";
 import { FileConfigurationStore } from "../../src/infrastructure/file-settings.ts";
 import {
@@ -117,6 +120,109 @@ async function contentsOf(stores: BackupStores) {
     credentials: await stores.credentials.read(),
   };
 }
+
+/** A store whose zones were written by the control plane, holding health checks. */
+async function storeWithHealthChecks(zone: string, addresses: number, enabled = true): Promise<BackupStores> {
+  const stores = memoryStores();
+  const service = new ControlPlane(stores.zones, stores.statuses, createInMemoryAdapters().provider,
+    { now: () => new Date("2026-08-08T00:00:00.000Z") }, undefined, {}, (target) => target.endsWith("/internal") ? "listener" : "provider");
+  await service.createZone(zone);
+  const records = Array.from({ length: addresses }, (_, index) => ({
+    id: `app-${index}`, name: "app", type: "A", content: `10.0.${Math.floor(index / 250)}.${(index % 250) + 1}`, ttl: 300,
+  }));
+  await service.replaceDesiredState(zone, { views: [{ name: "external", records: [] }, { name: "internal", records }] });
+  await service.setHealthCheck(zone, { name: "app", type: "A", enabled, probe: { kind: "tcp", port: 443 } });
+  return stores;
+}
+
+/** A restore target held to the rules a serving process enforces. */
+function guardedStores(): { stores: BackupStores; locked: () => number } {
+  let locked = 0;
+  const stores = memoryStores();
+  return {
+    locked: () => locked,
+    stores: {
+      ...stores,
+      healthChecks: {
+        exclusive: async (operation) => { locked += 1; return operation(); },
+        unsupported: (_zone, settings) => parseSettings(settings).allowLocalProvider,
+      },
+    },
+  };
+}
+
+async function assertNothingWritten(stores: BackupStores): Promise<void> {
+  assert.deepEqual(await stores.zones.list(), []);
+  assert.deepEqual(await stores.zones.audit(), []);
+  assert.deepEqual(await stores.settings.read(), {});
+}
+
+describe("restoring health checks", () => {
+  it("restores policies that hold, under the lock commits take", async () => {
+    const document = await exportBackup(await storeWithHealthChecks("example.com", 2));
+    const target = guardedStores();
+    await importBackup(target.stores, document);
+    assert.equal(target.locked(), 1);
+    const internal = (await target.stores.zones.get("example.com"))?.views.find((view) => view.name === "internal");
+    assert.equal(internal?.healthChecks?.[0]?.enabled, true);
+  });
+
+  it("refuses zones whose enabled addresses together pass the limit, before writing any", async () => {
+    const big = await exportBackup(await storeWithHealthChecks("example.com", MAX_HEALTH_CHECK_TARGETS));
+    const small = await exportBackup(await storeWithHealthChecks("example.net", 1));
+    const merged = { ...big, zones: [...big.zones, ...small.zones], audit: [...big.audit, ...small.audit.map((entry) => ({ ...entry, id: entry.id + 1000 }))] };
+    const target = guardedStores();
+    await assert.rejects(importBackup(target.stores, merged), (error: unknown) =>
+      error instanceof BackupError && error.message.includes(`at most ${MAX_HEALTH_CHECK_TARGETS} addresses`));
+    await assertNothingWritten(target.stores);
+    // A disabled policy probes nothing, so the same pair restores once it is off.
+    const off = await exportBackup(await storeWithHealthChecks("example.net", 1, false));
+    await importBackup(target.stores, { ...big, zones: [...big.zones, ...off.zones] });
+  });
+
+  it("refuses a policy that protects nothing, and one that does not read, before writing any", async () => {
+    const document = await exportBackup(await storeWithHealthChecks("example.com", 1));
+    const strip = (zone: typeof document.zones[number]["current"]) => ({
+      ...zone,
+      views: zone.views.map((view) => (view.name === "internal" ? { ...view, records: [] } : view)),
+    });
+    const dangling = { ...document, zones: document.zones.map((zone) => ({ ...zone, current: strip(zone.current) })) };
+    const target = guardedStores();
+    await assert.rejects(importBackup(target.stores, dangling), (error: unknown) =>
+      error instanceof BackupError && /no A record to protect/u.test(error.message));
+    await assertNothingWritten(target.stores);
+
+    const unreadable = {
+      ...document,
+      zones: document.zones.map((zone) => ({
+        ...zone,
+        revisions: zone.revisions.map((snapshot) => ({
+          ...snapshot,
+          views: snapshot.views.map((view) => (view.healthChecks
+            ? { ...view, healthChecks: view.healthChecks.map((policy) => ({ ...policy, enabled: "yes" as never })) }
+            : view)),
+        })),
+      })),
+    };
+    await assert.rejects(importBackup(target.stores, unreadable), (error: unknown) =>
+      error instanceof BackupError && error.message.includes("revisions["));
+    await assertNothingWritten(target.stores);
+    await importBackup(target.stores, document);
+  });
+
+  it("refuses an enabled policy the restored settings would publish elsewhere", async () => {
+    const document = await exportBackup(await storeWithHealthChecks("example.com", 1));
+    const target = guardedStores();
+    await assert.rejects(importBackup(target.stores, { ...document, settings: { allowLocalProvider: true } }), (error: unknown) =>
+      error instanceof BackupError && error.message.includes("published to a provider"));
+    await assertNothingWritten(target.stores);
+    // The store's own settings count when the document carries none.
+    const local = guardedStores();
+    await local.stores.settings.write({ allowLocalProvider: true });
+    await assert.rejects(importBackup(local.stores, document), /published to a provider/u);
+    assert.deepEqual(await local.stores.zones.list(), []);
+  });
+});
 
 describe("backup and restore", () => {
   /**

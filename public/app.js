@@ -135,6 +135,7 @@ const ERROR_TARGETS = {
   settings: "#settings-form-error",
   token: "#token-form-error",
   fallback: "#fallback-form-error",
+  health: "#health-form-error",
 };
 
 function renderErrors() {
@@ -225,6 +226,7 @@ function renderWorkspace(state) {
   renderRecords(state);
   renderFocusOptions(state);
   renderSync(state);
+  renderHealthChecks(state);
   renderHistory(state);
 }
 
@@ -390,6 +392,74 @@ function renderHistory(state) {
   more.textContent = t(state.loadingMoreHistory ? "history.loading" : "history.loadMore");
 }
 
+const HEALTH_TARGET_STATES = ["healthy", "unhealthy", "unknown", "stale", "disabled", "blocked", "unsupported_target", "over_limit"];
+const HEALTH_FAILURES = ["timeout", "connection", "tls", "http-status", "blocked"];
+// The chip colours the sync panel already uses, read for what each answer means.
+const HEALTH_ANSWER_CHIPS = { filtered: "applied", full: "unpublished", servfail: "failed", unknown: "pending" };
+const healthKey = (policy) => `${String(policy.name).toLowerCase()}/${String(policy.type).toUpperCase()}`;
+
+/**
+ * The zone's policies beside what this process makes of each address. The
+ * verdicts are this replica's own, so the panel says so instead of letting one
+ * answer stand for every listener.
+ */
+function renderHealthChecks(state) {
+  const policies = state.healthChecks ?? [];
+  const status = state.healthStatus;
+  $("#health-refresh-button").hidden = policies.length === 0;
+  let summary;
+  if (policies.length === 0) summary = t("health.none");
+  else if (state.healthStatusError) summary = t("health.statusFailed", { error: state.healthStatusError });
+  else if (!status) summary = t("health.statusUnread");
+  else {
+    summary = [
+      t(status.probing ? "health.probingOn" : "health.probingOff"),
+      t(status.servedHere ? "health.servedHere" : "health.notServedHere"),
+      status.transfers === "refused" ? t("health.transfersRefused") : "",
+    ].filter(Boolean).join(" ");
+  }
+  $("#health-summary").textContent = summary;
+  const verdicts = new Map((status?.healthChecks ?? []).map((entry) => [healthKey(entry), entry]));
+  const canEdit = editorControlsVisible(state);
+  $("#health-list").innerHTML = policies
+    .map((policy, index) => healthCheckItem(policy, verdicts.get(healthKey(policy)), index, canEdit))
+    .join("");
+}
+
+function healthCheckItem(policy, verdict, index, canEdit) {
+  const probe = policy.probe ?? { kind: "tcp", port: 0 };
+  const probeLabel = probe.kind === "tcp"
+    ? t("health.probeTcp", { port: probe.port })
+    : t("health.probeHttp", { kind: String(probe.kind).toUpperCase(), port: probe.port, path: probe.path ?? "" });
+  const answer = verdict && verdict.answer in HEALTH_ANSWER_CHIPS ? verdict.answer : (policy.enabled ? "unknown" : "full");
+  const targets = Array.isArray(verdict?.targets) ? verdict.targets : [];
+  const healthy = Number.isInteger(verdict?.healthyAddresses)
+    ? verdict.healthyAddresses
+    : targets.filter((target) => target.status === "healthy").length;
+  const latest = targets.map((target) => target.checkedAt).filter(Boolean).sort().at(-1);
+  const counts = targets.length > 0 ? t("health.healthyCount", { healthy, total: targets.length }) : "";
+  const checked = latest ? t("health.lastChecked", { date: formatDate(latest) }) : t("health.neverChecked");
+  const rows = targets.map((target) => {
+    const verdictState = HEALTH_TARGET_STATES.includes(target.status) ? target.status : "unknown";
+    const failure = HEALTH_FAILURES.includes(target.lastFailure) && target.status !== "healthy"
+      ? t(`health.failure.${target.lastFailure}`, { code: target.lastStatusCode ?? "—" })
+      : "";
+    const detail = [target.blockedReason ?? "", failure].filter(Boolean).join(" · ");
+    return `<li><code>${escapeHtml(target.address)}</code><span class="health-state ${verdictState}">${escapeHtml(t(`health.target.${verdictState}`))}</span>${detail ? `<small>${escapeHtml(detail)}</small>` : ""}</li>`;
+  }).join("");
+  const actions = canEdit
+    ? `<div class="health-actions"><button class="button compact quiet" type="button" data-edit-health="${index}">${escapeHtml(t("health.edit"))}</button><button class="button compact quiet" type="button" data-delete-health="${index}">${escapeHtml(t("health.delete"))}</button></div>`
+    : "";
+  return `<article class="health-item">
+    <header><b>${escapeHtml(displayName(policy.name))}</b><span class="health-type">${escapeHtml(policy.type)}</span><span class="status-chip ${HEALTH_ANSWER_CHIPS[answer]}">${escapeHtml(t(`health.answer.${answer}`))}</span></header>
+    <small>${escapeHtml(probeLabel)} · ${escapeHtml(t("health.ttl", { seconds: policy.responseTtlSeconds }))}</small>
+    <small>${escapeHtml([counts, checked].filter(Boolean).join(" · "))}</small>
+    ${verdict?.issue ? `<p class="health-issue">${escapeHtml(verdict.issue)}</p>` : ""}
+    ${rows ? `<ul class="health-targets">${rows}</ul>` : ""}
+    ${actions}
+  </article>`;
+}
+
 function renderPlan(state) {
   const summary = $("#plan-summary");
   const content = $("#plan-content");
@@ -543,6 +613,57 @@ function fillSettingsForm(state) {
   form.elements.revisionRetention.value = String(state.settings.revisionRetention ?? 0);
   form.elements.auditRetentionDays.value = String(state.settings.auditRetentionDays ?? 0);
   form.elements.fallbackResolver.value = state.settings.fallbackResolver ?? "";
+  form.elements.dnsHealthChecksEnabled.checked = Boolean(state.settings.dnsHealthChecksEnabled);
+  form.elements.dnsHealthCheckAllowCidrs.value = (state.settings.dnsHealthCheckAllowCidrs ?? []).join("\n");
+  form.elements.dnsHealthCheckAllowPorts.value = (state.settings.dnsHealthCheckAllowPorts ?? []).join(", ");
+}
+
+/** A list typed one per line or comma separated. */
+const listEntries = (value) => String(value).split(/[\s,]+/u).filter(Boolean);
+
+// ---- health-check dialog --------------------------------------------------
+
+function openHealthDialog(index = null) {
+  const form = $("#health-form");
+  form.reset();
+  $("#health-form-error").hidden = true;
+  const policy = index === null ? null : store.getState().healthChecks[index];
+  // A policy is keyed by its RRset, so editing one cannot move it to another.
+  form.elements.name.readOnly = Boolean(policy);
+  form.elements.type.disabled = Boolean(policy);
+  form.elements.responseTtlSeconds.value = "30";
+  if (policy) {
+    form.elements.name.value = policy.name;
+    form.elements.type.value = policy.type;
+    form.elements.enabled.checked = policy.enabled === true;
+    form.elements.kind.value = policy.probe?.kind ?? "tcp";
+    form.elements.port.value = String(policy.probe?.port ?? "");
+    form.elements.path.value = policy.probe?.path ?? "";
+    form.elements.responseTtlSeconds.value = String(policy.responseTtlSeconds ?? 30);
+  }
+  $("#health-dialog-title").textContent = t(policy ? "healthDialog.edit" : "healthDialog.add");
+  syncHealthProbeFields();
+  $("#health-dialog").showModal();
+  queueMicrotask(() => (policy ? form.elements.port : form.elements.name).focus());
+}
+
+function syncHealthProbeFields() {
+  const form = $("#health-form");
+  form.elements.path.disabled = form.elements.kind.value === "tcp";
+}
+
+/** Reads the dialog into the policy shape the API stores. */
+function readHealthForm(form) {
+  const kind = String(form.elements.kind.value);
+  const port = Number(form.elements.port.value);
+  const path = String(form.elements.path.value).trim();
+  return {
+    name: String(form.elements.name.value).trim(),
+    type: String(form.elements.type.value),
+    enabled: form.elements.enabled.checked,
+    probe: kind === "tcp" ? { kind, port } : { kind, port, ...(path ? { path } : {}) },
+    responseTtlSeconds: Number(form.elements.responseTtlSeconds.value),
+  };
 }
 
 // ---- record dialog --------------------------------------------------------
@@ -667,7 +788,7 @@ function syncRoleVisibility(state) {
   const canEdit = editorControlsVisible(state);
   const canAdmin = adminControlsVisible(state);
   $("#credential-settings-button").hidden = !canAdmin;
-  for (const id of ["#adopt-button", "#apply-button", "#preview-button", "#add-record-button"]) {
+  for (const id of ["#adopt-button", "#apply-button", "#preview-button", "#add-record-button", "#add-health-check-button"]) {
     $(id).hidden = !canEdit;
   }
   $("#delete-zone-button").hidden = !canAdmin;
@@ -890,6 +1011,29 @@ $("#record-rows").addEventListener("click", (event) => {
 });
 $("#focus-record").addEventListener("change", () => renderLens(store.getState()));
 
+$("#add-health-check-button").addEventListener("click", () => openHealthDialog());
+$("#health-refresh-button").addEventListener("click", () => void store.refreshHealthStatus());
+$("#health-list").addEventListener("click", (event) => {
+  const edit = event.target.closest("[data-edit-health]");
+  if (edit) return openHealthDialog(Number(edit.dataset.editHealth));
+  const remove = event.target.closest("[data-delete-health]");
+  if (!remove) return;
+  const policy = store.getState().healthChecks[Number(remove.dataset.deleteHealth)];
+  if (policy && confirm(t("health.deleteConfirm", { name: displayName(policy.name), type: policy.type }))) {
+    void store.deleteHealthCheck(policy.name, policy.type);
+  }
+});
+$("#health-form [name=kind]").addEventListener("change", syncHealthProbeFields);
+$("#health-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.checkValidity()) return form.reportValidity();
+  const button = $("#save-health-check-button");
+  button.disabled = true;
+  if (await store.saveHealthCheck(readHealthForm(form))) $("#health-dialog").close();
+  button.disabled = false;
+});
+
 for (const id of ["#preview-button", "#apply-button"]) {
   $(id).addEventListener("click", async () => {
     $("#plan-dialog").showModal();
@@ -1045,6 +1189,11 @@ $("#settings-form").addEventListener("submit", async (event) => {
     revisionRetention: Number(form.elements.revisionRetention.value),
     auditRetentionDays: Number(form.elements.auditRetentionDays.value),
     fallbackResolver: String(form.elements.fallbackResolver.value).trim(),
+    dnsHealthChecksEnabled: form.elements.dnsHealthChecksEnabled.checked,
+    dnsHealthCheckAllowCidrs: listEntries(form.elements.dnsHealthCheckAllowCidrs.value),
+    // A port that is not a number is sent as typed, so the server names it.
+    dnsHealthCheckAllowPorts: listEntries(form.elements.dnsHealthCheckAllowPorts.value)
+      .map((entry) => (/^\d+$/u.test(entry) ? Number(entry) : entry)),
   });
   fillSettingsForm(store.getState());
   $("#save-settings-button").disabled = false;

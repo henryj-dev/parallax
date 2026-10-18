@@ -5,8 +5,10 @@ import { AccessTokenService } from "./application/access-tokens.ts";
 import { CloudflareCredentialManager } from "./application/cloudflare-credentials.ts";
 import { FallbackDomainService } from "./application/fallback-domains.ts";
 import { ControlPlane } from "./application/control-plane.ts";
-import { SettingsService, type ParallaxSettings } from "./application/settings.ts";
+import { parseSettings, SettingsService, type ParallaxSettings } from "./application/settings.ts";
 import { DomainValidationError } from "./domain/dns.ts";
+import { createHealthMonitor, type HealthTransition } from "./dns/health/monitor.ts";
+import { createProbeTransport } from "./dns/health/transport.ts";
 import { watchingZones } from "./dns/zone-changes.ts";
 import { OwnershipSecretError } from "./adapters/ownership.ts";
 import { RoutingProviderAdapter } from "./adapters/router.ts";
@@ -91,7 +93,10 @@ export async function createRuntime(config: ParallaxConfig, options: RuntimeOpti
   const credentialRepository = pool ? new PostgresCredentialRepository(pool) : fileConfiguration!.credentials;
   const accessTokenRepository = pool ? new PostgresAccessTokenRepository(pool) : fileConfiguration!.accessTokens;
 
-  const settings = createSettingsService(settingsRepository, config);
+  // Bound once the control plane exists. Settings are read before it does, and a
+  // stored value cannot already contradict a policy: the commit refused that.
+  const healthChecks: HealthCheckSettingsHooks = {};
+  const settings = createSettingsService(settingsRepository, config, healthChecks);
   const accessTokens = new AccessTokenService(accessTokenRepository, config.bootstrapTokens);
   try {
     await settings.load();
@@ -178,7 +183,27 @@ export async function createRuntime(config: ParallaxConfig, options: RuntimeOpti
   (target) => {
     if (provider.isConfigured(target)) return "provider";
     return config.dns !== undefined && target.endsWith("/internal") ? "listener" : "none";
+  },
+  // The stored settings, read under the lock a settings write also takes: a
+  // replica that just turned the local provider on has not told this process's
+  // router yet, and an enabled policy saved now would be one nothing honours.
+  { unsupported: async () => parseSettings(await settingsRepository.read()).allowLocalProvider });
+  healthChecks.zones = () => controlPlane.zonesWithEnabledHealthChecks();
+  healthChecks.exclusive = (operation) => controlPlane.withHealthCheckLock(operation);
+
+  // Built on every runtime, probing on none until a listener hands it zones.
+  // The command line never does, so its status reads say "not served here"
+  // rather than inventing a verdict about addresses it has not looked at.
+  const healthMonitor = createHealthMonitor({
+    transport: createProbeTransport(),
+    // Evaluated against the router, so a zone whose internal view is
+    // published elsewhere is reported unsupported instead of being probed for
+    // answers this process does not give.
+    unsupported: (zone) => provider.isConfigured(`${zone}/internal`),
+    onTransition: (transition) => { console.log(describeTransition(transition)); },
   });
+  healthMonitor.configure(settings.current());
+  settings.onChange((current) => { healthMonitor.configure(current); });
 
   return {
     controlPlane,
@@ -199,23 +224,58 @@ export async function createRuntime(config: ParallaxConfig, options: RuntimeOpti
           settings: settingsRepository,
           accessTokens: accessTokenRepository,
           credentials: credentialRepository,
+          // A restore writes zones without passing through a commit, so it is
+          // held to the same health-check rules here, under the same lock.
+          healthChecks: {
+            exclusive: (operation) => controlPlane.withHealthCheckLock(operation),
+            unsupported: (_zone, stored) => parseSettings(stored).allowLocalProvider || internalUpdate !== undefined,
+          },
         },
       }
       : {}),
+    healthMonitor,
     onZoneChange: (listener) => { zoneChangeListeners.push(listener); },
     close: async () => {
+      await healthMonitor.close();
       await pool?.end().catch(() => undefined);
     },
   };
 }
 
-function createSettingsService(repository: SettingsRepository, config: ParallaxConfig): SettingsService {
+/** One line per status change. The failure category, never a body or a message. */
+function describeTransition(transition: HealthTransition): string {
+  const reason = transition.lastFailure
+    ? ` (${transition.lastFailure}${transition.lastStatusCode === undefined ? "" : ` ${transition.lastStatusCode}`})`
+    : "";
+  return `parallax: health check ${transition.zone} ${transition.name} ${transition.type} ${transition.address}: ${transition.from} -> ${transition.to}${reason}`;
+}
+
+interface HealthCheckSettingsHooks {
+  zones?: () => Promise<string[]>;
+  exclusive?: <T>(operation: () => Promise<T>) => Promise<T>;
+}
+
+function createSettingsService(
+  repository: SettingsRepository,
+  config: ParallaxConfig,
+  healthChecks: HealthCheckSettingsHooks = {},
+): SettingsService {
   // A setting that names a directory this process has to write is checked here.
   // Whoever turns one on is the only person who can still connect it to a
   // deployment that has to make that directory writable, so the answer is given
   // to them now rather than to whoever is on call when the first apply fails.
-  return new SettingsService(repository, async (candidate) => {
+  return new SettingsService(repository, async (candidate, previous) => {
     const issues: string[] = [];
+    // The local file provider would publish the internal view, and a published
+    // view is answered in full by whatever serves it. An enabled health check
+    // there is a promise nothing keeps, so the switch waits for the policies to
+    // be disabled or removed rather than silently dropping what they filter.
+    if (candidate.allowLocalProvider && !previous.allowLocalProvider && healthChecks.zones) {
+      const zones = await healthChecks.zones();
+      if (zones.length > 0) {
+        issues.push(`allowLocalProvider would publish the internal view of ${zones.join(", ")}, whose enabled health checks only the built-in listener can honour; disable or delete them first`);
+      }
+    }
     if (candidate.trustForwardedHeaders && !candidate.publicOrigin) {
       issues.push("trustForwardedHeaders requires publicOrigin so forwarded Host and Proto values cannot choose cookie security or same-origin policy");
     }
@@ -224,7 +284,11 @@ function createSettingsService(repository: SettingsRepository, config: ParallaxC
       if (failure) issues.push(`allowLocalProvider publishes to ${config.providerStateFile}, whose directory ${failure}`);
     }
     if (issues.length > 0) throw new DomainValidationError(issues);
-  });
+  }, undefined,
+  // A settings write and a commit keeping an enabled health check take one
+  // lock, so the zones the verifier reads cannot gain a policy before the
+  // value it allowed is stored.
+  (operation) => healthChecks.exclusive ? healthChecks.exclusive(operation) : operation());
 }
 
 /**

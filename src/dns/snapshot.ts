@@ -1,5 +1,8 @@
-import { materializeProviderViews } from "../application/control-plane.ts";
+import { materializeProviderViews, protectedRRsetsFor } from "../application/control-plane.ts";
 import type { Zone } from "../domain/dns.ts";
+import { healthCheckKey, healthChecksOf, type ProtectedRRset } from "../domain/health-checks.ts";
+import { probeAddress } from "./health/address.ts";
+import type { ServedHealthCheck } from "./health/targets.ts";
 import type { ServedZone } from "./server.ts";
 
 /**
@@ -52,7 +55,57 @@ export function servedZones(zones: readonly Zone[], onSkipped?: (zone: string, r
       overrideNames: new Set(
         (zone.views.find((view) => view.name === "internal")?.records ?? []).map((record) => record.name.toLowerCase()),
       ),
+      ...servedHealthChecks(zone),
     });
   }
   return served;
+}
+
+/**
+ * The enabled health checks, resolved against the same composed view the
+ * answers come from. A policy that no longer resolves -- its RRset was removed
+ * by some path the commit guard did not see, or now holds a provider-owned
+ * address -- is kept with its issue rather than dropped, because dropping it
+ * would answer the full RRset, and a policy someone enabled is a promise that
+ * an unchecked address is not given out.
+ */
+function servedHealthChecks(zone: Zone): { healthChecks?: ServedHealthCheck[] } {
+  const policies = healthChecksOf(zone.views.find((view) => view.name === "internal")).filter((policy) => policy.enabled);
+  if (policies.length === 0) return {};
+  let resolved: ProtectedRRset[];
+  let failure: string | undefined;
+  try {
+    resolved = protectedRRsetsFor(zone.views).rrsets;
+  } catch (error) {
+    resolved = [];
+    failure = error instanceof Error ? error.message : "the zone's views could not be composed";
+  }
+  const byKey = new Map(resolved.map((rrset) => [healthCheckKey(rrset.policy), rrset]));
+  return {
+    healthChecks: policies.map((policy): ServedHealthCheck => {
+      const owner = absolute(policy.name, zone.name);
+      const rrset = byKey.get(healthCheckKey(policy));
+      if (!rrset) {
+        return {
+          name: owner,
+          type: policy.type,
+          ttl: policy.responseTtlSeconds,
+          probe: policy.probe,
+          addresses: [],
+          issue: failure ?? `health check ${policy.name} ${policy.type} does not match a probeable RRset`,
+        };
+      }
+      return {
+        name: owner,
+        type: policy.type,
+        ttl: rrset.ttl,
+        probe: policy.probe,
+        addresses: rrset.addresses.map((address) => probeAddress(address)),
+      };
+    }),
+  };
+}
+
+function absolute(name: string, zone: string): string {
+  return name === "@" ? zone : `${name}.${zone}`.toLowerCase();
 }

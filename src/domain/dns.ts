@@ -1,6 +1,7 @@
 import { BlockList, isIP } from "node:net";
 import { encodeRdata } from "../dns/rdata.ts";
 import { MAX_RDATA_BYTES } from "../dns/wire.ts";
+import type { HealthCheckPolicy } from "./health-checks.ts";
 
 /**
  * Every record type Parallax will hold in a desired state.
@@ -64,6 +65,12 @@ export interface DesiredRecord {
 export interface DnsView {
   name: string;
   records: DesiredRecord[];
+  /**
+   * Internal view only. Absent and empty mean the same to the listener; they
+   * differ only to a full replacement, where absent means "the client did not
+   * say" -- see `readHealthChecks`.
+   */
+  healthChecks?: HealthCheckPolicy[];
 }
 
 export interface Zone {
@@ -713,7 +720,7 @@ function isValidLabel(label: string): boolean {
   return DNS_LABEL.test(label) || UNDERSCORED_LABEL.test(label);
 }
 
-function isValidRecordName(name: string): boolean {
+export function isValidRecordName(name: string): boolean {
   if (name === "@" || name === "*") return true;
   const normalized = name.startsWith("*.") ? name.slice(2) : name;
   return normalized.length <= 253 && normalized.split(".").every(isValidLabel);

@@ -5,6 +5,7 @@ import { fallbackCoverage, overridableZones, type FallbackDomainService } from "
 import { NotFoundError, type ControlPlane, type RecordQuery } from "../application/control-plane.ts";
 import type { SettingsService } from "../application/settings.ts";
 import { DomainValidationError } from "../domain/dns.ts";
+import type { HealthMonitor } from "../dns/health/monitor.ts";
 import { buildOpenApiDocument } from "../http/openapi.ts";
 import { MIGRATION_TARGETS, type MigrationRun } from "../infrastructure/migrations.ts";
 import { ROLES, type Role } from "../security/http-authorization.ts";
@@ -24,6 +25,11 @@ export interface CommandRuntime {
   readonly fallbackDomains?: FallbackDomainService;
   /** Present only when a database backs this process. */
   readonly migrate?: () => Promise<MigrationRun>;
+  /**
+   * This process's view of the health of protected addresses. Process-local:
+   * a process that does not serve DNS reports every zone as not served here.
+   */
+  readonly healthMonitor?: HealthMonitor;
 }
 
 /**
@@ -259,6 +265,45 @@ function recordQuery(input: CommandInput): RecordQuery {
   };
 }
 
+/**
+ * A zone's health-check policies next to what this process makes of them.
+ *
+ * The policies are shared state; the verdicts are not. Each replica probes from
+ * where it sits, so the answer below is this process's, and a process that does
+ * not serve the zone says so instead of guessing.
+ */
+async function healthCheckStatus(context: CommandContext, zoneName: string): Promise<unknown> {
+  const listed = await requireControlPlane(context.runtime).listHealthChecks(zoneName);
+  const monitor = context.runtime.healthMonitor;
+  const served = monitor?.status(listed.zone);
+  const probing = context.runtime.settings?.current().dnsHealthChecksEnabled ?? false;
+  const byKey = new Map((served?.checks ?? []).map((check) => [`${check.name}/${check.type}`, check]));
+  const anyEnabled = listed.healthChecks.some((policy) => policy.enabled);
+  return {
+    zone: listed.zone,
+    revision: listed.revision,
+    probing,
+    servedHere: served?.servedHere ?? false,
+    // The listener refuses AXFR and IXFR and skips NOTIFY for such a zone: a
+    // secondary would otherwise serve every address, healthy or not.
+    transfers: anyEnabled ? "refused" : "allowed",
+    healthChecks: listed.healthChecks.map((policy) => {
+      if (!policy.enabled) return { ...policy, answer: "full" };
+      const owner = (policy.name === "@" ? listed.zone : `${policy.name}.${listed.zone}`).toLowerCase();
+      const check = byKey.get(`${owner}/${policy.type}`);
+      if (!served?.servedHere || !check) return { ...policy, answer: "unknown" };
+      return {
+        ...policy,
+        answer: check.answer,
+        ttl: check.ttl,
+        healthyAddresses: check.healthyAddresses,
+        ...(check.issue ? { issue: check.issue } : {}),
+        targets: check.targets,
+      };
+    }),
+  };
+}
+
 const ZONE = { name: "zone", summary: "Apex domain", required: true } as const;
 const VIEW = { name: "view", summary: "internal or external" } as const;
 const EXPECTED = { name: "expectedRevision", summary: "Fail unless the zone is at this revision", type: "number" } as const;
@@ -435,6 +480,52 @@ const COMMANDS: readonly Command[] = [
     run: ({ runtime, actor }, input) => requireControlPlane(runtime).batchRecords(
       String(input.zone), String(input.view), input.operations, actor, expectedRevisionOf(input),
     ),
+  },
+  {
+    name: "health check list",
+    summary: "List the health-check policies on a zone's internal view",
+    role: "viewer",
+    options: [ZONE],
+    run: ({ runtime }, input) => requireControlPlane(runtime).listHealthChecks(String(input.zone)),
+  },
+  {
+    name: "health check set",
+    summary: "Create or replace the health-check policy for one internal A or AAAA RRset",
+    role: "editor",
+    options: [
+      ZONE,
+      {
+        name: "policy",
+        summary: "{name,type,enabled,probe:{kind,port,path},responseTtlSeconds} as JSON; enabled is false unless set to true",
+        type: "json",
+        required: true,
+      },
+      EXPECTED,
+    ],
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).setHealthCheck(
+      String(input.zone), input.policy, actor, expectedRevisionOf(input),
+    ),
+  },
+  {
+    name: "health check delete",
+    summary: "Remove the health-check policy for one internal RRset; its addresses are answered in full again",
+    role: "editor",
+    options: [
+      ZONE,
+      { name: "name", summary: "Owner name, @ for the apex", required: true },
+      { name: "type", summary: "A or AAAA", required: true },
+      EXPECTED,
+    ],
+    run: ({ runtime, actor }, input) => requireControlPlane(runtime).deleteHealthCheck(
+      String(input.zone), String(input.name), String(input.type), actor, expectedRevisionOf(input),
+    ),
+  },
+  {
+    name: "health check status",
+    summary: "Show a zone's health-check policies and this process's verdict on each address",
+    role: "viewer",
+    options: [ZONE],
+    run: (context, input) => healthCheckStatus(context, String(input.zone)),
   },
   {
     name: "preview",

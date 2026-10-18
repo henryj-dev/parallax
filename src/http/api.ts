@@ -464,6 +464,34 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
       return { command: "record list", input: { zone, ...readRecordQuery(url), ...readPageQuery(url) }, revisioned: true };
     }
 
+    // Process-local, unlike everything else under the zone: what this replica
+    // makes of the addresses, next to the policies every replica shares.
+    if (action === "health-check-status" && segments.length === 5 && method === "GET") {
+      return { command: "health check status", input: { zone } };
+    }
+
+    // Only the internal view carries health checks. Any other view name is a
+    // path that does not exist, not a request to be refused for its content.
+    if (action === "views" && segments[5] === "internal" && segments[6] === "health-checks") {
+      if (segments.length === 7 && method === "GET") {
+        return { command: "health check list", input: { zone }, revisioned: true };
+      }
+      if (segments.length === 9) {
+        const name = requireSegment(segments[7]);
+        const type = requireSegment(segments[8]);
+        if (method === "PUT") {
+          return {
+            command: "health check set",
+            input: { zone, policy: healthCheckBody(await parseJson(request), name, type), expectedRevision },
+            revisioned: true,
+          };
+        }
+        if (method === "DELETE") {
+          return { command: "health check delete", input: { zone, name, type, expectedRevision }, revisioned: true };
+        }
+      }
+    }
+
     if (action === "views" && segments[6] === "records") {
       const view = requireSegment(segments[5]);
       if (segments.length === 7 && method === "GET") {
@@ -518,6 +546,23 @@ async function matchRoute(segments: string[], method: string, url: URL, request:
   }
 
   throw new NotFoundError("route was not found");
+}
+
+/**
+ * The path names the RRset; the body describes the policy for it. A body that
+ * names a different RRset is a mistake somebody would want to hear about, so it
+ * is refused rather than silently overridden by the path.
+ */
+function healthCheckBody(body: Record<string, unknown>, name: string, type: string): Record<string, unknown> {
+  const issues: string[] = [];
+  if (body.name !== undefined && String(body.name).toLowerCase() !== name.toLowerCase()) {
+    issues.push("name in the body does not match the path");
+  }
+  if (body.type !== undefined && String(body.type).toUpperCase() !== type.toUpperCase()) {
+    issues.push("type in the body does not match the path");
+  }
+  if (issues.length > 0) throw new DomainValidationError(issues);
+  return { ...body, name, type };
 }
 
 async function credentialRoute(segments: string[], method: string, request: Request): Promise<RouteMatch> {

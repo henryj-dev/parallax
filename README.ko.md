@@ -109,7 +109,8 @@ Parallax는 목표 상태를 **하나만** 두고, 그것을 **두 뷰**로 투�
 ### 📡 DNS를 직접 응답
 내부 뷰를 UDP와 TCP로 직접 응답하는 권한 리스너입니다. EDNS(0), DNS 쿠키,
 AXFR(기본 거부), 아웃바운드 NOTIFY, 허용 목록 기반 포워딩, 클라이언트별
-레이트 리밋을 갖췄습니다.
+레이트 리밋을 갖췄습니다. 켜면 헬스체크가 실패하는 주소를 내부 A·AAAA 답에서
+뺍니다.
 
 </td>
 </tr>
@@ -207,7 +208,7 @@ flowchart LR
         C["⌨️ CLI"]
     end
 
-    faces --> CMD["명령 계층<br/>49개 명령"]
+    faces --> CMD["명령 계층<br/>53개 명령"]
     CMD --> CP["컨트롤 플레인<br/>존 · 리비전 · 감사"]
 
     CP --> ST[("저장소")]
@@ -346,6 +347,9 @@ Cloudflare 코멘트는 100자로 제한되는데, 호출자가 이미 아는 �
 | `revisionRetention` | 존마다 보관할 최신 스냅샷 수. `0`이면 전부 보관 |
 | `auditRetentionDays` | 존마다 보관할 감사 이력 일수. `0`이면 전부 보관 |
 | `fallbackResolver` | 클라이언트 측 리졸버 오버라이드가 가리킬 주소 |
+| `dnsHealthChecksEnabled` | 내부 헬스체크가 보호하는 주소를 프로브. 기본값 `false` |
+| `dnsHealthCheckAllowCidrs` | 프로브가 접속해도 되는 네트워크. 기본값은 빈 목록이고, 아무 데도 허용하지 않음 |
+| `dnsHealthCheckAllowPorts` | 프로브가 접속해도 되는 포트. 기본값은 빈 목록이고, 아무 포트도 허용하지 않음 |
 
 </details>
 
@@ -353,7 +357,7 @@ Cloudflare 코멘트는 100자로 제한되는데, 호출자가 이미 아는 �
 
 ## 명령줄
 
-49개 명령. 어느 것에든 `--json`을 붙이면 기계가 읽는 출력이 나오고,
+53개 명령. 어느 것에든 `--json`을 붙이면 기계가 읽는 출력이 나오고,
 `parallax help <command>`로 옵션을 봅니다.
 
 <details open>
@@ -421,6 +425,23 @@ Cloudflare의 로컬 도메인 fallback 목록을, 프로필이 이미 쥔 자�
 </details>
 
 <details>
+<summary><b>내부 헬스체크</b></summary>
+
+| 명령 | |
+|---|---|
+| `health check list` | 존의 내부 뷰에 걸린 정책 |
+| `health check set` · `health check delete` | 내부 A·AAAA RRset 하나당 정책 하나, 각각 새 리비전 |
+| `health check status` | 정책마다 **이 프로세스가** 각 주소를 어떻게 판정하는지 |
+
+```bash
+pnpm cli health check set --zone example.com \
+  --policy '{"name":"app","type":"A","enabled":true,"probe":{"kind":"tcp","port":443}}'
+pnpm cli health check status --zone example.com
+```
+
+</details>
+
+<details>
 <summary><b>운영</b></summary>
 
 | 명령 | |
@@ -453,7 +474,7 @@ DATABASE_URL=postgres://… parallax restore < parallax-backup.json
 
 ## HTTP API
 
-**40개 경로.** 프로세스가 자기 명령 표에서 생성하는 OpenAPI 3.1 문서가
+**43개 경로.** 프로세스가 자기 명령 표에서 생성하는 OpenAPI 3.1 문서가
 기술합니다 — 그래서 기술과 동작이 갈라질 수 없습니다.
 
 ```http
@@ -473,6 +494,7 @@ GET /api/v1/openapi.json
 | **관리** | `GET PUT /settings` · `GET POST /tokens` · `DELETE /tokens/{id}` |
 | **자격 증명** | `GET /credentials/profiles` · `GET PUT DELETE /credentials/profiles/{name}` · `POST …/test`<br/>`GET /credentials/cloudflare` · `GET PUT DELETE /credentials/cloudflare/{zone}` · `POST …/test` |
 | **Fallback** | `GET /fallback/{profile}` · `…/coverage` · `…/preview` · `POST …/sync` · `PUT DELETE …/domains/{suffix}` |
+| **헬스체크** | `GET /zones/{zone}/views/internal/health-checks` · `PUT DELETE …/health-checks/{name}/{type}`<br/>`GET /zones/{zone}/health-check-status` |
 | **메타** | `POST /cli` · `GET /openapi.json` · `POST DELETE /session` |
 | **프로브** | `GET /health/live` · `GET /health/ready` · `GET /metrics` |
 
@@ -543,6 +565,9 @@ parallax_ready                                  readiness 를 통과할 상태�
 parallax_desired_state_age_seconds              목표 상태를 마지막으로 읽은 뒤 경과
 parallax_desired_state_max_age_seconds          readiness 가 실패하기까지 허용되는 낡음
 parallax_dns_served_zones                       리스너가 답하는 존의 수
+parallax_dns_health_healthy_targets             이 프로세스가 내주는 보호 주소
+parallax_dns_health_unhealthy_targets           프로브가 실패해 뺀 보호 주소
+parallax_dns_health_unknown_targets             최신 결과가 없는 보호 주소
 parallax_access_token_cache_ready               캐시된 토큰으로 인증할 수 있으면 1
 parallax_access_token_cache_age_seconds         그 캐시를 마지막으로 갱신한 뒤 경과
 parallax_dns_zones_skipped_total                내부 뷰를 구성할 수 없어 제외된 존
@@ -550,10 +575,54 @@ parallax_dns_unservable_records_total           와이어에 닿았으나 쓸 �
 parallax_dns_unanswerable_replies_total         답할 수 없던 질의
 parallax_dns_notify_failures_total              실패한 NOTIFY 발송
 parallax_dns_forward_failures_total             업스트림 순번·사유별 DNS 포워딩 실패
+parallax_dns_health_probes_total                결과별 헬스 프로브
+parallax_dns_health_transitions_total           들어간 상태별 헬스 상태 변화
+parallax_dns_health_servfail_total              자격 있는 주소가 없어 거부한 보호 답
 parallax_refresh_failures_total                 서브시스템별 백그라운드 갱신 실패
 parallax_postgres_connection_errors_total       상태(idle, checked_out)·코드별로 실패한 풀 연결
 parallax_tls_certificate_reload_failures_total  실패한 인증서 재적재
 ```
+
+### 내부 헬스체크
+
+정책 하나는 존 **내부** 뷰의 A 또는 AAAA RRset 하나를 보호합니다. 그러면 내부
+리스너가 그 RRset을 프로브가 통과한 주소만으로 답합니다. 외부 뷰, 모든
+프로바이더, `preview`와 `apply`는 영향을 받지 않습니다. 헬스 상태는 어디에도
+발행되지 않습니다.
+
+- **두 가지를 설정하기 전에는 꺼져 있습니다.** `dnsHealthChecksEnabled`가 프로브를
+  켜고, 주소는 `dnsHealthCheckAllowCidrs` 안에 있고 포트가
+  `dnsHealthCheckAllowPorts`에 있을 때만 프로브합니다. 루프백, 링크 로컬,
+  멀티캐스트, 변환 대역(IPv4 호환, SIIT, NAT64, Teredo, 6to4), 알려진 클라우드
+  메타데이터 주소와 그 밖의 예약 대역은 목록과 상관없이 거부합니다.
+  프로브는 주소 자체에 접속하고, 이름을 해석하지 않습니다.
+- **fail closed입니다.** 켜진 정책의 RRset에 건강한 주소가 하나도 없으면 — 프로브가
+  꺼졌거나, 주소가 허용 목록 밖이거나, 최신 성공이 없으면 — 모든 주소가 아니라
+  `SERVFAIL`로 답합니다. 정책은 `enabled: true`일 때만 켜집니다. `enabled`를
+  빼거나 `false`로 두면 정책은 남고 RRset을 전부 답합니다.
+- **주기.** 지터를 섞어 10초마다, 프로브당 2초 기한, 결과는 30초 뒤 낡습니다.
+  실패한 적 없는 주소는 첫 성공에서 건강으로 봅니다. 실패한 적 있는 주소는 연달아 두 번
+  성공해야 돌아옵니다. 건강한 주소가 연달아 세 번 실패하면 비정상입니다. 동시에 최대
+  16개를 돌립니다.
+- **TTL.** 걸러진 답은 `responseTtlSeconds`(5–60, 기본값 30)를 쓰고, RRset에서 가장
+  작은 TTL보다 크면 그 값으로 낮춥니다.
+- **한도.** 존당 정책 64개, 프로세스당 프로브 주소 64개. 한도를 넘은 주소는
+  `over_limit`로 보고하고 답에 넣지 않습니다.
+- **전송이 멈춥니다.** 존에 켜진 정책이 있는 동안 AXFR·IXFR은 거부하고
+  세컨더리에 NOTIFY를 보내지 않습니다. 세컨더리는 모든 주소를 답하기
+  때문입니다. 세컨더리는 이미 가진 사본을 계속 씁니다.
+- **HTTPS 프로브**는 RRset 이름으로 인증서를 검증합니다. 사설 CA는
+  `NODE_EXTRA_CA_CERTS`로 Node에 넘깁니다.
+- **상태는 프로세스마다 따로입니다.** 레플리카마다 자기 자리에서 프로브하고
+  저장소에는 아무것도 남기지 않습니다. 로드 밸런서 뒤에서는 두 요청이 서로 다른
+  판정을 볼 수 있습니다.
+
+정책은 목표 상태의 내부 뷰에 들어 있습니다. 그래서 리비전, 복원, `backup`과
+`restore`가 정책도 함께 옮기고, 테이블이나 마이그레이션은 늘지 않습니다. 저장된
+뷰에 정책이 있는데 `healthChecks`를 빼고 보낸 `PUT /zones/{zone}` 전체 교체는
+`409`로 거부합니다. 헬스체크를 모르는 이전 작성기가 정책을 조용히 지우지 못하게
+하기 위해서입니다. 정책이 있는 저장소에 그런 작성기를 돌리지 마세요. 이 릴리스
+이전으로 되돌리려면 먼저 정책을 지워야 합니다.
 
 ### 배포
 
