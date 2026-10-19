@@ -98,8 +98,10 @@ async function listen(options: NodeHandlerOptions): Promise<Server> {
   const handler = createNodeHandler({ controlPlane: new ControlPlane(adapters.zones, adapters.statuses, adapters.provider) }, security, options);
   const server = createServer((incoming, response) => {
     handler(incoming, response).catch((error: unknown) => {
+      // The failure goes to the test log, not to the client.
+      console.error(error);
       response.statusCode = 500;
-      response.end(String(error));
+      response.end("internal error");
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
