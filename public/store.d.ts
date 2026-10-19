@@ -74,6 +74,8 @@ export interface HealthCheckPolicyValue {
   enabled: boolean;
   probe: { kind: string; port: number; path?: string };
   responseTtlSeconds: number;
+  /** `servfail` or `answer-all`. Absent means `servfail`; the server stores only `answer-all`. */
+  whenNoneHealthy?: string;
 }
 
 /** One address of a protected RRset, as this process judges it. */

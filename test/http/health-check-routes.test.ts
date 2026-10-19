@@ -110,6 +110,39 @@ describe("health check routes", () => {
     assert.equal(missing.status, 400, "no RRset to protect");
   });
 
+  it("stores answer-all through the API, leaves the default out, and refuses a value it does not know", async () => {
+    const { handler } = await setup();
+    const put = await handler(request(`${BASE}/app/A`, "PUT", { enabled: true, probe: tcp, whenNoneHealthy: "answer-all" }));
+    assert.equal(put.status, 200);
+    const saved = await put.json() as { healthCheck: Record<string, unknown> };
+    assert.deepEqual(saved.healthCheck, { name: "app", type: "A", enabled: true, probe: tcp, responseTtlSeconds: 30, whenNoneHealthy: "answer-all" });
+    const listed = await (await handler(request(BASE))).json() as { healthChecks: Record<string, unknown>[] };
+    assert.equal(listed.healthChecks[0]?.whenNoneHealthy, "answer-all");
+
+    const back = await handler(request(`${BASE}/app/A`, "PUT", { enabled: true, probe: tcp, whenNoneHealthy: "servfail" }));
+    assert.equal(back.status, 200);
+    assert.equal("whenNoneHealthy" in (await back.json() as { healthCheck: Record<string, unknown> }).healthCheck, false);
+
+    const invalid = await handler(request(`${BASE}/app/A`, "PUT", { enabled: true, probe: tcp, whenNoneHealthy: "fail-open" }));
+    assert.equal(invalid.status, 400);
+    assert.ok(JSON.stringify(await invalid.json()).includes("whenNoneHealthy must be servfail or answer-all"));
+  });
+
+  it("keeps a policy write an editor's, answer-all or not", async () => {
+    const { handler } = await setup();
+    const gated = createAuthorizedHandler({
+      enabled: true,
+      tokens: [
+        { token: "viewer-secret-0000000000000000000", role: "viewer", subject: "read-only" },
+        { token: "editor-secret-0000000000000000000", role: "editor", subject: "operator" },
+      ],
+    }, handler);
+    const body = { enabled: true, probe: tcp, whenNoneHealthy: "answer-all" };
+    const as = (token: string) => request(`${BASE}/app/A`, "PUT", body, { authorization: `Bearer ${token}` });
+    assert.equal((await gated(as("viewer-secret-0000000000000000000"))).status, 403);
+    assert.equal((await gated(as("editor-secret-0000000000000000000"))).status, 200);
+  });
+
   it("has no health-check routes on any view but the internal one", async () => {
     const { handler } = await setup();
     const response = await handler(request("/api/v1/zones/example.com/views/external/health-checks"));
@@ -164,6 +197,31 @@ describe("health check routes", () => {
     const viaCli = await runCommand({ runtime: { controlPlane: service, healthMonitor: monitor, settings }, actor: "test", role: "viewer" },
       "health check status", { zone: "example.com" }) as typeof status;
     assert.deepEqual(viaCli.healthChecks.map((policy) => policy.answer), ["full", "filtered"]);
+    await monitor.close();
+  });
+
+  it("reports an answer-all policy with nothing healthy as answering every address", async () => {
+    const { service } = await setup();
+    await service.setHealthCheck("example.com", { name: "app", type: "A", enabled: true, probe: tcp, whenNoneHealthy: "answer-all" });
+    // Probing is on and the address is tracked, but no probe has finished.
+    const monitor = createHealthMonitor({
+      transport: { probe: async () => ({ ok: false, category: "connection" }) },
+      now: () => 0,
+      random: () => 0,
+      timers: { setTimeout: () => 1, clearTimeout: () => undefined },
+    });
+    const enabled = { ...DEFAULT_SETTINGS, dnsHealthChecksEnabled: true, dnsHealthCheckAllowCidrs: ["10.0.0.0/24"], dnsHealthCheckAllowPorts: [443] };
+    monitor.update(servedZones([await service.getZone("example.com")]));
+    monitor.configure(enabled);
+    const settings = { current: () => enabled } as unknown as SettingsService;
+    const served = createApiHandler({ controlPlane: service, healthMonitor: monitor, settings });
+    const status = await (await served(request("/api/v1/zones/example.com/health-check-status"))).json() as {
+      healthChecks: { name: string; answer: string; whenNoneHealthy?: string; targets?: { status: string }[] }[];
+    };
+    const app = status.healthChecks.find((policy) => policy.name === "app");
+    assert.equal(app?.answer, "all");
+    assert.equal(app?.whenNoneHealthy, "answer-all");
+    assert.deepEqual(app?.targets?.map((target) => target.status), ["unknown"]);
     await monitor.close();
   });
 });

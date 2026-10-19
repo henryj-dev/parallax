@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ControlPlane, NotFoundError } from "../../src/application/control-plane.ts";
 import { findCommand, listCommands, runCommand, satisfiesRole } from "../../src/cli/commands.ts";
+import { HEALTH_NONE_HEALTHY_ACTIONS } from "../../src/domain/health-checks.ts";
 import { createApiHandler, resolveRoute } from "../../src/http/api.ts";
 import { buildOpenApiDocument, listOperations, minimumRole, type DocumentedOperation } from "../../src/http/openapi.ts";
 import { createInMemoryAdapters } from "../../src/infrastructure/in-memory.ts";
@@ -237,6 +238,19 @@ describe("the document is a document a generator can read", () => {
     assert.equal(saved.healthCheck.enabled, false, "a policy that leaves enabled out is stored off");
     const listed = await runCommand(parallax, "health check list", { zone: "example.com" }) as { healthChecks: { enabled: boolean }[] };
     assert.deepEqual(listed.healthChecks.map((policy) => policy.enabled), [false]);
+  });
+
+  it("describes whenNoneHealthy as the domain reads it, and the answer it can produce", () => {
+    type Property = { enum?: string[]; default?: unknown; description?: string };
+    const schemas = (document.components as { schemas: Record<string, { properties?: Record<string, Property> }> }).schemas;
+    const field = schemas.HealthCheckPolicy?.properties?.whenNoneHealthy;
+    assert.deepEqual(field?.enum, [...HEALTH_NONE_HEALTHY_ACTIONS]);
+    assert.equal(field?.default, "servfail");
+    assert.match(field?.description ?? "", /still answers SERVFAIL/u);
+    const status = JSON.stringify(schemas.HealthCheckStatus);
+    assert.ok(status.includes('"enum":["full","filtered","all","servfail","unknown"]'), "the status answer lists `all`");
+    const options = findCommand("health check set")?.options.map((option) => option.name);
+    assert.ok(options?.includes("whenNoneHealthy"));
   });
 
   it("takes its enumerations from the domain rather than listing them again", () => {

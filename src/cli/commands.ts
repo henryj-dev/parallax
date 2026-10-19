@@ -309,6 +309,15 @@ async function healthCheckStatus(context: CommandContext, zoneName: string): Pro
   };
 }
 
+/**
+ * The policy with `--whenNoneHealthy` laid over it. A policy that is not an
+ * object is passed on untouched, so the domain refuses it with its own message.
+ */
+function withNoneHealthy(policy: unknown, whenNoneHealthy: unknown): unknown {
+  if (whenNoneHealthy === undefined || policy === null || typeof policy !== "object" || Array.isArray(policy)) return policy;
+  return { ...policy, whenNoneHealthy };
+}
+
 const ZONE = { name: "zone", summary: "Apex domain", required: true } as const;
 const VIEW = { name: "view", summary: "internal or external" } as const;
 const EXPECTED = { name: "expectedRevision", summary: "Fail unless the zone is at this revision", type: "number" } as const;
@@ -524,14 +533,18 @@ const COMMANDS: readonly Command[] = [
       ZONE,
       {
         name: "policy",
-        summary: "{name,type,enabled,probe:{kind,port,path},responseTtlSeconds} as JSON; enabled is false unless set to true",
+        summary: "{name,type,enabled,probe:{kind,port,path},responseTtlSeconds,whenNoneHealthy} as JSON; enabled is false unless set to true",
         type: "json",
         required: true,
+      },
+      {
+        name: "whenNoneHealthy",
+        summary: "servfail (default) or answer-all, which answers every address when none is healthy; overrides the policy's own field",
       },
       EXPECTED,
     ],
     run: ({ runtime, actor }, input) => requireControlPlane(runtime).setHealthCheck(
-      String(input.zone), input.policy, actor, expectedRevisionOf(input),
+      String(input.zone), withNoneHealthy(input.policy, input.whenNoneHealthy), actor, expectedRevisionOf(input),
     ),
   },
   {

@@ -3,7 +3,7 @@ import { createSocket } from "node:dgram";
 import { connect, type AddressInfo } from "node:net";
 import { afterEach, describe, it } from "node:test";
 import { ControlPlane } from "../../src/application/control-plane.ts";
-import type { ServedHealthCheck } from "../../src/dns/health/targets.ts";
+import type { HealthJudgement, ServedHealthCheck } from "../../src/dns/health/targets.ts";
 import { createDnsServer, type ServedZone } from "../../src/dns/server.ts";
 import { servedZones } from "../../src/dns/snapshot.ts";
 import { RCODE, TYPE, readName } from "../../src/dns/wire.ts";
@@ -96,6 +96,11 @@ function servfails(): number {
   return match ? Number(match[1]) : 0;
 }
 
+function failOpens(): number {
+  const match = /^parallax_dns_health_fail_open_total (\d+)$/mu.exec(renderMetrics());
+  return match ? Number(match[1]) : 0;
+}
+
 const APP: ServedHealthCheck = {
   name: "app.example.com",
   type: "A",
@@ -118,8 +123,9 @@ const ZONE: ServedZone = {
   healthChecks: [APP],
 };
 
-/** A verdict that trusts exactly the listed addresses. */
-const only = (...healthy: string[]) => () => (_zone: string, _check: ServedHealthCheck, address: string) => healthy.includes(address);
+/** A verdict that trusts exactly the listed addresses and has probed, without success, the rest. */
+const only = (...healthy: string[]) => () => (_zone: string, _check: ServedHealthCheck, address: string): HealthJudgement =>
+  healthy.includes(address) ? "healthy" : "unconfirmed";
 
 describe("DNS listener with health checks", () => {
   const closers: (() => Promise<void>)[] = [];
@@ -199,6 +205,78 @@ describe("DNS listener with health checks", () => {
     assert.equal(rcodeOf(await ask(blocked.port, buildQuery("alias.example.com"))), RCODE.SERVFAIL);
     // The CNAME itself was asked for: nothing is chased, nothing is judged.
     assert.equal(rcodeOf(await ask(blocked.port, buildQuery("alias.example.com", TYPE.CNAME))), RCODE.NOERROR);
+  });
+
+  it("answers every address at the check's TTL when none is healthy and the check says answer-all", async () => {
+    const failOpen: ServedZone = { ...ZONE, healthChecks: [{ ...APP, whenNoneHealthy: "answer-all" }] };
+    const servfailsBefore = servfails();
+    const failOpensBefore = failOpens();
+    // Failing, stale and not-yet-probed all reach the verdict as `unconfirmed`;
+    // the monitor's own tests pin which state maps to which judgement.
+    const { port } = await start({ zones: () => [failOpen], health: only() });
+    const reply = await ask(port, buildQuery("app.example.com"));
+    assert.equal(rcodeOf(reply), RCODE.NOERROR);
+    assert.deepEqual(readAnswers(reply).map((answer) => [answer.data, answer.ttl]), [["10.0.0.11", 15], ["10.0.0.12", 15]]);
+    assert.equal(failOpens(), failOpensBefore + 1, "counted as a fail-open answer");
+    assert.equal(servfails(), servfailsBefore, "and not as a SERVFAIL");
+
+    // ANY and a CNAME chase fail open the same way, one count per RRset answered.
+    const any = readAnswers(await ask(port, buildQuery("app.example.com", TYPE.ANY)));
+    assert.deepEqual(any.filter((answer) => answer.type === TYPE.A).map((answer) => answer.data), ["10.0.0.11", "10.0.0.12"]);
+    const chased = readAnswers(await ask(port, buildQuery("alias.example.com")));
+    assert.deepEqual(chased.map((answer) => [answer.type, answer.data]), [
+      [TYPE.CNAME, chased[0]?.data],
+      [TYPE.A, "10.0.0.11"],
+      [TYPE.A, "10.0.0.12"],
+    ]);
+    assert.equal(failOpens(), failOpensBefore + 3);
+  });
+
+  it("still answers only the healthy addresses under answer-all when one is healthy", async () => {
+    const failOpen: ServedZone = { ...ZONE, healthChecks: [{ ...APP, whenNoneHealthy: "answer-all" }] };
+    const before = failOpens();
+    const { port } = await start({ zones: () => [failOpen], health: only("10.0.0.12") });
+    const reply = await ask(port, buildQuery("app.example.com"));
+    assert.deepEqual(readAnswers(reply).map((answer) => [answer.data, answer.ttl]), [["10.0.0.12", 15]]);
+    assert.equal(failOpens(), before, "a filtered answer is not a fail-open one");
+  });
+
+  it("keeps SERVFAIL under answer-all for configuration nobody is observing", async () => {
+    const failOpen: ServedZone = { ...ZONE, healthChecks: [{ ...APP, whenNoneHealthy: "answer-all" }] };
+    const servfailsBefore = servfails();
+    const failOpensBefore = failOpens();
+
+    // One address is not being probed at all -- off, outside the allow-list or
+    // past the limit -- and the other has no fresh success.
+    const mixed = await start({
+      zones: () => [failOpen],
+      health: () => (_zone, _check, address) => address === "10.0.0.11" ? "unprobeable" : "unconfirmed",
+    });
+    assert.equal(rcodeOf(await ask(mixed.port, buildQuery("app.example.com"))), RCODE.SERVFAIL);
+    const off = await start({ zones: () => [failOpen], health: () => () => "unprobeable" });
+    assert.equal(rcodeOf(await ask(off.port, buildQuery("app.example.com"))), RCODE.SERVFAIL);
+    // No monitor wired at all.
+    const unwired = await start({ zones: () => [failOpen] });
+    assert.equal(rcodeOf(await ask(unwired.port, buildQuery("app.example.com"))), RCODE.SERVFAIL);
+    // A policy with an issue, even though the verdict would fail open.
+    const broken: ServedZone = { ...ZONE, healthChecks: [{ ...APP, whenNoneHealthy: "answer-all", addresses: [], issue: "no A record to protect" }] };
+    const issue = await start({ zones: () => [broken], health: only() });
+    assert.equal(rcodeOf(await ask(issue.port, buildQuery("app.example.com"))), RCODE.SERVFAIL);
+    // A protected RRset the snapshot no longer holds.
+    const gone: ServedZone = { ...ZONE, records: ZONE.records.filter((record) => record.type !== "A"), healthChecks: [{ ...APP, whenNoneHealthy: "answer-all" }] };
+    const missing = await start({ zones: () => [gone], health: only() });
+    assert.equal(rcodeOf(await ask(missing.port, buildQuery("app.example.com"))), RCODE.SERVFAIL);
+
+    assert.equal(servfails(), servfailsBefore + 5);
+    assert.equal(failOpens(), failOpensBefore);
+  });
+
+  it("refuses transfers of a zone whose check says answer-all, as of any other", async () => {
+    const failOpen: ServedZone = { ...ZONE, healthChecks: [{ ...APP, whenNoneHealthy: "answer-all" }] };
+    const { port } = await start({ zones: () => [failOpen], transferAllow: ["127.0.0.0/8"], health: only() });
+    assert.equal(rcodeOf(await askOverTcp(port, buildQuery("example.com", TYPE.AXFR))), RCODE.REFUSED);
+    assert.equal(rcodeOf(await askOverTcp(port, buildQuery("example.com", TYPE.IXFR))), RCODE.REFUSED);
+    assert.equal(rcodeOf(await ask(port, buildQuery("example.com", TYPE.IXFR))), RCODE.REFUSED);
   });
 
   it("refuses to transfer a zone holding health checks, even to an allowed client", async () => {
@@ -382,6 +460,17 @@ describe("served zones with health checks", () => {
     await service.setHealthCheck("example.com", { name: "app", type: "A", enabled: false, probe: { kind: "tcp", port: 443 } });
     const [disabled] = servedZones([await service.getZone("example.com")]);
     assert.equal(disabled && "healthChecks" in disabled, false);
+  });
+
+  it("carries answer-all to the listener, and nothing when the policy keeps the default", async () => {
+    const service = await stored();
+    await service.setHealthCheck("example.com", { name: "app", type: "A", enabled: true, probe: { kind: "tcp", port: 443 } });
+    const [plain] = servedZones([await service.getZone("example.com")]);
+    assert.equal(plain?.healthChecks?.[0] && "whenNoneHealthy" in plain.healthChecks[0], false);
+
+    await service.setHealthCheck("example.com", { name: "app", type: "A", enabled: true, probe: { kind: "tcp", port: 443 }, whenNoneHealthy: "answer-all" });
+    const [failOpen] = servedZones([await service.getZone("example.com")]);
+    assert.equal(failOpen?.healthChecks?.[0]?.whenNoneHealthy, "answer-all");
   });
 
   it("keeps a policy that no longer resolves, with its issue, rather than answering the full RRset", async () => {

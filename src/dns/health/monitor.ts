@@ -10,7 +10,14 @@ import {
   type EffectiveStatus,
   type ProbeState,
 } from "./state.ts";
-import { healthTargetKey, healthTargetsOf, type HealthTarget, type HealthVerdict, type ServedHealthCheck } from "./targets.ts";
+import {
+  healthTargetKey,
+  healthTargetsOf,
+  type HealthJudgement,
+  type HealthTarget,
+  type HealthVerdict,
+  type ServedHealthCheck,
+} from "./targets.ts";
 import type { ProbeFailure, ProbeResult, ProbeTransport } from "./transport.ts";
 
 /**
@@ -24,10 +31,14 @@ import type { ProbeFailure, ProbeResult, ProbeTransport } from "./transport.ts";
  * The answer to "may this address be given out" is no unless this process has
  * a fresh success for it. Off, blocked, over the limit, not yet probed, stale
  * -- every state but healthy fails closed, and the listener answers SERVFAIL
- * when no address of an RRset is left.
+ * when no address of an RRset is left. A policy set to `answer-all` is the one
+ * exception, and only for the observed states -- unhealthy, stale, unknown --
+ * never for an address nobody is probing.
  */
 
 export const HEALTH_PROBE_CONCURRENCY = 16;
+/** The statuses an `answer-all` policy may fail open on: probed, just not healthy. */
+const OBSERVED: ReadonlySet<TargetStatus> = new Set(["unhealthy", "stale", "unknown"]);
 /** Up to 10% of the interval, so replicas that started together drift apart. */
 const JITTER_FRACTION = 0.1;
 
@@ -60,8 +71,12 @@ export interface HealthCheckStatus {
   readonly type: "A" | "AAAA";
   readonly ttl: number;
   readonly issue?: string;
-  /** `filtered` answers the healthy addresses; `servfail` answers nothing. */
-  readonly answer: "filtered" | "servfail";
+  /**
+   * `filtered` answers the healthy addresses; `all` answers every address
+   * because none is healthy and the policy says `answer-all`; `servfail`
+   * answers nothing.
+   */
+  readonly answer: "filtered" | "all" | "servfail";
   readonly healthyAddresses: number;
   readonly targets: readonly HealthTargetStatus[];
 }
@@ -113,7 +128,7 @@ export interface HealthMonitorOptions {
   readonly maxTargets?: number;
 }
 
-export type { HealthVerdict };
+export type { HealthJudgement, HealthVerdict };
 
 export interface HealthMonitor {
   /** Replaces the zones to watch. Targets whose fingerprint is unchanged keep their state. */
@@ -378,9 +393,16 @@ export function createHealthMonitor(options: HealthMonitorOptions): HealthMonito
 
     verdict() {
       const at = now();
-      return (zone, check, address) => {
+      return (zone, check, address): HealthJudgement => {
         const entry = entries.get(healthTargetKey(zone, check, address));
-        return entry !== undefined && eligible(entry) && effectiveStatus(entry.state, at, freshnessMs) === "healthy";
+        // Not tracked: nothing has looked at this address, not even the
+        // allow-list. `update` runs in the same tick as the snapshot, so this
+        // should not happen; if it ever does, an address nobody has judged is
+        // not one to hand out under answer-all. A tracked target that has not
+        // finished its first probe is "unconfirmed" below.
+        if (entry === undefined) return "unprobeable";
+        if (!eligible(entry)) return "unprobeable";
+        return effectiveStatus(entry.state, at, freshnessMs) === "healthy" ? "healthy" : "unconfirmed";
       };
     },
 
@@ -405,12 +427,14 @@ export function createHealthMonitor(options: HealthMonitorOptions): HealthMonito
             };
           });
           const healthyAddresses = targets.filter((target) => target.status === "healthy").length;
+          const failsOpen = check.whenNoneHealthy === "answer-all" && !check.issue && targets.length > 0
+            && targets.every((target) => OBSERVED.has(target.status));
           return {
             name: check.name,
             type: check.type,
             ttl: check.ttl,
             ...(check.issue ? { issue: check.issue } : {}),
-            answer: healthyAddresses > 0 ? "filtered" : "servfail",
+            answer: healthyAddresses > 0 ? "filtered" : failsOpen ? "all" : "servfail",
             healthyAddresses,
             targets,
           };

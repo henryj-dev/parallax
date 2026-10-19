@@ -249,3 +249,44 @@ describe("command line parsing", () => {
     assert.match(usage("record set"), /--record \(required\)/);
   });
 });
+
+describe("health check set --whenNoneHealthy", () => {
+  async function zoneWithApp() {
+    const adapters = createInMemoryAdapters();
+    const controlPlane = new ControlPlane(adapters.zones, adapters.statuses, adapters.provider, undefined, undefined, {},
+      (target) => target.endsWith("/internal") ? "listener" : "provider");
+    const context = { runtime: { controlPlane }, actor: "test", role: "editor" as const };
+    await controlPlane.createZone("example.com");
+    await controlPlane.upsertRecord("example.com", "internal", "app", { name: "app", type: "A", content: "10.0.0.11", ttl: 300 });
+    return context;
+  }
+
+  it("lays the flag over the policy, and leaves the policy's own field alone without it", async () => {
+    const context = await zoneWithApp();
+    const policy = '{"name":"app","type":"A","enabled":true,"probe":{"kind":"tcp","port":443}}';
+    const flagged = parseInvocation(["health", "check", "set", "--zone", "example.com", "--whenNoneHealthy", "answer-all", "--policy", policy]);
+    const saved = await runCommand(context, flagged.name, flagged.input) as { healthCheck: { whenNoneHealthy?: string } };
+    assert.equal(saved.healthCheck.whenNoneHealthy, "answer-all");
+
+    // The flag wins over the field, so `--whenNoneHealthy servfail` turns it back off.
+    const inline = '{"name":"app","type":"A","enabled":true,"probe":{"kind":"tcp","port":443},"whenNoneHealthy":"answer-all"}';
+    const off = parseInvocation(["health", "check", "set", "--zone", "example.com", "--whenNoneHealthy", "servfail", "--policy", inline]);
+    const reset = await runCommand(context, off.name, off.input) as { healthCheck: Record<string, unknown> };
+    assert.equal("whenNoneHealthy" in reset.healthCheck, false);
+
+    const kept = parseInvocation(["health", "check", "set", "--zone", "example.com", "--policy", inline]);
+    assert.equal((await runCommand(context, kept.name, kept.input) as { healthCheck: { whenNoneHealthy?: string } }).healthCheck.whenNoneHealthy, "answer-all");
+  });
+
+  it("refuses a value it does not know, a bare flag, and a viewer", async () => {
+    const context = await zoneWithApp();
+    const policy = { name: "app", type: "A", enabled: true, probe: { kind: "tcp", port: 443 } };
+    await assert.rejects(runCommand(context, "health check set", { zone: "example.com", policy, whenNoneHealthy: "open" }),
+      /whenNoneHealthy must be servfail or answer-all/u);
+    const bare = parseInvocation(["health", "check", "set", "--zone", "example.com", "--whenNoneHealthy"]);
+    await assert.rejects(runCommand(context, bare.name, { ...bare.input, policy }), /whenNoneHealthy/u);
+    await assert.rejects(runCommand({ ...context, role: "viewer" }, "health check set", { zone: "example.com", policy, whenNoneHealthy: "answer-all" }),
+      CommandPermissionError);
+    assert.match(usage("health check set"), /--whenNoneHealthy/u);
+  });
+});

@@ -396,7 +396,7 @@ function renderHistory(state) {
 const HEALTH_TARGET_STATES = ["healthy", "unhealthy", "unknown", "stale", "disabled", "blocked", "unsupported_target", "over_limit"];
 const HEALTH_FAILURES = ["timeout", "connection", "tls", "http-status", "blocked"];
 // The chip colours the sync panel already uses, read for what each answer means.
-const HEALTH_ANSWER_CHIPS = { filtered: "applied", full: "unpublished", servfail: "failed", unknown: "pending" };
+const HEALTH_ANSWER_CHIPS = { filtered: "applied", full: "unpublished", all: "pending", servfail: "failed", unknown: "pending" };
 const healthKey = (policy) => `${String(policy.name).toLowerCase()}/${String(policy.type).toUpperCase()}`;
 
 /**
@@ -453,7 +453,7 @@ function healthCheckItem(policy, verdict, index, canEdit) {
     : "";
   return `<article class="health-item">
     <header><b>${escapeHtml(displayName(policy.name))}</b><span class="health-type">${escapeHtml(policy.type)}</span><span class="status-chip ${HEALTH_ANSWER_CHIPS[answer]}">${escapeHtml(t(`health.answer.${answer}`))}</span></header>
-    <small>${escapeHtml(probeLabel)} · ${escapeHtml(t("health.ttl", { seconds: policy.responseTtlSeconds }))}</small>
+    <small>${escapeHtml(probeLabel)} · ${escapeHtml(t("health.ttl", { seconds: policy.responseTtlSeconds }))}${policy.whenNoneHealthy === "answer-all" ? ` · ${escapeHtml(t("health.failsOpen"))}` : ""}</small>
     <small>${escapeHtml([counts, checked].filter(Boolean).join(" · "))}</small>
     ${verdict?.issue ? `<p class="health-issue">${escapeHtml(verdict.issue)}</p>` : ""}
     ${rows ? `<ul class="health-targets">${rows}</ul>` : ""}
@@ -641,6 +641,7 @@ function openHealthDialog(index = null) {
     form.elements.port.value = String(policy.probe?.port ?? "");
     form.elements.path.value = policy.probe?.path ?? "";
     form.elements.responseTtlSeconds.value = String(policy.responseTtlSeconds ?? 30);
+    form.elements.whenNoneHealthy.value = policy.whenNoneHealthy === "answer-all" ? "answer-all" : "servfail";
   }
   $("#health-dialog-title").textContent = t(policy ? "healthDialog.edit" : "healthDialog.add");
   syncHealthProbeFields();
@@ -664,6 +665,7 @@ function readHealthForm(form) {
     enabled: form.elements.enabled.checked,
     probe: kind === "tcp" ? { kind, port } : { kind, port, ...(path ? { path } : {}) },
     responseTtlSeconds: Number(form.elements.responseTtlSeconds.value),
+    whenNoneHealthy: String(form.elements.whenNoneHealthy.value),
   };
 }
 

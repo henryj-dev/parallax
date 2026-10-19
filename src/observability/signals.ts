@@ -167,6 +167,16 @@ export const dnsHealthServfail = counter(
   "Queries the DNS listener answered SERVFAIL because no protected address was healthy.",
 );
 
+/**
+ * Protected RRsets answered with every address because none was healthy and
+ * the policy says `answer-all`. Apart from the SERVFAIL count: a rising count
+ * here is a name still answered while nothing vouches for it.
+ */
+export const dnsHealthFailOpen = counter(
+  "parallax_dns_health_fail_open_total",
+  "Protected RRsets the DNS listener answered in full because no address was healthy and the policy says answer-all.",
+);
+
 /** Answers the API sent, by status. A bounded set: this code chooses them all. */
 export const httpAnswered = counter(
   "parallax_http_responses_total",

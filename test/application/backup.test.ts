@@ -122,7 +122,7 @@ async function contentsOf(stores: BackupStores) {
 }
 
 /** A store whose zones were written by the control plane, holding health checks. */
-async function storeWithHealthChecks(zone: string, addresses: number, enabled = true): Promise<BackupStores> {
+async function storeWithHealthChecks(zone: string, addresses: number, enabled = true, extra: Record<string, unknown> = {}): Promise<BackupStores> {
   const stores = memoryStores();
   const service = new ControlPlane(stores.zones, stores.statuses, createInMemoryAdapters().provider,
     { now: () => new Date("2026-08-08T00:00:00.000Z") }, undefined, {}, (target) => target.endsWith("/internal") ? "listener" : "provider");
@@ -131,7 +131,7 @@ async function storeWithHealthChecks(zone: string, addresses: number, enabled = 
     id: `app-${index}`, name: "app", type: "A", content: `10.0.${Math.floor(index / 250)}.${(index % 250) + 1}`, ttl: 300,
   }));
   await service.replaceDesiredState(zone, { views: [{ name: "external", records: [] }, { name: "internal", records }] });
-  await service.setHealthCheck(zone, { name: "app", type: "A", enabled, probe: { kind: "tcp", port: 443 } });
+  await service.setHealthCheck(zone, { name: "app", type: "A", enabled, probe: { kind: "tcp", port: 443 }, ...extra });
   return stores;
 }
 
@@ -165,6 +165,44 @@ describe("restoring health checks", () => {
     assert.equal(target.locked(), 1);
     const internal = (await target.stores.zones.get("example.com"))?.views.find((view) => view.name === "internal");
     assert.equal(internal?.healthChecks?.[0]?.enabled, true);
+  });
+
+  it("round-trips answer-all, and restores a policy without it as the default", async () => {
+    const document = await exportBackup(await storeWithHealthChecks("example.com", 2, true, { whenNoneHealthy: "answer-all" }));
+    const exported = document.zones[0]?.current.views.find((view) => view.name === "internal")?.healthChecks;
+    assert.equal(exported?.[0]?.whenNoneHealthy, "answer-all");
+    const target = guardedStores();
+    await importBackup(target.stores, document);
+    const internal = (await target.stores.zones.get("example.com"))?.views.find((view) => view.name === "internal");
+    assert.equal(internal?.healthChecks?.[0]?.whenNoneHealthy, "answer-all");
+
+    const plain = await exportBackup(await storeWithHealthChecks("example.net", 1));
+    assert.equal("whenNoneHealthy" in (plain.zones[0]?.current.views.find((view) => view.name === "internal")?.healthChecks?.[0] ?? {}), false,
+      "an export of a policy that never opted in is what it was before the field existed");
+    const other = guardedStores();
+    await importBackup(other.stores, plain);
+    const restored = (await other.stores.zones.get("example.net"))?.views.find((view) => view.name === "internal");
+    assert.equal(restored?.healthChecks?.[0]?.whenNoneHealthy, undefined);
+  });
+
+  it("refuses a backup whose whenNoneHealthy it does not know, before writing any", async () => {
+    const document = await exportBackup(await storeWithHealthChecks("example.com", 1));
+    const unknown = {
+      ...document,
+      zones: document.zones.map((zone) => ({
+        ...zone,
+        current: {
+          ...zone.current,
+          views: zone.current.views.map((view) => (view.healthChecks
+            ? { ...view, healthChecks: view.healthChecks.map((policy) => ({ ...policy, whenNoneHealthy: "open" as never })) }
+            : view)),
+        },
+      })),
+    };
+    const target = guardedStores();
+    await assert.rejects(importBackup(target.stores, unknown), (error: unknown) =>
+      error instanceof BackupError && error.message.includes("whenNoneHealthy"));
+    await assertNothingWritten(target.stores);
   });
 
   it("refuses zones whose enabled addresses together pass the limit, before writing any", async () => {

@@ -19,13 +19,33 @@ export interface ServedHealthCheck {
   /**
    * Why the policy cannot be honoured as written -- a missing RRset, a
    * provider-owned address. The answer fails closed: SERVFAIL for this RRset
-   * until somebody fixes the zone or the policy.
+   * until somebody fixes the zone or the policy, whatever `whenNoneHealthy`
+   * says.
    */
   readonly issue?: string;
+  /**
+   * `answer-all` answers every address when none is healthy, provided each of
+   * them is one this process is probing and simply has no fresh success.
+   * Absent means SERVFAIL.
+   */
+  readonly whenNoneHealthy?: "answer-all";
 }
 
-/** Whether one address of one served check may be given out right now. */
-export type HealthVerdict = (zone: string, check: ServedHealthCheck, address: string) => boolean;
+/**
+ * What this process may say about one address right now.
+ *
+ * - `healthy`: a fresh success; the address may be given out.
+ * - `unconfirmed`: probed, or about to be, with no fresh success -- failing,
+ *   stale, or not yet known. A policy set to `answer-all` may still hand it out
+ *   when nothing in the RRset is healthy.
+ * - `unprobeable`: nobody is looking -- probing is off, the address or port is
+ *   outside the allow-list, or the address is past the process limit. That is
+ *   configuration, not an observation, so it never fails open.
+ */
+export type HealthJudgement = "healthy" | "unconfirmed" | "unprobeable";
+
+/** The judgement on one address of one served check. */
+export type HealthVerdict = (zone: string, check: ServedHealthCheck, address: string) => HealthJudgement;
 
 /** One address one policy probes, and where it came from. */
 export interface HealthTarget {
