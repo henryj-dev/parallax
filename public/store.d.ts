@@ -200,3 +200,4 @@ export function isNonGlobalAddress(value: string): boolean;
 export const ERROR_SCOPES: readonly string[];
 export const HISTORY_PAGE_SIZE: number;
 export const REVISION_PAGE_SIZE: number;
+export const MAX_RECORD_ID_LENGTH: number;

@@ -4,7 +4,40 @@ import { describe, it } from "node:test";
 
 import { createApiClient } from "../../public/api-client.js";
 import { syncPanel } from "../../public/panels.js";
-import { adminControlsVisible, createStore, editorControlsVisible } from "../../public/store.js";
+import { MAX_RECORD_ID_LENGTH, adminControlsVisible, createStore, editorControlsVisible } from "../../public/store.js";
+
+describe("portal record id proposal", () => {
+  // The server's rule, src/domain/dns.ts.
+  const server = /^[a-z0-9][a-z0-9_-]{0,35}$/;
+  const store = () => createStore(createApiClient({ fetchImpl: async () => Response.json({}) }));
+
+  it("keeps a long fully qualified name inside the server's 36 characters", () => {
+    const id = store().proposeRecordId("dev-icn-vtr.barycenter.tinyuniver.se", "A");
+    assert.match(id, server);
+    assert.ok(id.length <= MAX_RECORD_ID_LENGTH);
+    assert.ok(id.endsWith("-a"), "the type survives the cut");
+  });
+
+  it("keeps a short name as it was", () => {
+    assert.equal(store().proposeRecordId("dev-icn-vtr.barycenter", "A"), "dev-icn-vtr-barycenter-a");
+    assert.equal(store().proposeRecordId("@", "MX"), "root-mx");
+  });
+
+  it("never starts with an underscore the server would refuse", () => {
+    assert.equal(store().proposeRecordId("_dmarc", "TXT"), "dmarc-txt");
+  });
+
+  it("numbers a taken id without going over the limit", () => {
+    const s = store();
+    const long = "a-very-long-service-name.with-a-subdomain.example.com";
+    const first = s.proposeRecordId(long, "CNAME");
+    s.getState().records = [{ id: first, views: { internal: { id: first }, external: { id: first } } }];
+    const second = s.proposeRecordId(long, "CNAME");
+    assert.notEqual(second, first);
+    assert.match(second, server);
+    assert.ok(second.endsWith("-2"));
+  });
+});
 
 describe("portal mapping", () => {
   it("sends If-Match from the loaded zone revision when adopting", async () => {

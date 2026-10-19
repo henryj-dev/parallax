@@ -24,6 +24,8 @@ import { effectiveExternalTtl } from "./ttl.js";
  */
 export const HISTORY_PAGE_SIZE = 50;
 export const REVISION_PAGE_SIZE = 50;
+/** The longest record id the server accepts. */
+export const MAX_RECORD_ID_LENGTH = 36;
 
 /** Scopes a view can surface an inline error against. */
 export const ERROR_SCOPES = ["zone", "record", "credential", "profile", "settings", "token", "auth", "fallback", "health"];
@@ -417,16 +419,21 @@ export function createStore(client) {
 
     /** A stable identifier for a new record that no existing one already uses. */
     proposeRecordId(name, type) {
+      // The server takes 1 to 36 of [a-z0-9_-], starting with a letter or digit
+      // (src/domain/dns.ts). A longer proposal is refused on save, so the name
+      // part is cut to leave room for the type, and a cut never ends on "-".
+      const fit = (text, length) => text.slice(0, length).replace(/[-_]+$/u, "");
+      const suffixType = String(type || "record").toLowerCase().replace(/[^a-z0-9_-]+/gu, "") || "record";
       const base = String(name || "record").toLowerCase()
-        .replace(/^@$/u, "root").replace(/[^a-z0-9_-]+/gu, "-").replace(/^-+|-+$/gu, "") || "record";
-      const candidate = `${base}-${String(type || "record").toLowerCase()}`.slice(0, 63);
+        .replace(/^@$/u, "root").replace(/[^a-z0-9_-]+/gu, "-").replace(/^[-_]+|[-_]+$/gu, "") || "record";
+      const candidate = `${fit(base, MAX_RECORD_ID_LENGTH - suffixType.length - 1) || "record"}-${suffixType}`;
       const used = new Set(state.records.flatMap((record) => [record.id, record.views.internal.id, record.views.external.id]));
       if (!used.has(candidate)) return candidate;
       for (let suffix = 2; suffix < 1000; suffix += 1) {
-        const numbered = `${candidate.slice(0, 63 - String(suffix).length - 1)}-${suffix}`;
+        const numbered = `${fit(candidate, MAX_RECORD_ID_LENGTH - String(suffix).length - 1)}-${suffix}`;
         if (!used.has(numbered)) return numbered;
       }
-      return `${candidate.slice(0, 54)}-${state.records.length}`;
+      return `${fit(candidate, MAX_RECORD_ID_LENGTH - 7)}-${String(state.records.length).slice(-6)}`;
     },
 
     // ---- preview and apply ------------------------------------------------
