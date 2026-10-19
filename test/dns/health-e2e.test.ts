@@ -160,6 +160,21 @@ describe("health checks end to end", () => {
     const back = await eventually(query, (reply) => reply.rcode === RCODE.NOERROR, "the recovered app back");
     assert.deepEqual(back.addresses, [["10.0.0.11", 10]]);
 
+    // Opted into answer-all, the same RRset with nothing healthy is answered in
+    // full at the policy's TTL, and filtered again as soon as one app answers.
+    app("10.0.0.11").ready = false;
+    await eventually(query, (reply) => reply.rcode === RCODE.SERVFAIL, "nothing healthy again");
+    await service.setHealthCheck("example.com", {
+      name: "app", type: "A", enabled: true, probe: { kind: "http", port: 8080 }, responseTtlSeconds: 10, whenNoneHealthy: "answer-all",
+    });
+    zones = servedZones([await service.getZone("example.com")]);
+    monitor.update(zones);
+    assert.deepEqual(await query(), { rcode: RCODE.NOERROR, addresses: [["10.0.0.11", 10], ["10.0.0.12", 10]] });
+    assert.equal(monitor.status("example.com").checks[0]?.answer, "all");
+    app("10.0.0.11").ready = true;
+    const filtered = await eventually(query, (reply) => reply.addresses.length === 1, "filtered once one app answers");
+    assert.deepEqual(filtered, { rcode: RCODE.NOERROR, addresses: [["10.0.0.11", 10]] });
+
     // Disabling the policy hands the RRset back to the record TTLs, every address included.
     await service.setHealthCheck("example.com", { name: "app", type: "A", enabled: false, probe: { kind: "http", port: 8080 } });
     zones = servedZones([await service.getZone("example.com")]);
@@ -247,6 +262,18 @@ describe("health checks that are off", () => {
     assert.deepEqual(await query("app.example.com"), { rcode: RCODE.SERVFAIL, addresses: [] });
     // A name without a policy is answered as before.
     assert.deepEqual(await query("plain.example.com"), { rcode: RCODE.NOERROR, addresses: [["10.0.0.13", 300]] });
+    assert.deepEqual(probed, []);
+  });
+
+  it("keeps an answer-all policy SERVFAIL while probing is off, since nothing is being observed", async () => {
+    const { service, refresh, query, probed } = await start();
+    await service.setHealthCheck("example.com", {
+      name: "app", type: "A", enabled: true, probe: { kind: "tcp", port: 443 }, whenNoneHealthy: "answer-all",
+    });
+    const [zone] = await refresh();
+    assert.equal(zone?.healthChecks?.[0]?.whenNoneHealthy, "answer-all");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.deepEqual(await query("app.example.com"), { rcode: RCODE.SERVFAIL, addresses: [] });
     assert.deepEqual(probed, []);
   });
 });

@@ -88,13 +88,23 @@ describe("health monitor", () => {
     await h.advance(60_000);
     assert.equal(h.calls.length, 0);
     assert.equal(h.timers.size, 0);
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), false);
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "unprobeable");
     const status = h.monitor.status(ZONE);
     assert.equal(status.servedHere, true);
     assert.equal(status.probing, false);
     assert.equal(status.checks[0]?.targets[0]?.status, "disabled");
     assert.equal(status.checks[0]?.answer, "servfail");
     assert.deepEqual(h.monitor.summary(), { targets: 1, healthy: 0, unhealthy: 0, unknown: 0, blocked: 0, overLimit: 0 });
+  });
+
+  it("treats an address it was never given as unprobeable, so answer-all cannot hand it out", async () => {
+    const h = harness(healthy);
+    const served = check(["10.0.0.11"]);
+    h.monitor.configure(on);
+    // No update: nothing has judged this address against the allow-list.
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "unprobeable");
+    h.monitor.update([{ name: ZONE, healthChecks: [served] }]);
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "unconfirmed", "tracked but not yet probed");
   });
 
   it("trusts a first success, probes every interval, and drops the address on the third failure", async () => {
@@ -106,26 +116,26 @@ describe("health monitor", () => {
     await h.advance(0);
     assert.equal(h.calls.length, 1);
     assert.deepEqual(h.calls[0], { address: "10.0.0.11", probe: { kind: "tcp", port: 443 }, host: `app.${ZONE}` });
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), true);
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "healthy");
     assert.equal(h.monitor.status(ZONE).checks[0]?.answer, "filtered");
     assert.equal(h.monitor.status(ZONE).checks[0]?.targets[0]?.checkedAt, new Date(0).toISOString());
 
     answer = refused;
     await h.advance(INTERVAL * 2);
     assert.equal(h.calls.length, 3);
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), true, "two failures are survived");
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "healthy", "two failures are survived");
     await h.advance(INTERVAL * 3);
     assert.equal(h.calls.length, 4);
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), false);
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "unconfirmed");
     const target = h.monitor.status(ZONE).checks[0]?.targets[0];
     assert.equal(target?.status, "unhealthy");
     assert.equal(target?.lastFailure, "connection");
 
     answer = healthy;
     await h.advance(INTERVAL * 4);
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), false, "one success is not recovery");
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "unconfirmed", "one success is not recovery");
     await h.advance(INTERVAL * 5);
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), true);
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "healthy");
 
     // One transition per change, never per probe.
     assert.deepEqual(h.transitions.map((entry) => `${entry.from}>${entry.to}`), [
@@ -154,9 +164,9 @@ describe("health monitor", () => {
     await h.advance(INTERVAL);
     assert.equal(h.calls.length, 2);
     await h.advance(30_000);
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), true, "still fresh at the freshness limit");
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "healthy", "still fresh at the freshness limit");
     await h.advance(30_001);
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), false);
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "unconfirmed");
     assert.equal(h.monitor.status(ZONE).checks[0]?.targets[0]?.status, "stale");
     assert.equal(h.monitor.summary().unknown, 1);
     await h.monitor.close();
@@ -176,15 +186,15 @@ describe("health monitor", () => {
       ["203.0.113.7", "blocked", "outside-allowed-networks"],
     ]);
     assert.equal(web?.targets[0]?.blockedReason, "port-not-allowed");
-    assert.equal(h.monitor.verdict()(ZONE, served, "203.0.113.7"), false);
+    assert.equal(h.monitor.verdict()(ZONE, served, "203.0.113.7"), "unprobeable");
     assert.deepEqual(h.monitor.summary(), { targets: 3, healthy: 1, unhealthy: 0, unknown: 0, blocked: 2, overLimit: 0 });
 
     // Widening the list unblocks the address and starts it from nothing.
     h.monitor.configure({ ...on, dnsHealthCheckAllowCidrs: ["10.0.0.0/24", "203.0.113.0/24"], dnsHealthCheckAllowPorts: [443, 8080] });
     assert.equal(h.monitor.status(ZONE).checks[0]?.targets[1]?.status, "unknown");
     await h.advance(h.time());
-    assert.equal(h.monitor.verdict()(ZONE, served, "203.0.113.7"), true);
-    assert.equal(h.monitor.verdict()(ZONE, wrongPort, "10.0.0.11"), true);
+    assert.equal(h.monitor.verdict()(ZONE, served, "203.0.113.7"), "healthy");
+    assert.equal(h.monitor.verdict()(ZONE, wrongPort, "10.0.0.11"), "healthy");
   });
 
   it("holds the process to its target limit, in a fixed order, without counting unsupported zones", async () => {
@@ -198,7 +208,7 @@ describe("health monitor", () => {
     const statuses = h.monitor.status(ZONE).checks[0]?.targets.map((target) => `${target.address}=${target.status}`);
     assert.deepEqual(statuses, ["10.0.0.13=over_limit", "10.0.0.11=healthy", "10.0.0.12=healthy"]);
     assert.equal(h.monitor.status("published.example.com").checks[0]?.targets[0]?.status, "unsupported_target");
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.13"), false);
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.13"), "unprobeable");
     assert.equal(h.monitor.summary().overLimit, 1);
 
     // Losing an address frees a slot for the next one in order.
@@ -239,7 +249,7 @@ describe("health monitor", () => {
     h.monitor.update([{ name: ZONE, healthChecks: [served] }]);
     h.monitor.configure(on);
     await h.advance(0);
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), true);
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "healthy");
 
     h.monitor.configure({ ...on, dnsHealthChecksEnabled: false });
     assert.equal(h.monitor.status(ZONE).checks[0]?.targets[0]?.status, "disabled");
@@ -249,10 +259,10 @@ describe("health monitor", () => {
     await h.advance(h.time());
     const moved = check(["10.0.0.11"], { probe: { kind: "tcp", port: 443 }, ttl: 10 });
     h.monitor.update([{ name: ZONE, healthChecks: [moved] }]);
-    assert.equal(h.monitor.verdict()(ZONE, moved, "10.0.0.11"), true, "a TTL change is the same question");
+    assert.equal(h.monitor.verdict()(ZONE, moved, "10.0.0.11"), "healthy", "a TTL change is the same question");
     const otherPath = check(["10.0.0.11"], { probe: { kind: "https", port: 443, path: "/ready" } });
     h.monitor.update([{ name: ZONE, healthChecks: [otherPath] }]);
-    assert.equal(h.monitor.verdict()(ZONE, otherPath, "10.0.0.11"), false, "a new probe is a new question");
+    assert.equal(h.monitor.verdict()(ZONE, otherPath, "10.0.0.11"), "unconfirmed", "a new probe is a new question");
   });
 
   it("keeps at most the configured number of probes in flight and drops results after close", async () => {
@@ -276,9 +286,62 @@ describe("health monitor", () => {
     await h.advance(INTERVAL * 3);
     assert.equal(h.calls.length, 3);
     assert.equal(h.timers.size, 0);
-    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.12"), false);
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.12"), "unprobeable");
     h.monitor.update([{ name: ZONE, healthChecks: [] }]);
     assert.equal(h.monitor.status(ZONE).checks.length, 1, "a closed monitor ignores updates");
+  });
+
+  it("reports answer-all as answering every address while nothing is healthy and every address is probed", async () => {
+    let answer: () => ProbeResult = refused;
+    let hang = false;
+    const h = harness((_target, signal) => hang
+      ? new Promise<ProbeResult>((resolve) => signal.addEventListener("abort", () => resolve({ ok: false, category: "timeout" })))
+      : answer());
+    const served = check(["10.0.0.11", "10.0.0.12"], { whenNoneHealthy: "answer-all" });
+    const plain = check(["10.0.0.11"], { name: `web.${ZONE}` });
+    h.monitor.update([{ name: ZONE, healthChecks: [served, plain] }]);
+
+    // Probing off is configuration: nobody is looking, so nothing fails open.
+    assert.equal(h.monitor.status(ZONE).checks[0]?.answer, "servfail");
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "unprobeable");
+
+    // Just turned on, before any probe has finished: unknown, and answered in full.
+    h.monitor.configure(on);
+    assert.deepEqual(h.monitor.status(ZONE).checks[0]?.targets.map((target) => target.status), ["unknown", "unknown"]);
+    assert.equal(h.monitor.status(ZONE).checks[0]?.answer, "all");
+    assert.equal(h.monitor.status(ZONE).checks[1]?.answer, "servfail", "a policy left at the default still fails closed");
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.11"), "unconfirmed");
+
+    // Failing.
+    await h.advance(0);
+    assert.deepEqual(h.monitor.status(ZONE).checks[0]?.targets.map((target) => target.status), ["unhealthy", "unhealthy"]);
+    assert.equal(h.monitor.status(ZONE).checks[0]?.answer, "all");
+
+    // One healthy address: filtered as usual.
+    answer = healthy;
+    await h.advance(INTERVAL);
+    await h.advance(INTERVAL * 2);
+    assert.equal(h.monitor.status(ZONE).checks[0]?.answer, "filtered");
+
+    // Stale.
+    hang = true;
+    await h.advance(INTERVAL * 2 + 30_001);
+    assert.deepEqual(h.monitor.status(ZONE).checks[0]?.targets.map((target) => target.status), ["stale", "stale"]);
+    assert.equal(h.monitor.status(ZONE).checks[0]?.answer, "all");
+    assert.equal(h.monitor.verdict()(ZONE, served, "10.0.0.12"), "unconfirmed");
+    await h.monitor.close();
+  });
+
+  it("does not report answer-all for a blocked address or a check with an issue", () => {
+    const h = harness(healthy);
+    const blocked = check(["10.0.0.11", "203.0.113.7"], { whenNoneHealthy: "answer-all" });
+    const broken = check([], { name: `web.${ZONE}`, whenNoneHealthy: "answer-all", issue: "no A record to protect" });
+    h.monitor.update([{ name: ZONE, healthChecks: [blocked, broken] }]);
+    h.monitor.configure(on);
+    const [first, second] = h.monitor.status(ZONE).checks;
+    assert.deepEqual(first?.targets.map((target) => target.status), ["unknown", "blocked"]);
+    assert.equal(first?.answer, "servfail");
+    assert.equal(second?.answer, "servfail");
   });
 
   it("counts a transport that throws as a connection failure", async () => {

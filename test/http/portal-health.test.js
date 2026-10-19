@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 
 import { createApiClient } from "../../public/api-client.js";
+import { messages } from "../../public/i18n.js";
 import { createStore, desiredState } from "../../public/store.js";
 
 const policy = {
@@ -240,6 +242,41 @@ describe("portal health checks", () => {
     store.onNotice((entry) => notices.push(entry));
     assert.equal(await store.deleteHealthCheck("app", "A"), false);
     assert.ok(notices.some((entry) => entry.key === "health.deleteFailed" && entry.level === "error"));
+  });
+
+  it("writes answer-all through, and carries it on a full replace", async () => {
+    const api = fakeApi({ healthChecks: [] });
+    const store = await openZone(api);
+    const failOpen = { ...policy, whenNoneHealthy: "answer-all" };
+    assert.equal(await store.saveHealthCheck(failOpen), true);
+    const put = api.seen.find((call) => call.path.includes("/health-checks/") && call.method === "PUT");
+    assert.equal(put.body.whenNoneHealthy, "answer-all");
+    assert.equal(store.getState().healthChecks[0]?.whenNoneHealthy, "answer-all");
+
+    stageEdit(store, "10.0.0.12");
+    assert.equal(await store.apply(), true);
+    const replace = api.seen.find((call) => call.path.endsWith("/zones/example.com") && call.method === "PUT");
+    assert.equal(replace.body.views.find((view) => view.name === "internal").healthChecks[0].whenNoneHealthy, "answer-all");
+  });
+
+  it("offers the choice in the dialog, reads it back, and names every new string in both languages", async () => {
+    const html = await readFile(new URL("../../public/index.html", import.meta.url), "utf8");
+    const app = await readFile(new URL("../../public/app.js", import.meta.url), "utf8");
+    assert.match(html, /<select name="whenNoneHealthy"><option value="servfail"[^>]*>[^<]+<\/option><option value="answer-all"/u);
+    assert.match(app, /whenNoneHealthy: String\(form\.elements\.whenNoneHealthy\.value\)/u, "the form sends the choice");
+    assert.match(app, /form\.elements\.whenNoneHealthy\.value = policy\.whenNoneHealthy === "answer-all"/u, "an edit shows the stored choice");
+    assert.match(app, /all: "pending"/u, "a status of all has a chip");
+    for (const key of [
+      "health.answer.all",
+      "health.failsOpen",
+      "healthDialog.whenNoneHealthy",
+      "healthDialog.whenNoneHealthy.servfail",
+      "healthDialog.whenNoneHealthy.answerAll",
+      "healthDialog.whenNoneHealthyHelp",
+    ]) {
+      for (const locale of ["en", "ko"]) assert.ok(Object.hasOwn(messages[locale], key), `${locale}: ${key}`);
+      assert.ok(html.includes(`"${key}"`) || app.includes(`"${key}"`) || key === "health.answer.all", `${key} is used`);
+    }
   });
 
   it("refuses a policy write with the form's error and leaves the policies alone", async () => {

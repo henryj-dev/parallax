@@ -3,8 +3,10 @@ import { findCommand, type CommandOption } from "../cli/commands.ts";
 import { MAX_BATCH_OPERATIONS } from "../application/control-plane.ts";
 import {
   DEFAULT_HEALTH_HTTP_PATH,
+  DEFAULT_HEALTH_NONE_HEALTHY_ACTION,
   DEFAULT_HEALTH_RESPONSE_TTL_SECONDS,
   HEALTH_CHECK_TYPES,
+  HEALTH_NONE_HEALTHY_ACTIONS,
   MAX_HEALTH_CHECK_TARGETS,
   MAX_HEALTH_CHECKS_PER_ZONE,
   MAX_HEALTH_PATH_LENGTH,
@@ -306,7 +308,8 @@ const SCHEMAS: Readonly<Record<string, JsonSchema>> = {
     description:
       "Protects one internal A or AAAA RRset. Only the internal DNS listener filters by it; the external view and every "
       + "provider are unaffected. An enabled policy fails closed: when probing is off, an address is outside the allow-list, "
-      + "or no address has a fresh success, the RRset is answered SERVFAIL rather than with every address.",
+      + "or no address has a fresh success, the RRset is answered SERVFAIL rather than with every address -- unless "
+      + "`whenNoneHealthy` is `answer-all`, and then only for the last of those.",
     properties: {
       name: { type: "string", description: "`@` for the apex, otherwise relative. Wildcards are refused." },
       type: { type: "string", enum: [...HEALTH_CHECK_TYPES] },
@@ -322,6 +325,17 @@ const SCHEMAS: Readonly<Record<string, JsonSchema>> = {
         maximum: MAX_HEALTH_RESPONSE_TTL_SECONDS,
         default: DEFAULT_HEALTH_RESPONSE_TTL_SECONDS,
         description: "The TTL of a filtered answer, lowered further to the smallest TTL in the RRset.",
+      },
+      whenNoneHealthy: {
+        type: "string",
+        enum: [...HEALTH_NONE_HEALTHY_ACTIONS],
+        default: DEFAULT_HEALTH_NONE_HEALTHY_ACTION,
+        description:
+          "What the RRset is answered with when no address has a fresh success. `servfail` answers SERVFAIL. `answer-all` "
+          + "answers every address at the policy's TTL, so a broken probe path does not take the name away -- and an address "
+          + "that is really down is handed out too. It fails open only when every address is probed and simply not healthy "
+          + "(failing, stale or not yet known): a policy with an issue, probing turned off, an address outside the allow-list "
+          + "or past the process limit still answers SERVFAIL. Left out of a stored policy when it is `servfail`.",
       },
     },
   },
@@ -358,8 +372,10 @@ const SCHEMAS: Readonly<Record<string, JsonSchema>> = {
           properties: {
             answer: {
               type: "string",
-              enum: ["full", "filtered", "servfail", "unknown"],
-              description: "`full` for a disabled policy, `unknown` when this process does not serve the zone.",
+              enum: ["full", "filtered", "all", "servfail", "unknown"],
+              description:
+                "`full` for a disabled policy, `all` when no address is healthy and `whenNoneHealthy` is `answer-all`, "
+                + "`unknown` when this process does not serve the zone.",
             },
             ttl: { type: "integer" },
             healthyAddresses: { type: "integer" },

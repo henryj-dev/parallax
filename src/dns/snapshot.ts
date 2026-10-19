@@ -85,6 +85,7 @@ function servedHealthChecks(zone: Zone): { healthChecks?: ServedHealthCheck[] } 
     healthChecks: policies.map((policy): ServedHealthCheck => {
       const owner = absolute(policy.name, zone.name);
       const rrset = byKey.get(healthCheckKey(policy));
+      const failOpen = policy.whenNoneHealthy === "answer-all" ? { whenNoneHealthy: policy.whenNoneHealthy } : {};
       if (!rrset) {
         return {
           name: owner,
@@ -93,6 +94,7 @@ function servedHealthChecks(zone: Zone): { healthChecks?: ServedHealthCheck[] } 
           probe: policy.probe,
           addresses: [],
           issue: failure ?? `health check ${policy.name} ${policy.type} does not match a probeable RRset`,
+          ...failOpen,
         };
       }
       return {
@@ -101,6 +103,7 @@ function servedHealthChecks(zone: Zone): { healthChecks?: ServedHealthCheck[] } 
         ttl: rrset.ttl,
         probe: policy.probe,
         addresses: rrset.addresses.map((address) => probeAddress(address)),
+        ...failOpen,
       };
     }),
   };

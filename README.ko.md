@@ -437,6 +437,8 @@ Cloudflare의 로컬 도메인 fallback 목록을, 프로필이 이미 쥔 자�
 ```bash
 pnpm cli health check set --zone example.com \
   --policy '{"name":"app","type":"A","enabled":true,"probe":{"kind":"tcp","port":443}}'
+pnpm cli health check set --zone example.com --whenNoneHealthy answer-all \
+  --policy '{"name":"app","type":"A","enabled":true,"probe":{"kind":"https","port":8443,"path":"/readyz"}}'
 pnpm cli health check status --zone example.com
 ```
 
@@ -593,6 +595,7 @@ parallax_dns_forward_failures_total             업스트림 순번·사유별 D
 parallax_dns_health_probes_total                결과별 헬스 프로브
 parallax_dns_health_transitions_total           들어간 상태별 헬스 상태 변화
 parallax_dns_health_servfail_total              자격 있는 주소가 없어 거부한 보호 답
+parallax_dns_health_fail_open_total             건강한 주소가 없어 answer-all로 전부 답한 보호 RRset
 parallax_refresh_failures_total                 서브시스템별 백그라운드 갱신 실패
 parallax_postgres_connection_errors_total       상태(idle, checked_out)·코드별로 실패한 풀 연결
 parallax_tls_certificate_reload_failures_total  실패한 인증서 재적재
@@ -615,6 +618,19 @@ parallax_tls_certificate_reload_failures_total  실패한 인증서 재적재
   꺼졌거나, 주소가 허용 목록 밖이거나, 최신 성공이 없으면 — 모든 주소가 아니라
   `SERVFAIL`로 답합니다. 정책은 `enabled: true`일 때만 켜집니다. `enabled`를
   빼거나 `false`로 두면 정책은 남고 RRset을 전부 답합니다.
+- **정책마다 모든 주소로 답하게 할 수도 있습니다.** `whenNoneHealthy`의 기본값은
+  `servfail`입니다. `answer-all`로 두면 건강한 주소가 하나도 없는 RRset을 모든
+  주소와 정책 TTL로 답하고, 그 답은 `parallax_dns_health_servfail_total`이 아니라
+  `parallax_dns_health_fail_open_total`에 셉니다. `health check status`는 이를
+  `all`로 보고합니다. 맞바꾸는 것은 이렇습니다. 이 프로세스에서 오리진으로 가는
+  프로브 경로만 막혀도 이름 전체가 사라지는 일은 없어지지만, 실제로 죽은 주소도
+  다른 주소와 함께 나갑니다. 모든 주소를 프로브하고 있는데 최신 성공이 없을 때만 —
+  실패, 낡음, 시작 직후 아직 모름 — 전부 답합니다. 정책에 issue가 있거나, 프로브가
+  꺼졌거나, 주소가 허용 목록 밖이거나 프로세스 한도를 넘었다면 아무도 관측하지 않는
+  설정 문제이므로 여전히 `SERVFAIL`로 답합니다. 주소 하나라도 건강해지면 평소처럼
+  걸러 답합니다. 저장된 정책은 `answer-all`일 때만 이 필드를 가지므로 기존 정책·
+  리비전·백업은 그대로입니다. 이전 릴리스는 이 필드가 있는 정책을 거부하니, 모든
+  레플리카를 올린 뒤에 켜세요.
 - **주기.** 지터를 섞어 10초마다, 프로브당 2초 기한, 결과는 30초 뒤 낡습니다.
   실패한 적 없는 주소는 첫 성공에서 건강으로 봅니다. 실패한 적 있는 주소는 연달아 두 번
   성공해야 돌아옵니다. 건강한 주소가 연달아 세 번 실패하면 비정상입니다. 동시에 최대

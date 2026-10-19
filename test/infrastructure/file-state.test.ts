@@ -51,6 +51,29 @@ describe("FileStateRepository", () => {
       /invalid state file/u.test(error.message) && /only on the internal view/u.test(String((error.cause as Error | undefined)?.message)));
   });
 
+  it("keeps answer-all across a restart, and refuses a whenNoneHealthy it does not know", async () => {
+    const path = await statePath();
+    const zone: Zone = {
+      ...zoneFixture("example.com", 2),
+      views: [
+        { name: "external", records: [] },
+        {
+          name: "internal",
+          records: [{ id: "app", name: "app", type: "A", content: "10.0.0.11", ttl: 60 }],
+          healthChecks: [{ name: "app", type: "A", enabled: true, probe: { kind: "tcp", port: 443 }, responseTtlSeconds: 30, whenNoneHealthy: "answer-all" }],
+        },
+      ],
+    };
+    await new FileStateRepository(path).save(zone);
+    assert.deepEqual(await new FileStateRepository(path).get("example.com"), zone);
+
+    const stored = JSON.parse(await readFile(path, "utf8")) as { zones: Record<string, Zone> };
+    stored.zones["example.com"]!.views[1]!.healthChecks![0]!.whenNoneHealthy = "sometimes" as never;
+    await writeFile(path, JSON.stringify(stored));
+    await assert.rejects(new FileStateRepository(path).get("example.com"), (error: Error) =>
+      /invalid state file/u.test(error.message) && /whenNoneHealthy must be servfail or answer-all/u.test(String((error.cause as Error | undefined)?.message)));
+  });
+
   it("implements both repository ports and restores zones, audit, and status after restart", async () => {
     const path = await statePath();
     const repository = new FileStateRepository(path);

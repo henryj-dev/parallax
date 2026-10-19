@@ -4,7 +4,14 @@ import { connect, createServer, isIP, type Server, type Socket as TcpSocket } fr
 import { networkInterfaces } from "node:os";
 import { performance } from "node:perf_hooks";
 import { providerManagement, type RecordType } from "../domain/dns.ts";
-import { dnsAnswered, dnsFallback, dnsForwardFailures, dnsForwardSeconds, dnsHealthServfail } from "../observability/signals.ts";
+import {
+  dnsAnswered,
+  dnsFallback,
+  dnsForwardFailures,
+  dnsForwardSeconds,
+  dnsHealthFailOpen,
+  dnsHealthServfail,
+} from "../observability/signals.ts";
 import { canonicalAddress, isLoopbackAddress, isWildcardListener } from "./address.ts";
 import { cidrsContain, compileCidrs, parseIpBytes } from "./cidr.ts";
 import { createDnsCookies } from "./cookies.ts";
@@ -44,7 +51,8 @@ export interface ServedZone {
   readonly overrideNames?: ReadonlySet<string>;
   /**
    * The zone's enabled health checks. An RRset one of these names is answered
-   * with its healthy addresses only, or SERVFAIL when none is healthy, and a
+   * with its healthy addresses only, or SERVFAIL when none is healthy -- every
+   * address instead, for a check set to `answer-all` -- and a
    * zone holding any is not transferred: a secondary would serve every address
    * whatever its health.
    */
@@ -1239,11 +1247,17 @@ const BLOCKED = Symbol("no healthy address");
 
 type ServedRecords = ServedZone["records"];
 
+/** What may be given out of one protected RRset, and whether that is all of it for want of a healthy one. */
+interface Guarded {
+  readonly records: ServedRecords;
+  readonly failedOpen: boolean;
+}
+
 /**
  * The healthy part of one RRset, `BLOCKED` when nothing is left of it, or
  * `undefined` when no health check covers it.
  */
-type HealthGuard = (owner: string, type: "A" | "AAAA", records: ServedRecords) => ServedRecords | typeof BLOCKED | undefined;
+type HealthGuard = (owner: string, type: "A" | "AAAA", records: ServedRecords) => Guarded | typeof BLOCKED | undefined;
 
 const healthIndexes = new WeakMap<ServedZone, ReadonlyMap<string, ServedHealthCheck>>();
 
@@ -1295,11 +1309,19 @@ function healthGuard(zone: ServedZone, health: DnsServerOptions["health"]): Heal
     }
     const verdict = read.verdict;
     if (check.issue !== undefined || !verdict) return BLOCKED;
-    const healthy = records.filter((record) => verdict(zone.name, check, probeAddress(record.content)));
-    if (healthy.length === 0) return BLOCKED;
+    const judged = records.map((record) => verdict(zone.name, check, probeAddress(record.content)));
+    const healthy = records.filter((_, position) => judged[position] === "healthy");
+    // Failing open is for a probe path that may be what is broken, not for a
+    // policy nobody can act on. An address that is not being probed at all --
+    // probing off, outside the allow-list, past the limit -- is configuration,
+    // and answering it would hand out an address no one has looked at.
+    const failedOpen = healthy.length === 0 && check.whenNoneHealthy === "answer-all"
+      && judged.every((judgement) => judgement === "unconfirmed");
+    if (healthy.length === 0 && !failedOpen) return BLOCKED;
     // One TTL for the whole answer, no longer than the policy allows: a
-    // resolver must come back soon enough to learn an address went away.
-    return healthy.map((record) => ({ ...record, ttl: check.ttl }));
+    // resolver must come back soon enough to learn an address went away --
+    // or, failing open, came back.
+    return { records: (failedOpen ? records : healthy).map((record) => ({ ...record, ttl: check.ttl })), failedOpen };
   };
 }
 
@@ -1309,20 +1331,25 @@ function healthGuard(zone: ServedZone, health: DnsServerOptions["health"]): Heal
  */
 function guardRecords(guard: HealthGuard, owner: string, records: ServedRecords): ServedRecords | typeof BLOCKED {
   let result = records;
+  let failedOpen = 0;
   for (const type of ["A", "AAAA"] as const) {
     const group = result.filter((record) => record.type === type);
     if (group.length === 0) continue;
     const guarded = guard(owner, type, group);
     if (guarded === undefined) continue;
     if (guarded === BLOCKED) return BLOCKED;
+    if (guarded.failedOpen) failedOpen += 1;
     // The guard keeps the group's order, so its survivors are matched up in a
     // single pass and land where the records they replace stood.
-    const healthy = [...guarded];
+    const healthy = [...guarded.records];
     result = result.flatMap((record) => {
       if (record.type !== type) return [record];
       return healthy.length > 0 && healthy[0]!.content === record.content ? [healthy.shift()!] : [];
     });
   }
+  // Counted only once the whole owner is answerable: an ANY whose other
+  // protected RRset is blocked is a SERVFAIL, and counted as one.
+  for (let count = 0; count < failedOpen; count += 1) dnsHealthFailOpen();
   return result;
 }
 

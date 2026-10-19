@@ -317,6 +317,23 @@ describe("PostgresZoneRepository", () => {
     await assert.rejects(repository.get("example.com"), /only on the internal view/u);
   });
 
+  it("reads answer-all back from a snapshot, a policy without it as the default, and refuses an unknown value", async () => {
+    const policy = { name: "app", type: "A" as const, enabled: true, probe: { kind: "tcp" as const, port: 443 }, responseTtlSeconds: 10 };
+    const zoneWith = (healthChecks: unknown[]): Zone => ({
+      ...zoneFixture(3),
+      views: [
+        { name: "external", records: [] },
+        { name: "internal", records: [{ id: "app", name: "app", type: "A", content: "10.0.0.11", ttl: 60 }], healthChecks: healthChecks as never },
+      ],
+    });
+    const read = (zone: Zone) => new PostgresZoneRepository(new FakePool(() => ({ rows: [{ snapshot: zone }] }))).get("example.com");
+    const failOpen = zoneWith([{ ...policy, whenNoneHealthy: "answer-all" }]);
+    assert.deepEqual(await read(failOpen), failOpen);
+    const plain = zoneWith([policy]);
+    assert.deepEqual(await read(plain), plain, "a snapshot written before the field existed reads back unchanged");
+    await assert.rejects(read(zoneWith([{ ...policy, whenNoneHealthy: "never" }])), /whenNoneHealthy must be servfail or answer-all/u);
+  });
+
   it("pushes alphabetical zone pagination into PostgreSQL", async () => {
     const zone = zoneFixture(1);
     const pool = new FakePool(() => ({ rows: [{ snapshot: zone }] }));

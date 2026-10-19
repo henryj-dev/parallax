@@ -26,6 +26,15 @@ export type HealthCheckType = (typeof HEALTH_CHECK_TYPES)[number];
 export const HEALTH_CHECK_PROTOCOLS = ["tcp", "http", "https"] as const;
 export type HealthCheckProtocol = (typeof HEALTH_CHECK_PROTOCOLS)[number];
 
+/**
+ * What a protected RRset is answered with when no address in it has a fresh
+ * success. `servfail` holds the name back; `answer-all` hands out every address
+ * rather than lose the name to a probe path that may be the only thing broken.
+ */
+export const HEALTH_NONE_HEALTHY_ACTIONS = ["servfail", "answer-all"] as const;
+export type HealthNoneHealthyAction = (typeof HEALTH_NONE_HEALTHY_ACTIONS)[number];
+export const DEFAULT_HEALTH_NONE_HEALTHY_ACTION: HealthNoneHealthyAction = "servfail";
+
 export const DEFAULT_HEALTH_RESPONSE_TTL_SECONDS = 30;
 export const MIN_HEALTH_RESPONSE_TTL_SECONDS = 5;
 export const MAX_HEALTH_RESPONSE_TTL_SECONDS = 60;
@@ -51,6 +60,11 @@ export interface HealthCheckPolicy {
   enabled: boolean;
   probe: HealthCheckProbe;
   responseTtlSeconds: number;
+  /**
+   * Absent means `servfail`. Only `answer-all` is ever stored, so a policy
+   * that never opted in is written exactly as it was before the field existed.
+   */
+  whenNoneHealthy?: "answer-all";
 }
 
 export interface HealthCheckChanges {
@@ -78,7 +92,7 @@ export function createHealthCheckPolicy(input: unknown, label = "health check"):
   }
   const value = input as Record<string, unknown>;
   for (const key of Object.keys(value)) {
-    if (!["name", "type", "enabled", "probe", "responseTtlSeconds"].includes(key)) {
+    if (!["name", "type", "enabled", "probe", "responseTtlSeconds", "whenNoneHealthy"].includes(key)) {
       issues.push(`${label} has an unknown field ${key}`);
     }
   }
@@ -99,6 +113,12 @@ export function createHealthCheckPolicy(input: unknown, label = "health check"):
     || ttl < MIN_HEALTH_RESPONSE_TTL_SECONDS || ttl > MAX_HEALTH_RESPONSE_TTL_SECONDS) {
     issues.push(`${label} responseTtlSeconds must be an integer between ${MIN_HEALTH_RESPONSE_TTL_SECONDS} and ${MAX_HEALTH_RESPONSE_TTL_SECONDS}`);
   }
+  const whenNoneHealthy = value.whenNoneHealthy === undefined
+    ? DEFAULT_HEALTH_NONE_HEALTHY_ACTION
+    : typeof value.whenNoneHealthy === "string" ? value.whenNoneHealthy.trim().toLowerCase() : value.whenNoneHealthy;
+  if (!HEALTH_NONE_HEALTHY_ACTIONS.some((candidate) => candidate === whenNoneHealthy)) {
+    issues.push(`${label} whenNoneHealthy must be servfail or answer-all`);
+  }
   let probe: HealthCheckProbe | undefined;
   try {
     probe = readProbe(value.probe, label);
@@ -113,7 +133,13 @@ export function createHealthCheckPolicy(input: unknown, label = "health check"):
     enabled: enabled as boolean,
     probe,
     responseTtlSeconds: ttl as number,
+    ...(whenNoneHealthy === "answer-all" ? { whenNoneHealthy: "answer-all" as const } : {}),
   };
+}
+
+/** The action a policy takes when nothing in its RRset is healthy. */
+export function noneHealthyAction(policy: Pick<HealthCheckPolicy, "whenNoneHealthy">): HealthNoneHealthyAction {
+  return policy.whenNoneHealthy ?? DEFAULT_HEALTH_NONE_HEALTHY_ACTION;
 }
 
 function readProbe(input: unknown, label: string): HealthCheckProbe {
@@ -234,7 +260,7 @@ function canonicalPolicy(policy: HealthCheckPolicy): unknown {
   const probe = policy.probe.kind === "tcp"
     ? { kind: "tcp", port: policy.probe.port }
     : { kind: policy.probe.kind, port: policy.probe.port, path: policy.probe.path };
-  return [policy.name, policy.type, policy.enabled, policy.responseTtlSeconds, probe];
+  return [policy.name, policy.type, policy.enabled, policy.responseTtlSeconds, probe, noneHealthyAction(policy)];
 }
 
 export function countHealthCheckChanges(

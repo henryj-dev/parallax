@@ -206,7 +206,12 @@ try {
     id: `pool-${index}`, name: "pool", type: "A", content: `10.0.1.${index + 1}`, ttl: 300,
   }));
   await restarted.controlPlane.replaceDesiredState(ZONES[1], { views: [{ name: "external", records: [] }, { name: "internal", records }] });
-  await restarted.controlPlane.setHealthCheck(ZONES[1], tcp("pool"));
+  // Opted into answering every address when none is healthy: the one field a
+  // policy that never opted in does not carry, so it must survive on its own.
+  await restarted.controlPlane.setHealthCheck(ZONES[1], { ...tcp("pool"), whenNoneHealthy: "answer-all" });
+  const failOpen = await sql.query("SELECT snapshot FROM parallax_zones WHERE name = $1", [ZONES[1]]);
+  assert.equal(internalOf(failOpen.rows[0].snapshot).healthChecks[0]?.whenNoneHealthy, "answer-all", "answer-all is in the stored snapshot");
+  assert.equal(internalOf(stored.rows[0].snapshot).healthChecks[0]?.whenNoneHealthy, undefined, "a policy that never opted in is stored without the field");
   for (const zone of ZONES.slice(2)) {
     await restarted.controlPlane.createZone(zone);
     await restarted.controlPlane.upsertRecord(zone, "internal", "web", { name: "web", type: "A", content: "10.0.0.11", ttl: 300 });
@@ -228,6 +233,7 @@ try {
   // The zones that were already enabled kept their policies throughout.
   assert.deepEqual((await restarted.controlPlane.listHealthChecks(ZONES[0])).healthChecks, [policy]);
   assert.equal((await restarted.controlPlane.listHealthChecks(ZONES[1])).healthChecks[0]?.enabled, true);
+  assert.equal((await restarted.controlPlane.listHealthChecks(ZONES[1])).healthChecks[0]?.whenNoneHealthy, "answer-all");
 
   // Export, then restore into an empty database: one address too many is
   // refused before a row is written, the export itself restores whole.
@@ -247,6 +253,7 @@ try {
     assert.deepEqual(await restored.controlPlane.listHealthChecks(zone), await restarted.controlPlane.listHealthChecks(zone), zone);
   }
   assert.equal(enabledAddresses(await restored.stores.zones.list()), MAX_HEALTH_CHECK_TARGETS);
+  assert.equal((await restored.controlPlane.listHealthChecks(ZONES[1])).healthChecks[0]?.whenNoneHealthy, "answer-all", "the restore keeps answer-all");
   console.log(`  ok: ${ROUNDS} cross-replica rounds each admitted one policy at ${MAX_HEALTH_CHECK_TARGETS} addresses`);
 } finally {
   // Removed so the settings steps below are not refused for the policies

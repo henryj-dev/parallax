@@ -65,6 +65,36 @@ describe("health check policies", () => {
       .some((issue) => issue.includes("responseTtlSeconds")));
   });
 
+  it("stores whenNoneHealthy only when it is answer-all, and refuses any other value", () => {
+    const tcp = { name: "app", type: "A", probe: { kind: "tcp", port: 443 } };
+    assert.equal("whenNoneHealthy" in createHealthCheckPolicy(tcp), false, "the default leaves the policy as it always was");
+    assert.equal("whenNoneHealthy" in createHealthCheckPolicy({ ...tcp, whenNoneHealthy: "servfail" }), false);
+    assert.deepEqual(createHealthCheckPolicy({ ...tcp, whenNoneHealthy: " Answer-All " }), {
+      name: "app",
+      type: "A",
+      enabled: false,
+      probe: { kind: "tcp", port: 443 },
+      responseTtlSeconds: 30,
+      whenNoneHealthy: "answer-all",
+    });
+    for (const value of ["answer_all", "fail-open", "", true, 1, null, ["answer-all"]]) {
+      assert.ok(issuesOf(() => createHealthCheckPolicy({ ...tcp, whenNoneHealthy: value }))
+        .some((issue) => issue.includes("whenNoneHealthy must be servfail or answer-all")), `accepted ${JSON.stringify(value)}`);
+    }
+    // Read back from the store the same way, so an unknown value never reaches the listener.
+    assert.ok(issuesOf(() => readHealthChecks([{ ...tcp, whenNoneHealthy: "maybe" }], "internal"))
+      .some((issue) => issue.includes("healthChecks[0] whenNoneHealthy")));
+    assert.deepEqual(readHealthChecks([{ ...tcp, whenNoneHealthy: "answer-all" }], "internal")?.map((policy) => policy.whenNoneHealthy), ["answer-all"]);
+  });
+
+  it("treats an explicit servfail as the absent default and answer-all as a change", () => {
+    const base = createHealthCheckPolicy({ name: "app", type: "A", enabled: true, probe: { kind: "tcp", port: 443 } });
+    const explicit = createHealthCheckPolicy({ name: "app", type: "A", enabled: true, probe: { kind: "tcp", port: 443 }, whenNoneHealthy: "servfail" });
+    assert.deepEqual(countHealthCheckChanges([base], [explicit]), { added: 0, removed: 0, changed: 0 });
+    assert.deepEqual(countHealthCheckChanges([base], [{ ...base, whenNoneHealthy: "answer-all" }]), { added: 0, removed: 0, changed: 1 });
+    assert.deepEqual(countHealthCheckChanges([{ ...base, whenNoneHealthy: "answer-all" }], [base]), { added: 0, removed: 0, changed: 1 });
+  });
+
   it("holds the request path to an origin-form path", () => {
     assert.equal(healthCheckPathIssue("/health/ready?full=1"), undefined);
     assert.equal(healthCheckPathIssue("/a%20b"), undefined);

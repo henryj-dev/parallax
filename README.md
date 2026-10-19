@@ -440,6 +440,8 @@ already holds — nobody types a second token.
 ```bash
 pnpm cli health check set --zone example.com \
   --policy '{"name":"app","type":"A","enabled":true,"probe":{"kind":"tcp","port":443}}'
+pnpm cli health check set --zone example.com --whenNoneHealthy answer-all \
+  --policy '{"name":"app","type":"A","enabled":true,"probe":{"kind":"https","port":8443,"path":"/readyz"}}'
 pnpm cli health check status --zone example.com
 ```
 
@@ -598,6 +600,7 @@ parallax_dns_notify_failures_total              NOTIFY sends that failed
 parallax_dns_health_probes_total                health probes, by result
 parallax_dns_health_transitions_total           health state changes, by the state entered
 parallax_dns_health_servfail_total              protected answers refused because no address qualified
+parallax_dns_health_fail_open_total             protected RRsets answered in full under answer-all, none healthy
 parallax_dns_forward_failures_total             DNS forwarding failures by upstream index and reason
 parallax_refresh_failures_total                 background refresh failures, by subsystem
 parallax_postgres_connection_errors_total       pooled connections that failed, by state (idle, checked_out) and code
@@ -623,6 +626,22 @@ nothing about health is published anywhere.
   answered `SERVFAIL`, not with every address. Only `enabled: true` turns a
   policy on; a policy that leaves `enabled` out, or sets it to `false`, is kept
   and the RRset is answered in full.
+- **Or, per policy, it answers every address.** `whenNoneHealthy` is
+  `servfail` by default. Set to `answer-all`, an RRset with no healthy address
+  is answered with all of its addresses at the policy's TTL, and the answer is
+  counted in `parallax_dns_health_fail_open_total` rather than
+  `parallax_dns_health_servfail_total`; `health check status` reports it as
+  `all`. The trade-off: a broken path from this process to the origins no
+  longer takes the whole name away, but an address that really is down is
+  handed out with the rest. It fails open only when every address is being
+  probed and simply has no fresh success — failing, stale, or not yet probed
+  after a start. A policy with an issue, probing turned off, an address
+  outside the allow-list or past the process limit is configuration nobody is
+  observing, and still answers `SERVFAIL`. As soon as one address is healthy
+  the answer is filtered as usual. A stored policy carries the field only when
+  it is `answer-all`, so existing policies, revisions and backups are unchanged;
+  an older release refuses a policy that carries it, so upgrade every replica
+  before turning it on.
 - **Timing.** Every 10 seconds with jitter, a 2-second deadline per probe, and a
   result is stale after 30 seconds. An address never seen failing is healthy on
   its first success; one seen failing needs two successes in a row. A healthy
