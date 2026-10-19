@@ -30,10 +30,14 @@
   "packageManager": "pnpm@11.9.0",
   "devDependencies": {
     "@types/node": "^24.19.2",
+    "@types/nodemailer": "8.0.2",
     "oxlint": "^1.88.0",
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "jose": "6.2.12",
+    "nodemailer": "10.1.2",
+    "otpauth": "9.5.2",
     "pg": "^8.23.1"
   },
   "bin": {

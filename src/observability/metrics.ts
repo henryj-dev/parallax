@@ -57,12 +57,14 @@ const histograms = new Map<string, Histogram>();
  * reports the wrong thing is worse than no helper, because the test it breaks
  * looks like a finding.
  */
-export function counter(name: string, help: string): (labels?: Record<string, string>) => void {
+export function counter(name: string, help: string): (labels?: Record<string, string>, by?: number) => void {
   register(name, help);
-  return (labels) => {
+  return (labels, by = 1) => {
+    // A counter only goes up, in whole steps.
+    if (!Number.isSafeInteger(by) || by < 1) throw new TypeError(`counter ${name} can only be increased by a positive integer`);
     const metric = register(name, help);
     const key = labelKey(labels);
-    metric.values.set(key, (metric.values.get(key) ?? 0) + 1);
+    metric.values.set(key, (metric.values.get(key) ?? 0) + by);
   };
 }
 

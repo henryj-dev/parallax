@@ -80,11 +80,16 @@ async function main(): Promise<number> {
       // A machine-specific stored setting can make the serving runtime fail
       // closed. Keep a deliberately narrow local-CLI path available to repair it.
       : invocation.name === "settings set"
-        ? createSettingsRecoveryRuntime(config)
+        ? await createSettingsRecoveryRuntime(config)
         // The command line already acts with full rights against the store, so
         // it is the one caller that may hold the repositories themselves. See
         // `RuntimeOptions.exposeStores`.
-        : await createRuntime(config, { exposeStores: true });
+        : await createRuntime(config, { exposeStores: true, readAccountPassword: async () => {
+          if (process.stdin.isTTY) throw new UsageError("provide the account password on stdin");
+          const chunks: Buffer[] = []; let size = 0;
+          for await (const chunk of process.stdin) { const bytes = Buffer.from(chunk as Buffer); size += bytes.byteLength; if (size > 65536) throw new UsageError("password input is too large"); chunks.push(bytes); }
+          return Buffer.concat(chunks).toString("utf8").replace(/\r?\n$/u, "");
+        } });
     // The command line reaches the store directly, so it acts with full rights;
     // HTTP callers are restricted by the role their token carries.
     const result = await runCommand({ runtime, actor: actorName(), role: "admin" }, invocation.name, invocation.input);

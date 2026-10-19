@@ -144,6 +144,63 @@ const RECORD_FIELDS: JsonSchema = {
   },
 };
 
+
+/**
+ * Member accounts, answered before the dispatcher and only in accounts mode.
+ * None of them accepts a bearer token: a machine credential is never a person,
+ * so it cannot sign in, verify, or change a member. Every POST needs this
+ * origin and an `x-parallax-csrf` header -- the anonymous token from
+ * `GET /api/v1/account/csrf` before sign-in, the one `GET /api/v1/account/me`
+ * returns after it. A malformed header is refused, never retried with a cookie.
+ */
+const ANONYMOUS = "Anonymous. Same origin and the sign-in CSRF token; never a bearer token.";
+const CHALLENGE = "The HttpOnly challenge cookie a password or organization sign-in set, same origin and the sign-in CSRF token.";
+const MEMBER = "A member session cookie; never a bearer token.";
+const SENSITIVE = "A member's own account session (not a legacy sign-in) with a code entered within the policy's recent-verification window.";
+const ADMIN_READ = "An administrator member session.";
+const ADMIN = "An administrator member session with a code entered within the policy's recent-verification window.";
+const OK: DocumentedResponse = { status: 200, description: "Done.", schema: { type: "object", properties: { ok: { const: true } } } };
+const SIGNED_OUT: DocumentedResponse = { status: 200, description: "Done. Every session of this member has ended and the cookie is cleared.", schema: { type: "object", properties: { ok: { const: true } } } };
+const SESSION_ISSUED: DocumentedResponse = {
+  status: 200,
+  description: "Either a session (cookie set, CSRF token returned) or `mfaRequired`, with an HttpOnly challenge cookie and whether a new factor must be enrolled.",
+  schema: { type: "object", properties: { csrf: { type: "string" }, mfaRequired: { const: true }, enrollmentRequired: { type: "boolean" } } },
+};
+const accountOperation = (method: HttpMethod, leaf: string, summary: string, access: string, success: DocumentedResponse, body?: Record<string, unknown>, errors: readonly number[] = [400, 403, 409, 429, 503]): DocumentedOperation => ({
+  method, path: `/api/v1/account${leaf}`, tag: "Accounts",
+  source: { kind: "process", summary, access },
+  sample: { path: `/api/v1/account${leaf}`, ...(body ? { body } : {}) },
+  ...(body ? { requestBody: { description: "JSON object.", required: true, schema: { type: "object", required: Object.keys(body), properties: Object.fromEntries(Object.keys(body).map((key) => [key, typeof body[key] === "number" ? { type: "integer" } : typeof body[key] === "object" ? { type: "array" } : { type: "string" }])) } } } : {}),
+  success, errors,
+});
+const ACCOUNT_OPERATIONS: readonly DocumentedOperation[] = [
+  accountOperation("GET", "/csrf", "Issue a sign-in CSRF token", "Anonymous. Sets an HttpOnly nonce cookie the token is bound to.", { status: 200, description: "The token for anonymous POSTs.", schema: { type: "object", properties: { csrf: { type: "string" } } } }, undefined, [503]),
+  accountOperation("POST", "/login", "Sign in with email and password", ANONYMOUS, SESSION_ISSUED, { email: "member@example.com", password: "..." }),
+  accountOperation("POST", "/login/mfa", "Complete sign-in with a code or a recovery code", `${CHALLENGE} A recovery code issues an enrollment challenge, not a session.`, SESSION_ISSUED, { otp: "..." }),
+  accountOperation("POST", "/mfa/enroll", "Start authenticator enrollment", `${CHALLENGE} Or the member's own account session with no confirmed factor, together with the current password in \`password\`: a session cookie alone cannot attach a factor.`, { status: 200, description: "The key to add to an authenticator, shown once.", schema: { type: "object", properties: { secretBase32: { type: "string" }, otpauthUri: { type: "string" } } } }),
+  accountOperation("POST", "/mfa/confirm", "Confirm the authenticator with its first code", `${CHALLENGE} Or the member session that started enrollment.`, { status: 200, description: "A session and recovery codes, shown once.", schema: { type: "object", properties: { csrf: { type: "string" }, recoveryCodes: arrayOf({ type: "string" }) } } }, { otp: "..." }),
+  accountOperation("POST", "/reauthenticate", "Enter a code before a sensitive action", MEMBER, OK, { otp: "..." }),
+  accountOperation("GET", "/me", "The signed-in member", MEMBER, { status: 200, description: "The member, the session's CSRF token, and whether a code was entered recently." }, undefined, [403, 503]),
+  accountOperation("POST", "/logout", "End this session on the server", MEMBER, OK),
+  accountOperation("GET", "/sessions", "This member's sessions", MEMBER, { status: 200, description: "Sessions without their identifiers." }, undefined, [403, 503]),
+  accountOperation("POST", "/sessions/revoke", "End one session, or all of them", SENSITIVE, OK, { createdAt: 0 }),
+  accountOperation("POST", "/password/change", "Change the password", `${SENSITIVE} The new password needs eight characters and three of: lower case, upper case, digits, anything else.`, SIGNED_OUT, { currentPassword: "...", password: "..." }),
+  accountOperation("POST", "/delete", "Leave: delete this account", `${SENSITIVE} With the current password. Refused for the last administrator who can sign in. The address, name, password, factor, sessions and links go at once; linked provider identities stay so they cannot become a new member.`, SIGNED_OUT, { password: "..." }),
+  accountOperation("POST", "/password/forgot", "Ask for a reset link", `${ANONYMOUS} The answer is the same whether or not the address belongs to an account.`, OK, { email: "member@example.com" }),
+  accountOperation("POST", "/password/reset", "Set a new password from a reset link", `${ANONYMOUS} Never signs in.`, OK, { token: "...", password: "..." }),
+  accountOperation("POST", "/email/request", "Send a confirmation link to a new address", SENSITIVE, OK, { email: "new@example.com" }),
+  accountOperation("POST", "/email/confirm", "Confirm the new address from its link", `${SENSITIVE} The same session that asked for it.`, SIGNED_OUT, { token: "..." }),
+  accountOperation("POST", "/invite/accept", "Create an account from an invitation", `${ANONYMOUS} The address must be the one invited; the role is the one the invitation carries.`, OK, { token: "...", email: "member@example.com", password: "...", displayName: "Member" }),
+  accountOperation("GET", "/members", "Every member", ADMIN, { status: 200, description: "Member projections; no hashes, factors or sessions." }, undefined, [403, 503]),
+  accountOperation("POST", "/members/invite", "Invite a person by email", ADMIN, OK, { email: "member@example.com", role: "viewer" }),
+  accountOperation("POST", "/members/change", "Change a member's role or status", `${ADMIN} Refused if it would leave no administrator with a password and confirmed factor. The member's sessions end.`, { status: 200, description: "The member as it now is." }, { userId: "...", version: 1, role: "editor" }),
+  accountOperation("POST", "/mfa/recovery", "Replace the recovery codes", SENSITIVE, { status: 200, description: "New codes, shown once.", schema: { type: "object", properties: { recoveryCodes: arrayOf({ type: "string" }) } } }),
+  accountOperation("GET", "/identities", "Organization sign-ins linked to this member", MEMBER, { status: 200, description: "Issuer and subject pairs." }, undefined, [403, 503]),
+  accountOperation("POST", "/identities/unlink", "Unlink an organization sign-in", `${SENSITIVE} Needs a password to remain.`, SIGNED_OUT, { issuer: "https://idp.example.com", subject: "..." }),
+  accountOperation("GET", "/identities/policy", "The organization sign-in policy", ADMIN_READ, { status: 200, description: "Role source, verification source, automatic sign-up and the legacy window." }, undefined, [403, 503]),
+  accountOperation("POST", "/identities/policy", "Change automatic sign-up", `${ADMIN} Roles stay local and verification stays local TOTP: the provider proves neither a revoked role nor a fresh second factor, so anything else is refused.`, OK, { roleSource: "local", mfaEvidence: "local-totp", jit: [] }),
+];
+
 const SCHEMAS: Readonly<Record<string, JsonSchema>> = {
   Error: {
     type: "object",
@@ -1115,6 +1172,7 @@ const OPERATIONS: readonly DocumentedOperation[] = [
     sample: { path: "/health/ready" },
     success: { status: 200, description: "Ready. `503` with the same shape when it is not.", schema: ref("Opaque") },
   },
+  ...ACCOUNT_OPERATIONS,
   {
     method: "GET", path: "/metrics", tag: "Operations",
     source: {
@@ -1196,6 +1254,7 @@ const TAG_DESCRIPTIONS: Readonly<Record<string, string>> = {
   "Fallback domains": "The provider's client-side resolver overrides.",
   "Health checks": "Probing the internal listener's A and AAAA answers, and leaving out addresses that fail.",
   Meta: "The dispatcher, this document, and how a browser signs in.",
+  Accounts: "Member accounts, when this deployment runs them. A person signs in here; a machine keeps its bearer token for everything else.",
   Operations: "What a probe, a load balancer and a scraper ask for.",
 };
 

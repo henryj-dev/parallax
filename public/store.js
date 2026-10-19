@@ -153,15 +153,19 @@ export function createStore(client) {
         const answer = await client.authenticationMode();
         state.authRequired = answer.mode !== "disabled";
         state.identityProvider = answer.identityProvider;
+        state.memberAccounts = answer.memberAccounts === true;
         // A session may already exist -- an identity provider leaves one behind
         // without this page ever having asked for it.
-        state.role = await client.readSession().then((session) => session.role, () => null);
+        state.role = state.memberAccounts
+          ? await client.readAccount().then((account) => account.user.role, () => null)
+          : await client.readSession().then((session) => session.role, () => null);
         state.authenticated = state.role !== null;
       } catch {
         // Unreachable is treated as protected: drawing an open control plane
         // that turns out to be closed is the worse of the two mistakes.
         state.authRequired = true;
         state.identityProvider = false;
+        state.memberAccounts = false;
       }
       emitChange();
     },
@@ -183,8 +187,26 @@ export function createStore(client) {
     },
 
     async signOut() {
+      if (state.memberAccounts) {
+        let leaving;
+        try {
+          leaving = await client.endMemberSession({ identityProvider: state.identityProvider });
+        } catch {
+          notice("auth.signOutFailed", {}, "error");
+          return;
+        }
+        state.authenticated = false;
+        state.zones = [];
+        state.activeZone = null;
+        state.records = [];
+        emitChange();
+        // Going to the provider's logout already; sending the page to sign-in would cut that off.
+        if (!leaving) intent("auth-required");
+        return;
+      }
+      let providerLogout;
       try {
-        await client.endIdentitySession();
+        providerLogout = await client.endIdentitySession();
       } catch {
         // Token-only deployments have no identity route; the session delete below still ends it.
       }
@@ -198,7 +220,8 @@ export function createStore(client) {
       state.activeZone = null;
       state.records = [];
       emitChange();
-      intent("auth-required");
+      // Only after both local sign-outs: leaving the page first could cut the second one off.
+      if (!providerLogout || !client.followLocation(providerLogout)) intent("auth-required");
     },
 
     // ---- zones -----------------------------------------------------------

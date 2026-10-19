@@ -1,6 +1,6 @@
 import type { OidcSettings } from "../config.ts";
 import { cookieNameForRequest, readCookie as readCookieValue } from "../security/cookies.ts";
-import { hasSameOrigin, IDENTITY_COOKIE } from "../security/http-authorization.ts";
+import { clearedAccountSessionCookie, hasSameOrigin, IDENTITY_COOKIE } from "../security/http-authorization.ts";
 import { beginAuthorization, createEndpointResolver, endSessionUrl, exchangeCode, readIdentity, OidcError, type OidcConfig } from "../security/oidc.ts";
 import { randomUrlSafe, signSession } from "../security/session-token.ts";
 
@@ -119,6 +119,11 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
         // Kept so the provider can be told which session is ending; it is the
         // provider's own value and says nothing this deployment has to protect.
         ...(tokens.idToken ? [sessionCookie(ID_TOKEN_COOKIE, tokens.idToken, url, settings.sessionMaxAgeSeconds)] : []),
+        // 남은 회원 세션 쿠키는 이 새 신원 쿠키를 가린다. 회원 쿠키가 있는 요청은
+        // 그것으로만 판단하기 때문이다. 그러면 포털이 다시 로그인으로 보내고, 로그인은
+        // 다시 여기로 돌아오는 반복이 된다. 명시적인 로그인이 성공했을 때만 지운다.
+        // 이 처리기는 회원 세션 저장소에 닿지 않으므로, 지우는 것은 철회가 아니다.
+        clearedAccountSessionCookie(url),
       ]);
     } catch (error) {
       // An OidcError is Parallax's sentence about Parallax's own decision --
@@ -131,9 +136,25 @@ export function createIdentityHandler(options: IdentityRoutesOptions): (request:
 
   async function logout(request: Request, url: URL): Promise<Response> {
     const idToken = readCookie(request.headers.get("cookie"), handshakeName(ID_TOKEN_COOKIE, url));
-    const cleared = [clearedCookie(handshakeName(IDENTITY_COOKIE, url), url), clearedCookie(handshakeName(ID_TOKEN_COOKIE, url), url)];
+    // 회원 세션 쿠키도 지운다. 이 처리기는 회원 세션 저장소에 닿지 않으므로 서버
+    // 쪽 회원 세션을 끊지는 못한다. 회원 로그아웃은 `DELETE /api/v1/session` 이다.
+    const cleared = [
+      clearedCookie(handshakeName(IDENTITY_COOKIE, url), url),
+      clearedCookie(handshakeName(ID_TOKEN_COOKIE, url), url),
+      clearedAccountSessionCookie(url),
+    ];
     const returnTo = new URL("/", url).toString();
-    return redirect(endSessionUrl(await endpointsOf(), idToken, returnTo), cleared);
+    const endpoints = await endpointsOf();
+    const location = endSessionUrl(endpoints, idToken, returnTo);
+    // A page-script fetch cannot read a manual redirect's location, so it asks for it as JSON. Only a
+    // provider logout is named: sending the page back to `/` would sign it straight in again through
+    // the provider's still-open session, which is a sign-out that did not happen.
+    if ((request.headers.get("accept") ?? "").includes("application/json")) {
+      const headers = new Headers({ "content-type": "application/json", "cache-control": "no-store" });
+      for (const cookie of cleared) headers.append("set-cookie", cookie);
+      return new Response(JSON.stringify(endpoints.endSession ? { location } : {}), { status: 200, headers });
+    }
+    return redirect(location, cleared);
   }
 }
 

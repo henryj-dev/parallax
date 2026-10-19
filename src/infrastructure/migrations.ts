@@ -39,6 +39,7 @@ const MIGRATION_FILES: Readonly<Record<MigrationTarget, readonly string[]>> = {
     "003_audit_actions.sql",
     "004_security_invariants.sql",
     "005_access_token_lifetime.sql",
+    "006_member_accounts.sql",
   ],
 };
 

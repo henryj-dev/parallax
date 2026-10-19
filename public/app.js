@@ -164,6 +164,7 @@ function render(state) {
   if ($("#credential-dialog").open && !$("#panel-fallback").hidden) renderFallback(state);
   if ($("#record-dialog").open) renderRecordDialogHeading();
   $("#sign-out-button").hidden = !state.authRequired || !state.authenticated;
+  $("#account-link").hidden = !state.memberAccounts;
   syncRoleVisibility(state);
   // Every error the store records reaches the surface that caused it, or a
   // refused action would look like nothing happened at all.
@@ -798,6 +799,11 @@ function syncRoleVisibility(state) {
 }
 
 function openAuthDialog() {
+  // Members sign in on the account page; there is no token form in this mode.
+  if (store.getState().memberAccounts) {
+    location.assign("/account/login");
+    return;
+  }
   const dialog = $("#auth-dialog");
   const identity = $("#auth-identity");
   identity.hidden = !store.getState().identityProvider;

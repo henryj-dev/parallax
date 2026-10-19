@@ -209,7 +209,7 @@ describe("portal mapping", () => {
     const seen = [];
     const client = createApiClient({
       fetchImpl: async (input, init = {}) => {
-        seen.push({ url: String(input), method: init.method ?? "GET", redirect: init.redirect });
+        seen.push({ url: String(input), method: init.method ?? "GET", accept: new Headers(init.headers).get("accept") });
         return new Response(null, { status: 204 });
       },
     });
@@ -218,7 +218,8 @@ describe("portal mapping", () => {
     const identity = seen.find((call) => call.url.includes("/auth/logout"));
     assert.ok(identity, "sign-out must POST /auth/logout");
     assert.equal(identity.method, "POST");
-    assert.equal(identity.redirect, "manual");
+    // Asked for as JSON: a manual redirect is opaque, so its location could never be followed.
+    assert.equal(identity.accept, "application/json");
     const session = seen.find((call) => call.url.includes("/session") && call.method === "DELETE");
     assert.ok(session, "sign-out must still clear the token session");
   });

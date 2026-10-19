@@ -3,6 +3,7 @@ import type {
 } from "./ports.ts";
 import { DomainValidationError, type AuditEntry, type Zone, type ZoneRevision } from "../domain/dns.ts";
 import { readHealthChecks } from "../domain/health-checks.ts";
+import { readAccountState, readMemberAudit, type AccountState, type AccountStateStore, type MemberAudit } from "./accounts/state.ts";
 import { healthCheckStoreIssues } from "./control-plane.ts";
 
 /**
@@ -22,7 +23,25 @@ import { healthCheckStoreIssues } from "./control-plane.ts";
  * on the far side and the operator finds out at the next apply.
  */
 
-export const BACKUP_FORMAT = 1;
+/**
+ * Format 2 adds member accounts. Format 1 documents still restore; they simply
+ * carry no accounts.
+ */
+export const BACKUP_FORMAT = 2;
+const READABLE_FORMATS: readonly number[] = [1, 2];
+
+/**
+ * Members as they are stored: password hashes, encrypted factors (useless
+ * without `PARALLAX_ACCOUNT_KEY`, kept apart from this file), recovery-code
+ * hashes, linked identities, policy and the account audit trail.
+ *
+ * Never sessions, invitation/reset/link/challenge tokens or attempt counters:
+ * a restore starts everybody signed out and no mailed link works again.
+ */
+export interface BackupAccounts {
+  readonly state: AccountState;
+  readonly audit: readonly MemberAudit[];
+}
 
 export interface BackupZone {
   readonly current: Zone;
@@ -31,7 +50,7 @@ export interface BackupZone {
 }
 
 export interface BackupDocument {
-  readonly format: typeof BACKUP_FORMAT;
+  readonly format: 1 | 2;
   readonly takenAt: string;
   readonly zones: readonly BackupZone[];
   /** Ascending by id. */
@@ -41,6 +60,8 @@ export interface BackupDocument {
   readonly accessTokens: readonly StoredAccessToken[];
   /** The credential store's document, byte for byte. Absent when none exists. */
   readonly credentials?: string;
+  /** Format 2 only, and only where member accounts exist in the source. */
+  readonly accounts?: BackupAccounts;
 }
 
 export interface BackupStores {
@@ -59,6 +80,8 @@ export interface BackupStores {
     /** Whether a zone's internal view would be published elsewhere under these settings. */
     readonly unsupported: (zone: string, settings: Record<string, unknown>) => boolean | Promise<boolean>;
   };
+  /** Present where this process can read and write member accounts. */
+  readonly accounts?: AccountStateStore;
 }
 
 export class BackupError extends Error {
@@ -100,8 +123,10 @@ export async function exportBackup(stores: BackupStores, now: () => Date = () =>
   // away the history of every zone ever deleted.
   const audit = (await stores.zones.audit()).slice().sort((left, right) => left.id - right.id);
   const credentials = await stores.credentials.read();
+  const accounts = stores.accounts ? withoutLiveSecrets(await stores.accounts.snapshot()) : undefined;
   return {
-    format: BACKUP_FORMAT,
+    // A deployment without member accounts still writes format 1, which every earlier reader accepts.
+    format: accounts ? BACKUP_FORMAT : 1,
     takenAt: now().toISOString(),
     zones: backupZones,
     audit,
@@ -109,7 +134,15 @@ export async function exportBackup(stores: BackupStores, now: () => Date = () =>
     settings: await stores.settings.read(),
     accessTokens: await stores.accessTokens.list(),
     ...(credentials === undefined ? {} : { credentials }),
+    ...(accounts ? { accounts } : {}),
   };
+}
+
+/** Keeps only what a member is, never what lets somebody act as one right now. */
+function withoutLiveSecrets(snapshot: { state: AccountState; audit: MemberAudit[] }): BackupAccounts | undefined {
+  const { state, audit } = snapshot;
+  if (!state.enabled && state.users.length === 0) return undefined;
+  return { state: { ...state, sessions: [], tokens: [], throttle: [], memberThrottle: {} }, audit };
 }
 
 export interface RestoreSummary {
@@ -120,6 +153,8 @@ export interface RestoreSummary {
   readonly settings: number;
   readonly accessTokens: number;
   readonly credentials: boolean;
+  /** Members restored. Every one of them starts signed out. */
+  readonly members: number;
   /**
    * Said out loud rather than left for somebody to notice.
    *
@@ -139,6 +174,9 @@ export interface RestoreSummary {
  * having to remove a state file or drop a schema on purpose.
  */
 export async function importBackup(stores: BackupStores, document: BackupDocument): Promise<RestoreSummary> {
+  if (document.accounts && !stores.accounts) {
+    throw new BackupError("this backup carries member accounts; restore it with PARALLAX_AUTH_MODE=accounts so they are not silently dropped");
+  }
   // Held across the check and every write: a commit adding an enabled health
   // check elsewhere meanwhile would be counted against an empty store.
   return stores.healthChecks
@@ -181,6 +219,13 @@ async function restore(stores: BackupStores, document: BackupDocument): Promise<
   if (Object.keys(document.settings).length > 0) await stores.settings.write(document.settings);
   for (const token of document.accessTokens) await stores.accessTokens.create(token);
   if (document.credentials !== undefined) await stores.credentials.write(document.credentials);
+  // Last, and in one account transaction: state, audit and the activation marker
+  // commit together or not at all. A failure anywhere above leaves member
+  // accounts unrestored and therefore not enabled, so sign-in stays closed
+  // rather than open on half a member set. The zone, settings and token writes
+  // above are not one transaction across stores; an interrupted restore is
+  // retried into an emptied store.
+  if (document.accounts) await restoreAccounts(stores.accounts!, document.accounts);
 
   return {
     zones: document.zones.length,
@@ -190,6 +235,7 @@ async function restore(stores: BackupStores, document: BackupDocument): Promise<
     settings: Object.keys(document.settings).length,
     accessTokens: document.accessTokens.length,
     credentials: document.credentials !== undefined,
+    members: document.accounts?.state.users.length ?? 0,
     auditRenumbered: document.audit.length > 0,
   };
 }
@@ -204,9 +250,11 @@ export function readBackupDocument(value: unknown): BackupDocument {
     throw new BackupError("a backup document must be a JSON object");
   }
   const candidate = value as Record<string, unknown>;
-  if (candidate.format !== BACKUP_FORMAT) {
-    throw new BackupError(`unsupported backup format ${String(candidate.format)}; this build writes and reads ${BACKUP_FORMAT}`);
+  if (typeof candidate.format !== "number" || !READABLE_FORMATS.includes(candidate.format)) {
+    throw new BackupError(`unsupported backup format ${String(candidate.format)}; this build writes ${BACKUP_FORMAT} and reads ${READABLE_FORMATS.join(" and ")}`);
   }
+  if (candidate.format === 1 && candidate.accounts !== undefined) throw new BackupError("a format 1 backup cannot carry member accounts");
+  const accounts = candidate.accounts === undefined ? undefined : readBackupAccounts(candidate.accounts);
   const zones = requireArray(candidate.zones, "zones").map((entry, index) => {
     const zone = requireObject(entry, `zones[${index}]`);
     return {
@@ -215,7 +263,7 @@ export function readBackupDocument(value: unknown): BackupDocument {
     };
   });
   return {
-    format: BACKUP_FORMAT,
+    format: candidate.format as 1 | 2,
     takenAt: typeof candidate.takenAt === "string" ? candidate.takenAt : "",
     zones,
     audit: requireArray(candidate.audit, "audit") as unknown as AuditEntry[],
@@ -223,7 +271,47 @@ export function readBackupDocument(value: unknown): BackupDocument {
     settings: requireObject(candidate.settings, "settings"),
     accessTokens: requireArray(candidate.accessTokens, "accessTokens") as unknown as StoredAccessToken[],
     ...(typeof candidate.credentials === "string" ? { credentials: candidate.credentials } : {}),
+    ...(accounts ? { accounts } : {}),
   };
+}
+
+/**
+ * Strict, unlike the rest of the document: the account state is checked
+ * whole -- exact fields, references, unique addresses and identities, and a
+ * ready state only with an administrator who can sign in -- because nothing
+ * after this would catch a wrong one before people sign in against it. Any
+ * activation stage of an enabled store is accepted and restored as taken.
+ */
+function readBackupAccounts(value: unknown): BackupAccounts {
+  const section = requireObject(value, "accounts");
+  const keys = Object.keys(section).sort();
+  if (keys.length !== 2 || keys[0] !== "audit" || keys[1] !== "state") throw new BackupError("accounts must carry exactly state and audit");
+  let state: AccountState, audit: MemberAudit[];
+  try {
+    state = readAccountState(section.state);
+    audit = readMemberAudit(section.audit);
+  } catch {
+    throw new BackupError("accounts is not a valid member account state");
+  }
+  if (state.sessions.length > 0 || state.tokens.length > 0 || state.throttle.length > 0 || Object.keys(state.memberThrottle).length > 0) {
+    throw new BackupError("accounts must not carry sessions, mailed or sign-in tokens, or attempt counters");
+  }
+  // Any activation stage restores as it was taken: enabled with no member yet, the first administrator
+  // still enrolling, or an administrator recovery in progress. Member sign-in stays closed until that
+  // administrator signs in with the password and enrolls a factor; no challenge or session comes back.
+  if (!state.enabled) throw new BackupError("accounts must be enabled; a store that never enabled them has nothing to restore");
+  return { state, audit };
+}
+
+/** One transaction into an account store that has never been enabled and holds no member. */
+async function restoreAccounts(store: AccountStateStore, accounts: BackupAccounts): Promise<void> {
+  await store.transact((transaction) => {
+    if (transaction.state.enabled || transaction.state.users.length > 0 || transaction.state.bootstrap !== "empty") {
+      throw new BackupError("refusing to restore member accounts into a store that already has them");
+    }
+    transaction.state = structuredClone(accounts.state);
+    transaction.audit.push(...structuredClone([...accounts.audit]));
+  });
 }
 
 /**
@@ -253,6 +341,12 @@ async function assertEmpty(stores: BackupStores, document: BackupDocument): Prom
       "refusing to restore into a store that already holds a credential document."
       + " Replacing it would discard credentials this backup cannot restore if the two master keys differ.",
     );
+  }
+  if (document.accounts && stores.accounts) {
+    const state = await stores.accounts.read();
+    if (state.enabled || state.users.length > 0 || state.bootstrap !== "empty") {
+      throw new BackupError("refusing to restore into a store whose member accounts are already enabled or populated");
+    }
   }
   const settings = await stores.settings.read();
   if (Object.keys(document.settings).length > 0 && Object.keys(settings).length > 0) {

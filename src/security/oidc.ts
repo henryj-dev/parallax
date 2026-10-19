@@ -327,6 +327,10 @@ export async function readIdentity(
 /** No standard claim carries this, so one provider's name is the default. */
 const DEFAULT_ROLE_CLAIM = "entitlements";
 
+/** Legacy sign-in's reading of a role claim, shared so the accounts-mode legacy window reads it identically. */
+export function readLegacyRole(value: unknown): Role | undefined { return readRole(value); }
+export const LEGACY_ROLE_CLAIM = DEFAULT_ROLE_CLAIM;
+
 function readRole(value: unknown): Role | undefined {
   const keys = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
   const held = new Set(keys.filter((key): key is string => typeof key === "string").map((key) => key.toLowerCase()));

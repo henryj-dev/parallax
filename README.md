@@ -210,7 +210,7 @@ flowchart LR
         C["⌨️ CLI"]
     end
 
-    faces --> CMD["command layer<br/>53 commands"]
+    faces --> CMD["command layer<br/>60 commands"]
     CMD --> CP["control plane<br/>zones · revisions · audit"]
 
     CP --> ST[("store")]
@@ -293,6 +293,7 @@ Nothing below is required to start on loopback with file state.
 | `DATABASE_URL` | Use PostgreSQL. Absent means single-node files |
 | `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | Where those files live. The state file keeps its history beside it in `<state file>.d/` — back up the directory, not the one file |
 | `PARALLAX_AUTH_TOKENS` | Break-glass tokens, as JSON. Normal tokens are issued through the portal |
+| `PARALLAX_AUTH_MODE` | `legacy` (the default when unset) or `accounts`. `accounts` needs its own policy file, key and SMTP settings and refuses to start without them; any other value is a configuration error. See [Member accounts](#member-accounts) |
 | `PARALLAX_OWNERSHIP_SECRET` | Signs ownership markers |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | Encrypts stored provider credentials (AES-256-GCM) |
 
@@ -346,7 +347,7 @@ and the defaults are the careful ones.
 |---|---|
 | `allowLocalProvider` | Publish to a local file when no real provider is configured |
 | `publicOrigin` | Absolute origin browsers reach the portal at; empty derives it per request |
-| `trustForwardedHeaders` | Trust `X-Forwarded-Proto` / `X-Forwarded-Host` |
+| `trustForwardedHeaders` | Trust `X-Forwarded-Proto` / `X-Forwarded-Host`, and `X-Forwarded-For` as the client address member attempt limits count by |
 | `revisionRetention` | Newest snapshots kept per zone; `0` keeps every one |
 | `auditRetentionDays` | Days of audit history kept per zone; `0` keeps everything |
 | `fallbackResolver` | Address a client-side resolver override should point at |
@@ -360,7 +361,7 @@ and the defaults are the careful ones.
 
 ## Command line
 
-53 commands. Add `--json` to any of them for machine-readable output; run
+60 commands. Add `--json` to any of them for machine-readable output; run
 `parallax help <command>` for its options.
 
 <details open>
@@ -457,6 +458,20 @@ pnpm cli health check status --zone example.com
 
 </details>
 
+<details>
+<summary><b>Member accounts (host only)</b></summary>
+
+| Command | |
+|---|---|
+| `accounts enable` · `accounts status` · `accounts list` | Turn member accounts on, and look at them |
+| `accounts bootstrap` | The first administrator, password from stdin |
+| `accounts recover` · `accounts mfa reset` | Replace a lost second factor |
+| `accounts legacy` | A fixed window for existing provider sign-ins |
+
+None of these is reachable over HTTP. See [Member accounts](#member-accounts).
+
+</details>
+
 `backup` and `restore` have no HTTP route and cannot get one: the serving
 runtime is not given the repositories they use, so neither the credential
 document nor a direct write to the revision history is reachable through a
@@ -481,7 +496,7 @@ DATABASE_URL=postgres://… parallax restore < parallax-backup.json
 
 ## HTTP API
 
-**43 paths**, described by an OpenAPI 3.1 document the process generates from
+**67 paths**, described by an OpenAPI 3.1 document the process generates from
 its own command table — so the description cannot drift from the behaviour.
 
 ```http
@@ -687,8 +702,321 @@ a substitute for the 32-byte minimum token entropy.
 
 | Store | When |
 |---|---|
-| **PostgreSQL** | `DATABASE_URL` is set. Seven tables, applied by `parallax migrate` |
+| **PostgreSQL** | `DATABASE_URL` is set. Ten tables, applied by `parallax migrate` |
 | **Files** | Otherwise. Atomic writes, `0600` files inside a `0700` directory |
+
+### Member accounts
+
+People can sign in with an account of their own — an email address, a password
+and an authenticator app — and may link an organization (OpenID Connect)
+account to it. It is off until a host operator turns it on, and machines keep
+their bearer tokens throughout.
+
+**Turning it on.** Every step is explicit; nothing turns on by itself.
+
+1. `parallax migrate`. Migration 006 adds three tables and turns nothing on.
+2. Write the policy file and set the variables below. **No number has a
+   default.** A missing, unknown or out-of-range field stops startup and
+   `parallax config check` alike.
+3. Stop every replica of an older version (see *Rolling back* below).
+4. Start with `PARALLAX_AUTH_MODE=accounts`, then on the host:
+
+   ```bash
+   parallax accounts enable
+   parallax accounts bootstrap --email admin@example.com --display-name Admin < password-file
+   ```
+
+   The password is read from stdin and never from the command line, and the
+   command prints no sign-in secret. That administrator then signs in at
+   `/account/login` with the password, enrolls an authenticator and saves the
+   recovery codes; until then every member session is refused.
+
+| Variable | |
+|---|---|
+| `PARALLAX_ACCOUNT_POLICY_FILE` | The JSON policy below. Required |
+| `PARALLAX_ACCOUNT_KEY` | 32 random bytes, base64url. Separate keys for authenticator-secret encryption, CSRF tokens and attempt counters are derived from it. Keep it out of backups: without it no stored factor can be read |
+| `PARALLAX_ACCOUNT_PUBLIC_ORIGIN` | The `https://` origin mailed links point at. Never taken from a request's `Host` |
+| `PARALLAX_SMTP_HOST` · `PARALLAX_SMTP_PORT` · `PARALLAX_SMTP_TLS` | Where mail goes. `PARALLAX_SMTP_TLS` is `implicit` or `starttls` and is never guessed from the port; both verify the server certificate and refuse plain text |
+| `PARALLAX_SMTP_NAME` · `PARALLAX_SMTP_FROM` · `PARALLAX_SMTP_USER` · `PARALLAX_SMTP_PASSWORD` | EHLO name, sender address and credentials |
+| `PARALLAX_SMTP_CONNECTION_TIMEOUT_MS` · `PARALLAX_SMTP_GREETING_TIMEOUT_MS` · `PARALLAX_SMTP_SOCKET_TIMEOUT_MS` · `PARALLAX_SMTP_DNS_TIMEOUT_MS` | Each one required |
+| `PARALLAX_SMTP_MAX_CONNECTIONS` · `PARALLAX_SMTP_MAX_QUEUED` · `PARALLAX_SMTP_MAX_MESSAGES` | Each one required |
+| `PARALLAX_ACCOUNT_OIDC_ALGORITHMS` · `PARALLAX_ACCOUNT_OIDC_TIMEOUT_MS` · `PARALLAX_ACCOUNT_OIDC_COOLDOWN_MS` · `PARALLAX_ACCOUNT_OIDC_CACHE_MAX_AGE_MS` · `PARALLAX_ACCOUNT_OIDC_MAX_TOKEN_AGE_SECONDS` · `PARALLAX_ACCOUNT_OIDC_CLOCK_TOLERANCE_SECONDS` | Required when `PARALLAX_OIDC_ISSUER` is set. Algorithms are a comma list of `RS256`, `ES256`, `EdDSA` |
+
+The policy file has exactly these fields. The code carries no value; the
+example below fills in the shared account policy agreed so far (test values
+are separate and much smaller). The zeros are what is still the operator's to
+choose — concurrent and queued hashing, the session touch interval and
+per-member session count, the email-change and sign-in code lifetimes, the
+provider sign-in limit, the table bound, the audit entry bound and the TOTP
+issuer name — and the file is refused until they are set.
+
+```json
+{
+  "loginKey": "email-nfc-lowercase-v1",
+  "password": { "minLength": 8, "maxBytes": 65536, "maxConcurrent": 0, "maxQueued": 0,
+    "scrypt": { "N": 65536, "r": 8, "p": 2, "maxmem": 100663296, "keylen": 32 },
+    "verifyLimits": { "maxMemoryBytes": 100663296, "maxWork": 1048576, "maxKeylen": 32 } },
+  "session": { "idleSeconds": 1800, "absoluteSeconds": 43200, "touchIntervalSeconds": 0, "maxPerUser": 0 },
+  "recentAuthSeconds": 600,
+  "mfa": { "digits": 6, "periodSeconds": 30, "window": 1, "algorithm": "SHA1", "recoveryCodeCount": 10, "issuer": "" },
+  "tokens": { "inviteSeconds": 259200, "resetSeconds": 1800, "emailChangeSeconds": 0, "challengeSeconds": 0, "enrollmentSeconds": 86400 },
+  "rateLimit": {
+    "login": { "attempts": 5, "windowSeconds": 900, "baseDelaySeconds": 1, "maxDelaySeconds": 900 },
+    "mfa": { "attempts": 5, "windowSeconds": 900, "baseDelaySeconds": 1, "maxDelaySeconds": 900 },
+    "reset": { "attempts": 5, "windowSeconds": 900, "baseDelaySeconds": 1, "maxDelaySeconds": 900 },
+    "link": { "attempts": 0, "windowSeconds": 0, "baseDelaySeconds": 0, "maxDelaySeconds": 0 },
+    "maxEntries": 0 },
+  "retention": { "auditDays": 365, "auditMaxEntries": 0 }
+}
+```
+
+The shared values mean: passwords of at least 8 characters using three of
+lower-case letters, upper-case letters, digits and anything else (spaces and
+other scripts count), judged after Unicode NFC, with no maximum beyond the
+64 KiB request body and no breached-password list; scrypt N 65536, r 8, p 2;
+sessions idle 30 minutes and absolute 12 hours; a code entered at sign-in
+counts as recent for 10 minutes; 6-digit SHA-1 codes every 30 seconds with
+one step either side, each step used once; 10 single-use recovery codes;
+invitations for 3 days, resets for 30 minutes, an authenticator enrollment the
+host starts (bootstrap or recovery) for 24 hours — one that follows a password
+step lasts as long as any sign-in step, and its browser cookie only for the
+browser session; after 5 failures each further attempt waits 1, 2, 4… seconds up
+to 15 minutes, a counter starts over 15 minutes after its last attempt, and
+nothing locks for good; audit kept a year. A password that misses the rule is
+answered `400 weak-password`, before any hashing. Addresses are
+compared after Unicode NFC and lower-casing, and nothing else: `a.b+tag@` and
+`ab@` stay two people.
+
+**Sessions.** A 32-byte random cookie, `parallax_account` (`__Host-parallax_account`
+over HTTPS), `HttpOnly` and `SameSite=Lax`. Only its digest is stored. Every
+request reads the member's current role and status from the shared store, so
+signing out, suspending, deleting, changing a role or resetting a password ends
+the session on every replica from the next request. A missing or ended session
+is `401` on every route, read or write. If the account store cannot be read,
+management answers `503`; the DNS listener keeps answering. Every mutation needs
+this origin and an `x-parallax-csrf` header; a wrong header is refused and never
+retried with a cookie.
+
+**Second factor.** Administrators always enter a code at sign-in. A member has
+at most one unfinished sign-in challenge (and one reset, email-change or
+enrollment link) at a time: a new one replaces the earlier, which stops
+working, so repeating the password step cannot crowd out anyone else. The one
+exception is the re-enrollment challenge a recovery code issues: an ordinary
+sign-in does not replace it, so it stays usable until the new factor is set up
+or it expires. Changing a
+password, an email address, sessions, organization links, members, tokens,
+credentials or settings, and the CLI route, also need a code entered within
+`recentAuthSeconds`, from a confirmed authenticator. Enrolling one from a
+signed-in session also needs the current password, so a copied session cookie
+cannot attach a factor of its own. A code step is accepted once across all
+replicas. A
+recovery code works once, ends every session, and leads only to enrolling a new
+authenticator. That enrollment must finish within `challengeSeconds`; after
+that the next recovery code is needed, and once every code is used the factor
+is reset on the host. A lost factor is reset on the host: `parallax accounts mfa reset
+--user-id <id>`, or for the last administrator `parallax accounts recover
+--user-id <id>`, which closes member sign-in until that administrator enrolls
+again. The last active administrator with a password and a confirmed factor
+cannot be suspended, deleted, demoted or reset, even by two requests at once.
+
+**Machines.** Bearer tokens keep every DNS route. They cannot reach
+`/api/v1/account/*`, and in accounts mode `POST /api/v1/session` refuses to turn
+a token into a browser session (`403 human_login_required`). `parallax accounts
+…` commands exist on the host command line only; `POST /api/v1/cli` cannot run
+them. A machine token is independent of the member who issued it: suspending,
+demoting or deleting that member leaves the token working until it is revoked or
+expires. Who issued or revoked one is recorded in the account audit trail. Listing
+tokens needs an administrator session but no recent code; issuing and revoking
+need one.
+
+**Attempt limits.** Two limits, both of which must allow an attempt. Each
+member carries its own sign-in, code and reset counters, which nothing else can
+push out. Every attempt is counted before any password is hashed; a password or
+code that turns out right takes back its own attempt from the member, so a
+person is never limited for signing in often, while earlier failures stay
+counted. Up to `attempts` there is no wait; after that each attempt waits
+`baseDelaySeconds × 2^(n−1)` (n counting past `attempts`), capped at
+`maxDelaySeconds`, with one attempt allowed after each wait (`429` with
+`Retry-After` while waiting), and a counter starts over `windowSeconds` after
+its last attempt. Nothing locks for good. The address limit is different on purpose: it
+counts every attempt from that address, successes included, so sign-ins to an
+account one controls cannot be mixed in to stretch an address's allowance for
+guesses at other accounts.
+
+That makes the per-account limit a lever too: anyone who knows an address can
+spend its allowance with wrong passwords and make that person — an
+administrator included — wait between attempts, up to `maxDelaySeconds`, for as
+long as the guessing goes on. It is the
+price of limiting guesses per account rather than per client only. To recover
+sooner than the window, first make sure the password is one only that person
+knows — change it, or reset it — because until a new factor is enrolled anyone
+who knows the password can enroll one; then run
+`parallax accounts recover --user-id <id>` for the last administrator or
+`parallax accounts mfa reset --user-id <id>` for anyone else. Both clear that
+member's counters (and replace the factor). A shorter
+`windowSeconds` or a larger `attempts` applies to windows that start after the
+change. Because a counter starts over only `windowSeconds` after its last
+attempt, one request every `maxDelaySeconds` is enough to keep a member waiting
+indefinitely; the answer is the same host recovery, after replacing the
+password.
+
+Two of these behaviours are product exceptions, decided as such: the client
+limit counts successful attempts too, and when a table is saturated the client
+and unknown-address counters fall back to each process, so with N replicas
+they can be up to N times looser. A real member's own counter is never in a
+process: it is always in the shared store.
+
+An address that belongs to no member gets its own keyed counter with the same
+limit and window, so in normal operation when it is limited does not show
+whether an account exists. Clients are counted by network address — IPv4 by address, IPv6 by its
+/64. Both shared tables hold `maxEntries` per kind; a full one drops its oldest
+entry still under the limit, and an entry at its limit stays until its window
+ends. When a table is full of entries at their limit, the new counter is kept
+by the serving process instead, under the same limit: no client shares
+another's allowance, an unknown address is still limited at the same attempt
+as a real one, and every check runs before any password is hashed. Those
+per-process counters have two costs. Each replica keeps its own, so N replicas
+allow up to N times the limit while a table is saturated; and they are bounded
+in memory, so under a long enough flood the least recently used are dropped,
+which can include a counter at its limit
+(`parallax_account_local_limiter_evictions_total`). Alert on
+`parallax_account_throttle_saturated_total`, which counts every time a table
+was full. `rateLimit.link` limits starting a provider sign-in, separately from
+resets.
+
+While a table is saturated, that sameness can be bought. Someone willing to
+spend requests can tell a missing address from a real one in three ways: with
+N replicas behind a load balancer, a missing address may be allowed up to
+N × `attempts` tries before every replica limits it, while a real account stops
+at `attempts`; the per-process counters are dropped least recently used first,
+so roughly 25,000 other requests (half the 50,000-entry bound) can push out a
+missing address's locked counter; and the shared table for missing addresses
+drops its oldest entry under the limit, so about `maxEntries` requests can push
+one out. Each costs a flood that is visible: alert on
+`parallax_account_throttle_saturated_total` and
+`parallax_account_local_limiter_evictions_total`.
+
+The client limit counts a network address, not a person, and that is intended:
+people behind one NAT, office proxy or VPN exit share one bucket, so one of
+them guessing or mistyping can make the others get `429` for a sign-in, a code
+or a reset while the wait lasts; their own member counters are unaffected.
+Which address that is depends on how requests arrive. Behind a reverse proxy,
+turn on the `trustForwardedHeaders` setting only when every request comes
+through that proxy and it overwrites `X-Forwarded-For`: off, every client is
+counted as the proxy and shares one bucket; on without such a proxy, a client
+can name any address it likes. Size `attempts` and `windowSeconds` for the
+largest group that shares an address and how often its members sign in — every
+sign-in behind a NAT or office proxy, successful or not, counts against that one
+address — and watch for `429` bursts from one address before raising them. A client whose address cannot be read shares a single bucket,
+counted in `parallax_account_unidentified_clients_total` and reported once on
+stderr: check the `trustForwardedHeaders` setting and what the proxy puts in
+`X-Forwarded-For`. Counters are never backed up, and a counter of an older or
+broken shape is dropped (`parallax_account_throttle_entries_dropped_total`)
+rather than refusing the store.
+
+Password hashing takes up to `maxConcurrent` × scrypt `maxmem` at once (queued
+work waits and takes none). `parallax config check` prints that figure as
+`accountHashing.peakMiB` and warns above 512 MiB; compare it with the memory the
+container is given.
+
+**Passwords.** A reset replaces a password a member already has; it never
+creates one. A person who has only signed in through the provider — automatic
+sign-up or the legacy window — has no password to reset, so the provider stays
+the only way in for them.
+
+**Leaving and deletion.** A member can delete their own account with a recent
+code and the current password (`POST /api/v1/account/delete`); the last
+administrator who can sign in cannot. An administrator can delete a member.
+Either way the address, display name, password, factor, sessions, mailed links
+and attempt counters go at once; what stays is a tombstone with the member id
+and `deleted` status, and the provider identities (issuer and subject) the
+member linked, so that provider account cannot quietly become a new member.
+The address can be invited again. The account audit trail never holds an
+address. Backups taken before a deletion still hold that person's data: keep
+backups for 30 days, so a departed person's data is gone from them too within
+30 days.
+
+**Organization sign-in.** The ID token's signature, issuer, audience, nonce,
+age and the PKCE exchange are verified; discovery is not followed off the
+issuer's origin. A provider account is linked only from a signed-in member who
+entered a code recently, and only by issuer and subject — never by email.
+Roles stay in Parallax and the second factor stays the Parallax authenticator,
+so an administrator who signs in through the provider still enters a code here.
+A provider role source or provider MFA is refused, not merely discouraged: the
+current provider contract cannot show that a role was revoked by the next
+request, or that a second factor is fresh. Automatic sign-up on a first
+provider sign-in is off unless an administrator names one issuer and the most
+people it may admit; it makes viewers, refuses an address already in use, and
+restricts by issuer and count only — there is no tenant or group restriction
+yet.
+
+**The legacy window.** Existing provider sign-ins can keep working for a fixed
+time: `parallax accounts legacy --until 2030-01-01T00:00:00.000Z --role-cap
+editor`. The role is read the way legacy mode reads it — from userinfo, whose
+subject must match the signed ID token, under `PARALLAX_OIDC_ROLE_CLAIM` (by
+default `entitlements`), a string or a list, in any case, highest role wins —
+then capped, and read again at each sign-in. No email is needed. A legacy
+sign-in is not a member: it is kept under a key derived from issuer and
+subject, has no address, password or factor, and cannot obtain one by reset,
+enrollment or invitation. Its sessions are stored and revocable, end at the
+deadline including those already issued, and can do nothing sensitive. When
+the person links the same provider account to their invited account, the legacy
+record is folded into it and its sessions end. Cookies signed by the old OpenID
+Connect session secret are never accepted in accounts mode.
+
+Differences from legacy mode to check before the switch: nobody signs in as an
+administrator through the window (the cap is `viewer` or `editor`); every
+administrator needs an invited account with an authenticator first; userinfo
+must answer for this client with the role claim; and a session made before the
+switch is not carried over.
+
+**Backups.** `backup` now writes format 2: members, password hashes, encrypted
+factors, recovery-code hashes, linked identities, policy and the account audit
+trail. Sessions, mailed links, sign-in challenges and attempt counters are left
+out, so a restore starts everybody signed out. A deployment without member
+accounts still writes format 1, and format 1 documents still restore. Every
+activation stage restores as taken — enabled with no member yet, the first
+administrator still enrolling, an administrator recovery in progress — and
+member sign-in stays closed in the last two until that administrator signs in
+with the password and enrolls a factor. The account section is parsed strictly and every check runs before
+anything is written; it is written last, in one transaction with its
+activation marker. Zones, settings and tokens are written before it and are not
+one transaction across stores: an interrupted restore leaves accounts not
+enabled, so sign-in stays closed, and is retried into an emptied store. A
+backup is as personal as the store it came from — it still holds members
+deleted since — so keep it no longer than 30 days.
+
+**Storage.** All account state is one row (`parallax_account_state`) or one
+section of the configuration file, changed under one lock, plus an append-only
+audit table pruned by `retention`. Checking a session only reads it; the row is
+rewritten when a session is due its `touchIntervalSeconds` touch and by every
+sign-in, attempt count and account change. That keeps every rule in one
+transaction, and is meant for tens to hundreds of members rather than
+thousands.
+
+**Refusing a store a newer version changed.** Enabling writes
+`member-accounts-v1` to `parallax_auth_features` (PostgreSQL) or `authFeatures`
+(configuration file, now version 2) in the same transaction as the state. A
+version that does not recognize a recorded feature stops before any listener
+opens; this one stops in legacy mode once accounts are enabled. A record that
+cannot be read stops startup too: "could not check" is not "nothing there".
+
+| Message | Meaning |
+|---|---|
+| `authentication storage is not compatible with this version: ...` | A newer version turned a feature on. Run that version, or follow the rollback below |
+| `authentication storage could not be checked, so this version did not start: ...` | The connection, a permission or the lookup failed. Fix access; do not delete records |
+| `member accounts are enabled; PARALLAX_AUTH_MODE=accounts is required` | This store has members; legacy mode would serve it without them |
+
+**Rolling back.** The new tables are additive, which does not make an older
+binary safe: one that predates the feature check would ignore the members and
+reopen the old sign-in. Roll back only to a version that refuses the marker,
+from a verified backup, and never by dropping the tables.
+
+**Not yet.** Security notices (password changed, email changed, factor reset,
+recovery code used, factor replaced after a recovery code, provider linked or
+unlinked) are sent once and not retried. A session is named in the list by when it began. There are no
+passkeys, and a member who only ever signed in through the provider cannot add
+a password themselves.
 
 ### Does this release change the schema?
 
@@ -784,7 +1112,9 @@ provider adapter, Cloudflare; the **internal** view is either published into a
 server that speaks RFC 2136 (`PARALLAX_DNS_INTERNAL_UPDATE`) or answered by this
 process's own listener, and the local file provider stands in for deployments with
 no provider configured at all. `restore` is not a merge and refuses a store that
-already holds zones or tokens.
+already holds zones or tokens. Member accounts keep roles and the second factor
+local: a provider role source or provider MFA is refused, and automatic sign-up
+is limited by issuer and count only ([details](#member-accounts)).
 
 ---
 

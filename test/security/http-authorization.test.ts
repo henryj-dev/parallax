@@ -37,6 +37,7 @@ describe("HTTP token authentication", () => {
     assert.deepEqual(authenticate(request("/api/v1/zones", "GET", "viewer-secret-0000000000000000000"), config), {
       role: "viewer",
       subject: "read-only",
+      kind: "access-token",
     });
   });
 
@@ -64,6 +65,7 @@ describe("HTTP token authentication", () => {
     assert.deepEqual(authenticate(request("/api/v1/zones"), { enabled: false, tokens: [] }), {
       role: "admin",
       subject: "authentication-disabled",
+      kind: "authentication-disabled",
     });
   });
 
@@ -467,6 +469,6 @@ describe("the authorization path does not re-prepare on every request", () => {
     }));
 
     assert.equal(answer.status, 200);
-    assert.deepEqual(seen, { role: "editor", subject: "ed" });
+    assert.deepEqual(seen, { role: "editor", subject: "ed", kind: "access-token" });
   });
 });

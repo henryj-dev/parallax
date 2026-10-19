@@ -1,3 +1,5 @@
+import type { AccountService } from "../application/accounts/service.ts";
+import type { AccountStateStore } from "../application/accounts/state.ts";
 import { TOKEN_REFRESH_INTERVAL_MS, type AccessTokenService } from "../application/access-tokens.ts";
 import { exportBackup, importBackup, readBackupDocument, type BackupStores } from "../application/backup.ts";
 import type { CloudflareCredentialManager } from "../application/cloudflare-credentials.ts";
@@ -23,6 +25,9 @@ export interface CommandRuntime {
   readonly accessTokens?: AccessTokenService;
   readonly credentials?: CloudflareCredentialManager;
   readonly fallbackDomains?: FallbackDomainService;
+  readonly accounts?: AccountService;
+  /** Never provided to HTTP, including the /cli bridge. */
+  readonly accountsHost?: { service: AccountService; store: AccountStateStore; readPassword: () => Promise<string> };
   /** Present only when a database backs this process. */
   readonly migrate?: () => Promise<MigrationRun>;
   /**
@@ -312,7 +317,30 @@ const PAGING = [
   { name: "offset", summary: "Entries to skip", type: "number" },
 ] as const;
 
+function accountsHost(context: CommandContext): NonNullable<CommandRuntime["accountsHost"]> {
+  const host = context.runtime.accountsHost;
+  if (!host) throw new CommandUnavailableError("account host operations are available only from the local CLI in accounts mode");
+  return host;
+}
 const COMMANDS: readonly Command[] = [
+  { name: "accounts enable", summary: "Explicitly activate member accounts", role: "admin", options: [], run: async (c) => { await accountsHost(c).service.enable(); return { enabled: true }; } },
+  { name: "accounts bootstrap", summary: "Create the first administrator with a password from stdin", role: "admin", options: [
+    { name: "email", summary: "Administrator email", required: true }, { name: "display-name", summary: "Display name", required: true },
+  ], run: async (c, input) => {
+    // The enrollment challenge stays inside the service: printing it would put a sign-in secret into
+    // whatever collects this command's output. The password sign-in issues a fresh one.
+    const host = accountsHost(c); await host.service.bootstrap(String(input.email), await host.readPassword(), String(input["display-name"]));
+    return { enrollmentRequired: true, next: "Sign in at /account/login with this password; the sign-in asks for an authenticator to be enrolled" };
+  } },
+  { name: "accounts status", summary: "Inspect account activation", role: "admin", options: [], run: async (c) => { const { state } = await accountsHost(c).store.snapshot(); return { enabled: state.enabled, bootstrap: state.bootstrap, users: state.users.length }; } },
+  { name: "accounts list", summary: "List local member projections", role: "admin", options: [], run: async (c) => (await accountsHost(c).store.snapshot()).state.users },
+  { name: "accounts recover", summary: "Enter the closed administrator MFA recovery state", role: "admin", options: [{ name: "user-id", summary: "Administrator ID", required: true }], run: async (c, i) => { await accountsHost(c).service.recoverAdministratorHost(String(i["user-id"])); return { enrollmentRequired: true, next: "Sign in at /account/login with this password; the sign-in asks for an authenticator to be enrolled" }; } },
+  { name: "accounts mfa reset", summary: "Reset a member factor without changing the password", role: "admin", options: [{ name: "user-id", summary: "Member ID", required: true }], run: async (c, i) => { await accountsHost(c).service.resetMfaHost(String(i["user-id"])); return { reset: true }; } },
+  { name: "accounts legacy", summary: "Set an explicit bounded legacy parallel period", role: "admin", options: [{ name: "until", summary: "UTC deadline", required: true }, { name: "role-cap", summary: "viewer or editor", required: true }], run: async (c, i) => {
+    if (i["role-cap"] !== "viewer" && i["role-cap"] !== "editor") throw new DomainValidationError(["role-cap must be viewer or editor"]);
+    await accountsHost(c).service.setLegacyHost(String(i.until), i["role-cap"]); return { configured: true };
+  } },
+
   {
     name: "zone list",
     summary: "List zones and their desired revisions",
@@ -689,6 +717,8 @@ const COMMANDS: readonly Command[] = [
       { name: "expiresIn", summary: "Seconds until it stops working; omitted means never", type: "number" },
     ],
     run: async (context, input) => {
+      // A machine token does not belong to the member who issued it, but who issued it is recorded.
+      await context.runtime.accounts?.recordMachineTokenAudit(context.actor, "token-issue-requested");
       const issued = await requireAccessTokens(context).issue(input.subject, input.role, input.expiresIn);
       // A server that is already running loaded its tokens at startup and
       // refreshes on an interval, so this one does not work the instant the
@@ -703,6 +733,7 @@ const COMMANDS: readonly Command[] = [
     role: "admin",
     options: [{ name: "id", summary: "Token identifier", required: true }],
     run: async (context, input) => {
+      await context.runtime.accounts?.recordMachineTokenAudit(context.actor, "token-revoke-requested");
       if (!await requireAccessTokens(context).revoke(String(input.id))) {
         throw new NotFoundError("access token was not found");
       }

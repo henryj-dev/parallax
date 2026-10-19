@@ -58,7 +58,66 @@ export interface SecurityConfig {
    * schedule, so "last used" lags rather than costing a write per call.
    */
   readonly onTokenUse?: (id: string) => void;
+  /**
+   * 공유 저장소에 둔 불투명(opaque) 회원 세션을 확인하는 접점.
+   *
+   * accounts 모드에서는 회원 서비스(`AccountService`)가 이것을 맡고, legacy 모드에서는
+   * 주지 않는다. 확인이 비동기여야 하는 이유는 이렇다. 세션을
+   * 철회하거나 역할을 내리면 다음 요청부터 바로 반영돼야 하고, 그러려면 요청마다
+   * 저장소에 물어야 한다. 서명만 확인하는 쿠키로는 그렇게 할 수 없다.
+   *
+   * 없으면 회원 세션 쿠키는 자격 증명으로 받지 않는다. 그 쿠키를 보낸 요청은
+   * 다른 쿠키로 넘어가지 않고 인증 실패로 끝난다. 남은 쿠키는 명시적인 로그인
+   * 성공(토큰 세션 POST, OIDC 콜백)과 로그아웃(DELETE, OIDC 로그아웃)이 지운다.
+   */
+  readonly accountSessions?: AccountSessionResolver;
+  readonly disableTokenExchange?: boolean;
 }
+
+/**
+ * 회원 세션 쿠키 값 하나를 저장소에서 확인한다.
+ *
+ * - 유효한 세션이면 `{ status: "active", role, subject }` 를 돌려준다.
+ * - 없거나 만료됐거나 철회된 세션이면 `{ status: "rejected" }` 를 돌려준다.
+ * - 저장소가 답하지 못하면 예외를 던진다. 이 경우는 401 이 아니라 503 이 된다.
+ *   "모르겠다"를 "없다"로 읽으면 장애가 로그아웃처럼 보이고, 다른 자격 증명으로
+ *   넘어가는 길이 생기기 때문이다.
+ *
+ * 두 메서드 모두 `ACCOUNT_SESSION_DEADLINE_MS` 안에 끝나야 한다. 넘으면 이 계층이
+ * `signal` 을 중단시키고 503 으로 답한다. 쿠키 값이 `MAX_ACCOUNT_SESSION_COOKIE_BYTES`
+ * 를 넘으면 장치를 부르지 않는다.
+ */
+export interface AccountSessionResolver {
+  /**
+   * 요청은 넘기지 않고 쿠키 값만 넘긴다. 확인하는 쪽이 본문을 읽어 버리면 뒤의
+   * 처리기가 받을 본문이 사라진다.
+   */
+  resolve(value: string, signal: AbortSignal): Promise<AccountSessionResolution>;
+  /**
+   * 로그아웃(`DELETE /api/v1/session`)에서 그 세션을 저장소에서 끊는다. 끝까지
+   * 끊었을 때만 성공으로 돌아와야 한다. 이 계층은 이 답을 받은 뒤에만 204 를
+   * 보낸다. 실패하거나 시간을 넘기면 503 이고, 쿠키도 지우지 않는다. 지우기만 하면
+   * 브라우저는 로그아웃된 줄 알지만 그 값을 가진 다른 사람은 계속 쓸 수 있다.
+   * 이미 없는 세션을 끊는 것은 성공이다.
+   */
+  revoke(value: string, signal: AbortSignal): Promise<void>;
+}
+
+export type AccountSessionResolution =
+  /** `recentVerification`: the member's own session entered a second-factor code within the policy window. */
+  | { readonly status: "active"; readonly role: Role; readonly subject: string; readonly recentVerification?: boolean }
+  | { readonly status: "rejected" };
+
+/**
+ * 요청 하나를 확인한 결과.
+ *
+ * `unavailable` 은 자격 증명을 판단할 저장소가 답하지 못했다는 뜻이다. 호출자는
+ * 이것을 인증 실패(401)나 익명으로 바꾸지 않고 503 으로 답해야 한다.
+ */
+export type Authentication =
+  | { readonly status: "authenticated"; readonly principal: Principal }
+  | { readonly status: "unauthenticated" }
+  | { readonly status: "unavailable" };
 
 /** Tokens open the whole control plane, so they get the same floor as the other secrets. */
 export const MIN_TOKEN_BYTES = 32;
@@ -73,10 +132,40 @@ export const SESSION_PATH = "/api/v1/session";
  * of them being tried as the other on every request.
  */
 export const IDENTITY_COOKIE = "parallax_identity";
+/**
+ * 회원 세션 쿠키 이름. 토큰 세션·신원 쿠키와 따로 둔다. 한 이름을 같이 쓰면 한
+ * 종류가 다른 종류로 해석되는 일이 매 요청 생긴다(`IDENTITY_COOKIE` 와 같은 이유).
+ */
+export const ACCOUNT_SESSION_COOKIE = "parallax_account";
+/**
+ * 회원 세션 쿠키 값의 상한(바이트). 넘는 값은 저장소에 묻지 않고 인증 실패다.
+ * 저장소 조회 하나에 임의 길이의 값을 싣지 않으려는 안전 장치다.
+ */
+export const MAX_ACCOUNT_SESSION_COOKIE_BYTES = 512;
+/**
+ * 회원 세션 저장소에 한 번 묻고(확인·철회) 기다리는 상한(밀리초). 세션 수명
+ * 정책이 아니다. 저장소가 멈췄을 때 요청이 같이 멈추지 않게 하는 안전 장치다.
+ */
+export const ACCOUNT_SESSION_DEADLINE_MS = 3_000;
+
+/**
+ * 어떤 자격 증명으로 확인된 주체인지.
+ *
+ * 선택 필드다. 역할과 이름만 보던 기존 호출자는 그대로 동작한다.
+ */
+export type PrincipalKind =
+  | "access-token"
+  | "token-session"
+  | "identity-session"
+  | "account-session"
+  | "authentication-disabled";
 
 export interface Principal {
   readonly role: Role;
   readonly subject: string;
+  readonly kind?: PrincipalKind;
+  /** Account sessions only: a code was entered recently enough for administration writes. */
+  readonly recentVerification?: boolean;
 }
 
 export type FetchHandler = (request: Request) => Response | Promise<Response>;
@@ -93,11 +182,14 @@ interface PreparedConfig {
   readonly identitySessionSecret?: string;
   readonly tokenSessionSecret?: string;
   readonly onTokenUse?: (id: string) => void;
+  readonly accountSessions?: AccountSessionResolver;
+  readonly disableTokenExchange?: boolean;
 }
 
 type RevokedSessions = Map<string, number>;
 
 const trustedClientKeys = new WeakMap<Request, string>();
+export function trustedClientKey(request: Request): string { return trustedClientKeys.get(request) ?? "direct-fetch-client"; }
 /**
  * The principal this layer already established, so the routing layer does not
  * authenticate the same request a second time to learn its role.
@@ -124,10 +216,43 @@ const SUBJECT_PATTERN = /^[^\u0000-\u001f\u007f]+$/u;
 /**
  * Authenticates one request against application-provided token records.
  * Token values are never included in the returned principal or an error.
+ *
+ * 동기 API 는 회원 세션을 확인할 수 없다. 그래서 `accountSessions` 가 있는
+ * 설정은 받지 않고 TypeError 로 거절한다. 조용히 회원 세션을 건너뛰고 다른
+ * 쿠키로 답하는 동기 경로가 남지 않게 하려는 것이다. 그런 설정에는
+ * `authenticateRequest` 를 쓴다.
  */
 export function authenticate(request: Request, config: SecurityConfig): Principal | undefined {
-  if (!config.enabled) return { role: "admin", subject: "authentication-disabled" };
+  if (config.accountSessions !== undefined) throw new TypeError("account sessions can only be checked by authenticateRequest");
+  if (!config.enabled) return DISABLED_PRINCIPAL;
+  const presented = presentedCredential(request, prepareConfig(config));
+  return presented.kind === "settled" ? presented.principal : undefined;
+}
+
+/**
+ * 요청 하나를 확인한다. 회원 세션까지 기다려서 확인하는 비동기 판이다.
+ *
+ * 결과는 세 가지다. 저장소가 답하지 못한 경우(`unavailable`)를 인증 실패와
+ * 구분해서 돌려준다. 호출자가 그것을 401 이나 익명으로 바꾸지 않게 하려는 것이다.
+ */
+export async function authenticateRequest(request: Request, config: SecurityConfig): Promise<Authentication> {
+  assertAccountSessionsNeedAuthentication(config);
+  if (!config.enabled) return { status: "authenticated", principal: DISABLED_PRINCIPAL };
   return authenticateWithPreparedTokens(request, prepareConfig(config));
+}
+
+const DISABLED_PRINCIPAL: Principal = { role: "admin", subject: "authentication-disabled", kind: "authentication-disabled" };
+
+/**
+ * 회원 세션 확인 장치가 있는데 인증이 꺼져 있는 설정은 모순이다. 그대로 두면
+ * 저장소에 회원이 있어도 모든 호출자가 관리자가 된다. 회원 0명이나 저장소
+ * 장애를 익명 관리로 바꾸는 추론을 막기 위해 설정 단계에서 거절한다.
+ *
+ * API 처리기, `authenticateRequest`, API 밖의 관리 경로(지표, 준비 상태, 포털 진입)가
+ * 모두 이 하나로 확인한다.
+ */
+export function assertAccountSessionsNeedAuthentication(config: SecurityConfig): void {
+  if (!config.enabled && config.accountSessions !== undefined) throw invalidConfiguration();
 }
 
 /**
@@ -242,9 +367,11 @@ export function createAuthorizedHandler(
   // Fail fast on a configuration that could never authenticate anyone.
   if (initial.enabled) preparedFor(initial);
 
+  assertAccountSessionsNeedAuthentication(initial);
   return async (request) => {
     const clientKey = trustedClientKeys.get(request) ?? "direct-fetch-client";
     const config = resolve();
+    assertAccountSessionsNeedAuthentication(config);
     if (!config.enabled) {
       // The actor is security-owned in both modes; a client must never be able
       // to choose the identity that its changes are recorded under.
@@ -254,15 +381,26 @@ export function createAuthorizedHandler(
     const sessionMaxAge = config.sessionMaxAgeSeconds ?? DEFAULT_SESSION_MAX_AGE_SECONDS;
     if (isSessionRoute(request)) return handleSession(request, prepared, throttle, sessionMaxAge, clientKey, now, revokedSessions);
 
-    const principal = authenticateWithPreparedTokens(request, prepared, revokedSessions, now);
-    if (!principal) {
+    const authentication = await authenticateWithPreparedTokens(request, prepared, revokedSessions, now);
+    // 저장소가 답하지 못한 것은 잘못된 자격 증명이 아니다. 실패로 세지 않고,
+    // 다시 로그인하라는 401 도 보내지 않는다.
+    if (authentication.status === "unavailable") return authenticationUnavailable();
+    if (authentication.status === "unauthenticated") {
       const retryAfterMs = throttle.recordFailure(clientKey);
       return retryAfterMs === undefined ? authenticationError(401) : tooManyAttempts(retryAfterMs);
     }
+    const principal = authentication.principal;
     if (isUnsafeMethod(request.method) && !request.headers.has("authorization") && !hasSameOrigin(request)) {
       return authenticationError(403);
     }
     if (!authorize(principal, request)) return authenticationError(403);
+    // A member administrator writes tokens, credentials, settings or runs a command only with a fresh code.
+    // Decided on the router's own reading of the path, so `//`, `%74` or a trailing `/` cannot slip past it.
+    if (principal.kind === "account-session" && principal.role === "admin" && isUnsafeMethod(request.method)) {
+      const surface = isStepUpSurface(request);
+      if (surface === undefined) return Response.json({ error: "invalid_path" }, { status: 400, headers: { "cache-control": "no-store" } });
+      if (surface && !principal.recentVerification) return Response.json({ error: "reauthentication_required" }, { status: 403, headers: { "cache-control": "no-store" } });
+    }
     // Recorded against the request the transport still holds, as well as the
     // one handed onward. The transport needs it to name the actor in its access
     // log, and the header it would otherwise read is client-supplied on the way
@@ -299,9 +437,13 @@ async function handleSession(
     // Who the caller currently is. The portal draws itself from this: an
     // administration control it cannot use is worse than one it cannot see,
     // because pressing it is the only way to find out.
-    const principal = authenticateWithPreparedTokens(request, prepared, revokedSessions, now);
-    return principal
-      ? Response.json({ role: principal.role, subject: principal.subject }, { headers: { "cache-control": "no-store" } })
+    const authentication = await authenticateWithPreparedTokens(request, prepared, revokedSessions, now);
+    if (authentication.status === "unavailable") return authenticationUnavailable();
+    return authentication.status === "authenticated"
+      ? Response.json(
+        { role: authentication.principal.role, subject: authentication.principal.subject },
+        { headers: { "cache-control": "no-store" } },
+      )
       : authenticationError(401);
   }
   if (request.method !== "POST" && request.method !== "DELETE") {
@@ -309,13 +451,29 @@ async function handleSession(
   }
   if (!hasSameOrigin(request)) return authenticationError(403);
   if (request.method === "DELETE") {
+    // 회원 세션은 저장소에서 먼저 끊는다. 끊었다는 답을 받기 전에는 204 를 보내지
+    // 않는다. 쿠키만 지우고 성공이라 답하면 그 값은 저장소에 살아 있다.
+    const accountSessions = prepared.accountSessions;
+    if (accountSessions !== undefined) {
+      const values = presentedAccountSessionValues(request);
+      if (values.length > 0) {
+        try {
+          await withAccountSessionDeadline((signal) => Promise.all(values.map((value) => accountSessions.revoke(value, signal))));
+        } catch {
+          return authenticationUnavailable();
+        }
+      }
+    }
     revokeTokenSession(request, prepared, revokedSessions, now);
-    return new Response(null, {
-      status: 204,
-      headers: { "cache-control": "no-store", "set-cookie": clearedCookieValue(prepared.cookieName, request) },
-    });
+    // 확인 장치가 없는 배포에서는 회원 쿠키가 쓸모없는 값이다. 남아 있으면 다른
+    // 로그인을 모두 막으므로, 로그아웃이 같이 지운다.
+    const headers = new Headers({ "cache-control": "no-store" });
+    headers.append("set-cookie", clearedCookieValue(prepared.cookieName, request));
+    headers.append("set-cookie", clearedAccountSessionCookie(request));
+    return new Response(null, { status: 204, headers });
   }
 
+  if (prepared.disableTokenExchange) return Response.json({ error: "human_login_required" }, { status: 403, headers: { "cache-control": "no-store" } });
   let candidate: unknown;
   try {
     const body: unknown = await request.json();
@@ -340,16 +498,26 @@ async function handleSession(
     expiresAt: Math.floor(now() / 1000) + maxAgeSeconds,
     id: randomUrlSafe(18),
   }, prepared.tokenSessionSecret);
+  const headers = new Headers({ "cache-control": "no-store" });
+  headers.append("set-cookie", sessionCookieValue(prepared.cookieName, session, request, maxAgeSeconds));
+  // 명시적인 로그인이 성공했을 때만 남은 회원 쿠키를 지운다. 확인 장치가 없는
+  // 배포에서 그 쿠키는 이 새 세션을 가린다(회원 쿠키가 있으면 그것으로만 판단한다).
+  // 평소 요청에서는 지우지도, 건너뛰지도 않는다. 실패한 로그인도 지우지 않는다.
+  // 확인 장치가 있으면 그 쿠키는 살아 있는 회원 세션일 수 있으므로 손대지 않는다.
+  if (prepared.accountSessions === undefined) headers.append("set-cookie", clearedAccountSessionCookie(request));
   return Response.json(
     { role: principal.role, subject: principal.subject, expiresIn: maxAgeSeconds },
-    {
-      status: 200,
-      headers: {
-        "cache-control": "no-store",
-        "set-cookie": sessionCookieValue(prepared.cookieName, session, request, maxAgeSeconds),
-      },
-    },
+    { status: 200, headers },
   );
+}
+
+/**
+ * 회원 세션 쿠키를 지우는 Set-Cookie 값. 회원 쿠키의 속성 계약과 같아야 지워진다.
+ * 계약: `Path=/`, `HttpOnly`, `SameSite=Strict`, Domain 없음, https 에서는 `Secure`
+ * 와 `__Host-` 이름. OIDC 경로도 이것을 쓴다.
+ */
+export function clearedAccountSessionCookie(requestOrUrl: Request | URL): string {
+  return clearedCookieValue(ACCOUNT_SESSION_COOKIE, requestOrUrl);
 }
 
 function sessionCookieValue(name: string, token: string, request: Request, maxAgeSeconds: number): string {
@@ -364,15 +532,15 @@ function sessionCookieValue(name: string, token: string, request: Request, maxAg
   ].join("; ");
 }
 
-function clearedCookieValue(name: string, request: Request): string {
-  const cookieName = cookieNameForRequest(name, request);
+function clearedCookieValue(name: string, requestOrUrl: Request | URL): string {
+  const url = requestOrUrl instanceof URL ? requestOrUrl : new URL(requestOrUrl.url);
   return [
-    `${cookieName}=`,
+    `${cookieNameForRequest(name, url)}=`,
     "Path=/",
     "HttpOnly",
     "SameSite=Strict",
     "Max-Age=0",
-    ...(isSecureRequest(request) ? ["Secure"] : []),
+    ...(url.protocol === "https:" ? ["Secure"] : []),
   ].join("; ");
 }
 
@@ -475,6 +643,8 @@ export function hasSameOrigin(request: Request): boolean {
 function prepareConfig(config: SecurityConfig): PreparedConfig {
   const cookieName = config.cookieName ?? "parallax_session";
   if (!COOKIE_NAME_PATTERN.test(cookieName)) throw invalidConfiguration();
+  // 토큰 쿠키가 회원 세션 쿠키 이름을 쓰면 토큰 세션이 회원 세션으로 읽힌다.
+  if (cookieName.replace(/^__Host-/u, "") === ACCOUNT_SESSION_COOKIE) throw invalidConfiguration();
   if (config.identitySessionSecret !== undefined) assertSessionSecret(config.identitySessionSecret);
   if (config.tokenSessionSecret !== undefined) assertSessionSecret(config.tokenSessionSecret);
 
@@ -493,7 +663,7 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
     const key = recordDigest.toString("base64url");
     if (seen.has(key)) throw invalidConfiguration();
     seen.add(key);
-    prepared.push({ digest: recordDigest, principal: { role, subject }, ...(id === undefined ? {} : { id }) });
+    prepared.push({ digest: recordDigest, principal: { role, subject, kind: "access-token" }, ...(id === undefined ? {} : { id }) });
   };
 
   for (const record of config.tokens) {
@@ -513,42 +683,168 @@ function prepareConfig(config: SecurityConfig): PreparedConfig {
     ...(config.identitySessionSecret === undefined ? {} : { identitySessionSecret: config.identitySessionSecret }),
     ...(config.tokenSessionSecret === undefined ? {} : { tokenSessionSecret: config.tokenSessionSecret }),
     ...(config.onTokenUse === undefined ? {} : { onTokenUse: config.onTokenUse }),
+    ...(config.accountSessions === undefined ? {} : { accountSessions: config.accountSessions }),
+    ...(config.disableTokenExchange ? { disableTokenExchange: true } : {}),
   };
 }
 
-function authenticateWithPreparedTokens(
+/**
+ * 요청이 내민 자격 증명. 동기로 끝나는 것은 여기서 판정하고(`settled`), 회원
+ * 세션만 저장소에 물어야 하므로 값을 들고 나간다. 동기·비동기 판이 우선순위를
+ * 이 한 곳에서 같이 쓴다.
+ */
+type PresentedCredential =
+  | { readonly kind: "settled"; readonly principal: Principal | undefined }
+  | { readonly kind: "account-session"; readonly value: string; readonly resolver: AccountSessionResolver };
+
+async function authenticateWithPreparedTokens(
   request: Request,
   prepared: PreparedConfig,
   revokedSessions: RevokedSessions = new Map(),
   now: () => number = Date.now,
-): Principal | undefined {
+): Promise<Authentication> {
+  const presented = presentedCredential(request, prepared, revokedSessions, now);
+  if (presented.kind === "settled") {
+    return presented.principal === undefined
+      ? { status: "unauthenticated" }
+      : { status: "authenticated", principal: presented.principal };
+  }
+  let resolution: unknown;
+  try {
+    resolution = await withAccountSessionDeadline((signal) => presented.resolver.resolve(presented.value, signal));
+  } catch {
+    // 던졌거나 시간을 넘겼다. 어느 쪽도 "없음"이 아니다.
+    return { status: "unavailable" };
+  }
+  return accountSessionOutcome(resolution);
+}
+
+/**
+ * 회원 세션 저장소에 묻는 일 하나를 `ACCOUNT_SESSION_DEADLINE_MS` 안으로 묶는다.
+ * 넘으면 `signal` 을 중단시키고 거절한다. 장치가 signal 을 무시해도 이 요청은
+ * 기다리지 않는다.
+ */
+async function withAccountSessionDeadline<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error("account session store did not answer in time");
+      controller.abort(error);
+      reject(error);
+    }, ACCOUNT_SESSION_DEADLINE_MS);
+  });
+  try {
+    return await Promise.race([Promise.resolve().then(() => operation(controller.signal)), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 상한 안의 회원 쿠키 값인지. 넘는 값은 저장소에 묻지 않는다. */
+function isAccountSessionValue(value: string): boolean {
+  return TOKEN_PATTERN.test(value) && Buffer.byteLength(value, "utf8") <= MAX_ACCOUNT_SESSION_COOKIE_BYTES;
+}
+
+/**
+ * 로그아웃이 끊을 회원 세션 값. 인증은 두 번 온 쿠키를 어느 쪽도 믿지 않지만,
+ * 철회는 권한을 줄이기만 하므로 받은 값을 모두 끊는다. 모양이 틀리거나 상한을
+ * 넘는 값은 어떤 세션도 가리킬 수 없으므로 뺀다.
+ */
+function presentedAccountSessionValues(request: Request): string[] {
+  const name = cookieNameForRequest(ACCOUNT_SESSION_COOKIE, request);
+  const values = new Set<string>();
+  for (const part of request.headers.get("cookie")?.split(";") ?? []) {
+    const separator = part.indexOf("=");
+    if (separator < 1 || part.slice(0, separator).trim() !== name) continue;
+    let value: string;
+    try {
+      value = decodeURIComponent(part.slice(separator + 1).trim());
+    } catch {
+      continue;
+    }
+    if (isAccountSessionValue(value)) values.add(value);
+  }
+  return [...values];
+}
+
+function presentedCredential(
+  request: Request,
+  prepared: PreparedConfig,
+  revokedSessions: RevokedSessions = new Map(),
+  now: () => number = Date.now,
+): PresentedCredential {
   const authorization = request.headers.get("authorization");
   if (authorization !== null) {
     const match = /^Bearer ([^\s]+)$/iu.exec(authorization);
     // Explicit credentials are authoritative. A malformed or invalid Bearer
     // value must not silently inherit the browser's OIDC identity cookie.
-    return match?.[1] === undefined ? undefined : matchToken(match[1], prepared);
+    return settled(match?.[1] === undefined ? undefined : matchToken(match[1], prepared));
   }
-  const candidate = readCookie(request.headers.get("cookie"), cookieNameForRequest(prepared.cookieName, request));
+  const cookies = request.headers.get("cookie");
+  // 회원 세션 쿠키를 보낸 요청은 그 쿠키로만 판단한다. 값이 망가졌거나 두 번
+  // 왔거나, 상한을 넘거나, 확인할 장치가 없으면 인증 실패다. 옆의 토큰 세션·신원
+  // 쿠키로 넘어가면, 철회된 회원 세션을 든 브라우저가 다른 신분으로 계속 행동하게
+  // 된다. 남은 쿠키는 명시적인 로그인 성공이나 로그아웃이 지운다.
+  const accountCookie = cookieNameForRequest(ACCOUNT_SESSION_COOKIE, request);
+  if (hasCookie(cookies, accountCookie)) {
+    const value = readCookie(cookies, accountCookie);
+    return value === undefined || !isAccountSessionValue(value) || prepared.accountSessions === undefined
+      ? settled(undefined)
+      : { kind: "account-session", value, resolver: prepared.accountSessions };
+  }
+  const candidate = readCookie(cookies, cookieNameForRequest(prepared.cookieName, request));
   if (prepared.tokenSessionSecret !== undefined) {
-    return candidate === undefined ? undefined : matchTokenSession(candidate, prepared.tokenSessionSecret, revokedSessions, now);
+    return settled(candidate === undefined ? undefined : matchTokenSession(candidate, prepared.tokenSessionSecret, revokedSessions, now));
   }
   // A token-shaped cookie is never accepted without the separate signing
   // secret. This also retires raw bearer cookies left by an older deployment.
-  if (candidate !== undefined) return undefined;
+  if (candidate !== undefined) return settled(undefined);
   // Second, not first: a request that presented a token meant to act as that
   // token, and answering it as whoever the browser happens to be signed in as
   // would attribute the change to the wrong actor.
-  return prepared.identitySessionSecret === undefined
+  return settled(prepared.identitySessionSecret === undefined
     ? undefined
-    : matchIdentitySession(request, prepared.identitySessionSecret);
+    : matchIdentitySession(request, prepared.identitySessionSecret));
+}
+
+function settled(principal: Principal | undefined): PresentedCredential {
+  return { kind: "settled", principal };
+}
+
+/**
+ * 확인 장치의 답을 그대로 믿지 않는다. 모양이 틀린 답은 "거절"이 아니라
+ * "답하지 못함"으로 본다. 알 수 없는 역할을 가장 낮은 역할로 바꿔 들이는 일도
+ * 하지 않는다.
+ */
+function accountSessionOutcome(resolution: unknown): Authentication {
+  if (!isRecord(resolution)) return { status: "unavailable" };
+  if (resolution.status === "rejected") return { status: "unauthenticated" };
+  const { role, subject } = resolution;
+  if (resolution.status !== "active"
+    || !ROLES.includes(role as Role)
+    || typeof subject !== "string"
+    || !SUBJECT_PATTERN.test(subject)
+    || subject.trim().length === 0) {
+    return { status: "unavailable" };
+  }
+  return { status: "authenticated", principal: { role: role as Role, subject, kind: "account-session", ...(resolution.recentVerification === true ? { recentVerification: true } : {}) } };
+}
+
+/** 값이 어떻든 그 이름의 쿠키가 하나라도 왔는지. */
+function hasCookie(header: string | null, name: string): boolean {
+  if (!header) return false;
+  return header.split(";").some((part) => {
+    const separator = part.indexOf("=");
+    return separator >= 1 && part.slice(0, separator).trim() === name;
+  });
 }
 
 function matchTokenSession(value: string, secret: string, revokedSessions: RevokedSessions, now: () => number): Principal | undefined {
   const claims = readSession(value, secret, now);
   if (claims === undefined || claims.id === undefined) return undefined;
   if (revokedSessions.has(claims.id)) return undefined;
-  return { role: claims.role, subject: claims.subject };
+  return { role: claims.role, subject: claims.subject, kind: "token-session" };
 }
 
 function revokeTokenSession(request: Request, prepared: PreparedConfig, revokedSessions: RevokedSessions, now: () => number): void {
@@ -567,7 +863,7 @@ function matchIdentitySession(request: Request, secret: string): Principal | und
   const value = readCookie(request.headers.get("cookie"), cookieNameForRequest(IDENTITY_COOKIE, request));
   if (value === undefined) return undefined;
   const claims = readSession(value, secret);
-  return claims === undefined ? undefined : { role: claims.role, subject: claims.subject };
+  return claims === undefined ? undefined : { role: claims.role, subject: claims.subject, kind: "identity-session" };
 }
 
 function matchToken(candidate: string, prepared: PreparedConfig): Principal | undefined {
@@ -600,6 +896,19 @@ export function tokenDigest(token: string): string {
   return digest(token).toString("base64url");
 }
 
+/**
+ * Whether a request reaches an administration surface that needs a fresh code: tokens, credentials,
+ * settings, or the command route. Segments are read exactly as the API router reads them -- empty ones
+ * dropped, each percent-decoded -- and compared without regard to case. `undefined` is a path that
+ * cannot be decoded, which is refused rather than guessed at.
+ */
+export function isStepUpSurface(request: Request): boolean | undefined {
+  const segments = pathnameSegments(request);
+  if (!segments) return undefined;
+  const [api, version, area] = segments.map((segment) => segment.toLowerCase());
+  return api === "api" && version === "v1" && ["tokens", "credentials", "settings", "cli"].includes(area ?? "");
+}
+
 function pathnameSegments(request: Request): string[] | undefined {
   try {
     return new URL(request.url).pathname.split("/").filter(Boolean).map(decodeURIComponent);
@@ -621,6 +930,18 @@ function authenticationError(status: 401 | 403): Response {
         ...(unauthorized ? { "www-authenticate": "Bearer" } : {}),
       },
     },
+  );
+}
+
+/**
+ * 자격 증명을 판단할 저장소가 답하지 못했다. 401 을 보내면 클라이언트는
+ * 로그아웃된 줄 알고, 익명으로 넘기면 장애가 권한 상승이 된다. 그래서 따로 답한다.
+ * `www-authenticate` 는 붙이지 않는다. 다른 자격 증명을 내라는 뜻이 아니다.
+ */
+function authenticationUnavailable(): Response {
+  return Response.json(
+    { error: "authentication_unavailable", message: "credentials could not be checked right now" },
+    { status: 503, headers: { "cache-control": "no-store" } },
   );
 }
 

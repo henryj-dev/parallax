@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { createAccountRoutes } from "./account-routes.ts";
+import { trustedClientKey } from "../security/http-authorization.ts";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { performance } from "node:perf_hooks";
 import { ConflictError, NotFoundError, ProviderManagedRecordError } from "../application/control-plane.ts";
@@ -19,7 +21,7 @@ import {
 import { DomainValidationError } from "../domain/dns.ts";
 import { httpAnswered, httpSeconds } from "../observability/signals.ts";
 import { CredentialInUseError, CredentialValidationError } from "../security/credential-store.ts";
-import { authenticate, createAuthorizedHandler, resolvedPrincipal, setTrustedClientKey, type Role, type SecurityConfig } from "../security/http-authorization.ts";
+import { authenticateRequest, createAuthorizedHandler, resolvedPrincipal, setTrustedClientKey, type Role, type SecurityConfig } from "../security/http-authorization.ts";
 
 const MAX_REQUEST_BODY_BYTES = 1_048_576;
 
@@ -73,7 +75,12 @@ export function createApiHandler(
   // Always wrap: even with authentication disabled the security layer owns the
   // audit actor, so a client can never choose the identity of its own changes.
   const authorized = createAuthorizedHandler(security ?? { enabled: false, tokens: [] }, handler);
-  return async (request) => authorized(request);
+  const members = runtime.accounts ? createAccountRoutes(runtime.accounts, trustedClientKey) : undefined;
+  return async (request) => {
+    const handled = await members?.handle(request); if (handled) return handled;
+    const rejected = await members?.guard(request); if (rejected) return rejected;
+    return authorized(request);
+  };
 }
 
 /**
@@ -146,7 +153,15 @@ export function createNodeHandler(
     const result = await handler(fetchRequest);
     const seconds = (performance.now() - startedAt) / 1000;
     response.statusCode = result.status;
-    result.headers.forEach((value, name) => response.setHeader(name, value));
+    // `Headers.forEach` 는 Set-Cookie 를 하나씩 따로 넘긴다. 그때마다 `setHeader`
+    // 를 부르면 앞의 쿠키를 덮어써서 마지막 하나만 나간다. 로그인 응답이라면
+    // 토큰 세션은 빠지고 회원 쿠키 지우기만 남는다. Set-Cookie 는 배열로 한 번에
+    // 넘겨 줄마다 하나씩 나가게 한다. 신원 경로(`src/index.ts`)와 같은 방식이다.
+    result.headers.forEach((value, name) => {
+      if (name !== "set-cookie") response.setHeader(name, value);
+    });
+    const cookies = result.headers.getSetCookie();
+    if (cookies.length > 0) response.setHeader("set-cookie", cookies);
     response.setHeader("x-request-id", requestId);
     httpAnswered({ status: String(result.status) });
     httpSeconds(seconds);
@@ -179,7 +194,7 @@ export function createNodeHandler(
   };
 }
 
-function requestClientKey(request: IncomingMessage, options: NodeHandlerOptions): string {
+export function requestClientKey(request: IncomingMessage, options: NodeHandlerOptions): string {
   const forwarded = options.trustForwardedHeaders
     ? lastHeaderValue(request.headers["x-forwarded-for"])
     : undefined;
@@ -261,7 +276,7 @@ async function route(runtime: CommandRuntime, request: Request, security: Securi
   const context = {
     runtime,
     actor: request.headers.get("x-parallax-actor") ?? "web-console",
-    role: roleOf(request, security),
+    role: await roleOf(request, security),
   };
 
   const match = await matchRoute(segments, method, url, request);
@@ -624,14 +639,18 @@ async function credentialRoute(segments: string[], method: string, request: Requ
  * been established -- and the fallback below is what that second pass would
  * have degraded to anyway.
  */
-function roleOf(request: Request, security: SecurityConfig): Role {
+async function roleOf(request: Request, security: SecurityConfig): Promise<Role> {
   if (!security.enabled) return "admin";
   const resolved = resolvedPrincipal(request);
   if (resolved) return resolved.role;
   // `createApiHandler` is the only production path and always goes through the
   // authorization layer. A caller that builds this handler differently -- a
   // test, an embedding -- still gets an answer rather than a wrong one.
-  return authenticate(request, security)?.role ?? "viewer";
+  //
+  // 회원 세션을 확인하지 못한 경우도 가장 낮은 역할이다. 높은 역할로 넘어가는
+  // 동기 경로는 남기지 않는다.
+  const authentication = await authenticateRequest(request, security);
+  return authentication.status === "authenticated" ? authentication.principal.role : "viewer";
 }
 
 function json(value: unknown, status = 200): Response {

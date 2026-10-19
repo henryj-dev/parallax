@@ -1,4 +1,8 @@
 import { isIP } from "node:net";
+import { readFileSync } from "node:fs";
+import { AccountPolicyError, readAccountPolicy, type AccountPolicy } from "./domain/account-policy.ts";
+import { AccountMailer, type AccountMailerConfig } from "./adapters/account-mailer.ts";
+import type { OidcVerificationPolicy } from "./security/accounts/oidc-verifier.ts";
 import { isStrongBootstrapToken } from "./application/access-tokens.ts";
 import { canonicalAddress, isLoopbackAddress, isWildcardListener } from "./dns/address.ts";
 import { parseTsigKey, type TsigKey } from "./dns/tsig.ts";
@@ -51,6 +55,32 @@ export interface ParallaxConfig {
   readinessMaxStalenessMs?: number;
   /** Answers DNS for the internal view directly. Unset leaves the port unbound. */
   dns?: DnsListenerSettings;
+  /**
+   * 관리 화면의 사람을 누가 확인하는지. 없으면 `legacy` 와 같다.
+   *
+   * `legacy` 는 지금까지의 방식(접근 토큰, 토큰 세션, OIDC)이다. `accounts` 는
+   * 자체 회원이며, 정책 파일·키·SMTP 설정이 모두 있어야 시작한다
+   * (`readAccounts`, `assertSupportedAuthMode`). 모르는 모드를 legacy 로 조용히 바꾸면
+   * 운영자는 회원 모드라고 믿고, 실제로는 예전 규칙이 열려 있게 된다.
+   */
+  authMode?: AuthMode;
+  accounts?: { policy: AccountPolicy; key: Buffer; mailer: AccountMailerConfig; oidcPolicy?: OidcVerificationPolicy };
+}
+
+export type AuthMode = "legacy" | "accounts";
+const AUTH_MODES: readonly AuthMode[] = ["legacy", "accounts"];
+
+/** The refusal when accounts mode is asked for with none of its configuration. Every other gap names its variable. */
+export const ACCOUNTS_CONFIGURATION_REQUIRED = "accounts requires PARALLAX_ACCOUNT_POLICY_FILE, PARALLAX_ACCOUNT_KEY and explicit SMTP configuration";
+export function assertSupportedAuthMode(config: Pick<ParallaxConfig, "authMode" | "accounts">): void {
+  if (config.authMode !== "accounts") return;
+  if (!config.accounts) throw new Error(ACCOUNTS_CONFIGURATION_REQUIRED);
+  readAccountPolicy(config.accounts.policy);
+  if (config.accounts.key.byteLength !== 32) throw new Error(ACCOUNTS_CONFIGURATION_REQUIRED);
+  // The same SMTP validation the server runs, without opening a connection, so `config check` cannot pass a value startup refuses.
+  try {
+    new AccountMailer(config.accounts.mailer, { transportFactory: () => ({ sendMail: () => Promise.reject(new Error("preflight only")), close: () => undefined }) }).close();
+  } catch { throw new Error("accounts SMTP configuration is invalid: check PARALLAX_SMTP_* and PARALLAX_ACCOUNT_PUBLIC_ORIGIN"); }
 }
 
 /**
@@ -195,6 +225,7 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
   }
   const oidc = readOidc(environment);
   const portalSignIn = readPortalSignIn(environment, oidc !== undefined);
+  const authMode = readAuthMode(environment.PARALLAX_AUTH_MODE);
   const readinessMaxStalenessMs = readStaleness(environment.PARALLAX_READINESS_MAX_STALENESS_SECONDS);
   const dns = readDnsListener(environment);
   assertInternalUpdateIsUsable(dns, ownershipSecret);
@@ -224,7 +255,57 @@ export function readConfig(environment: NodeJS.ProcessEnv = process.env): Parall
     portalSignIn,
     ...(readinessMaxStalenessMs !== undefined ? { readinessMaxStalenessMs } : {}),
     ...(dns ? { dns } : {}),
+    ...(authMode ? { authMode } : {}),
+    ...(authMode === "accounts" ? { accounts: readAccounts(environment) } : {}),
   };
+}
+
+function readAccounts(env: NodeJS.ProcessEnv): NonNullable<ParallaxConfig["accounts"]> {
+  const required = (key: string): string => {
+    const value = env[key];
+    if (!value) throw new Error(key === "PARALLAX_ACCOUNT_POLICY_FILE" ? ACCOUNTS_CONFIGURATION_REQUIRED : `${key} is required when PARALLAX_AUTH_MODE=accounts`);
+    return value;
+  };
+  const number = (key: string): number => { const v = required(key); if (!/^[0-9]+$/u.test(v) || !Number.isSafeInteger(Number(v))) throw new Error(`invalid ${key}`); return Number(v); };
+  let policy: AccountPolicy;
+  const policyFile = required("PARALLAX_ACCOUNT_POLICY_FILE");
+  try { policy = readAccountPolicy(JSON.parse(readFileSync(policyFile, "utf8"))); }
+  catch (error) {
+    // The policy's own message names the field; it never carries a secret.
+    throw new Error(`PARALLAX_ACCOUNT_POLICY_FILE is not a usable account policy: ${error instanceof AccountPolicyError ? error.message : "it could not be read as JSON"}`);
+  }
+  const encoded = required("PARALLAX_ACCOUNT_KEY"), key = Buffer.from(encoded, "base64url");
+  if (key.byteLength !== 32 || key.toString("base64url") !== encoded) throw new Error("PARALLAX_ACCOUNT_KEY must be 32 random bytes in base64url");
+  const port = number("PARALLAX_SMTP_PORT"); if (port < 1 || port > 65535) throw new Error("PARALLAX_SMTP_PORT must be between 1 and 65535");
+  // The TLS mode is named, never guessed from the port. Both modes verify the server certificate.
+  const tls = required("PARALLAX_SMTP_TLS"); if (tls !== "implicit" && tls !== "starttls") throw new Error("PARALLAX_SMTP_TLS must be implicit or starttls");
+  let oidcPolicy: OidcVerificationPolicy | undefined;
+  if (env.PARALLAX_OIDC_ISSUER) {
+    const algorithms = required("PARALLAX_ACCOUNT_OIDC_ALGORITHMS").split(",");
+    if (!algorithms.length || !algorithms.every((a) => ["RS256", "ES256", "EdDSA"].includes(a))) throw new Error("invalid account OIDC algorithms");
+    oidcPolicy = { issuer: required("PARALLAX_OIDC_ISSUER"), clientId: required("PARALLAX_OIDC_CLIENT_ID"), algorithms: algorithms as OidcVerificationPolicy["algorithms"],
+      timeoutMs: number("PARALLAX_ACCOUNT_OIDC_TIMEOUT_MS"), cooldownMs: number("PARALLAX_ACCOUNT_OIDC_COOLDOWN_MS"), cacheMaxAgeMs: number("PARALLAX_ACCOUNT_OIDC_CACHE_MAX_AGE_MS"),
+      maxTokenAgeSeconds: number("PARALLAX_ACCOUNT_OIDC_MAX_TOKEN_AGE_SECONDS"), clockToleranceSeconds: number("PARALLAX_ACCOUNT_OIDC_CLOCK_TOLERANCE_SECONDS") };
+  }
+  return { policy, key, ...(oidcPolicy ? { oidcPolicy } : {}), mailer: {
+    from: required("PARALLAX_SMTP_FROM"), publicOrigin: required("PARALLAX_ACCOUNT_PUBLIC_ORIGIN"),
+    actionPaths: { invite: "/account/invite", "password-reset": "/account/reset", "email-change": "/account/email" },
+    smtp: { name: required("PARALLAX_SMTP_NAME"), host: required("PARALLAX_SMTP_HOST"), port, tls,
+      auth: { user: required("PARALLAX_SMTP_USER"), pass: required("PARALLAX_SMTP_PASSWORD") },
+      connectionTimeoutMs: number("PARALLAX_SMTP_CONNECTION_TIMEOUT_MS"), greetingTimeoutMs: number("PARALLAX_SMTP_GREETING_TIMEOUT_MS"),
+      socketTimeoutMs: number("PARALLAX_SMTP_SOCKET_TIMEOUT_MS"), dnsTimeoutMs: number("PARALLAX_SMTP_DNS_TIMEOUT_MS"),
+      maxConnections: number("PARALLAX_SMTP_MAX_CONNECTIONS"), maxQueued: number("PARALLAX_SMTP_MAX_QUEUED"), maxMessages: number("PARALLAX_SMTP_MAX_MESSAGES") },
+  } };
+}
+
+/** 모르는 값은 기본값으로 바꾸지 않고 거절한다. */
+function readAuthMode(value: string | undefined): AuthMode | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (!AUTH_MODES.includes(trimmed as AuthMode)) {
+    throw new Error(`PARALLAX_AUTH_MODE must be one of: ${AUTH_MODES.join(", ")}`);
+  }
+  return trimmed as AuthMode;
 }
 
 /**

@@ -26,8 +26,8 @@ COPY . .
 RUN pnpm build
 
 # Runtime dependencies are resolved separately rather than carried over from the
-# build stage. This application declares exactly one -- `pg` -- so the difference
-# is the whole TypeScript toolchain.
+# build stage, keeping the TypeScript toolchain out of the serving image. The
+# account adapters and database driver are installed from the same lockfile.
 FROM node:24-alpine AS deps
 WORKDIR /app
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0

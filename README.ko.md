@@ -208,7 +208,7 @@ flowchart LR
         C["⌨️ CLI"]
     end
 
-    faces --> CMD["명령 계층<br/>53개 명령"]
+    faces --> CMD["명령 계층<br/>60개 명령"]
     CMD --> CP["컨트롤 플레인<br/>존 · 리비전 · 감사"]
 
     CP --> ST[("저장소")]
@@ -290,6 +290,7 @@ Cloudflare 코멘트는 100자로 제한되는데, 호출자가 이미 아는 �
 | `DATABASE_URL` | PostgreSQL 사용. 없으면 단일 노드 파일 |
 | `PARALLAX_STATE_FILE` · `PARALLAX_CONFIG_FILE` · `PARALLAX_PROVIDER_STATE_FILE` | 그 파일들의 위치. 상태 파일은 히스토리를 옆의 `<상태 파일>.d/` 에 둔다 — 백업은 파일 하나가 아니라 디렉터리 단위로 |
 | `PARALLAX_AUTH_TOKENS` | 비상용 토큰(JSON). 평소 토큰은 포털에서 발급 |
+| `PARALLAX_AUTH_MODE` | `legacy`(없을 때의 기본값) 또는 `accounts`. `accounts`는 자기 정책 파일·키·SMTP 설정이 있어야 하고, 없으면 시작을 거절한다. 그 밖의 값은 설정 오류다. [회원 계정](#회원-계정) 참고 |
 | `PARALLAX_OWNERSHIP_SECRET` | 소유권 마커 서명 |
 | `PARALLAX_CREDENTIAL_MASTER_KEY` | 저장된 프로바이더 자격 증명 암호화(AES-256-GCM) |
 
@@ -343,7 +344,7 @@ Cloudflare 코멘트는 100자로 제한되는데, 호출자가 이미 아는 �
 |---|---|
 | `allowLocalProvider` | 대상에 실제 프로바이더가 없을 때 로컬 파일로 발행 |
 | `publicOrigin` | 브라우저가 포털에 닿는 절대 origin. 비우면 요청마다 유도 |
-| `trustForwardedHeaders` | `X-Forwarded-Proto` / `X-Forwarded-Host` 신뢰 |
+| `trustForwardedHeaders` | `X-Forwarded-Proto` / `X-Forwarded-Host` 신뢰, 그리고 회원 시도 제한이 세는 클라이언트 주소로 `X-Forwarded-For` 사용 |
 | `revisionRetention` | 존마다 보관할 최신 스냅샷 수. `0`이면 전부 보관 |
 | `auditRetentionDays` | 존마다 보관할 감사 이력 일수. `0`이면 전부 보관 |
 | `fallbackResolver` | 클라이언트 측 리졸버 오버라이드가 가리킬 주소 |
@@ -357,7 +358,7 @@ Cloudflare 코멘트는 100자로 제한되는데, 호출자가 이미 아는 �
 
 ## 명령줄
 
-53개 명령. 어느 것에든 `--json`을 붙이면 기계가 읽는 출력이 나오고,
+60개 명령. 어느 것에든 `--json`을 붙이면 기계가 읽는 출력이 나오고,
 `parallax help <command>`로 옵션을 봅니다.
 
 <details open>
@@ -454,6 +455,20 @@ pnpm cli health check status --zone example.com
 
 </details>
 
+<details>
+<summary><b>회원 계정 (호스트 전용)</b></summary>
+
+| 명령 | |
+|---|---|
+| `accounts enable` · `accounts status` · `accounts list` | 회원 계정을 켜고 상태를 본다 |
+| `accounts bootstrap` | 첫 관리자. 비밀번호는 stdin으로 |
+| `accounts recover` · `accounts mfa reset` | 잃어버린 2단계 인증수단 교체 |
+| `accounts legacy` | 기존 조직 로그인을 위한 정해진 기간 |
+
+어느 것도 HTTP로는 닿지 않는다. [회원 계정](#회원-계정) 참고.
+
+</details>
+
 `backup` 과 `restore` 에는 HTTP 경로가 없고 생길 수도 없다 — 서빙 런타임에는 이
 둘이 쓰는 리포지터리 자체가 주어지지 않는다. 백엔드 사이를 옮기는 방법이기도
 하다. 두 저장소가 같은 인터페이스를 구현하고, 문서는 그 인터페이스만 말한다:
@@ -474,7 +489,7 @@ DATABASE_URL=postgres://… parallax restore < parallax-backup.json
 
 ## HTTP API
 
-**43개 경로.** 프로세스가 자기 명령 표에서 생성하는 OpenAPI 3.1 문서가
+**67개 경로.** 프로세스가 자기 명령 표에서 생성하는 OpenAPI 3.1 문서가
 기술합니다 — 그래서 기술과 동작이 갈라질 수 없습니다.
 
 ```http
@@ -641,8 +656,255 @@ docker run --rm -p 3000:3000 \
 
 | 저장소 | 언제 |
 |---|---|
-| **PostgreSQL** | `DATABASE_URL`이 설정됐을 때. 7개 테이블, `parallax migrate`가 적용 |
+| **PostgreSQL** | `DATABASE_URL`이 설정됐을 때. 10개 테이블, `parallax migrate`가 적용 |
 | **파일** | 그 밖의 경우. 원자적 쓰기, `0700` 디렉터리 안의 `0600` 파일 |
+
+### 회원 계정
+
+사람은 자기 계정 — 이메일 주소, 비밀번호, 인증 앱 — 으로 로그인하고, 원하면 조직
+(OpenID Connect) 계정을 연결할 수 있다. 호스트 운영자가 켜기 전까지는 꺼져 있고,
+기계는 그동안 계속 bearer 토큰을 쓴다.
+
+**켜는 방법.** 모든 단계는 명시적이다. 저절로 켜지는 것은 없다.
+
+1. `parallax migrate`. 006 migration은 테이블 세 개를 더할 뿐 아무것도 켜지 않는다.
+2. 정책 파일을 쓰고 아래 변수를 설정한다. **어떤 수치에도 기본값이 없다.** 빠졌거나
+   모르는 필드, 범위를 벗어난 값이 있으면 기동과 `parallax config check`가 모두 멈춘다.
+3. 이전 버전의 레플리카를 모두 멈춘다(아래 *되돌리기* 참고).
+4. `PARALLAX_AUTH_MODE=accounts`로 기동한 뒤 호스트에서:
+
+   ```bash
+   parallax accounts enable
+   parallax accounts bootstrap --email admin@example.com --display-name Admin < password-file
+   ```
+
+   비밀번호는 명령줄이 아니라 stdin으로만 읽고, 명령은 로그인 비밀값을 출력하지 않는다.
+   그 관리자가 `/account/login`에서 비밀번호로 로그인해 인증 앱을 등록하고 복구 코드를
+   보관하기 전까지 모든 회원 세션은 거부된다.
+
+| 변수 | |
+|---|---|
+| `PARALLAX_ACCOUNT_POLICY_FILE` | 아래 JSON 정책. 필수 |
+| `PARALLAX_ACCOUNT_KEY` | base64url로 쓴 무작위 32바이트. 인증 앱 비밀 암호화, CSRF 토큰, 시도 제한 키를 여기서 따로 유도한다. 백업과 떨어뜨려 보관한다. 없으면 저장된 인증수단을 읽을 수 없다 |
+| `PARALLAX_ACCOUNT_PUBLIC_ORIGIN` | 메일 링크가 가리키는 `https://` origin. 요청의 `Host`에서 가져오지 않는다 |
+| `PARALLAX_SMTP_HOST` · `PARALLAX_SMTP_PORT` · `PARALLAX_SMTP_TLS` | 메일을 보낼 곳. `PARALLAX_SMTP_TLS`는 `implicit` 또는 `starttls`이며 포트로 추측하지 않는다. 둘 다 서버 인증서를 검증하고 평문을 거부한다 |
+| `PARALLAX_SMTP_NAME` · `PARALLAX_SMTP_FROM` · `PARALLAX_SMTP_USER` · `PARALLAX_SMTP_PASSWORD` | EHLO 이름, 보내는 주소, 자격 증명 |
+| `PARALLAX_SMTP_CONNECTION_TIMEOUT_MS` · `PARALLAX_SMTP_GREETING_TIMEOUT_MS` · `PARALLAX_SMTP_SOCKET_TIMEOUT_MS` · `PARALLAX_SMTP_DNS_TIMEOUT_MS` | 모두 필수 |
+| `PARALLAX_SMTP_MAX_CONNECTIONS` · `PARALLAX_SMTP_MAX_QUEUED` · `PARALLAX_SMTP_MAX_MESSAGES` | 모두 필수 |
+| `PARALLAX_ACCOUNT_OIDC_ALGORITHMS` · `PARALLAX_ACCOUNT_OIDC_TIMEOUT_MS` · `PARALLAX_ACCOUNT_OIDC_COOLDOWN_MS` · `PARALLAX_ACCOUNT_OIDC_CACHE_MAX_AGE_MS` · `PARALLAX_ACCOUNT_OIDC_MAX_TOKEN_AGE_SECONDS` · `PARALLAX_ACCOUNT_OIDC_CLOCK_TOLERANCE_SECONDS` | `PARALLAX_OIDC_ISSUER`가 있으면 필수. 알고리즘은 `RS256`, `ES256`, `EdDSA`를 쉼표로 나열한다 |
+
+정책 파일에는 정확히 이 필드만 있다. 코드에는 값이 없다. 아래 예시는 지금까지 합의한
+공통 회원 정책 값으로 채웠다(테스트 값은 따로 있고 훨씬 작다). 0으로 둔 것은 아직 운영자가
+정할 값이다. 동시·대기 해싱 수, 세션 갱신 간격과 회원당 세션 수, 이메일 변경과 로그인 코드
+만료, 조직 계정 로그인 시작 제한, 표 상한, 감사 항목 상한, TOTP 발급자 이름이 그렇다. 이 값을
+채우기 전에는 파일이 거부된다.
+
+```json
+{
+  "loginKey": "email-nfc-lowercase-v1",
+  "password": { "minLength": 8, "maxBytes": 65536, "maxConcurrent": 0, "maxQueued": 0,
+    "scrypt": { "N": 65536, "r": 8, "p": 2, "maxmem": 100663296, "keylen": 32 },
+    "verifyLimits": { "maxMemoryBytes": 100663296, "maxWork": 1048576, "maxKeylen": 32 } },
+  "session": { "idleSeconds": 1800, "absoluteSeconds": 43200, "touchIntervalSeconds": 0, "maxPerUser": 0 },
+  "recentAuthSeconds": 600,
+  "mfa": { "digits": 6, "periodSeconds": 30, "window": 1, "algorithm": "SHA1", "recoveryCodeCount": 10, "issuer": "" },
+  "tokens": { "inviteSeconds": 259200, "resetSeconds": 1800, "emailChangeSeconds": 0, "challengeSeconds": 0, "enrollmentSeconds": 86400 },
+  "rateLimit": {
+    "login": { "attempts": 5, "windowSeconds": 900, "baseDelaySeconds": 1, "maxDelaySeconds": 900 },
+    "mfa": { "attempts": 5, "windowSeconds": 900, "baseDelaySeconds": 1, "maxDelaySeconds": 900 },
+    "reset": { "attempts": 5, "windowSeconds": 900, "baseDelaySeconds": 1, "maxDelaySeconds": 900 },
+    "link": { "attempts": 0, "windowSeconds": 0, "baseDelaySeconds": 0, "maxDelaySeconds": 0 },
+    "maxEntries": 0 },
+  "retention": { "auditDays": 365, "auditMaxEntries": 0 }
+}
+```
+
+공통 값의 뜻은 이렇다. 비밀번호는 8자 이상이고 영소문자·영대문자·숫자·그 밖의 문자(공백·한글
+등 포함) 중 세 가지를 써야 하며, Unicode NFC로 바꾼 뒤 판정한다. 64 KiB 요청 본문 말고는 최대
+길이가 없고, 유출 비밀번호 목록은 쓰지 않는다. scrypt는 N 65536, r 8, p 2. 세션은 유휴 30분,
+절대 12시간. 로그인 때 입력한 코드는 10분 동안 최근 인증으로 인정한다. TOTP는 30초마다 6자리
+SHA-1, 앞뒤 한 단계까지 받고 각 단계는 한 번만 쓴다. 복구 코드는 10개이며 각각 한 번만 쓴다.
+초대는 3일, 재설정은 30분 유효하다. 호스트가 시작한 인증 앱 등록(부트스트랩이나 복구)은 24시간 유효하고,
+비밀번호 단계 뒤의 등록은 다른 로그인 단계와 같은 시간만 유효하며 그 브라우저 쿠키는 브라우저 세션 동안만 남는다. 실패가 5번 쌓이면 이후 시도마다
+1, 2, 4…초씩 최대 15분까지 기다려야 하고, 마지막 시도 뒤 15분이 지나면 카운터가 처음부터
+다시 시작하며, 영구 잠금은 없다. 감사 기록은 1년 보관한다. 규칙에 맞지 않는 비밀번호는 해싱
+전에 `400 weak-password`로 답한다. 주소는 Unicode NFC와 소문자 변환만 거쳐
+비교한다. `a.b+tag@`와 `ab@`는 서로 다른 사람이다.
+
+**세션.** 32바이트 무작위 쿠키 `parallax_account`(HTTPS에서는
+`__Host-parallax_account`), `HttpOnly`, `SameSite=Lax`. 저장하는 것은 다이제스트뿐이다.
+요청마다 공유 저장소에서 회원의 현재 역할과 상태를 읽으므로, 로그아웃·정지·삭제·역할
+변경·비밀번호 재설정은 다음 요청부터 모든 레플리카에서 세션을 끝낸다. 세션이 없거나
+끝났으면 읽기든 쓰기든 모든 경로가 `401`이다. 계정 저장소를 읽지 못하면 관리 경로는 `503`으로 답하고, DNS 리스너는 계속 답한다. 모든 변경 요청은
+같은 origin과 `x-parallax-csrf` 헤더가 필요하다. 헤더가 틀리면 거부하고 쿠키로 다시
+시도하지 않는다.
+
+**2단계 인증.** 관리자는 로그인할 때 항상 코드를 입력한다. 회원마다 끝나지 않은 로그인 challenge
+(그리고 재설정·이메일 변경·등록 링크)는 한 번에 하나뿐이다. 새로 받으면 이전 것을 대신하고 이전 것은
+더 이상 쓸 수 없으므로, 비밀번호 단계를 반복해도 다른 사람을 밀어내지 못한다. 하나만 예외다. 복구 코드가
+발급한 재등록 challenge는 일반 로그인이 대신하지 않으므로, 새 인증수단을 등록하거나 만료될 때까지 쓸 수
+있다. 비밀번호·이메일·세션·조직
+연결·회원·토큰·자격 증명·설정 변경과 CLI 경로는 `recentAuthSeconds` 안에 입력한 코드도
+필요하다. 코드는 확인된 인증 앱에서 나온 것만 받는다. 로그인한 세션에서 인증 앱을
+등록할 때도 현재 비밀번호가 필요하므로, 복사한 세션 쿠키만으로는 인증수단을 붙일 수
+없다. 같은 코드 단계는 모든 레플리카를 통틀어 한 번만 받는다. 복구 코드는 한 번만
+쓸 수 있고, 쓰면 모든 세션이 끝나며 새 인증 앱 등록으로만 이어진다. 이 등록은
+`challengeSeconds` 안에 끝내야 하고, 넘기면 복구 코드가 하나 더 든다. 코드를 다 쓰면
+호스트에서 초기화한다. 인증수단을 잃으면
+호스트에서 초기화한다: `parallax accounts mfa reset --user-id <id>`, 마지막 관리자라면
+`parallax accounts recover --user-id <id>`. 후자는 그 관리자가 다시 등록할 때까지 회원
+로그인을 닫는다. 비밀번호와 확인된 인증수단이 있는 마지막 활성 관리자는 요청 두 개가
+동시에 와도 정지·삭제·강등·초기화되지 않는다.
+
+**기계.** bearer 토큰은 모든 DNS 경로를 그대로 쓴다. `/api/v1/account/*`에는 닿지
+못하고, accounts 모드에서 `POST /api/v1/session`은 토큰을 브라우저 세션으로 바꿔 주지
+않는다(`403 human_login_required`). `parallax accounts …` 명령은 호스트 명령줄에만
+있고 `POST /api/v1/cli`로는 실행할 수 없다. 기계 토큰은 발급한 회원과 독립이다. 그
+회원을 정지·강등·삭제해도 토큰은 폐기하거나 만료될 때까지 동작한다. 누가 발급·폐기했는지는
+계정 감사 기록에 남는다. 토큰 목록 조회는 관리자 세션만 있으면 되고, 발급과 폐기에는 최근
+인증 코드가 필요하다.
+
+**시도 제한.** 두 가지 제한이 모두 허용해야 시도가 통과한다. 회원마다 로그인·코드·재설정
+카운터를 따로 가지며, 다른 무엇도 이것을 밀어내지 못한다. 모든 시도는 비밀번호를 해싱하기 전에
+센다. 맞는 비밀번호나 코드는 회원 카운터에서 자기가 올린 한 번을 되돌리므로 자주 로그인한다고 그 사람이
+제한되지는 않고, 그 전의 실패는 계속 센다. `attempts`번까지는 기다림이 없고, 그 뒤로는 시도마다
+`baseDelaySeconds × 2^(n−1)`(n은 `attempts`를 넘긴 횟수)만큼, 최대 `maxDelaySeconds`까지 기다려야
+하며, 기다린 뒤에는 한 번 시도할 수 있다(기다리는 동안은 `Retry-After`를 단 `429`). 마지막 시도 뒤
+`windowSeconds`가 지나면 카운터가 처음부터 다시 시작한다. 영구 잠금은 없다. 주소 단위 제한은 일부러 다르게
+동작한다. 그 주소에서 온 모든 시도를 성공까지 포함해 센다. 그래야 자기가 가진 계정의 로그인을 섞어
+다른 계정을 추측할 주소의 허용량을 늘리지 못한다.
+
+그래서 계정별 한도는 지렛대가 되기도 한다. 주소를 아는 누구든 틀린 비밀번호로 허용량을 다 써서
+그 사람(관리자 포함)이 추측이 이어지는 동안 시도마다 최대 `maxDelaySeconds`까지 기다리게 만들 수 있다. 클라이언트만이 아니라 계정마다
+추측을 제한하는 대가다. 창보다 빨리 풀려면 먼저 비밀번호를 그 사람만 아는
+것으로 바꾼다(변경 또는 재설정). 새 인증수단을 등록하기 전까지는 비밀번호를 아는 누구나 인증 앱을
+등록할 수 있기 때문이다. 그다음 마지막 관리자는 `parallax accounts recover --user-id <id>`, 그 밖의
+회원은 `parallax accounts mfa reset --user-id <id>`를 실행한다. 둘 다 그 회원의 카운터를 지운다(인증수단도
+바꾼다). 더 짧은 `windowSeconds`나 더 큰 `attempts`는 바꾼 뒤 시작하는 창부터
+적용된다. 카운터는 마지막 시도 뒤 `windowSeconds`가 지나야 처음부터 다시 시작하므로, `maxDelaySeconds`마다
+한 번씩 요청하는 것만으로 그 회원을 계속 기다리게 할 수 있다. 대응은 같은 호스트 복구이며, 그 전에
+비밀번호를 바꾼다.
+
+이 중 두 가지 동작은 제품 예외로 정했다. 클라이언트 제한은 성공한 시도도 세고, 표가 포화되면
+클라이언트와 없는 주소의 카운터는 프로세스마다 따로 세므로 레플리카 N개면 최대 N배까지 느슨해진다.
+실제 회원 자신의 카운터는 프로세스에 두지 않고 언제나 공유 저장소에 둔다.
+
+어느 회원의 것도 아닌 이메일 주소도 같은 한도와 창을 가진 자기 카운터로
+세므로, 평소에는 언제 제한되는지로 계정이 있는지 알 수 없다. 클라이언트는 네트워크 주소로 센다. IPv4는
+주소, IPv6는 /64 단위다. 두 공유 표는 종류마다 `maxEntries`칸이다. 표가 차면 한도에 이르지 않은
+항목 중 가장 오래된 것을 내보내고, 한도에 이른 항목은 창이 끝날 때까지 남는다. 표가 한도에 이른
+항목으로 가득하면 새 카운터는 서빙 프로세스가 대신 같은 한도로 센다. 그래서 어떤 클라이언트도
+다른 클라이언트의 허용량을 나눠 쓰지 않고, 없는 주소도 실제 계정과 같은 시도에서 제한되며, 모든
+판정은 비밀번호를 해싱하기 전에 끝난다. 이 프로세스별 카운터에는 두 가지 비용이 있다. 레플리카마다
+따로 세므로 표가 포화된 동안에는 레플리카 N개가 최대 N배까지 허용한다. 그리고 메모리 상한이
+있어서, 쏟아붓기가 충분히 길면 가장 오래 쓰지 않은 카운터부터 버리며, 그중에는 한도에 이른
+카운터도 있을 수 있다(`parallax_account_local_limiter_evictions_total`). 표가 찰 때마다 세는
+`parallax_account_throttle_saturated_total`에 알림을 걸어 둔다. `rateLimit.link`는 조직 계정
+로그인 시작을 재설정과 따로 제한한다.
+
+표가 포화된 동안에는 이 같음을 비용을 들여 깰 수 있다. 요청을 쏟아부을 의사가 있으면 없는 주소와
+실제 계정을 세 가지로 구별할 수 있다. 레플리카 N개가 부하 분산기 뒤에 있으면 없는 주소는 모든
+레플리카가 막기 전까지 최대 N × `attempts`번 허용되지만 실제 계정은 `attempts`번에서 멈춘다.
+프로세스별 카운터는 가장 오래 쓰지 않은 것부터 버리므로, 다른 요청 약 25,000개(상한 50,000칸의
+절반)로 없는 주소의 잠긴 카운터를 밀어낼 수 있다. 없는 주소용 공유 표는 한도에 이르지 않은 가장
+오래된 항목을 내보내므로, 요청 약 `maxEntries`개로 하나를 밀어낼 수 있다. 어느 쪽이든 드러나는
+쏟아붓기가 필요하다. `parallax_account_throttle_saturated_total`과
+`parallax_account_local_limiter_evictions_total`에 알림을 걸어 둔다.
+
+클라이언트 제한은 사람이 아니라 네트워크 주소를 세며, 이는 의도된 동작이다. 같은 NAT, 사내 프록시,
+VPN 출구 뒤의 사람들은 버킷 하나를 함께 쓰므로, 그중 한 사람이 추측하거나 잘못 입력하면 기다림이
+이어지는 동안 다른 사람도 로그인·코드·재설정에서 `429`를 받을 수 있다. 각자의 회원 카운터에는 영향이 없다.
+어느 주소로 세는지는 요청이 들어오는 경로에 달려 있다. 리버스 프록시 뒤라면 모든 요청이 그 프록시를
+거치고 프록시가 `X-Forwarded-For`를 덮어쓸 때만 `trustForwardedHeaders` 설정을 켠다. 끄면 모든
+클라이언트를 프록시 하나로 세어 버킷 하나를 나눠 쓰고, 그런 프록시 없이 켜면 클라이언트가 아무 주소나
+댈 수 있다. `attempts`와 `windowSeconds`는 한 주소를 함께 쓰는 가장 큰 무리와 그 사람들이 로그인하는
+빈도에 맞춰 정한다. NAT나 사내 프록시 뒤의 로그인은 성공이든 실패든 모두 그 한 주소로 센다. 올리기
+전에 한 주소에서 몰리는 `429`를 먼저 살핀다. 주소를 읽을 수 없는 클라이언트는 공유 버킷 하나에 세고,
+`parallax_account_unidentified_clients_total`로 세며 stderr에 한 번 알린다. 그때는
+`trustForwardedHeaders` 설정과 프록시가 `X-Forwarded-For`에 넣는 값을 점검한다. 카운터는
+백업하지 않고, 옛 형식이거나 깨진 카운터는 저장소를 거부하는 대신 버린다
+(`parallax_account_throttle_entries_dropped_total`).
+
+비밀번호 해싱은 한 번에 최대 `maxConcurrent` × scrypt `maxmem`만큼 메모리를 쓴다(대기 중인 작업은
+기다릴 뿐 메모리를 쓰지 않는다). `parallax config check`는 이 값을 `accountHashing.peakMiB`로 보여 주고
+512 MiB를 넘으면 경고한다. 컨테이너에 준 메모리와 비교한다.
+
+**비밀번호.** 재설정은 회원이 이미 가진 비밀번호를 바꿀 뿐, 새로 만들지 않는다. 조직
+계정으로만 로그인해 온 사람(자동 가입이나 legacy 기간)은 재설정할 비밀번호가 없으므로
+그 사람에게는 계속 제공자만이 들어오는 길이다.
+
+**탈퇴와 삭제.** 회원은 최근 인증 코드와 현재 비밀번호로 자기 계정을 삭제할 수 있다
+(`POST /api/v1/account/delete`). 비밀번호와 인증수단으로 로그인할 수 있는 마지막 관리자는 삭제할 수
+없다. 관리자도 회원을 삭제할 수 있다. 어느 쪽이든 이메일 주소·표시 이름·비밀번호·인증수단·세션·메일
+링크·시도 카운터는 바로 지운다. 남는 것은 회원 ID와 `deleted` 상태만 가진 묘비, 그리고 그 회원이
+연결한 조직 계정(발급자와 subject)뿐이다. 그래야 그 조직 계정이 몰래 새 회원이 되지 못한다. 그
+주소는 다시 초대할 수 있다. 계정 감사 기록에는 주소가 남지 않는다. 삭제 전에 찍은 백업에는 그
+사람의 정보가 남아 있으므로, 백업은 30일 보관해 떠난 사람의 정보가 30일 안에 백업에서도 사라지게
+한다.
+
+**조직 계정 로그인.** ID 토큰의 서명·발급자·audience·nonce·나이와 PKCE 교환을
+검증하고, discovery가 발급자 origin 밖을 가리키면 따르지 않는다. 조직 계정은 최근에
+코드를 입력한 로그인 회원만, 발급자와 subject로만 연결한다. 이메일로는 연결하지 않는다.
+역할은 Parallax에 남고 2단계 인증도 Parallax 인증 앱이 맡으므로, 조직 계정으로
+로그인한 관리자도 여기서 코드를 입력한다. 역할 출처나 MFA를 제공자에게 맡기는 설정은
+권장하지 않는 수준이 아니라 거부된다. 지금 제공자 계약으로는 다음 요청에서 권한 철회도,
+최근 2단계 인증도 증명할 수 없기 때문이다. 첫 조직 로그인 때의 자동 가입은 관리자가
+발급자 하나와 받을 최대 인원을 적어야만 켜진다. 뷰어로 만들고, 이미 쓰는 주소는
+거부하며, 발급자와 인원으로만 제한한다. tenant나 group 제한은 아직 없다.
+
+**legacy 기간.** 기존 조직 로그인을 정해진 기간 동안 유지할 수 있다:
+`parallax accounts legacy --until 2030-01-01T00:00:00.000Z --role-cap editor`. 역할은
+legacy 모드와 같은 방식으로 읽는다. 서명된 ID 토큰과 subject가 같은 userinfo에서
+`PARALLAX_OIDC_ROLE_CLAIM`(기본값 `entitlements`)을 문자열이든 목록이든, 대소문자와
+상관없이 읽어 가장 높은 역할을 고르고, 상한을 씌우며, 로그인할 때마다 다시 읽는다.
+이메일은 필요 없다. legacy 로그인은 회원이 아니다. 발급자와 subject에서 만든 키로만
+보관하고 주소·비밀번호·인증수단이 없으며, 재설정·등록·초대로도 그것을 얻을 수 없다.
+legacy 세션은 저장되고 철회할 수 있으며, 이미 발급된 것도 기한에 끝나고, 민감한 작업은
+하지 못한다. 그 사람이 같은 조직 계정을 초대받은 자기 계정에 연결하면 legacy 기록은
+그 계정에 흡수되고 legacy 세션은 끝난다. accounts 모드에서는 예전 OpenID Connect 세션
+비밀로 서명된 쿠키를 받지 않는다.
+
+전환 전에 legacy 모드와 달라지는 점을 점검한다: 이 기간에는 아무도 관리자로 로그인하지
+못한다(상한은 `viewer` 또는 `editor`). 모든 관리자는 먼저 초대받은 계정과 인증 앱이
+있어야 한다. userinfo가 이 클라이언트에 역할 클레임을 답해야 한다. 전환 전에 만든 세션은
+이어지지 않는다.
+
+**백업.** 이제 `backup`은 format 2를 쓴다: 회원, 비밀번호 해시, 암호화된 인증수단,
+복구 코드 해시, 연결된 계정, 정책, 계정 감사 기록. 세션·메일 링크·로그인 challenge·
+시도 횟수는 빠지므로 복원하면 모두 로그아웃된 상태로 시작한다. 회원 계정이 없는 배포는
+계속 format 1을 쓰고, format 1 문서도 그대로 복원된다. 활성화의 어느 단계든 — 켰지만 회원이
+없음, 첫 관리자 등록 중, 관리자 복구 중 — 찍힌 그대로 복원되고, 뒤의 두 단계에서는 그
+관리자가 비밀번호로 로그인해 인증수단을 등록할 때까지 회원 로그인이 닫혀 있다. 계정 영역은 엄격하게 파싱하고 모든 검사를 쓰기 전에 마친다. 계정 영역은
+마지막에, 활성화 표식과 한 트랜잭션으로 쓴다. 그보다 먼저 쓰는 존·설정·토큰은 저장소를
+가로지르는 하나의 트랜잭션이 아니다. 복원이 중간에 끊기면 계정은 켜지지 않은 채로 남아
+로그인이 닫혀 있고, 비운 저장소에 다시 복원한다. 백업은 원래 저장소만큼 개인적이다. 그 뒤에
+삭제된 회원도 담고 있으므로 30일보다 오래 두지 않는다.
+
+**저장.** 계정 상태 전체는 행 하나(`parallax_account_state`) 또는 설정 파일의 영역
+하나이며 잠금 하나 아래에서 바뀐다. 감사 기록은 따로 추가 전용 테이블에 쌓이고
+`retention`에 따라 정리된다. 세션 확인은 읽기만 한다. 행을 다시 쓰는 것은 세션이
+`touchIntervalSeconds` 갱신 시점이 됐을 때와 로그인·시도 횟수·계정 변경 때다. 모든
+규칙을 한 트랜잭션에 담지만, 수천 명이 아니라 수십에서 수백 명 규모를 위한 것이다.
+
+**새 버전이 바꾼 저장소 거부.** 활성화는 상태와 같은 트랜잭션에서
+`member-accounts-v1`을 `parallax_auth_features`(PostgreSQL) 또는 `authFeatures`(설정
+파일, 이제 version 2)에 기록한다. 기록된 기능을 모르는 버전은 리스너를 열기 전에
+멈추고, 이 버전은 계정이 켜진 저장소를 legacy 모드로 서빙하지 않고 멈춘다. 기록을 읽지
+못해도 멈춘다. "확인하지 못함"은 "아무것도 없음"이 아니다.
+
+| 메시지 | 뜻 |
+|---|---|
+| `authentication storage is not compatible with this version: ...` | 새 버전이 기능을 켰다. 그 버전을 실행하거나 아래 되돌리기를 따른다 |
+| `authentication storage could not be checked, so this version did not start: ...` | 연결·권한·조회가 실패했다. 접근을 고친다. 기록을 지우지 않는다 |
+| `member accounts are enabled; PARALLAX_AUTH_MODE=accounts is required` | 이 저장소에는 회원이 있다. legacy 모드는 회원 없이 서빙하게 된다 |
+
+**되돌리기.** 새 테이블은 더하기만 하지만, 그렇다고 이전 바이너리가 안전한 것은 아니다.
+기능 검사보다 오래된 바이너리는 회원을 무시하고 예전 로그인을 다시 연다. 표식을 거부하는
+버전으로만, 검증한 백업을 가지고 되돌린다. 테이블을 지워서 되돌리지 않는다.
+
+**아직 없는 것.** 보안 알림(비밀번호 변경, 이메일 변경, 인증수단 초기화, 복구 코드 사용,
+복구 코드 뒤 인증수단 교체, 조직 계정 연결·해제)은 한 번 보내고 다시 시도하지 않는다. 세션 목록은 세션을 시작 시각으로 구분한다. 패스키는 없고, 조직
+계정으로만 로그인해 온 회원은 스스로 비밀번호를 추가할 수 없다.
 
 ### 배포 시 보안 가정
 
@@ -763,7 +1025,9 @@ UDP·TCP 권한 있는 DNS 리스너, 번호가 매겨진 리비전과 스냅샷
 하나이고, **내부** 뷰는 RFC 2136을 말하는 서버로 발행하거나
 (`PARALLAX_DNS_INTERNAL_UPDATE`) 이 프로세스의 리스너가 직접 답합니다. 로컬 파일
 프로바이더는 프로바이더가 아예 설정되지 않은 배포를 위한 대역입니다. `restore`는 병합이
-아니며, 이미 존이나 토큰이 있는 저장소는 거부합니다.
+아니며, 이미 존이나 토큰이 있는 저장소는 거부합니다. 회원 계정은 역할과 2단계 인증을
+Parallax에 둡니다. 제공자에게 역할 출처나 MFA를 맡기는 설정은 거부되고, 자동 가입은
+발급자와 인원으로만 제한합니다([자세히](#회원-계정)).
 
 
 ---

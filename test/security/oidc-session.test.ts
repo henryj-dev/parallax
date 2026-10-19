@@ -160,7 +160,7 @@ describe("identity sign-in", () => {
       new Request("https://parallax.example/api/v1/zones", { headers: { cookie: `${identityCookieName}=${encodeURIComponent(session)}` } }),
       { enabled: true, tokens: [{ token: "a-token-of-at-least-32-bytes-long-x", subject: "deploy", role: "admin" }], identitySessionSecret: SECRET },
     );
-    assert.deepEqual(principal, { role: "editor", subject: "keystone-user-1" });
+    assert.deepEqual(principal, { role: "editor", subject: "keystone-user-1", kind: "identity-session" });
   });
 
   it("reports who the caller is, so the portal can leave out what it cannot use", async () => {

@@ -40,3 +40,17 @@ drop or reinterpret data that the previous version still uses.
 Run `pnpm verify:postgres` before merging. It exercises the manifest and
 checksum ledger against real PostgreSQL, verifies that a second run is a no-op,
 and runs concurrent migrators under the advisory lock.
+
+## 006 and member accounts
+
+`006_member_accounts.sql` adds `parallax_auth_features`,
+`parallax_account_state` and `parallax_account_audit` and inserts nothing, so
+applying it leaves member accounts off. `parallax accounts enable` is what
+writes the `member-accounts-v1` marker, in the same transaction as the account
+state.
+
+Additive here does not mean an older binary is safe afterwards. A binary that
+predates the authentication feature check ignores the marker and would serve
+the old sign-in over a store that has members. Once accounts are enabled, roll
+back only to a version that refuses the marker, and never by dropping these
+tables.
