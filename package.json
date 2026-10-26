@@ -35,7 +35,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "jose": "6.2.12",
+    "jose": "6.2.13",
     "nodemailer": "10.1.2",
     "otpauth": "9.5.2",
     "pg": "^8.23.1"
