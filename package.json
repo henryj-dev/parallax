@@ -37,7 +37,7 @@
   "dependencies": {
     "jose": "6.2.12",
     "nodemailer": "10.1.2",
-    "otpauth": "9.5.2",
+    "otpauth": "9.6.0",
     "pg": "^8.23.1"
   },
   "bin": {
