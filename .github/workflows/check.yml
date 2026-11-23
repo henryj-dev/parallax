@@ -137,7 +137,7 @@ jobs:
       # exit 127, on every run since the leg was added -- it has never once been
       # green. This action reads the same `packageManager` field corepack read,
       # so the pnpm version stays declared in exactly one place.
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       # A step in `verify` rather than a job of its own: this is the other half
@@ -333,7 +333,7 @@ jobs:
         with:
           # 하한선에서 잰다. 상한선에서만 재면 하한선이 끌어오는 트리는 아무도 안 본다.
           node-version: 24
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
       - run: pnpm install --frozen-lockfile
 
       # `moderate` 부터 막는다. 직접 의존이 셋뿐이라 전이 의존성의 소음에 파묻힐 트리가
@@ -387,7 +387,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
       - run: pnpm install --frozen-lockfile
       - name: 스위트를 세 번 돌린다 (${{ matrix.os }} · node ${{ matrix.node }})
         run: |
